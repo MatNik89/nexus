@@ -334,3 +334,36 @@ lazy schema-fetch, mjeri schema-token + selection-miss-rate (Pi princip: manje a
 diff/exec/mcp = Go REUSE (ne port). **Honest gap:** 4.1/4.2/4.4/4.7 bez dediciranog Annex RED
 (posredno P1.1/P1.3/P2.2). **Verifikacija:** kandidati stvarni (Mentat izbačen — neaktivan).
 **S4 STATUS: ZAOKRUŽEN.**
+
+---
+
+# S5 — KANONSKA SINTEZA (Workspace/VCS/checkpoint; coding sigurnosna mreža; 3-way, Pareto PASS)
+
+Git: `go-git` (pure-Go, bez cgo) ili `exec git` fallback. Gate P1.2 (orphan/lock sweep).
+
+**5.1 checkpoint/rollback (MEHANIZAM):** `ShadowGit` zaseban repo IZVAN radnog stabla (ne zagađuje
+korisničku povijest — **diferencijator** vs Aider auto-commit/Cline grana); `Snapshot(step)` PRIJE
+svakog side-effecta (content-addressed, jeftino), `Rollback` byte-identičan, checkpoint-ID=journal
+offset. **Salvage:** `core/checkpoint.py`+`core/memgit.py` port. **RED:** Rollback→byte-identično
+pre-stanje, ne dira ne-staged korisničke promjene. **Pareto:** Cline+Aider+LangGraph+shadow-git-izvan-stabla (naš).
+
+**5.2 workspace izolacija (MEHANIZAM+ADAPTER):** git worktree per-task/per-subagent (`NewIsolated
+(owner)` detached, isti .git), eksplicitan `SyncBack` first-writer-wins, `Cleanup` lock-release;
+container backend (S6) isti interface. **Temelj za S12** (svaki subagent svoj worktree, nema
+konflikta). **Salvage:** `core/worktree.py` port. **RED P1.2:** `test_sigkill_restart_reaps_owned_
+tree_only` + symlink izvan roota→odbij, djelomični cleanup→CLEANING nikad RELEASED. **Pareto:**
+OpenHands+SWE-agent+Sandbox-Agents(beta)+worktree-per-subagent (naš).
+
+**5.3 dirty/atomic/conflict/provenance (MEHANIZAM):** `AtomicWriter` tmp→fsync→rename (nikad in-
+place, nikad pola fajla); `TaintTier{GENERATED|USER|UNKNOWN}` first-writer-wins (USER-tainted +
+GENERATED write→CONFLICT, tuđi rad se ne gazi); **sandbox-neutralni atestor** (obsidian): provenance
+iz NIŽEG trust sloja (sandbox vidio stvarni argv/fs/net), runtime NE atestira sam sebe (6.0
+trust-boundary), export W3C PROV-O (veže 6.2+15.3). **Salvage:** `core/provenance.py` datamark port
++ `gortex/diff_engine.go` atomic Go REUSE. **RED:** konkurentni GENERATED-vs-USER edit→CONFLICT,
+korisnički sadržaj sačuvan; atomic write usred pada→stari ili novi, nikad pola. **Pareto:** Aider+
+Codex+Cline+sandbox-atestor-PROV-O (naš).
+
+**S5 diferencijator:** shadow-git izvan stabla (byte-identičan undo bez zagađenja povijesti) +
+worktree-per-subagent (S12 temelj) + sandbox-neutralni atestor. **Honest gap:** 5.1/5.3 bez
+dediciranog Annex RED (P0.11 kandidat). **Verifikacija:** kandidati stvarni; `diff_engine.go` Go
+reuse. **S5 STATUS: ZAOKRUŽEN.**
