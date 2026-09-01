@@ -565,3 +565,36 @@ mjerenja→odbij.
 
 **S10 = ADAPTER-sučelja (ne spajaj engine) + ACL-prije-retrievala + iskren CAG-UNCLEAR + quality-
 gate.** **Verifikacija:** kandidati stvarni (obsidian runners-up matrica). **S10 STATUS: ZAOKRUŽEN.**
+
+---
+
+# S11 — KANONSKA SINTEZA (Prompt/instrukcijski sloj; 3-way, Pareto PASS)
+
+**11.1 assembly (MEHANIZAM, jezgra):** deterministički prompt-assembler + precedence + trust-fencing
+(untrusted ContextBlock NE postaje instrukcija — P0.3) + provenance. **Salvage:** `core/promptlayer.py`.
+OpenClaw (SOUL.md/AGENTS.md/TOOLS.md) najbliži precedence-match. **Pareto:** Aider+SWE-agent+OpenClaw.
+
+**11.2 skills (DATA):** Agent-Skills-standard (SKILL.md) + Hermes agent-authored + Codex-skills.
+**Reversa** = signed skill-pack OVDJE (data, ne 17.1 plugin): legacy→spec+migracijski-plan PRIJE
+mutacije, `allowLegacyEdits:false` provodi kernel 6.1/6.9. Source-grounded synthesis: skill nosi
+source-manifest+citate+expiry+eval. **Salvage:** `core/reversa.py`+40 skillova. **Pareto:** goose+Agent-Skills+Codex+Reversa.
+
+**11.3 projektne-instrukcije:** AGENTS.md standard (Codex/OpenCode/Cline .clinerules). **11.4
+prompt-optimizacija:** DSPy+TextGrad+promptfoo.
+
+**11.5 skill-lifecycle/governance (MEHANIZAM jezgra, `extensions`):** `install→scan→pin→activate→
+measure→update→rollback→archive`; scan=injection/exfil/tool-chain/install-skripte (pre-install);
+**P1.1 TOCTOU runtime hash-on-load** (`SkillLock.VerifyOnLoad` — provjera pri SVAKOM loadu, canonical
+root bez symlink-escapea, mismatch→QUARANTINED); write_approval DEFAULT ON, auto-install DEFAULT OFF,
+self-authoring inertan do gatea. **Salvage:** `managers/skill_*` 15 modula (Skill Forge izolirana
+eval grana). Cisco-scanner/ZIRAN/Depx. **RED P1.1:** `test_skill_swap_after_install_is_quarantined`.
+**Pareto:** NEXUS-forge+Cisco+ZIRAN+TOCTOU-hash (naš).
+
+**11.6 role→agent→skill data-manifest (MEHANIZAM interpreter=jezgra, sadržaj=data):** role/agent-
+template/team/skill=VALIDIRANI PODATKOVNI MANIFESTI (nova rola=nova mapa, nula izmjene jezgre —
+NEXUS lekcija); kernel jedini rješava precedence/capability/budget/output-contract; core NE zna
+nazive domena. **Salvage:** NEXUS role/agent/skill hijerarhija. **Pareto:** CrewAI-YAML+OpenClaw+
+MetaGPT+manifest-interpreter (naš).
+
+**S11 = TOCTOU skill-hash + role-data-hijerarhija (nula-izmjene-jezgre) + Reversa-kao-data.**
+**Verifikacija:** kandidati stvarni; salvage interni. **S11 STATUS: ZAOKRUŽEN.**
