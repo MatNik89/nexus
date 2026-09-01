@@ -367,3 +367,59 @@ Codex+Cline+sandbox-atestor-PROV-O (naš).
 worktree-per-subagent (S12 temelj) + sandbox-neutralni atestor. **Honest gap:** 5.1/5.3 bez
 dediciranog Annex RED (P0.11 kandidat). **Verifikacija:** kandidati stvarni; `diff_engine.go` Go
 reuse. **S5 STATUS: ZAOKRUŽEN.**
+
+---
+
+# S6 — KANONSKA SINTEZA (Sigurnost; NAJKRITIČNIJA — membrane salvage 1:1, ne rewrite; 3-way, Pareto PASS)
+
+**Načelo (audit-konsenzus):** izbrušene membrane se PRESAĐUJU s parity testom, ne pišu iznova.
+GORTEX je već Go → direktan reuse. Fail-closed, non-bypassable.
+
+**6.0 trust/PEP (MEHANIZAM):** OPA-stil policy decision point ("smije li subjekt X alat Y nad Z"),
+executor fail-closed provodi. **Salvage:** `core/permissions.py classify` + `core/provenance.py`.
+**Pareto:** Codex-approval+OpenHands-analyzer+OPA.
+
+**6.1 permission gating (MEHANIZAM):** `permissions.py` shlex-token analiza po argumentu (GREEN/
+YELLOW/RED, 5-tier), hooks pre_tool deny. **Salvage:** `core/permissions.py`+`core/hooks.py` port.
+**RED:** RED-regex komanda→deny. **Pareto:** Codex+goose+gptme+per-argument.
+
+**6.2 sandbox (MEHANIZAM, per-OS build-tag, GORTEX Go REUSE):** `Boundary` interface;
+`sandbox_linux.go` (Landlock 3 syscalla preko `x/sys/unix` BEZ cgo + seccomp prctl BPF + bwrap),
+`sandbox_windows.go` (Job Object KILL_ON_JOB_CLOSE + restricted token), `sandbox_darwin.go`
+(Seatbelt sandbox-exec adapter — nema Landlock ekvivalent). **GORTEX = Go REUSE 1:1**
+(`landlock_linux.go`/`sandbox.go`/`process_manager.go`/`tool_executor.go`/`netjail.go` — NE port,
+NE prepisati; samo adapter koji ga zove). Opasni I/O u out-of-process helperu iza autentificiranog
+IPC, NIKAD in-process fallback. **RED P2.2 + PARITY:** Landlock write na ne-dopušten path→EPERM
+identično NEXUS membrani; bez dopuštenog patha→fail-closed. **Pareto:** Codex+OpenHands+gVisor+GORTEX-parity (naš).
+
+**6.3 egress (MEHANIZAM):** allowlist + **SSRF metadata hard-block** (169.254.169.254 u decimal/hex/
+octal/mapped-IPv6 → REFUSE PRIJE diala) + redirect re-check + `netjail filtered_jail` (bwrap prazan
+netns, jedini izlaz UDS→FilterProxy). **Salvage:** `core/egress.py`+`core/netjail.py` port/reuse.
+**RED:** metadata-IP u bilo kojem kodiranju→block. **Pareto:** Codex+microsandbox+OpenHands+SSRF-hardening (naš).
+
+**6.4 secrets (MEHANIZAM):** keyring, `broker.py` redact (entropija+shape), SECRET_ARGS. **Salvage:**
+`core/secrets.py`+`core/broker.py` port. **RED:** secret u izlazu→redigiran prije journala (P0.3).
+
+**6.5 injection-obrana + canary (MEHANIZAM):** datamark fence + guardian judge + deny-list;
+**canary tripwire** per-install token, detekcija u izlazu→**FAIL-CLOSED blok cijele isporuke** +
+audit+alert+rotacija+ljudska odluka (ne samo redakcija). **Salvage:** `core/provenance.py datamark`+
+`core/guardrail.py`+`core/guardian.py`+`core/canary.py`. **RED:** canary u izlazu→blok isporuke.
+**Pareto:** LlamaFirewall+NeMo+LLM-Guard+canary-failclosed (naš); AgentDojo mjeri.
+
+**6.6 authn/tenant (`service` flag):** channel-scoped allowlist deny-default, PKCE OAuth; multi-
+tenant RBAC. **Salvage:** `gateway/base.py`+`core/oauthcode.py`. **6.7 data-governance:** BASELINE
+(jezgra, svaki store: retention/delete/export/PII — Presidio + vlastiti SQLite purge) + SERVICE
+dodatak (DSAR/legal-hold). **RED P2.1:** MEMORY_FORGET vs DATA_PURGE razdvojeni.
+
+**6.8 supply-chain (`extensions` flag):** Sigstore/cosign potpis + OSV-Scanner + in-toto provenance;
+`core/supplychain.py` OSV + trust-by-hash. **RED P1.5:** post-signature artefakt tamper→publish blok.
+
+**6.9 lifecycle enforcement (MEHANIZAM, jezgra):** `MiddlewareChain` success-faze `before_run→
+before_tool→after_tool→before_deliver` (jezgreni policy PRVI i ZADNJI, plugin hook samo SUZI);
+**on_error = GRANA iz svake faze** (causal-error+audit, BEZ kasnijih success-hookova). + **P1.4
+draft→approve→commit→verify→compensate** za ireverzibilne side-effecte. **Salvage:** `permissions.py`+
+`hooks.py`. **RED P1.4:** `test_approval_cannot_authorize_modified_effect`. **Pareto:** NEXUS-hooks+
+Claude-Code-referent+DeepSeek-Cordis+on_error-grana (naš).
+
+**S6 = membrane REUSE ne rewrite (gortex 1:1 + parity), per-OS build-tags, fail-closed svugdje.**
+**Verifikacija:** kandidati stvarni; GORTEX interni (audit potvrdio). **S6 STATUS: ZAOKRUŽEN.**
