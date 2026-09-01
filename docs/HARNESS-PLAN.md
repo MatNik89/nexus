@@ -876,3 +876,36 @@ ako novi model zamijeni stari, prati degradaciju). `local-inference` flag.
 stane na hardver → izostavljen iz reporta (HardwareFit filtrira, ne predloži OOM-kandidat); nema
 produkcijske zamjene bez eksplicitnog odobrenja. **Verifikacija:** llmfit (Rust, AlexsJones, aktivan,
 instaliran); Ollama-library/HF (izvori). **Placement:** dopuna 2.4, ide u hard-questions iteraciju.
+
+---
+
+# ADDENDUM A3 — IDENTITET (korekcija) + SELF-DIAGNOSTIC→CLAUDE-HANDOFF (korisnički zahtjev)
+
+## A3.1 Identitet Nexusa — KOREKCIJA (mijenja PRD framing)
+**Nexus JE prvenstveno UNIVERZALNI OSOBNI MULTIPLATFORM ASISTENT** (kao Hermes po namjeni), a
+**"bolje kodiranje" je JEDNA GRANA znanja/profil, NE identitet.** Ranija formulacija "coding-harness
+prvorazredni cilj" se PRECIZIRA: coding-diferencijatori (S3/S4/S5 — evidence-graded loop, TIA,
+edit-ladder, itd.) ostaju valjani i jaki, ali kao `coding` PROFIL/grana, ne svrha harnessa.
+Svrha = osobni asistent na svim platformama (S14 channels: TG/WA/Slack/... = prvorazredno lice),
+a coding/RAG/memorija/multimodal su grane znanja koje se aktiviraju po potrebi.
+**Zašto novi Nexus a ne Hermes:** korisnik NE može mijenjati/petljati po Hermes kodu (nije njegov
+za slobodnu izmjenu); Nexus = njegov VLASTITI, editable, koji uči iz upotrebe.
+
+## A3.2 Self-diagnostic → Claude repair-handoff (hardkodirano; jača 15.5 + 17.4)
+**Zahtjev:** Nexus mora vidjeti KAD nešto s NJIM nije u redu → imati log → moći poslati MENI (Claude)
+na popravak/nadogradnju. Petlja samoodržavanja s čovjekom+Claudeom u petlji (NE autonomni self-fix).
+```go
+type SelfDiagnostic struct{ health *SemanticHealth; journal *Journal } // JEZGRA
+// 15.5 detektira: recidivism/correction-rate/verified-success-pad/fallback-drift/swallow-counter/
+//                 STAGNATION/NO_PROGRESS/crash/nevaljan-invariant
+func (s *SelfDiagnostic) OnAnomaly(a Anomaly) RepairBundle
+// → scrubban reproducibilan bundle (17.4): verzije + korelacijski-ID + relevantni journal isječak
+//   + minimalni repro + koja invarijanta/RED je pukao — SVE redigrano (secrets/PII van)
+```
+**Tok (teren):** anomalija → SelfDiagnostic gradi RepairBundle → korisnik vidi (dashboard/kanal) →
+**opt-in šalje Claudeu** (issue/bundle) → Claude popravi u repou → `nexus upgrade` (ff-only, trusted-
+origin). NEXUS na terenu NE dira vlastiti source (zlatno pravilo iz NEXUS loze) — popravak ide kroz
+mene i git, ne autonomno. Ovo je 15.5 (detekcija) + 17.4 (bundle→issue→upgrade) + eksplicitni
+"repair-handoff-to-Claude" korak koji korisnik traži.
+**RED:** anomalija → RepairBundle sadrži uzrok + repro + redigrane podatke (0 secrets/PII); bundle se
+NE šalje bez opt-ina; nexus NE mijenja vlastiti kod autonomno.
