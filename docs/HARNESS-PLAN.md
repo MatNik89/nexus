@@ -466,3 +466,40 @@ durable-delivery-outbox+orphan-sweep (naš).
 
 **S7 = popravlja glavni audit-nalaz (queue lease/fencing) + N9 durable-delivery.** **Verifikacija:**
 Temporal/Dapr stvarni; Restate source-available (matrica). **S7 STATUS: ZAOKRUŽEN.**
+
+---
+
+# S8 — KANONSKA SINTEZA (Kontekst management; 3-way, Pareto PASS)
+
+**8.1 window-budžet (MEHANIZAM):** `ContextBudget` token-mjerenje + hard-limit + pressure-state +
+fold; fallback estimate vidljiv. **Salvage:** `core/contextbudget.py`+`core/context.py`. **Pareto:**
+Aider+letta+OpenHands.
+
+**8.2 kompakcija (MEHANIZAM, jezgra):** anchored 8-sekcijski summary (cilj/napredak/odluke/greške/
+otvorena-pitanja/artefakti/sljedeći-korak/ograničenja). **KLJUČNO P0.3:** sažetak NASLJEĐUJE
+lineage — `trust_class(sažetak)=MAX(izvori)`, `sensitivity=MAX`, `lineage=union+summary-id`;
+sažetak NE smije oprati untrusted→SYSTEM/instrukcija (injection vektor). Branch-summary (pi-mono).
+**Salvage:** `core/compact.py anchored_summary`. **RED P0.3:** `test_s0_rejects_provenance_laundering`
+(untrusted kroz compactor koji skine lineage→PROVENANCE_DOWNGRADE). **Pareto:** letta+OpenHands+pi-mono+lineage-monoton (naš).
+
+**8.3 repo-mapa (MEHANIZAM, coding):** Aider tree-sitter + **PPR (personalized PageRank) rangiranje**
++ NEXUS `archmap` (arhitektura kao queryable graf — coding-diferencijator iznad pretrage). Skalirano
+po token-budžetu. **Salvage:** `core/archmap.py`+`core/rank.py PPR`+`core/codeindex.py`+`core/wiki.py`.
+Runners-up (obsidian): Understand-Anything/Scan, Graphify. **Pareto:** Aider+Repomix+Continue+archmap-PPR (naš).
+
+**8.4 cache (MEHANIZAM, dva sloja):** (a) API `cache-control` propagacija; (b) lokalni prefix/
+RadixAttention (SAMO self-hosted). **Cache-key MORA nositi (codex#19):** namespace/tenant/principal-
+scope/authz-policy-version/sensitivity/corpus-version/model/prompt-hash/purge-generation — bez
+wildcard fallbacka; SECRET=NO_STORE; purge/revocation povećava generation. **Salvage:** `core/
+respcache.py`+`core/promptlayer.py`. **RED codex#19:** `test_cross_tenant_cache_key_cannot_alias`.
+**Pareto:** LiteLLM+vLLM+SGLang+tenant-scoped-key (naš).
+
+**8.5 observation-pruning (MEHANIZAM):** filter-PA-komprimiraj tipiziran adapter PO ALATU — test
+čuva failures, git-diff čuva hunks, crawl čuva citations; raw artefakt po referenci + fidelity eval.
+**Salvage:** `core/crush.py` (fail-open head+tail fallback). Kandidati: RTK (proxy 100+ CLI),
+Headroom (multi-tier + learn), SWE-agent ACI-pager. **RED:** pruning čuva error-linije/exit-status.
+**Pareto:** RTK+Headroom+SWE-agent+crush (naš, per-tool typed adapter).
+
+**S8 = lineage-monoton kompakcija (anti-injection) + tenant-scoped cache + archmap-PPR coding-
+diferencijator.** **Honest gap:** 8.1/8.3/8.5 bez dediciranog Annex RED (P0.3 pokriva 8.2, codex#19
+pokriva 8.4). **Verifikacija:** kandidati stvarni (RTK/Headroom obsidian, matrica). **S8 STATUS: ZAOKRUŽEN.**
