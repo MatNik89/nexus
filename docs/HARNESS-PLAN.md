@@ -713,3 +713,36 @@ counter → S7 circuit-breaker prije lažno-zdravog rada. **Salvage:** `core/hea
 **S15 = journal-projekcije (jedan write-owner) + tamper-evident+vanjski-anchor + semantic-health.**
 **Honest gap:** 15.1/15.2/15.4/15.5 bez dediciranog Annex RED (P0.3 pokriva pisanje). **Verifikacija:**
 OTel/Prometheus/Grafana stvarni. **S15 STATUS: ZAOKRUŽEN.**
+
+---
+
+# S16 — KANONSKA SINTEZA (Eval; dokazuje vodeće načelo; 3-way, Pareto PASS)
+
+Zahtjevi: versioniran task-corpus, holdout, deterministic-fixtures, snapshot-identiteta, ablation
+(harness može postati RED), paired-baseline-gate, cost/latency/turn-budžeti, flaky-politika.
+**Matrica dobiva HARD-LIMIT pojavljivanja po projektu (anti over-indexing) + critical-gate floor**
+(0.1/0.2/7.2 se ne kompenziraju perifernim IMA).
+
+**16.1 task-benchmark (MEHANIZAM):** SWE-bench (benchmark)/Aider-suite/Inspect + **app-contract**
+deliverable-level (ekrani/tokovi/persistence, ne test-count). **Salvage:** `evals/bench.py`+
+`app_contract.py`. **16.2 ratchet:** promptfoo/DeepEval/Opik + baseline; retrieval-ratchet cross-ref
+10.7. **Salvage:** `evals/regression_tester.py`. **16.3 red-team:** garak/PyRIT/promptfoo-redteam +
+**STRIX** (usestrix/strix — dinamički pentest agent, PoC-validacija) + Shannon; kandidat `security-
+audit` skill-pack. **Salvage:** `evals/redteam.py`+`cmdjail.py`.
+
+**16.4 feedback-flywheel + credit-ledger (MEHANIZAM, kanonski owner):** provenance-aware credit —
+memorija/skill/ruta prima kredit SAMO iz revision-bound VERIFICIRANOG ishoda (test-gate/loop-judge,
+NIKAD self-report); epsilon-greedy; feeds 2.6/9.3/11.5. Dormantan jezgreni ugovor dok potrošač ne
+aktivira (Q3). Langfuse/Opik/AgentOps annotations. **Salvage:** `core/reward.py`+`core/credit.py`.
+**16.5 trajectory-export (`destilacija`):** SWE-gym/Axolotl/ShareGPT-JSONL.
+
+**16.6 anti-sycophancy/neovisna-provjera (MEHANIZAM jezgra + `multi-agent`):** minimalni checker=
+jezgra, council=multi-agent strategija. Checker OBARA premisu+zaključak na ARTEFAKTIMA (git-diff+
+exit-code+determinističke signale), NE prozi (checker≠worker); confidence iz logproba (UQLM);
+blokira "uspjeh" kad dokaz ne prati tvrdnju. **CODING-diferencijator** (nitko od Kilo/OpenHands/
+OpenCode nema). Council (P2.7) sealed→anonimni-cross→chairman, dissent-očuvan, NE zamjenjuje checker.
+**Salvage:** `core/confidence.py` ChainPoll + `loop_engine` checker + `managers/council.py`. **RED
+P2.7:** `test_council_cannot_drop_sealed_material_dissent`. **Pareto:** vlastiti-checker+UQLM+Inspect+council.
+
+**S16 = evidence-graded checker (coding-diferencijator) + verified-credit-ledger + strix-red-team +
+matrica-hard-limit.** **Verifikacija:** kandidati stvarni (strix 36k aktivan). **S16 STATUS: ZAOKRUŽEN.**
