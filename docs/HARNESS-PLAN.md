@@ -503,3 +503,34 @@ Headroom (multi-tier + learn), SWE-agent ACI-pager. **RED:** pruning čuva error
 **S8 = lineage-monoton kompakcija (anti-injection) + tenant-scoped cache + archmap-PPR coding-
 diferencijator.** **Honest gap:** 8.1/8.3/8.5 bez dediciranog Annex RED (P0.3 pokriva 8.2, codex#19
 pokriva 8.4). **Verifikacija:** kandidati stvarni (RTK/Headroom obsidian, matrica). **S8 STATUS: ZAOKRUŽEN.**
+
+---
+
+# S9 — KANONSKA SINTEZA (Memorija; `memorija` flag osim 9.1=jezgra; 3-way, Pareto PASS)
+
+**9.1 sesije (JEZGRA):** save/resume=svaki stateful harness (naslanja 7.3); branch/user-visible=
+profil. Memory-SPINE=SQLite-WAL (`modernc.org/sqlite`, bez cgo). **Salvage:** `core/session.py`+
+`core/resume.py`. Runner-up: Stash (shared team-memory, multi-agent handoff). **Pareto:** goose+OpenHands+Codex+spine.
+
+**9.2 perzistentna memorija (`memorija`):** 5-scope spine (`core/memory.py`), memvec+kg+entres;
+write-approval DEFAULT ON, untrusted-context labeling (P0.3). **P2.1 MEMORY_FORGET (reverzibilno,
+zabrana recalla) vs DATA_PURGE (ireverzibilno, S6.7 nadjačava, briše i tombstone).** **Salvage:**
+`core/memory.py`+`memvec.py`+`kg.py`+`entres.py`. Runner-up: OpenHuman-Memory-Tree/TokenJuice
+(cold-start). **RED P2.1:** `test_purge_cannot_complete_with_residual_copy`. **Pareto:** letta+mem0+zep+forget/purge-split.
+
+**9.3 učenje-iz-iskustva (`memorija`):** Hermes Agent (produkcijski OSS, agent-authored skills —
+PAŽNJA write_approval default OFF u Hermesu, MI ga uključujemo); reasonbank/reflexion/selfimprove
+quality-gated (promocija samo iz verificiranog). **Salvage:** `core/reflexion.py`+`core/reasonbank.py`.
+Reflexion/Voyager=research referenti. **Pareto:** Hermes+cognee+research-referenti.
+
+**9.4 konsolidacija/decay (`memorija`, veliki salvage):** `Consolidator.Dream(episodes)→gist+KG`
+(offline sleep-time); `Decay` FSRS-lite mijenja RANG ne postojanje (LOSSLESS — original uvijek u
+hot/warm/cold arhivi); `Audn.Resolve` kontradikcije ADD/NOOP/SUPERSEDE na read (ne silent overwrite);
+`MemGit` verzionirani write (undo memorije); `MemAssoc` spreading-activation; temporalni upiti ("što
+sam znao TADA"). **Salvage:** `core/dream.py`+`sleeptime.py`+`audn.py`+`memgit.py`+`recall.py`+
+`memassoc.py` — NAJBOGATIJI memorijski salvage. **RED:** decay NE briše bajtove; konsolidacija
+untrusted epizode→gist ostaje UNTRUSTED (P0.3). **Pareto:** letta+mem0+zep+sleep-time-decay-AUDN (naš).
+
+**S9 = najbogatiji NEXUS salvage (6 memorijskih modula) + forget/purge trust-razdvajanje.**
+**Honest gap:** 9.1/9.3/9.4 bez dediciranog Annex RED (P0.13 "decay-never-destroys-bytes" kandidat).
+**Verifikacija:** kandidati stvarni; salvage interni (audit potvrdio). **S9 STATUS: ZAOKRUŽEN.**
