@@ -287,3 +287,50 @@ once_across_restart`. **Pareto:** NEXUS-admission+Temporal-DST+APScheduler.
 (3.4), TIA (3.5) — nijedan od Kilo/OpenHands/OpenCode nema. **Honest gap:** 3.2/3.3/3.5 bez
 dediciranog Annex RED (P0.9 "verify-never-silent" kandidat za matrix-prep). **Verifikacija:** svi
 javni kandidati stvarni; Kilo Code = to-beat meta bez javne licence. **S3 STATUS: ZAOKRUŽEN.**
+
+---
+
+# S4 — KANONSKA SINTEZA (Tool sustav; coding-kritično 4.2-4.4; 3-way, Pareto PASS)
+
+**4.1 tool-registry (MEHANIZAM):** typed schema po alatu (`ToolSpec{ID,SchemaHash,EffectClass}`),
+dispatch, timeout, result-envelope, permission-wrapper. **Salvage:** `core/tools.py`+`toolschema.py`.
+**RED:** poziv bez validne sheme→reject. **Pareto:** FastMCP+smolagents+OpenAI-SDK.
+
+**4.2 shell/exec (MEHANIZAM, coding):** bash-sesija koja drži stanje, rlimits, tree-kill.
+**Salvage:** `core/subproc.py run_isolated` (rlimits/grupa-kill) port + **`gortex/tool_executor.go`
+= Go REUSE** (već Go). **RED:** timeout→cijelo procesno stablo ubijeno (P1.2). **Pareto:** OpenHands+
+Codex-sandbox+gptme + gortex-reuse.
+
+**4.3 edit formati (MEHANIZAM, PRESUDNI coding-lever, PRODUBLJENO):** multi-format engine
+(WHOLE/DIFF/UDIFF/SEARCH_REPLACE) + **izbor PO MODELU** (Aider benchmark: slab→SEARCH_REPLACE,
+jak→DIFF) + **deterministički LADDER** `exact(editapply)→fuzzy(editrepair, više kandidata→REFUSE)→
+AST/LSP symedit`. Fail-closed na ambiguous (nikad pogađaj). Atomic staged→verify(3.5)→commit,
+dirty-tuđi-rad se ne gazi (5.3). **DIFERENCIJATOR:** symedit (AST-scoped rename/refactor) + refuse-
+on-ambiguous — Aider/Cline/Codex nemaju. **Salvage:** `editapply.py`+`editrepair.py`+`symedit.py`
+port; **`gortex/diff_engine.go` Go REUSE**. **RED:** 2 identična matcha→REFUSE; symedit rename ne
+dira string/komentar (AST). **Pareto:** Aider(multi-format/per-model)+Cline(checkpoint)+Codex+ladder+symedit (naš).
+
+**4.4 pretraga koda (MEHANIZAM+ADAPTER, coding, PRODUBLJENO):** slojevito text→AST→simbol→
+semantika→arhitektura. `SearchStack{ripgrep, ast-grep, serena-LSP, codeindex, callgraph, archmap}`.
+Svaki Hit datamarked-untrusted + source_uri. **DIFERENCIJATOR dev-inteligencija IZNAD pretrage:**
+pre-indexirani simboli + call-graph + arhitektura-kao-queryable-graf (NEXUS) — konkurenti staju na
+LSP+grep. **Salvage:** `codeindex.py`+`coderetrieval.py`+`callgraph.py`+`archmap.py`+`lsp.py` port.
+**RED:** stale index→re-scan, ne krivi hit. **Pareto:** ripgrep+ast-grep+Serena+dev-intel (naš).
+
+**4.5 web/browser (ADAPTER, `browser` flag):** browser-use+Playwright-MCP+Skyvern; Camoufox
+runner-up SAMO uz ToS/robots policy jezgre. Egress-gated (S6.3). **Salvage:** `core/browse.py`
+egress-guarded CDP. **RED:** browser bez egress-checka→blokiran.
+
+**4.6 MCP klijent (MEHANIZAM+ADAPTER):** klijent + **P1.3 transport/auth ugovor** (local-stdio vs
+remote-https, peer-identity pin, scoped OAuth, tool-list size-limit + injection-fencing, cancel=S7).
+**Salvage:** `core/mcp.py`+`mcpauth.py` (OAuth) port; `gortex/mcp_server.go` Go reuse.
+**RED P1.3:** `test_mcp_wrong_pinned_peer_gets_no_credentials`. **Pareto:** goose+Cline+Codex+auth-ugovor.
+
+**4.7 tool-exposure-budget (MEHANIZAM, jezgra):** per-turn minimalni capability-scoped tool-view,
+lazy schema-fetch, mjeri schema-token + selection-miss-rate (Pi princip: manje alata pobjeđuje).
+**RED:** turn dobiva samo scoped set, ne cijeli registry. **Pareto:** pi-mono+MCP-discovery+ToolView (naš).
+
+**S4 = 2 coding-diferencijatora:** edit-ladder+symedit (4.3), dev-inteligencija (4.4). gortex
+diff/exec/mcp = Go REUSE (ne port). **Honest gap:** 4.1/4.2/4.4/4.7 bez dediciranog Annex RED
+(posredno P1.1/P1.3/P2.2). **Verifikacija:** kandidati stvarni (Mentat izbačen — neaktivan).
+**S4 STATUS: ZAOKRUŽEN.**
