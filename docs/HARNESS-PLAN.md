@@ -33,3 +33,40 @@ Verifikacija aspekata: WebSearch/WebFetch za sporne tvrdnje; NEXUS kod za salvag
 ---
 
 <!-- Sinteze se dodaju ispod, sekcija po sekcija -->
+
+---
+
+## DIREKTIVA: `coding` profil = PRVORAZREDNI CILJ (bolji od Kilo Code / OpenHands / OpenCode)
+
+Korisnički zahtjev: NEXUS mora biti ODLIČAN coding harness — cilj nadmašiti Kilo Code,
+OpenHands, OpenCode. `coding` profil (3.5 + 4.2–4.4 + S5 + 8.3 + TIA + app-contract + Reversa)
+dobiva DUBLJI hibrid-sintezni pass od ostalih, s dodatnom rigoroznošću.
+
+**Što moramo BAREM izjednačiti (iz analize 28 harnessa):**
+- **Aider** — benchmarkirani edit-formati (diff/whole/udiff/search-replace) po modelu + tree-sitter/
+  PageRank repo-map. Edit-format je dokazani lever za slab model → 4.3 mora imati više formata + izbor po modelu.
+- **Codex** — turn/session/tool/context razdvojeni moduli (zlatni standard modularnosti) → naša S0/S3 dekompozicija.
+- **OpenHands** — Action/Observation event-stream model → čist runtime; error u observationu, ne pad petlje (3.4).
+- **Cline/Roo** — checkpoint/rollback po koraku (shadow-git) → 5.1 sigurnosna mreža.
+- **OpenCode/Kilo** — LSP-integrirana simbolička navigacija → 4.4 (LSP + AST + callgraph).
+
+**Naši DIFERENCIJATORI (što ostali NEMAJU — iz NEXUS audita + obsidiana):**
+- **Evidence-graded loop** (loop_engine): checker ocjenjuje git-diff + realan exit-code, NE prozu
+  workera (anti-sycophancy strukturno) → 3.1 + 16.6. Nijedan od tri konkurenta to nema.
+- **TIA** (3.5): coverage × git-diff → samo pogođeni testovi (sekunde umjesto minuta).
+- **app-contract** (16.1): deliverable-level acceptance (ekrani/tokovi/persistence), ne test-count.
+- **Skill-forge** (11.5) + **credit/reward ledger** (16.4): harness uči iz coding-iskustva, greške se ne ponavljaju.
+- **Reversa** (11.2): reverse-engineering legacy repoa → spec+migracijski plan prije mutacije.
+
+**Organizacija:** kad hibrid-sinteza dođe do coding-sekcija (3.x, 4.2-4.4, 5.x, 8.3), radi se
+KAO ZASEBAN produbljeni blok — svaka od te tri meta (Kilo/OpenHands/OpenCode) razložena na
+coding-aspekte, hibrid mora na SVAKOM aspektu biti ≥ najbolji od njih + naši diferencijatori nadgradnja.
+
+## PROVIDER MEHANIZAM (salvage-osnova za 2.1/2.2/2.6)
+
+NEXUS spaja na modele DVA načina (llm/providers.py — potvrđeno čitanjem):
+1. **CLI-agent provideri** — subprocess na instalirani `codex`/`claude` CLI s UGAŠENIM alatima
+   (`--tools ""`, ephemeral, ignore-config) → tuđi harness kao čisti text-in/out model, bez API ključa.
+2. **API provideri** — OpenAI-kompatibilan base_url+api_key HTTP (DeepSeek/LiteLLM/Local).
++ router (naučeni winner + barbell fallback), KeyPool rotacija, CostTracker.
+Go-verzija ZADRŽAVA oba + sigurnosnu finesu (CLI-agent bez alata — NEXUS drži petlju/alate).
