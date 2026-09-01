@@ -909,3 +909,50 @@ mene i git, ne autonomno. Ovo je 15.5 (detekcija) + 17.4 (bundle→issue→upgra
 "repair-handoff-to-Claude" korak koji korisnik traži.
 **RED:** anomalija → RepairBundle sadrži uzrok + repro + redigrane podatke (0 secrets/PII); bundle se
 NE šalje bez opt-ina; nexus NE mijenja vlastiti kod autonomno.
+
+---
+
+# ADDENDUM A4 — HERMES AUDIT gap-analiza (osobni-asistent rupe koje plan NIJE imao)
+
+Puni Hermes audit (3 agenta, ~/.hermes/hermes-agent) — konsenzus: **~80% preklapanje na osi
+"osobni asistent"**; naš plan je bio coding-nagnut pa MU FALE asistentski obrasci koje Hermes ima.
+Kako je identitet sad "asistent prvo" (A3.1), foldam materijalne rupe:
+
+**G1 — OS-wide computer-use (MATERIJALNO, NOVO):** asistent bez rada u lokalnim DESKTOP aplikacijama
+ostaje browser/terminal-only. Nije samo `vision` (13.1) — input-injection (klik/tipkanje) je
+side-effect s DRUGAČIJIM approvalom/replayom/focusom/OS-permissionima. → nova podsekcija u S4/S13,
+`computer-use` flag; approval kroz 6.9 + P1.4 (ireverzibilni GUI side-effect). Salvage-ideja: Hermes
+computer_use obrazac (ne kod — Go rebuild).
+
+**G2 — Izolirani osobni PROFIL (MATERIJALNO):** "posao"/"privatno"/"obitelj" NE smiju dijeliti
+memoriju/tajne/channel-route/cache/automation/skill-state. Annex tenant/cache granice pomažu, ali
+korisnički profil-LIFECYCLE nije definiran. → jača 6.6/6.7 + 9.2: `PersonalProfile` kao izolacijska
+jedinica (kao qm/Durable-Objects pattern iz obsidiana — memory+secrets+channels+budget zajedno).
+
+**G3 — Voice kao RAZGOVORNI runtime (MATERIJALNO):** 13.3 je STT/TTS adapter, ali fali barge-in/
+echo-cancel/wake-owner/client-vs-host-capture/partial-audio/consent-recording-indicator/cancel. →
+jača 13.3 punim voice-conversation ugovorom.
+
+**G4 — Trajni korisnički CILJ/obveza (MATERIJALNO, NOVO):** asistent mora pamtiti "dovrši X"
+ODVOJENO od razgovorne memorije (9.2) i infra-queue-taska (7.2). Bez toga cilj postaje prompt-tekst
+ili cron bez završnosti. → nova podsekcija: `ObligationStore` (cilj s eksplicitnom done-definicijom,
+persistira preko sesija, ne cron). Veže 9.1+3.6.
+
+**G5 — Osobno-asistentski control-plane nad automation (MATERIJALNO):** 3.6 ima trigger-admission,
+ali fali korisničko lice ("podsjeti me", "svaki ponedjeljak", "kad stigne mail od X") → jača 3.6 +
+14.5 kao asistentski control-plane, ne samo cron-mehanizam.
+
+**G6 — prompt-cache stabilnost kroz session-lineage (SLABIJE):** 8.4 cache-key nema session-lineage
+dimenziju → dopuna 8.4. **G7 — user learning-control-plane (SLABIJE):** 9.3/16.4 uče, ali korisnik
+ne vidi/upravlja ("zapamti da volim X", "zaboravi to") → jača 9.3 korisničkim learning-kontrolama.
+**G8 — provider account-fleet (SLABIJE):** između 2.1-auth/2.2-fallback/2.5-cost fali "fleet" više
+računa istog providera (rotacija, per-account budžet) → dopuna 2.2 KeyPool→AccountFleet. **G9 —
+channel surface-capability snapshot (SLABIJE):** 14.5 treba bogatiji "što ovaj kanal podržava"
+(markdown/slike/gumbi/thread) → dopuna 14.5.
+
+**G10 pet/presence = nizak prioritet** (skill/persona, ne kernel). **G11:** Hermes NIJE automatski
+bolji na A1/A2/A3 (OCR/model-scout/self-repair) — te su naše, ostaju.
+
+**Placement:** G1-G5 = materijalne, ulaze u plan (nove podsekcije/jače postojeće); G6-G9 = dopune;
+sve ide u hard-questions iteraciju. Ovo je najvrjedniji output Hermes audita — plan je bio coding-
+nagnut, sad dobiva asistentsku dubinu koju Hermes dokazano ima.
