@@ -746,3 +746,51 @@ P2.7:** `test_council_cannot_drop_sealed_material_dissent`. **Pareto:** vlastiti
 
 **S16 = evidence-graded checker (coding-diferencijator) + verified-credit-ledger + strix-red-team +
 matrica-hard-limit.** **Verifikacija:** kandidati stvarni (strix 36k aktivan). **S16 STATUS: ZAOKRUŽEN.**
+
+---
+
+# S17 — KANONSKA SINTEZA (Ekstenzibilnost/distribucija; 3-way, Pareto PASS)
+
+**17.1 plugin-sustav (`extensions`):** DeepSeek-Harness Cordis DI "everything-is-a-plugin" (najdublji
+pristup) + goose-MCP + OpenCode; **pluginovi iza 6.8/11.5 gatea** (signature/scan/permission-delta
+PRIJE učitavanja — P1.5). **17.2 update/kanali:** Codex-kanali + goose-self-update + Aider-višekanalni;
+**TUF sigurnosna-osnova** (rollback/freeze zaštita metadata lanca). **Salvage:** `core/update.py`
+(ff-only trusted-origin). **17.3 packaging:** goose-Go-single-binary + **dist/cargo-dist** (reusable
+cross-platform artefakt) + uv (Python-strane). Naš cilj: `CGO_ENABLED=0` single-binary.
+
+**17.4 field-diagnostics/upgrade-bridge (`service`):** opt-in scrubban reproducibilan bundle (verzije
++ korelacijski-ID) → issue → VERIFICIRAN update, bez auto-slanja/instalacije (teren: bug→bundle→issue→
+upgrade). **Salvage:** `core/bugreport.py`. **RED P1.5:** `test_post_signature_artifact_tamper_blocks_publish`.
+
+# S18 — KANONSKA SINTEZA (Deployment/operacije; `service` flag; 3-way, Pareto PASS)
+
+**18.1 worker/queue/scaling:** OpenHands konkurentne-sesije + Dify multi-worker + Temporal queue-
+lease (iz S7 — P2.3 fencing). headless worker/API razdvajanje. **Salvage:** `core/queue.py`+`fleet.py`
+(popravljeni lease iz S7). **18.2 multi-tenant-gateway:** LiteLLM-proxy per-tenant ključevi/budgeti +
+Portkey + Dify-kvote; non-null tenant_id na svakom persistentnom envelopeu (codex#5). **18.3 health/
+rollout/canary:** Kubernetes/Argo-Rollouts/Flagger (komponente); SHA-pinned canary (NEXUS live-canary
+obrazac). **18.4 state-migracije/backup:** UNCLEAR dok S0.4 ne odabere persistence backend; kandidati
+alembic/yoyo-migrations + point-in-time backup (Litestream za SQLite). **Salvage:** `core/store.py`
+migracije + `core/export.py` verificiran bundle.
+
+**S17+S18 = plugin-iza-supply-chain-gatea + TUF-update + single-binary + service-deployment.**
+**Verifikacija:** DeepSeek-Harness (rc, matrica), dist/TUF/K8s/Argo stvarni. **S17+S18 STATUS: ZAOKRUŽEN.**
+
+---
+
+# ═══ SVIH 19 SEKCIJA (S0-S18) ZAOKRUŽENO — PLAN KOMPLETAN ═══
+
+**Datum:** 2026-09-01. Metoda: hibrid-hibrida sinteza po podsekciji (3 agenta neovisno → moderator
+Pareto-floor merge). **~100 podsekcija**, svaka: Tip · aspekti+izvor · Go sinteza · salvage · RED · Pareto.
+
+**Coding-diferencijatori (bolji od Kilo/OpenHands/OpenCode):** evidence-graded loop (3.1/16.6),
+stuck-detection (3.4), TIA (3.5), edit-ladder+symedit (4.3), dev-inteligencija (4.4), shadow-git (5.1).
+**Popravljeni NEXUS bugovi:** queue lease/fencing (7.2). **60 NEXUS modula salvage** (GORTEX Go-reuse
+1:1 + Python→Go port). **Auth-modovi** (API/OAuth/CLI-agent/subscription-opt-in). **Sigurnosne membrane
+reuse-ne-rewrite** (parity test).
+
+**SLJEDEĆE (dogovoreni tijek, 6-datoteka workflow):**
+1. PRD.md (product-sloj — KORISNIK vodi) + ARCHITECTURE-ESSENTIALS.md (cheat-sheet kritičnih odluka)
+2. HARD-QUESTIONS review-runda = ITERACIJA (agenti napadaju plan: što će puknuti/edge/over-engineered)
+3. CLAUDE.md + AGENTS.md (nexus repo) + Go scaffold (folder-paketi + stub + data-modeli iz S0)
+4. Go/no-go → kodiranje P0 kernela
