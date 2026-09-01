@@ -598,3 +598,37 @@ MetaGPT+manifest-interpreter (naš).
 
 **S11 = TOCTOU skill-hash + role-data-hijerarhija (nula-izmjene-jezgre) + Reversa-kao-data.**
 **Verifikacija:** kandidati stvarni; salvage interni. **S11 STATUS: ZAOKRUŽEN.**
+
+---
+
+# S12 — KANONSKA SINTEZA (Orkestracija/multi-agent; `multi-agent` flag; 3-way, Pareto PASS)
+
+**12.1 subagenti/delegacija (MEHANIZAM):** subagent-orchestrator; **svaki subagent = vlastiti
+worktree (5.2)** — nema dijeljenog radnog stabla, nema kolizije, eksplicitan sync-back (first-writer-
+wins). solo/parallel/sequential; fenced handoff envelope. **Salvage:** `subagent_runner.py`+
+`managers/subagent_orchestrator.py`. MAF nasljednik AutoGena. **Pareto:** LangGraph+CrewAI+MAF+worktree-per-subagent (naš).
+
+**12.2 workflow/DAG (MEHANIZAM):** DAG scheduler + cycle-guard + wave-scheduler; deterministički +
+model-led koraci (Google ADK obrazac). **Salvage:** `core/workflow.py`. **Pareto:** LangGraph+
+Temporal+ADK. **12.3 routing:** POTROŠAČ 2.6 (jezgra owner tamo); ovdje samo "koji subagent koji model".
+
+**12.4 HITL (MEHANIZAM):** `core/gate.py` persistira jednokratnu ljudsku odluku (preživi procesnu
+granicu); durable approval token (P1.6): exact-intent+expiring+single-use, ne može proširiti kernel
+policy. **Salvage:** `core/gate.py`. **Pareto:** LangGraph+OpenAI-SDK+MAF.
+
+**12.5 A2A interop (MEHANIZAM+ADAPTER, A2A spec):** `AgentCard`+`A2AServer`(idempotent task IDs)+
+`A2AClient.Discover`. **SIGURNOSNA CIJENA (card NIJE autorizacija):** schema+size validacija PRIJE
+parsea, allowlist/SSRF obrana pri discoveryju (6.3 metadata-IP/redirect-recheck), AuthN/AuthZ (P1.3),
+timeout/cancel (S7), idempotent task-ID, audit-korelacija (15.3); remote agent=UNTRUSTED peer
+(P0.1 trust_class, izlaz ne postaje instrukcija). Referencira 0.1 sheme + 0.3 capability.
+**RED codex#3 (Tier-3):** A2A adapter conformance (version-negotiation/revocation/replay/bypass).
+**Pareto:** A2A-spec+MAF+ADK+sigurnosni-conformance (naš).
+
+**12.6 council (MEHANIZAM, P2.7):** `CouncilRequest` sealed nezavisni review → anonimni cross-review
+→ chairman sinteza; svi nad istim `artifact_revision_hash`; chairman NE izbacuje materijalni dissent
+bez adjudication-recorda; quorum+budget hard-gate; council NE promovira sam ni ne zamjenjuje 16.6
+checker. **Salvage:** `managers/council.py` (5-persona). **RED P2.7:** `test_council_cannot_drop_
+sealed_material_dissent`. **Pareto:** NEXUS-council+MAF+CrewAI-hierarchical+dissent-očuvan (naš).
+
+**S12 = worktree-per-subagent + A2A-card-nije-autorizacija + council-dissent-očuvan.**
+**Verifikacija:** A2A-spec/MAF/ADK stvarni. **S12 STATUS: ZAOKRUŽEN.**
