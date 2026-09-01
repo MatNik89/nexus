@@ -656,3 +656,32 @@ OCRmyPDF/pyHanko + NEXUS `core/pdf.py` adapteri (nakon parity). Read-ingestion o
 
 **S13 = generički Artifact-transformer (ne format-anatomija) + canvas-sandboxiran + input-caps jezgra.**
 **Verifikacija:** kandidati stvarni. **S13 STATUS: ZAOKRUŽEN.**
+
+---
+
+# S14 — KANONSKA SINTEZA (Sučelja UX; jezgra=library+tanki adapteri; 3-way, Pareto PASS)
+
+**Načelo:** jezgra=library, sva sučelja=TANKI adapteri nad istim application-API (bez poslovne
+logike u UI-ju). Minimalni CLI/TUI rano (P1); puni UX kasno (P4).
+
+**14.1 CLI/TUI (jezgra minimum):** bubbletea TUI (garantiran single-binary) + Codex-stil dispatcher;
+crush ♦ referent. Desktop Wails/Fyne (odluka kasnije — WebView vs pure-Go toolchain). **Salvage:**
+`cli.py`+`tui/`. **14.2 headless/API/embeddable-SDK (`full-UX`):** OpenAI-kompatibilan REST/SSE +
+**embeddable SDK isti S0/6.9/7.x put** (dry-run default, ne poseban nereentrantan executor — NEXUS
+audit dug). **Salvage:** `sdk.py`+serve-loop. **14.3 web-UI:** Open-WebUI/LibreChat/OpenHands +
+serve-dashboard (loopback+Host-check, read-only, XSS-safe). **Salvage:** `gateway/dashboard.py`.
+
+**14.4 IDE/ACP:** Agent-Client-Protocol standard (wire+capability-negotiation, Rust/TS/Py/Java/
+Kotlin SDK) + Cline/Continue; workspace-trust/URI-normalizacija/dirty-buffer conflict granice.
+**14.5 messaging/channel-gateway (`channels`):** auth/routing/delivery-state-machine=jezgra,
+adapteri (TG/Slack/Discord/Matrix/Signal/WhatsApp/email)=pluginovi; ugovor identity/deny-default-
+allowlist/threading/receipt/idempotent-retry/**udaljeni-HITL** (agent pita na mobitel, run čeka);
+durable-delivery (7.3); **`channels requires extensions`** (P1.6). **Salvage:** `gateway/` 6 kanala.
+**RED P1.6:** `test_channels_contract_fails_closed` (bez extensions-closurea→INCOMPLETE + replay-approval→APPROVAL_REPLAY).
+
+**Napomena (obsidian, S2 veza):** FreeLLMAPI/awesome-freellm-apis = provider-config PRESET (data),
+opcionalan API-key put za razvoj/prototip; NE default, NE produkcija (njihov vlastiti disclaimer +
+ToS rizik) — ide u 2.1 kao preset, ne u UX jezgru.
+
+**S14 = library-jezgra + tanki adapteri + channels-requires-extensions + embeddable-SDK-isti-put.**
+**Verifikacija:** kandidati stvarni (crush ♦ FSL). **S14 STATUS: ZAOKRUŽEN.**
