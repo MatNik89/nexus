@@ -234,3 +234,56 @@ semantic-router+LiteLLM+barbell+verified-bandit.
 2.3, hardware-fit za 2.4, P2.2 za 2.5). Matrix-prep kandidati: P0.7 structured-never-silent,
 P0.8 hardware-fit-fail-closed. **Verifikacija:** svi kandidati stvarni (Kong webfetch-verificiran).
 **S2 STATUS: ZAOKRUŽEN.** Auth-mod dizajn (a-d) odgovara korisnikovom OAuth/subscription pitanju.
+
+---
+
+# S3 — KANONSKA SINTEZA (Core Loop; PRVA coding-kritična, produbljeno; 3-way, Pareto PASS)
+
+**Owner granica (P0.2, najvažnija S3 invarijanta):** S3 NIKAD ne retry-a — 3.4 classify-a→S7,
+3.3 emitira user-cancel, svaki pokušaj nosi `s7.AttemptGrant`. Kilo Code = "to-beat" meta (nema
+javnu licencu, ne salvage-izvor); OpenHands/OpenCode/SWE-agent = javni salvage-referenti.
+
+**3.1 plan-act-observe (MEHANIZAM, coding-jezgra):** `Loop{planner,executor,verifier,checker,
+state,journal}`: plan(adaptivan small/medium/large) → authorize(6.9) → execute(→Observation,
+3.4) → verify(3.5 in-turn) → **GRADE(16.6 checker)** → re-plan s dokazom. **DIFERENCIJATOR
+evidence-graded:** `Checker.Grade` ocjenjuje **git-diff + realan exit-code + determinističke
+signale, NIKAD prozu workera** (anti-sycophancy strukturno) — NITKO od Kilo/OpenHands/OpenCode
+nema. **Salvage:** `loop_engine.py` (majority-checker) + `runtime.py` (handle→loop→verify→learn) +
+`executor.py _run_loop` — NAJVRJEDNIJI salvage u kernelu. **RED:** worker kaže "done" bez
+diff/testa → Grade=FAIL, run ne u SUCCEEDED. **Pareto:** Action/Obs+event-stream (OpenHands) +
+modularnost (Codex) + adaptivni planer (SWE-agent ACI) + evidence-graded (naš).
+
+**3.2 streaming (MEHANIZAM):** `Chunk{Delta,Seq,Finish}` channel + ctx-cancel; stream=projekcija
+journala. **Salvage:** `providers.py` (`stream:False` SLABO → POPRAVAK na pravi token-stream).
+**RED:** cancel usred streama→channel zatvoren, turn CANCELLED. **Pareto:** Gemini+Codex+OpenHands+cancel-token.
+
+**3.3 cancel/turn (MEHANIZAM):** `TurnController{Cancel/Pause(offset)/Resume(offset)}`; cancel=S7
+token, pause/resume=journal offset (replay fold, ne mutable state); CANCELLED terminalan.
+**Salvage:** `core/steer.py`+`core/circuit.py`. **RED P0.2:** cancel usred tool-poziva→prekid, nikakav side-effect. **Pareto:** goose+OpenHands+Codex+S7-token.
+
+**3.4 error recovery (MEHANIZAM, coding-jezgra):** tool-pad → `TypedError` PAKIRAN u observation
+(model vidi, korigira se — alat pao ≠ petlja pala); classify→retryable(S7)/terminal(re-plan).
+**DIFERENCIJATOR stuck-detection** (`circuit.py`): STAGNATION (isti tool/arg N puta) + NO_PROGRESS
+(verify ne zelena M puta) → breaker prije lažno-zdravog vrtenja. NITKO nema. **Salvage:**
+`recovery.py`+`executor.py OBSERVATION`+`circuit.py`. **RED P0.2:** tool-pad→obs nosi error, loop
+ne crasha; STAGNATION→breaker. **Pareto:** error-u-obs (OpenHands) + checkpoint (LangGraph) +
+razumljiv-format (SWE-agent) + stuck-detection (naš).
+
+**3.5 deterministička verifikacija + TIA (MEHANIZAM, coding-jezgra, `coding` flag):** in-turn
+verify (pokreni→dijagnostika NATRAG U ISTOM TURNU→odbij završetak dok ne prođe). **DIFERENCIJATOR
+TIA:** coverage/dependency-graf × git-diff → SAMO pogođeni testovi (sekunde umjesto punog suitea),
+full-suite fallback kad stale. NITKO od 3 nema (vrte pun suite/linter). **Salvage:** `verifier.py`
+(DORMANTAN→REVIVATI) + `tia.py` + `testcmd.py` + `executor.py _validate`. **RED:** edit s lint-
+greškom→Diagnostic, korak ne prihvaćen, model dobiva u istom turnu; TIA pokreće samo pogođene.
+Treći slot UNCLEAR (spec praznina — naša petlja je odgovor). **Pareto:** Aider+SWE-agent+TIA (naš).
+
+**3.6 run-trigger-plane (MEHANIZAM admission=jezgra; triggeri=`automation`):** `Trigger` interface
+(Manual/Schedule/Webhook/Watch/Heartbeat) → SVI kroz isti S0 envelope → dedup+idempotency+policy+
+budget+audit PRIJE petlje (autonomni = iste granice kao ručni). `ScheduleManifest` s P2.6 clock/DST/
+missed-run/overlap. **Salvage:** `schedule.py`+`watch.py`. **RED P2.6:** `test_zagreb_dst_fold_runs_
+once_across_restart`. **Pareto:** NEXUS-admission+Temporal-DST+APScheduler.
+
+**S3 = 3 CODING-DIFERENCIJATORA gdje POBJEĐUJEMO:** evidence-graded checker (3.1), stuck-detection
+(3.4), TIA (3.5) — nijedan od Kilo/OpenHands/OpenCode nema. **Honest gap:** 3.2/3.3/3.5 bez
+dediciranog Annex RED (P0.9 "verify-never-silent" kandidat za matrix-prep). **Verifikacija:** svi
+javni kandidati stvarni; Kilo Code = to-beat meta bez javne licence. **S3 STATUS: ZAOKRUŽEN.**
