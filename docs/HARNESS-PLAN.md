@@ -177,3 +177,60 @@ NIKAD ne obuhvaća state/security/audit klase; throughput floor MJERI se (proof 
 kod-vs-data načelo. Akcija: dodati **P0.6 "config-bounds + process-identity"** u matrix-prep (uz
 P0.5 iz S0). **Verifikacija:** svi kandidati stvarni (Codex/Aider/Continue/goose Apache-2.0; OTel
 CNCF; structlog/tracing/OpenHands MIT). **S1 STATUS: ZAOKRUŽEN.**
+
+---
+
+# S2 — KANONSKA SINTEZA (Provider sloj; 3-way, Pareto PASS)
+
+**Owner granica (P0.2):** retry/deadline/cancel = S7; 2.2/2.6 NIKAD ne retry-aju (svaki pokušaj
+nosi `s7.AttemptGrant`). Routing owner = 2.6 jezgra (12.3=multi-agent potrošač). Oba NEXUS načina
+spajanja zadržana (API HTTP + CLI-agent subprocess).
+
+**2.1 multi-provider + 3 AUTH-MODA (MEHANIZAM) — ovo odgovara na OAuth pitanje:**
+Jedan `Provider` interface (`Chat/Stream/Capabilities/DataDescriptor`), auth pluggable `AuthMode`:
+- **(a) `APIKeyAuth`** — DEFAULT, čisto (Bearer, OpenAI-kompatibilan)
+- **(b) `OAuthAuth`** — device/auth-code→token→refresh, keyring-cache (1.2); SANKCIONIRANO gdje
+  provider službeno nudi OAuth za API
+- **(c) `CLIAgentAuth`** — subprocess `codex exec --tools "" --ephemeral` / `claude -p --tools ""`;
+  tuđi CLI = čisti text-in/out, NEXUS drži petlju/alate, bez API ključa
+- **(d) `SubscriptionOAuthAuth`** — ZASEBAN config blok, NIKAD default; repliciran OAuth bez CLI za
+  subscription. Loader FAIL-CLOSED odbija `Resolve` ako `subscription_oauth.acknowledged_tos != true`
+  + redacted ToS-upozorenje ("može prekršiti ToS providera, rizik bana") prije prve upotrebe.
+`AuthCredential.Redacted()` — nikad curenje. Petlja NE zna koji mod (razlika samo `Capabilities()`).
+**Salvage:** `llm/providers.py` (CLI subprocess+API+KeyPool+CostTracker) port. **RED:** (d) bez
+acknowledged_tos→error; (c) bez `--tools ""`→odbij. **Pareto:** LiteLLM+PydanticAI+Vercel-AI-SDK +
+3-auth-moda (nijedan od 3 nema CLI-agent ni OAuth-device auth).
+
+**2.2 fallback (MEHANIZAM, TANKI — NE retry petlja):** `FallbackPlanner.Plan(err,cur)→
+(Target, s7.FallbackProposal)` — vraća PRIJEDLOG, puni `s7.ExecutionPolicy.fallback_targets[]` +
+mapira provider-error→kategorični kod; retry je S7. Cooldown/KeyPool rotacija. **Salvage:**
+`router.py FallbackModel` + `_KeyPool`. **RED P0.2:** `test_adapter_cannot_self_retry` (2× isti
+AttemptGrant→`ATTEMPT_NOT_AUTHORIZED`, counter=1). **Pareto:** LiteLLM+Portkey+Kong + no-self-retry.
+
+**2.3 structured output (MEHANIZAM):** `StructuredOutput[T].Validate→re-ask→salvage`, NIKAD tiho
+prihvati nevalidan T. Tolerant parser (strip fences/trailing comma). Constrained-decoding (Outlines)
+= OPT-IN adapter za local (2.4), ne jezgra za HTTP. **Salvage:** `executor.py` SYSTEM protokol +
+`spawner.py _salvage_json`. **RED:** malformiran JSON→salvage/re-ask, silent-accept zabranjen.
+**Pareto:** Instructor+Outlines+BAML.
+
+**2.4 lokalni + hardware-fit (ADAPTER+MEHANIZAM):** `LocalProvider{Kind:ollama|llama_cpp|vllm}`
+OpenAI-kompatibilan HTTP; `HardwareFit.Fits(spec,quant)` preflight MJERI RAM/VRAM/AVX/CUDA na hostu
+→ ne stane: odbij+predloži kvantizaciju (ne OOM). `Capabilities()`=Measured. **Salvage:**
+`providers.py LocalProvider`. **RED:** model>RAM/VRAM→Fits=false+prijedlog. **Pareto:** Ollama+
+llama.cpp+vLLM+hardware-fit (obsidian).
+
+**2.5 cost tracking (MEHANIZAM):** `CostTracker.Record(model,usage)` price-table, real usage ili
+len//4 estimate (označen), MONOTON cumulative spend→S7 circuit-breaker (P2.2 cost_minor_units);
+feed-a 16.4 verified-credit. **Salvage:** `providers.py CostTracker`+`circuit.py add_cost`. **RED:**
+spend>ceiling→fence (ne samo log). **Pareto:** LiteLLM+Aider+Helicone+budget-ceiling.
+
+**2.6 model routing (MEHANIZAM, jezgra owner):** `Router` ABI; `BarbellRouter` (plan/execute/verify
+po fazi) = jezgra; `LearnedRouter{bandit}` epsilon-greedy OPT-IN, reward SAMO iz 16.4 verificiranog
+(nikad self-report). Route fail-closed: kandidat ispod capability floora (S0.3) odbijen. **Salvage:**
+`router.py`+`reward.py`. **RED:** Route na model ispod floora→error. **Pareto:** RouteLLM+
+semantic-router+LiteLLM+barbell+verified-bandit.
+
+**S2 honest gap:** 2.1/2.3/2.4/2.5 bez dediciranog Annex RED — gate posredno (P2.5 za 2.1, S0.1 za
+2.3, hardware-fit za 2.4, P2.2 za 2.5). Matrix-prep kandidati: P0.7 structured-never-silent,
+P0.8 hardware-fit-fail-closed. **Verifikacija:** svi kandidati stvarni (Kong webfetch-verificiran).
+**S2 STATUS: ZAOKRUŽEN.** Auth-mod dizajn (a-d) odgovara korisnikovom OAuth/subscription pitanju.
