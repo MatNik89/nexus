@@ -685,3 +685,31 @@ ToS rizik) — ide u 2.1 kao preset, ne u UX jezgru.
 
 **S14 = library-jezgra + tanki adapteri + channels-requires-extensions + embeddable-SDK-isti-put.**
 **Verifikacija:** kandidati stvarni (crush ♦ FSL). **S14 STATUS: ZAOKRUŽEN.**
+
+---
+
+# S15 — KANONSKA SINTEZA (Observability; sve PROJEKCIJE journala P0.3; 3-way, Pareto PASS)
+
+**Načelo (P0.3, codex#21):** log/trace/transcript/metrics/audit su PROJEKCIJE jednog write-ownera
+(`EventJournal`), NE paralelni sinkovi; redakcija PRIJE journala.
+
+**15.1 tracing (MEHANIZAM):** OTel-GenAI semantika (span/log/metrika, correlation run/turn/tool/
+attempt/parent/sequence); OTLP exporter=adapter, stabilan ID-mapping (replay ne mijenja trace-ID).
+Langfuse/Phoenix=backendovi. **Salvage:** `core/trace.py`+`core/otel.py`. **15.2 cost-dashboardi:**
+LiteLLM/Langfuse/Helicone spend po ključu/trace. **Salvage:** CostTracker (2.5) feed.
+
+**15.3 transcript/audit (MEHANIZAM):** **tamper-evident** append-only hash-lanac + verify() (tamper
+blokira UPDATE/DELETE) + **vanjski potpisani checkpoint** (lokalni lanac SAM nije dokaz protiv
+potpunog rewritea — Sigstore-Rekor/immudb/Trillian). **Salvage:** `core/audit.py` hash-chain +
+`core/transcript.py`. **15.4 metrics/SLO:** Prometheus/Grafana/OTel-Collector; latency/error/
+availability SLI (izveden iz journala).
+
+**15.5 semantic-agent-health (MEHANIZAM jezgra):** distinktno od 15.4-SLO i 18.3-liveness — hvata
+agenta ŽIV-ali-degradira: recidivism/correction-rate/verified-success-trend/fallback-drift/swallow-
+counter → S7 circuit-breaker prije lažno-zdravog rada. **Salvage:** `core/health.py` swallow +
+`core/circuit.py`. **RED:** rast recidivisma→breaker (ne čeka liveness-fail). Vault-tvrdnja
+"većina harnessa nema self-critique/health" = hipoteza, ne "0/28".
+
+**S15 = journal-projekcije (jedan write-owner) + tamper-evident+vanjski-anchor + semantic-health.**
+**Honest gap:** 15.1/15.2/15.4/15.5 bez dediciranog Annex RED (P0.3 pokriva pisanje). **Verifikacija:**
+OTel/Prometheus/Grafana stvarni. **S15 STATUS: ZAOKRUŽEN.**
