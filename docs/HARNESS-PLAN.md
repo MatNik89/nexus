@@ -794,3 +794,50 @@ reuse-ne-rewrite** (parity test).
 2. HARD-QUESTIONS review-runda = ITERACIJA (agenti napadaju plan: što će puknuti/edge/over-engineered)
 3. CLAUDE.md + AGENTS.md (nexus repo) + Go scaffold (folder-paketi + stub + data-modeli iz S0)
 4. Go/no-go → kodiranje P0 kernela
+
+---
+
+# ADDENDUM A1 — OCR PIPELINE s hardware-routingom (korisnički zahtjev, spanira 2.4/10.1/13.5/retrieval)
+
+**Cilj:** iz velike količine PDF-ova napraviti ODLIČAN OCR — slikovni PDF dobije TEXT LAYER +
+metapodatke → tekst sa slike pretraživ u tražilici (full-text). Harness DETEKTIRA NVIDIA/CUDA i
+bira put.
+
+**Mehanizam (jezgra, veže 2.4 HardwareFit):**
+```go
+type OCRBackend int // UNLIMITED_OCR_GPU | CPU_FALLBACK
+func SelectOCR(fit HardwareFit) OCRBackend {
+    // NVIDIA CUDA + VRAM ≥ 8GB → UNLIMITED_OCR_GPU (najbolja kvaliteta, tablice/layout)
+    // inače → CPU_FALLBACK (bez GPU ovisnosti, ne OOM, ne crash)
+    if fit.CUDA && fit.VRAMBytes >= 8<<30 { return UNLIMITED_OCR_GPU }
+    return CPU_FALLBACK
+}
+```
+
+**GPU put (`local-inference`+GPU okidač):** **baidu/Unlimited-OCR** (MIT, 3B VLM, BF16 ~6GB, CUDA
+12.9, one-shot dugi PDF + tablice/layout, do 32k tokena). Opt-in heavy (fail-closed ako VRAM ne
+stane — 2.4 HardwareFit odbije, ne OOM). Adapter iza `OCRBackend`.
+
+**CPU fallback put (bez NVIDIA):** **OCRmyPDF** (Tesseract) — dodaje NEVIDLJIVI text-layer slikovnom
+PDF-u → izlaz je PDF/A: pretraživ + metapodatci, bez GPU-a; + **Surya** (CPU-capable layout/OCR) za
+teš\e layoute. Isti `DocOp` Artifact-transformer ugovor (13.5): image-PDF → text-layer → atomic
+staged → verify → commit. Marker/MinerU za layout-heavy.
+
+**Pretraga (veže 10.1 ingest + 10.3 hibrid + 9.2 spine FTS):** ekstrahirani tekst → FTS index
+(SQLite FTS5 u spine) + embed za semantičku pretragu → tekst sa slike nalaziv i egzaktno (FTS) i
+semantički (vektor). Batch-processing velike količine PDF-ova kroz queue (7.2 lease) — otporno na pad.
+
+**Ugovor/RED:**
+- image-only PDF → nakon pipelinea full-text pretraga NAĐE tekst sa slike (RED: pretraga prije=0
+  hitova, poslije=hit na sadržaj slike).
+- GPU odsutan → CPU put IPAK proizvede pretraživ PDF/A (RED: nema NVIDIA → ne crash, ne GPU-import,
+  izlaz pretraživ). GPU prisutan ali VRAM<8GB → HardwareFit odbije Unlimited-OCR + padne na CPU (ne OOM).
+- batch 1000 PDF-ova, pad usred → queue-lease (7.2) nastavi, nema dvostruke obrade (idempotency).
+
+**Profili/flagovi:** `documents` (mutacija=text-layer) + `vector-retrieval` (FTS/embed) + GPU put
+uz `local-inference`+CUDA okidač. **Salvage:** NEXUS `core/pdf.py` (OCR put) + `core/ingest.py` +
+`core/fts.py` FTS5 + `core/embed.py`. **Verifikacija:** Unlimited-OCR (MIT, GPU), OCRmyPDF (MPL/GPL,
+CPU), Surya (aktivan), Tesseract (Apache-2.0) — stvarni.
+
+**Placement u tijeku:** ovo je dopuna 2.4+10.1+13.5, NE nova sekcija — folda se u hard-questions
+iteraciju (agenti provjere hardware-routing granicu + CPU-fallback kvalitetu).
