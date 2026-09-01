@@ -534,3 +534,34 @@ untrusted epizode→gist ostaje UNTRUSTED (P0.3). **Pareto:** letta+mem0+zep+sle
 **S9 = najbogatiji NEXUS salvage (6 memorijskih modula) + forget/purge trust-razdvajanje.**
 **Honest gap:** 9.1/9.3/9.4 bez dediciranog Annex RED (P0.13 "decay-never-destroys-bytes" kandidat).
 **Verifikacija:** kandidati stvarni; salvage interni (audit potvrdio). **S9 STATUS: ZAOKRUŽEN.**
+
+---
+
+# S10 — KANONSKA SINTEZA (Retrieval; `vector/graph-retrieval`+`preload-cache` flagovi; 3-way)
+
+Većina ADAPTER (sučelje+primarni-pick, ne spajaj baze); ACL/provenance/freshness=MEHANIZAM jezgra.
+
+**10.1 ingestion (ADAPTER, READ-ONLY):** RAGFlow-deepdoc/docling/unstructured; runners-up Marker/
+MinerU/OCRmyPDF/Surya (obsidian). SurfSense live-konektori (typed REST + MCP tool). **Salvage:**
+`core/ingest.py`+`core/pdf.py` read-put. **10.2 chunking (ADAPTER):** semantic(cosine-drop)/parent-
+child/contextual usporedba; LlamaIndex+chonkie+RAGFlow. **10.3 hibrid+rerank (ADAPTER):** Qdrant
+(dense+sparse+RRF)+Haystack + **cross-encoder** (sentence-transformers/BGE) + LanceDB/sqlite-rag
+(file-based v1)+query-rewrite. **Salvage:** `core/embed.py`+`core/rerank.py`.
+
+**10.4 GraphRAG (`graph-retrieval`):** Microsoft-GraphRAG/LightRAG/cognee; NEXUS `core/kg.py`
+multi-hop. **10.5 CAG (`preload-cache`, MEHANIZAM decision-rule):** `CAGDecision.Decide(corpus,
+authz)→CAG|RAG|HYBRID` (mali/stabilni/AUTORIZIRAN→CAG preload; velik/dinamičan→RAG; neautoriziran→
+RAG). Top-3 IMPLEMENTACIJA **UNCLEAR** (infra vLLM/SGLang je 8.4). **RED:** neautoriziran korpus→RAG
+(ne preload). **Pareto:** decision-rule (top-3 pošteno prazno).
+
+**10.6 retrieval-auth (MEHANIZAM jezgra + ADAPTER):** **ACL PRIJE candidate-generation** (deny-
+default, NE post-filter); `RetrievalRequest{principal,tenant,corpus_version,policy_version}`; cache
+invalidacija nakon revocationa; nedopušten dokument NIKAD u candidate/rerank/trace. Qdrant-payload-
+filter/OpenSearch-doc-security/Vespa. **RED codex#2 (Tier-3):** nedopušten dokument ne uđe.
+**10.7 quality-gate (`vector-retrieval`, MEHANIZAM):** golden-queries + Recall@k/MRR/nDCG +
+freshness-SLA + citat-do-izvornog-chunka + stale-index-detekcija; odgovor NIJE grounded ako retrieval
+nije izmjeren. Ragas/BEIR/Phoenix. Cross-ref 16.2 (generički ratchet). **RED:** grounding-tvrdnja bez
+mjerenja→odbij.
+
+**S10 = ADAPTER-sučelja (ne spajaj engine) + ACL-prije-retrievala + iskren CAG-UNCLEAR + quality-
+gate.** **Verifikacija:** kandidati stvarni (obsidian runners-up matrica). **S10 STATUS: ZAOKRUŽEN.**
