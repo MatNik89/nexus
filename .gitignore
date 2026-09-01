@@ -1,0 +1,4 @@
+nexus
+*.log
+/build/
+/dist/
