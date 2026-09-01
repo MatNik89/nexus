@@ -632,3 +632,27 @@ sealed_material_dissent`. **Pareto:** NEXUS-council+MAF+CrewAI-hierarchical+diss
 
 **S12 = worktree-per-subagent + A2A-card-nije-autorizacija + council-dissent-očuvan.**
 **Verifikacija:** A2A-spec/MAF/ADK stvarni. **S12 STATUS: ZAOKRUŽEN.**
+
+---
+
+# S13 — KANONSKA SINTEZA (Multimodal; composable flagovi; 3-way, Pareto PASS)
+
+Većina ADAPTER (backend iza sučelja) + MEHANIZAM (input-validation/MIME-size-caps/egress-consent jezgra).
+
+**13.1 vision (`vision`):** browser-use screenshot+DOM / Open-Interpreter / OpenHands; egress-gated.
+**Salvage:** `core/vision.py`. **13.2 image-gen+canvas (`image-out`):** ComfyUI/InvokeAI/diffusers;
++ **canvas** strukturirani-dijagram-JSON→SVG/PNG (schema-validiran + sandboxiran render, NE "injection-
+proof" tvrdnja — SVG sanitizacija obavezna). **Salvage:** `core/imagegen.py`+`core/canvas.py`.
+
+**13.3 voice (`voice`):** pipecat/LiveKit-Agents/speaches STT+TTS. **Salvage:** `core/voice.py`.
+**13.4 video (`video`):** FFmpeg (deterministička obrada)/WhisperX (word-level+diarizacija)/ComfyUI;
+runner-up Remotion/HyperFrames (HTML→MP4). **Salvage:** `core/video.py`.
+
+**13.5 dokument-mutacija (`documents`, INSTANCA Artifact-transformer ugovora):** typed-op → preview/
+dry-run → atomic-staging (5.3) → output-verify → commit/rollback; MIME/size caps; NE anatomija-po-
+formatu (isti ugovor za PDF/DOCX/spreadsheet/sliku — novi format = adapter, ne podsekcija). pypdf/
+OCRmyPDF/pyHanko + NEXUS `core/pdf.py` adapteri (nakon parity). Read-ingestion odvojen (10.1).
+**RED:** sign/edit bez consent/atomic→odbij.
+
+**S13 = generički Artifact-transformer (ne format-anatomija) + canvas-sandboxiran + input-caps jezgra.**
+**Verifikacija:** kandidati stvarni. **S13 STATUS: ZAOKRUŽEN.**
