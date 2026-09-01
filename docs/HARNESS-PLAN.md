@@ -956,3 +956,44 @@ bolji na A1/A2/A3 (OCR/model-scout/self-repair) — te su naše, ostaju.
 **Placement:** G1-G5 = materijalne, ulaze u plan (nove podsekcije/jače postojeće); G6-G9 = dopune;
 sve ide u hard-questions iteraciju. Ovo je najvrjedniji output Hermes audita — plan je bio coding-
 nagnut, sad dobiva asistentsku dubinu koju Hermes dokazano ima.
+
+---
+
+# ADDENDUM A5 — OpenClaw FULL-CODE audit (dokaz da README-razina daje LAŽNE tvrdnje)
+
+Prvi full-code audit vanjskog harnessa (OpenClaw, 561MB lokalni klon, 25k fajlova). Rezultat MIJENJA
+povjerenje u README-razinu ostatka plana:
+
+## KRITIČNA KOREKCIJA (O3): "stuck-detection" NIJE naš diferencijator
+Plan (S3.4) je tvrdio: evidence-graded + stuck-detection "nitko od Kilo/OpenHands/OpenCode nema".
+**NETOČNO** — OpenClaw IMA `tool-loop-detection.ts` (786 linija) + `tool-loop-no-progress.ts` +
+`tool-loop-admission.ts` + `tool-loop-argument-churn.ts`. Naša tvrdnja je bila iz README/reputacije,
+ne iz koda. **Ispravak: stuck-detection ostaje NAŠ zahtjev, ali NIJE unikatan — OpenClaw je referenca,
+ne meta-koju-pobjeđujemo.** (Evidence-graded git-diff-checker tek treba provjeriti protiv njihovog koda.)
+
+## GAP-ovi (O1-O14) — što OpenClaw ima a plan NEMA:
+- **O1** harness-registry kao pluggable plugin-vlasništvo (`harness/registry.ts`)
+- **O2** subagent registry + **sweeper + fencing + orphan-recovery + liveness** (~100 fajlova) — naš
+  12.1 ima worktree-per-subagent ali NE sweeper/fencing/announce-loop
+- **O3** tool-loop-detection (vidi korekciju gore)
+- **O4** compaction-depth: planning-projection + failure-proof (naš 8.2 nema)
+- **O5** model live-turn-probes + sticky-selection + failover-cooldown + catalog-browse (naš 2.x plići)
+- **O6** exec-**auto-reviewer** (pregleda exec NAKON) + host-node-phases (naš 6.1/6.9 nema auto-reviewer)
+- **O7** identity dubina: per-channel-prefix + human-delay + avatar + incognito (naš 11.1 plići)
+- **O8** commitments (agent se OBVEŽE na posao — "promised-work") — koncept ne postoji u planu
+- **O9** flows (58 fajlova workflow) — naš 12.2 DAG plići
+- **O10** boards + tasks (kanban+task-mgmt, 87+14) — task/board površina nema u planu
+- **O11** fleet + claws-lifecycle + **device-pairing** — naš 18.x nema fleet ni pairing
+- **O12** state snapshot · **O13** meeting-bot + realtime-transcription · **O14** tool-call-repair paket
+
+## ŠTO OVO ZNAČI (iskreno):
+1. README/git-tree razina je proizvela BAREM jednu lažnu "diferencijator" tvrdnju (O3). Ostale
+   ("evidence-graded nitko nema", "TIA nitko nema", "symedit nitko nema") su SUMNJIVE dok ih ne
+   provjerimo protiv STVARNOG koda konkurenata.
+2. OpenClaw sam nosi 14 gapova — a to je JEDAN harness. Full Tier-A landscape audit (25 harnessa)
+   je NUŽAN, ne opcionalan — inače gradimo na neprovjerenim tvrdnjama.
+3. Gapovi O2/O8/O9/O10/O11 su asistentska+orkestracijska dubina koju plan nema (kandidati za
+   nove podsekcije nakon Tier-A tablice).
+
+**Placement:** ovo je PRVI Tier-A audit. Ostali (OpenHands/OpenCode/Codex/Aider/...) tek slijede →
+tek nakon svih Tier-A + who-has-what tablice smiju se "diferencijator" i "top-3" tvrdnje smatrati dokazane.
