@@ -423,3 +423,46 @@ Claude-Code-referent+DeepSeek-Cordis+on_error-grana (naš).
 
 **S6 = membrane REUSE ne rewrite (gortex 1:1 + parity), per-OS build-tags, fail-closed svugdje.**
 **Verifikacija:** kandidati stvarni; GORTEX interni (audit potvrdio). **S6 STATUS: ZAOKRUŽEN.**
+
+---
+
+# S7 — KANONSKA SINTEZA (Pouzdanost; JEDINI owner retry/cancel P0.2; 3-way, Pareto PASS)
+
+**S7 je JEDINI vlasnik retry/deadline/cancel** — 2.2/3.3/3.4 delegati; svaki fizički pokušaj nosi
+`s7.AttemptGrant`.
+
+**7.1 timeout/cancel/retry-taksonomija (MEHANIZAM):** `ExecutionPolicy{operation_id,effect_class,
+deadline,max_attempts,attempt_timeout,backoff,retryable_codes,fallback_targets,idempotency_key,
+cancel_token}` + `AttemptGrant{attempt_no,target,expires_at,grant_nonce}`; stanja PENDING→GRANTED→
+RUNNING→{SUCCEEDED|FAILED_RETRYABLE|FAILED_TERMINAL|CANCELLED|UNKNOWN}; samo S7 iz FAILED_RETRYABLE
+izdaje sljedeći grant; IRREVERSIBLE+UNKNOWN se NE retry-a bez reconciliationa. context za deadline/
+cancel (propagira u child). **Salvage:** `core/recovery.py classify+STRATEGY`. **RED P0.2:**
+`test_adapter_cannot_self_retry`. **Pareto:** Temporal+LangGraph+tenacity+S7-sole-owner (naš).
+
+**7.2 idempotency/budgets/lease/fencing (MEHANIZAM, jezgra — POPRAVLJA NEXUS bug):**
+- **Queue (P2.3):** `QueueTask{state,attempt,lease_id,owner_worker,fencing_token,heartbeat,
+  lease_expires,result_hash}`; `Claim` atomski CAS READY→LEASED uz `fencing_token++` (single-winner);
+  `Heartbeat` vrijedi samo za aktualni lease; `Reclaim` expiry/crash→READY s novim pokušajem + STROGO
+  većim tokenom; stari token na commit→`STALE_FENCING_TOKEN`; ACK tek nakon durable commit;
+  COMMIT_PENDING+nepoznat učinak→UNKNOWN_EFFECT→RECONCILING (NIKAD ravno READY). **Popravlja audit-
+  nalaz** (NEXUS queue.py nema lease/reclaim za `running` nakon pada).
+- **ResourceBudget (P2.2, IZVRŠNI ne advisory):** wall/CPU/RSS/disk/file/process/socket/net/output/
+  tokens/cost/tool-calls/loop-steps, svaki SOFT|HARD; hard→atomic fence+cancel+drain/kill owned
+  stablo (S1.2 process-group + S6); child budget ≤ preostali parent; gaugeovi knjiže PEAK; cleanup≠
+  success. **cost-checkpoint** (obsidian): budget provjera PRIJE skupe operacije u grafu.
+**Salvage:** `core/queue.py _claim` + `core/circuit.py` + `core/fleet.py` port UZ POPRAVAK.
+**RED P2.3:** `test_reclaimed_worker_cannot_commit_with_stale_fence` (A token 7 zamrznut, B token 8
+commit, A sa 7→STALE, točno jedan rezultat=B). **RED P2.2:** `test_hard_process_budget_kills_
+descendants`. **Pareto:** Temporal+Restate+Dapr+lease/fencing/executable-budget (naš — popravlja bug).
+
+**7.3 crash-recovery + durable-delivery (MEHANIZAM):** resume idempotent iz event-loga (journal
+fold, ne mutable state); WAL spine (`modernc.org/sqlite`); **N9 durable-delivery:** `run_done ≠
+result_delivered` DVA trajna stanja, transactional outbox + idempotent-delivery + receipt (gateway
+crash ne gubi odgovor ni ne ponavlja side-effect). **Startup orphan/lock sweep (P1.2):** `ResourceLease
+{PROCESS_TREE|WORKSPACE_LOCK|TEMP_DIR}` + start-token (S1.2), OWNED→ORPHAN_SUSPECTED→FENCED→CLEANING→
+RELEASED; nedokazivo vlasništvo→QUARANTINED ne kill. **Salvage:** `core/resume.py`+`core/store.py` WAL.
+**RED P1.2:** `test_sigkill_restart_reaps_owned_tree_only`. **Pareto:** LangGraph+Temporal+OpenHands+
+durable-delivery-outbox+orphan-sweep (naš).
+
+**S7 = popravlja glavni audit-nalaz (queue lease/fencing) + N9 durable-delivery.** **Verifikacija:**
+Temporal/Dapr stvarni; Restate source-available (matrica). **S7 STATUS: ZAOKRUŽEN.**
