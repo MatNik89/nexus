@@ -841,3 +841,38 @@ CPU), Surya (aktivan), Tesseract (Apache-2.0) — stvarni.
 
 **Placement u tijeku:** ovo je dopuna 2.4+10.1+13.5, NE nova sekcija — folda se u hard-questions
 iteraciju (agenti provjere hardware-routing granicu + CPU-fallback kvalitetu).
+
+---
+
+# ADDENDUM A2 — LOCAL-MODEL FRESHNESS SCOUT (hardkodirano; korisnički zahtjev) + llmfit u 2.4
+
+**Rupa koju zatvara:** 2.4 je imao hardware-fit (right-sizing), ali NIJE imao mehanizam da PRATI
+ima li NOVIH lokalnih LLM-ova na tržištu koji stanu na hardver. Korisnik traži da to bude HARDKODIRANO.
+
+**Mehanizam (JEZGRA, hardkodirano — analogno skill_scout iz 11.5, ali za lokalne modele):**
+```go
+type ModelScout struct{ sources []ModelSource; fit HardwareFit } // JEZGRA
+// izvori (DATA): Ollama library, HuggingFace, llmfit katalog (94+ modela, raste)
+func (s *ModelScout) Sweep(ctx) []ModelCandidate
+// periodički (3.6 schedule/heartbeat): dohvati NOVE lokalne modele → HardwareFit (2.4) filtrira
+// što STANE na ovaj hardver → llmfit-score (quality/speed/fit/context) → rangiraj
+// vrati kandidate koji STANU i NADMAŠE trenutni pick
+```
+**Kod-vs-data:** scout ENGINE = hardkodiran (jezgra); izvori/katalog modela = DATA (config). 
+**SIGURNOSNA GRANICA (isto kao skill_scout):** scout **INFORMIRA** (report → CLI/kanal/dashboard),
+NIKAD ne mijenja produkcijski model sam — čovjek/policy odobrava adopciju (ne autonomna zamjena;
+konzistentno s "no autonomous change without gate" iz cijelog plana). Read-only sweep, paced.
+
+**llmfit = primarni 2.4 kandidat (zamjenjuje Odysseus/Colibri runner-up):** ili (a) shell-out adapter
+na instalirani `llmfit` binary (Rust, već na Piju — kao CLI-agent provideri, subprocess), ili (b)
+konzumiraj llmfit KATALOG (94+ modela + scoring) kao ModelSource. Podržava Ollama/llama.cpp/MLX/
+Docker-Model-Runner/LM-Studio (multi-GPU, MoE, dinamička kvantizacija) — pokriva 2.4 backendove.
+
+**Veza:** 2.4 (hardware-fit right-sizing) + 3.6 (schedule/heartbeat trigger — periodički sweep) +
+2.6 (routing može uzeti novi bolji lokalni model kad ga scout+HardwareFit odobre) + 15.5 (health —
+ako novi model zamijeni stari, prati degradaciju). `local-inference` flag.
+
+**Ugovor/RED:** RED (naš): scout nađe novi model koji stane → REPORT (ne auto-swap); model koji NE
+stane na hardver → izostavljen iz reporta (HardwareFit filtrira, ne predloži OOM-kandidat); nema
+produkcijske zamjene bez eksplicitnog odobrenja. **Verifikacija:** llmfit (Rust, AlexsJones, aktivan,
+instaliran); Ollama-library/HF (izvori). **Placement:** dopuna 2.4, ide u hard-questions iteraciju.
