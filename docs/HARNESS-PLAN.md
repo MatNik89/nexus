@@ -997,3 +997,39 @@ ne meta-koju-pobjeđujemo.** (Evidence-graded git-diff-checker tek treba provjer
 
 **Placement:** ovo je PRVI Tier-A audit. Ostali (OpenHands/OpenCode/Codex/Aider/...) tek slijede →
 tek nakon svih Tier-A + who-has-what tablice smiju se "diferencijator" i "top-3" tvrdnje smatrati dokazane.
+
+---
+
+# ADDENDUM A6 — CODE-VERIFIED diferencijatori (11 full-code audita: 3 PALA, 3 PREŽIVJELA)
+
+Full-code audit 11 harnessa (Hermes, OpenClaw, OpenHands, Aider, OpenCode, Codex, Cline, Continue,
+Roo, Goose, Kilo) — PROVJERA naših "nitko nema" tvrdnji protiv STVARNOG koda. Rezultat ISPRAVLJA plan.
+
+## OBORENE (README-plan je bio KRIV — 3):
+- **stuck-detection** → OBORENO DEFINITIVNO. Cline `runtime/safety/loop-detection.ts:66-153`
+  (`toolCallSignature`+`consecutiveIdenticalCount`+soft/hard threshold = naš STAGNATION 1:1);
+  OpenClaw `tool-loop-detection.ts` (786 lin); Roo `processor.ts:29,356`; Codex `tool_inspection.rs`
+  (djelomično). **NIJE naš diferencijator.**
+- **barbell plan/execute** → OBORENO. Aider `architect_coder.py` (ArchitectCoder→editor s
+  `editor_model`); Continue role-separation. **NIJE unikatan.**
+- **edit-ladder exact→fuzzy→refuse** → NIJE NOVEL. Aider (`search_replace.py:62`+`udiff_coder.py:270`),
+  OpenCode 9-stupanjski replacer. Delta = SAMO AST-symedit tier + fail-closed-na-više-kandidata.
+
+## PREŽIVJELE (stvarni diferencijatori nakon 11 audita — 3):
+- **TIA (coverage×diff→pogođeni testovi)** — NITKO nema. Aider `base_coder.py:1616` pokreće PUN
+  test_cmd; Continue/OpenCode/Codex/Cline/Roo grep "coverage/affected" = samo ignore-liste. **STOJI.**
+- **evidence-git-diff+exit-code completion GATE** (programski checker≠worker, ne prompt-tekst) —
+  NITKO nema pravi. Continue `review.ts:350` pass=postoji-patch (ne exit-code); OpenCode verifikacija
+  = samo tekst u promptu; Cline `attempt_completion` nema odvojenog checkera. **STOJI (s nijansom).**
+- **AST/LSP symedit** (symbol-scoped rename, ne text-match) — NITKO nema ZA EDIT. Svi koriste
+  tree-sitter za repomap/lint, NE za edit (Continue `deterministic.ts` = AST-assisted PLACEMENT, ne
+  symedit; Aider tree-sitter samo u repomap). **STOJI.**
+
+## POSLJEDICA ZA PLAN:
+1. S3.4/S3.1 tekst se ISPRAVLJA: makni "stuck-detection nitko nema" i "barbell nitko nema" — to su
+   sad NAŠI ZAHTJEVI (dobri), ali s referencama (Cline/OpenClaw/Aider), NE unikati.
+2. Naš iskren coding-USP se svodi na TROJKU: **TIA + evidence-completion-gate + AST-symedit** — to
+   NITKO od 9 coding-harnessa nema. Uz to: kombinacija svega + Go-single-binary + hardened membrana.
+3. **Metodološka pouka (za korisnika):** README/git-tree razina proizvela je 3 lažne "unikat"
+   tvrdnje od 6. Full-code audit je JEDINI pošten put. Preostali Tier-A (frameworks + landscape) tek
+   slijede — ali coding-tvrdnje su sad code-provjerene.
