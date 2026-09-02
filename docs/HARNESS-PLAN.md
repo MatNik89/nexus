@@ -1092,3 +1092,39 @@ ne 6. Ovo je bio ispravan pristup od početka (korisnikova vizija). Plan je sad 
 
 **SLJEDEĆE:** plan je iskren i potpun → PRD.md (korisnik vodi) + ARCHITECTURE-ESSENTIALS → hard-
 questions review → CLAUDE/AGENTS + scaffold → gradnja. USP je sad 4 code-dokazana + kombinacija.
+
+---
+
+# ADDENDUM A9 — FOLD A8 gapova u sekcije + KOMPONENTNA strategija (RAG/OCR/vector/baza/memorija)
+
+## Fold gapova iz 29 audita u dizajn sekcija:
+- **S12.2** ← LangGraph BSP/Pregel superstep obrazac: kanali nepromjenjivi unutar koraka, taskovi vide
+  update tek idući korak, atomski reduce+checkpoint na kraju superstepa. NAŠ DAG dobiva deterministički
+  superstep-mode (uz zadržan typed S0 envelope — LangGraph ima `Any`, mi typed).
+- **S7.2** ← OpenClaw `ingress-queue` (claim/refresh/stale-CAS-reclaim/DLQ) je REFERENCA dublja od
+  NEXUS queue — naš lease/fencing (P2.3) uzima taj obrazac (DLQ + refresh eksplicitno).
+- **S12.6 / nove asistentske podsekcije** ← OpenClaw O1-14: **commitments** (promised-work, veže G4
+  ObligationStore), **flows** (workflow), **boards/tasks** (kanban), **fleet+device-pairing** (S18),
+  **exec-auto-reviewer** (exec pregledan NAKON — jača 6.9). Ovi ulaze kao `multi-agent`/`service`
+  addendum-podsekcije u gradnji.
+- **S17.1** ← DeepSeek-Harness Cordis "everything-is-plugin" DI-kernel obrazac (potvrđen kandidat).
+- **Go binary efikasnost** ← jcode RAM-lifecycle (Arc-shared→Go pointeri na immutable, static/dynamic
+  prompt-cache split, drop-dup-buffer) — cilj sličan 27.8MB.
+- **2.2 AccountFleet** ← jcode account-failover + cost-model (curated→OpenRouter→models.dev, unknown≠free).
+- **S12.5** ← MAF nativni A2A+MCP hosting (potvrđeno; MAF `go/` je STUB — nismo u Go-konkurenciji).
+- **S10** ← Haystack BM25+dense+rerank komponentna dubina (adapter-referenca).
+
+## KOMPONENTNA STRATEGIJA (RAG/OCR/vector/baza/memorija) — ZAŠTO nisu full-audited:
+Ove su ADAPTERI iza sučelja (adaptiramo, ne kopiramo kod) + NEXUS salvage — NE trebaju 300 full-code
+audita, nego laganu capability-potvrdu PO ADAPTERU u trenutku gradnje te sekcije:
+- **MEMORIJA (S9):** ponajviše NEXUS salvage (dream/sleeptime/audn/memgit/recall/memassoc + spine) →
+  Go port. letta/mem0/zep = referenca. NAJDUBLJI naš dio.
+- **BAZA:** `modernc.org/sqlite` pure-Go spine (memorija/journal/queue/FTS5), bez cgo → single-binary.
+  Postgres samo za `service`. (S9.1 + S0.4)
+- **VECTOR (S10.3):** ADAPTER iza `Retriever` — pick (Qdrant/LanceDB/sqlite-vec) capability-confirm pri gradnji.
+- **RAG (S10):** adapteri (chunker/embedder/reranker) iza sučelja; Haystack/LlamaIndex kao referenca.
+- **OCR (A1):** hardware-routing Unlimited-OCR(GPU)/OCRmyPDF(CPU) → searchable-PDF + FTS. Gotov dizajn.
+Pravilo: KOMPONENTE se biraju laganom matricom (URL/licenca/radi-li-X) KAD gradimo tu sekciju, ne unaprijed.
+
+**PLAN JE SAD POTPUN I CODE-GROUNDED.** Sljedeće: PRD (korisnik) + Essentials → hard-questions review
+→ CLAUDE/AGENTS + scaffold → gradnja P0. Komponente (vector/OCR backend) biraju se u gradnji sekcije.
