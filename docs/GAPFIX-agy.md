@@ -1,3 +1,5 @@
+> **⚠ DJELOMIČNO SUPERSEDED (REVIEW2/4):** AccountFleet `automatski failover/rotacija` je ZAMIJENJEN — AccountFleet SAMO klasificira (candidate+cooldownHint); **S7 je jedini failover/retry owner** (DESIGN-FIXES-r2 §Vlasništvo). Ostatak (jcode RAM-lifecycle, Cordis) važeći.
+
 GAPFIX agy
 
 # Kanonska Sinteza Gap-Fix Rješenja: Efikasnost, Provider Sloj i Plugin Arhitektura

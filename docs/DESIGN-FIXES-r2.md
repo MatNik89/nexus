@@ -27,35 +27,46 @@ type EffectPath struct {
     retry   *s7.RetryOwner     // S7 (JEDINI grant)
 }
 
+// ToolCall nosi resolved ExecutionKind iz S4 ToolSpec (dopuna DESIGN-S0 ToolCall; fix V-K1/N4-C02):
+//   ToolSpec{ID, SchemaHash, EffectClass, ExecutionKind}   ExecutionKind ∈ {ExecInProcess, ExecProcess}
+//   registry PEČATI ExecutionKind; call.ExecutionKind = resolved iz zapečaćenog spec-a (ne od modela).
+
 func (p EffectPath) RunTool(ctx context.Context, call contracts.ToolCall, grant s7.AttemptGrant) (contracts.ToolResult, error) {
-    switch p.pep.Decide(call) {                                            // 1) S6.0 TOTALNI switch (fix N3-C01)
-    case s6.DENY:  return denied(call), nil
-    case s6.ASK:                                                           //    ASK ≠ ALLOW: traži exact-intent
-        if !p.pep.ApprovedExact(call) { return needsApproval(call), nil }  //    odobrenje (P1.4) ili staje
+    switch p.pep.Decide(call) {                                            // 1) S6.0 TOTALNI switch + default-deny
     case s6.ALLOW: // nastavi
+    case s6.ASK:
+        if !p.pep.ApprovedExact(call) { return needsApproval(call), nil }  //    exact-intent (P1.4) ili staje
+    case s6.DENY:  return denied(call), nil
+    default:       return denied(call), ErrInvalidDecision                 //    nepoznat/zero → DENY (fix N4-C01)
     }
     if err := p.mw.BeforeTool(ctx, call); err != nil { return p.mw.OnError(ctx, err) } // 2) S6.9 order
-    // 3) grananje ISKLJUČIVO po tome treba li OS proces (fix RUN-01/REG-01 — Effect NIJE kriterij):
-    exec := p.inproc
-    if call.ExecutionKind == contracts.ExecProcess {                       //    authoritative S4 ToolSpec (fix V-K1)
-        exec = p.sbproc                                                    //    → S6.2.Launch(S1.2 unutra)
+    var exec ToolExecutor                                                  // 3) TOTALNI switch po pečatu (N4-C02)
+    switch call.ExecutionKind {
+    case contracts.ExecInProcess: exec = p.inproc
+    case contracts.ExecProcess:   exec = p.sbproc                          //    → S6.2.Launch(S1.2 unutra)
+    default: return denied(call), p.mw.OnError(ctx, ErrUnknownExecKind)    //    zero/nepoznat → reject (ne inproc)
     }
     out, err := exec.Execute(ctx, call)                                    // 4) izvršenje
-    if err != nil { return p.retry.Record(grant, contracts.ToolResult{}, p.mw.OnError(ctx, err)) } // fix N3-C02
-    if verr := p.mw.AfterTool(ctx, call, out); verr != nil {               //    post-exec veto FAIL-CLOSED (N3-C02)
-        return p.retry.Record(grant, contracts.ToolResult{}, verr)         //    veto → nema isporuke outputa
+    if err != nil {                                                        //    Execute err → OnError (audit/lifecycle)
+        return p.retry.Record(grant, contracts.ToolResult{}, p.mw.OnError(ctx, err))
+    }
+    if verr := p.mw.AfterTool(ctx, call, out); verr != nil {               //    post-exec veto (N3-C02/N4-C03):
+        oe := p.mw.OnError(ctx, verr)                                      //    kroz OnError (lifecycle/audit grana)
+        phase := classifyEffectPhase(call, out)                           //    P1.4/effect-taxonomy:
+        return p.retry.RecordVeto(grant, phase, oe)                        //    IRREVERSIBLE+committed → UNKNOWN→RECONCILING
     }
     return p.retry.Record(grant, out, nil)                                 // 5) S7 (JEDINI retry)
 }
 ```
-**Invarijante:** (1) grananje po `ToolSpec.ExecutionKind==ExecProcess` (pečat u S4, ne `call.Effect`) —
-read-only shell (`cat`,`git log`) je i dalje proces → sandbox. `proc.Spawn` nedostupan mimo Launcha.
-(2) In-process alat NIKAD ne spawna. (3) ASK≠ALLOW (traži exact-intent approval). (4) `Execute` err ILI
-`AfterTool` veto → OnError + NULA isporuke outputa; AfterTool se NE zove na err-putu. (5) grant PRIJE Execute.
-**RED:** `TestReadOnlyProcessStillSandboxed` (EffectReadOnly+ExecProcess → sbproc, ne inproc);
-`TestAskRequiresExactApproval`; `TestExecErrorSkipsAfterToolAndOutput`; `TestInProcessToolNeverSpawns`;
-`TestNoAttemptWithoutGrant`. + S4: `ToolSpec.ExecutionKind ∈ {ExecInProcess, ExecProcess}` je autoritativan,
-4.2 NE prisvaja tree-kill (predaje exec-spec; kill je unutar S6.2.Launch/S1.2).
+**Invarijante:** (1) grananje po zapečaćenom `ToolSpec.ExecutionKind` (S4 registry, ne `call.Effect`) —
+read-only shell (`cat`,`git log`) je proces → sandbox; zero/nepoznat kind → **reject, NE inproc**.
+(2) `PEP.Decide` switch ima default-deny (nepoznata odluka NE izvršava). (3) In-process alat NIKAD ne
+spawna; `proc.Spawn` nedostupan mimo S6.2.Launch. (4) ASK≠ALLOW (exact-intent). (5) `Execute` err ILI
+`AfterTool` veto → **OnError** (audit/lifecycle grana), NULA isporuke; veto nakon commit-a → `RecordVeto`
+klasificira `IRREVERSIBLE+UNKNOWN→RECONCILING` (P1.4, ne slijepi retry). (6) grant PRIJE Execute.
+**RED:** `TestUnknownDecisionDenies`; `TestUnknownExecKindRejectsNotInproc`; `TestReadOnlyProcessStillSandboxed`;
+`TestAskRequiresExactApproval`; `TestVetoGoesThroughOnErrorAndReconciles`; `TestExecErrorSkipsAfterToolAndOutput`;
+`TestInProcessToolNeverSpawns`; `TestNoAttemptWithoutGrant`.
 **Ispravan put:** `S3.Loop → S4.tool-spec → S6.0.Decide → S6.9.Before → {InProc | S6.2.Launch(S1.2)} → S6.9.After → S7`.
 
 ## Vlasništvo-fix (codex C10/C11, kilo R2-08/R2-11)
@@ -71,13 +82,15 @@ read-only shell (`cat`,`git log`) je i dalje proces → sandbox. `proc.Spawn` ne
 ## K3 — Fleet↔Pairing cirkularni import (kilo R2-10, V-K3/R3-04 leaf-fix)
 Nadjačava `GAPFIX-codex` cross-import (`ExecutionNode{Device *pairing.DeviceID}` ↔ `RemoteInvoke{Node fleet.NodeID}`).
 ```
-internal/fleet/ids   # SAMO skalarni ID-ovi: NodeID, DeviceID  — TRUE leaf, nula importa (fix R3-04)
-internal/fleet       # ExecutionNode → ids ; PlacementGrant OVDJE (nosi queue.TaskID + s7.AttemptGrant + time)
-internal/fleet/pairing # RemoteInvoke → ids  (uzima fleet.NodeID kao ids.NodeID, ne uvozi `fleet`)
+internal/fleet/ids      # SAMO skalari: type NodeID string; type DeviceID string  — TRUE leaf, 0 importa
+internal/contracts      # PlacementGrant{Node ids.NodeID; Task queue.TaskID; Attempt s7.AttemptGrant; Exp time.Time}
+                        #   (neutralni kernel-contracts paket; već postoji, uvozi ids/queue/s7 — nizvodno od njih)
+internal/fleet          # ExecutionNode{ID ids.NodeID; Device ids.DeviceID} → ids
+internal/fleet/pairing  # RemoteInvoke(node ids.NodeID, g contracts.PlacementGrant)  → ids + contracts
 ```
-`PlacementGrant` NIJE u `ids` (povlačio bi queue/reliability → ids ne bi bio leaf). Ostaje u `fleet`;
-`pairing` referencira samo `ids` skalare, prima grant kao argument (ne import-tip). **RED:** `go build ./...`
-prolazi; `TestNoImportCycle` (import-graf: `ids` uvozi 0 internih; `pairing` ne uvozi `fleet`; `fleet` ne uvozi `pairing`).
+Konkretni potpis: `pairing.RemoteInvoke` prima `contracts.PlacementGrant` (neutralni tip), NE `fleet.*`.
+`fleet` i `pairing` oba uvoze `ids`(+`contracts`); nijedan ne uvozi drugoga. Nema ciklusa. **RED:**
+`go build ./...` prolazi; `TestNoImportCycle` (`ids` uvozi 0 internih; `pairing`⊄`fleet`; `fleet`⊄`pairing`).
 
 ## 4.8 password-DENY neizvodiv (kilo R2-15)
 Zamjena RED: OS input-injection NE zna sadržaj polja. `InputInject` u polje s `input_purpose=password`

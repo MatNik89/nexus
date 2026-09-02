@@ -20,13 +20,14 @@ FAZA K0 (primitivi — ništa ne ovisi prije):
   EventJournal paket (P0.3 write-owner — NIJE S0.3; S0.3=capability-negotiation)   ✅
   S1.1 config · S1.2 paths + PROCESS-IDENTITY primitiv (PID+start-token)  (→S0)
   S1.3 telemetry (projekcija journala)
-  S8.1-min budget-mjerenje · S11.1-min assembly   ← da S3 turn radi bez foldanja unatrag
+  S8.1-min (ContextBudget.Measure+HardLimit) · S11.1-min (Assembler.Base — bez skills/archmap)
+  S16.6-det (Checker deterministic: coding.diff_exit+state_invariant) — izdvojeni MIN ugovori (fix V-K4)
 
 FAZA K1 (sigurnost+pouzdanost+workspace, →K0):
   S6.0 PEP · S6.1 perm · S6.2 sandbox · S6.9 lifecycle   ✅6.2
   S7 retry/queue/crash  (KONZUMIRA S1.2 process-identity; S1.2 NE ovisi o S7 — fix C05)
   S5 workspace/checkpoint (5.1/5.2/5.3)  (→S1)   ✅5.1/5.3   ← PRIJE S4 (fix DAG-01)
-  S16.6-det deterministic checker (coding.diff_exit/state_invariant; council-integr.→N)  ✅
+  6.3 egress · 6.4 secrets · 6.5 injection · 6.6 authn(`service`) · 6.7 governance · 6.8 supply-chain (→K1)
 
 FAZA L (izvršni put, →K):
   S2 provider (DETERMINISTIČKI router; learned→P)  (→S6,S7)
@@ -34,8 +35,8 @@ FAZA L (izvršni put, →K):
   S4 tools/exec/edit/search  (→S3,S5,S6.2)   ✅4.3   ← search staje na grep/AST/LSP (archmap→M)
 
 FAZA M (kontekst/memorija/prompt PUNI, →L):
-  S8 puni (8.2 compaction/8.3 archmap/8.4 cache/8.5 pruning) → 4.4 archmap-integr.   ✅8.3
-  S9 (9.2 store/9.4 Decay+Audn; 9.5/9.6 SAMO persistence+namespace, binding→N/O)   ✅9.2/9.4
+  S8 puni (8.1-puni/8.2 compaction/8.3 archmap/8.4 cache/8.5 pruning) → 4.4 archmap-integr.   ✅8.3
+  S9 (9.1 sesije/9.2 store/9.3 learn/9.4 Decay+Audn; 9.5/9.6 SAMO persistence+namespace, binding→N/O)   ✅9.2/9.4
   S11 puni (11.2/11.4/11.5/11.6)
 
 FAZA N (orkestracija/observability, →M):

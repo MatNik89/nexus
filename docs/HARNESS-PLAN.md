@@ -107,7 +107,7 @@ polje); checkpoint = journal offset. `UNKNOWN`→samo reconciliation event. **RE
 Streaming,ContextLimit}`; `Effective()=min(declared,measured)`; `Resolve` nepoznatog → error
 (fail-closed, "mjeri ne pretpostavljaj"). **HONEST GAP (kilo+moderator):** 0.3 JEDINA S0
 podsekcija — ugovor **P0.5 "capability-matrix fail-closed"** je u Annexu A (dodan);
-Tier-3 (matrix-prep) ILI vezati na capability-floor načelo kao gate. Odluka: dodati P0.5 ugovor.
+Tier-3. Ugovor **P0.5** je u Annexu A (dodan).
 **Pareto:** cap-as-data (LiteLLM)+declared-on-adapter (PydanticAI)+cap-routing (Portkey)+fail-closed (naš).
 
 **0.4 verzioniranje/migracija (MEHANIZAM):** `SchemaRegistry{byID map[string]map[int]Upcaster}`,
@@ -126,7 +126,7 @@ cap-matching (OSGi)+topološko (Bazel)+gate-attestation (naš).
 
 **S0 verifikacija:** svi kandidati stvarni (MCP Apache-2.0, OpenAI-SDK/LangGraph/LiteLLM/PydanticAI/
 OpenHands/Temporal MIT, CloudEvents CNCF, Cargo/Bazel/OSGi) — licence+aktivnost potvrđeni.
-**S0 STATUS: DIZAJN (salvage uklonjen; RESOLVED/UNRESOLVED po podsekciji → PLAN-HOLES-CONSOLIDATED.md)** (uz akciju: dodati P0.5 ugovor za 0.3 u Annex).
+**S0 STATUS: DIZAJN (salvage uklonjen; RESOLVED/UNRESOLVED po podsekciji → PLAN-HOLES-CONSOLIDATED.md)** (P0.5 ugovor za 0.3 je u Annexu A).
 
 ---
 
@@ -172,8 +172,7 @@ NIKAD ne obuhvaća state/security/audit klase; throughput floor MJERI se (proof 
 **Pareto PASS.**
 
 **S1 honest gap:** 1.1 i 1.2 nemaju dedicirani Annex RED (kao 0.3) — gate posredno kroz P1.2/P0.4 +
-kod-vs-data načelo. Akcija: dodati **P0.6 "config-bounds + process-identity"** u matrix-prep (uz
-P0.5 iz S0). **Verifikacija:** svi kandidati stvarni (Codex/Aider/Continue/goose Apache-2.0; OTel
+kod-vs-data načelo. Ugovori **P0.6** (config-bounds+process-identity) i P0.5 su u Annexu A. **Verifikacija:** svi kandidati stvarni (Codex/Aider/Continue/goose Apache-2.0; OTel
 CNCF; structlog/tracing/OpenHands MIT). **S1 STATUS: DIZAJN (salvage uklonjen; RESOLVED/UNRESOLVED po podsekciji → PLAN-HOLES-CONSOLIDATED.md).**
 
 ---
@@ -225,8 +224,7 @@ po fazi) = jezgra; `LearnedRouter{bandit}` epsilon-greedy OPT-IN, reward SAMO iz
 semantic-router+LiteLLM+barbell+verified-bandit.
 
 **S2 honest gap:** 2.1/2.3/2.4/2.5 bez dediciranog Annex RED — gate posredno (P2.5 za 2.1, S0.1 za
-2.3, hardware-fit za 2.4, P2.2 za 2.5). Matrix-prep kandidati: P0.7 structured-never-silent,
-P0.8 hardware-fit-fail-closed. **Verifikacija:** svi kandidati stvarni (Kong webfetch-verificiran).
+2.3, hardware-fit za 2.4, P2.2 za 2.5). U Annexu A: P0.7 structured-never-silent, P0.8 hardware-fit-fail-closed. **Verifikacija:** svi kandidati stvarni (Kong webfetch-verificiran).
 **S2 STATUS: DIZAJN (salvage uklonjen; RESOLVED/UNRESOLVED po podsekciji → PLAN-HOLES-CONSOLIDATED.md).** Auth-mod dizajn (a-d) odgovara korisnikovom OAuth/subscription pitanju.
 
 ---
@@ -282,7 +280,7 @@ javni kandidati stvarni; Kilo Code = to-beat meta bez javne licence. **S3 STATUS
 
 # S4 — KANONSKA SINTEZA (Tool sustav; coding-kritično 4.2-4.4; 3-way, Pareto PASS)
 
-**4.1 tool-registry (MEHANIZAM):** typed schema po alatu (`ToolSpec{ID,SchemaHash,EffectClass}`),
+**4.1 tool-registry (MEHANIZAM):** typed schema po alatu (`ToolSpec{ID,SchemaHash,EffectClass,ExecutionKind}`; ExecutionKind∈{ExecInProcess,ExecProcess} pečati grananje za effect-path),
 dispatch, timeout, result-envelope, permission-wrapper. **RED:** poziv bez validne sheme→reject. **Pareto:** FastMCP+smolagents+OpenAI-SDK.
 
 **4.2 shell/exec (MEHANIZAM, coding):** bash-sesija koja drži stanje, rlimits, tree-kill.
@@ -350,8 +348,7 @@ Codex+Cline+sandbox-atestor-PROV-O (naš).
 
 **S5 diferencijator:** shadow-git izvan stabla (byte-identičan undo bez zagađenja povijesti) +
 worktree-per-subagent (S12 temelj) + sandbox-neutralni atestor. **Honest gap:** 5.1/5.3 bez
-dediciranog Annex RED (P0.11 kandidat). **Verifikacija:** kandidati stvarni; `diff_engine.go` Go
-reuse. **S5 STATUS: DIZAJN (salvage uklonjen; RESOLVED/UNRESOLVED po podsekciji → PLAN-HOLES-CONSOLIDATED.md).**
+dediciranog Annex RED (P0.11 u Annexu A). **Verifikacija:** kandidati stvarni; atomic-write greenfield Go. **S5 STATUS: DIZAJN (salvage uklonjen; RESOLVED/UNRESOLVED po podsekciji → PLAN-HOLES-CONSOLIDATED.md).**
 
 ---
 
@@ -1045,8 +1042,7 @@ Roo, Goose, Kilo) — PROVJERA naših "nitko nema" tvrdnji protiv STVARNOG koda.
 symedit; loop zreo ali "pliće na coding gateovima"). Naša S6 sigurnost DUBLJA (jcode classifier sam
 priznaje "nije sandbox", nema Landlock/egress). **Uzeti obrasce:** RAM-lifecycle (Arc-shared immutable
 messages, static/dynamic prompt-cache split, drop-dup-provider-transcript, single-flight route-memo) —
-meta za naš Go binary; account-failover + cost-model (curated→OpenRouter→models.dev, unknown≠free) —
-za A4 G8 account-fleet. MCP child ne nasljeđuje credential env (least-authority — dobar detalj).
+meta za naš Go binary; account-candidate + cost-model (curated→OpenRouter→models.dev, unknown≠free) — feed za A4-G8 AccountFleet (classify-only; failover-owner=S7). MCP child ne nasljeđuje credential env (least-authority — dobar detalj).
 
 **ruflo** (Rust meta-harness, 66k★): NIJE stub ali MALEN (~2000 lin swarm/authz + watermarking) i
 **marketing-težak** (5× više doc-bajtova nego koda — "star=warning" djelomično opravdan). Stvaran samo
@@ -1083,7 +1079,7 @@ Sve to OSTAJE naš zahtjev, ali s REFERENCAMA (uči od njih), NE kao "nitko nema
 - **OpenClaw O1-14** (commitments/flows/boards/fleet+pairing/exec-auto-reviewer) → asistentske podsekcije
 - **DeepSeek-Harness Cordis** (everything-is-plugin DI) → S17.1 obrazac (potvrditi iz A5-nasljeđa)
 - **jcode RAM-lifecycle** (Arc-shared/static-dynamic-cache-split/drop-dup) → Go single-binary efikasnost
-- **jcode account-failover + cost-model** (curated→OpenRouter→models.dev) → A4-G8 account-fleet
+- **jcode cost-model + account-candidate** (curated→OpenRouter→models.dev) → A4-G8 AccountFleet (classify-only; S7 failover-owner)
 - **MAF nativni A2A+MCP hosting** (potvrđeno; MAF `go/` je STUB — nismo u Go-konkurenciji) → S12.5
 - **Haystack RAG pipeline dubina** (BM25+dense+rerank komponente) → S10 adapteri
 - **CrewAI/AutoGen/MetaGPT team-role obrasci** → S12.1 (role-as-data već imamo, potvrđeno)
@@ -1113,7 +1109,7 @@ questions review → CLAUDE/AGENTS + scaffold → gradnja. USP je sad 4 code-dok
 - **S17.1** ← DeepSeek-Harness Cordis "everything-is-plugin" DI-kernel obrazac (potvrđen kandidat).
 - **Go binary efikasnost** ← jcode RAM-lifecycle (Arc-shared→Go pointeri na immutable, static/dynamic
  prompt-cache split, drop-dup-buffer) — cilj sličan 27.8MB.
-- **2.2 AccountFleet** ← jcode account-failover + cost-model (curated→OpenRouter→models.dev, unknown≠free).
+- **2.2 AccountFleet** ← jcode cost-model + account-candidate (classify-only; S7 jedini izdaje grant/failover).
 - **S12.5** ← MAF nativni A2A+MCP hosting (potvrđeno; MAF `go/` je STUB — nismo u Go-konkurenciji).
 - **S10** ← Haystack BM25+dense+rerank komponentna dubina (adapter-referenca).
 
@@ -1160,7 +1156,7 @@ RED + paket-placement) u `docs/GAPFIX-{codex,kilo,agy}.md`. Index + sekcija-plac
 - **jcode RAM-lifecycle** → `ImmutableMessageList` (Go ekvivalent Arc), static/dynamic prompt-cache
  split, single-flight route-resolver, drop-dup. RED: `go test -race` 50 gorutina; static-prefix SHA
  invariant; single-flight 100→1 izvršenje.
-- **2.2 AccountFleet** → account-failover + credential-cache-invalidate + tiered cost-model
+- **2.2 AccountFleet** → account-CLASSIFY (candidate+cooldownHint) + credential-cache-invalidate + tiered cost-model (failover-owner=S7)
  (curated→OpenRouter→models.dev, unknown≠free).
 - **17.1 Cordis DI-kernel** → everything-is-plugin obrazac.
 
