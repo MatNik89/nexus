@@ -206,6 +206,24 @@ const (
     EffectIrreversible
 )
 
+type ExecutionKind uint8 // gdje alat teče; 0=INVALID fail-closed (REVIEW2 V-K1)
+const (
+    ExecInProcess ExecutionKind = iota + 1 // edit/read/grep/memory — čista Go funkcija
+    ExecProcess                            // bash/exec/python — OBAVEZNO kroz S6.2.Launch
+)
+
+type EffectPhase uint8 // commit-faza učinka; executor atestira (REVIEW2 N4-C03)
+const (
+    PhaseBeforeCommit EffectPhase = iota + 1 // učinak nije počeo
+    PhaseAfterCommit                         // učinak potvrđen (commit-receipt)
+    PhaseUnknown                             // ireverzibilan bez potvrde → RECONCILING
+)
+
+type CommitReceipt struct {
+    Phase       EffectPhase
+    ReceiptHash Digest        // veže ExecutionReceipt (pkg/attest); dokaz commita
+}
+
 type ToolCall struct {
     ToolCallID         ToolCallID
     ToolID             string
@@ -232,6 +250,7 @@ type ToolResult struct {
     Status       ToolResultStatus
     OutputBlocks []ContextBlock
     Error        Optional[TypedError]
+    Commit       Optional[CommitReceipt] // executor-atestirana commit-faza (N4-C03); prazno za in-process read-only
     StartedAt    time.Time
     FinishedAt   time.Time
 }

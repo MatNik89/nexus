@@ -9,16 +9,11 @@ ranijih DESIGN-*.md (navedeno po fixu).
 Nadjačava `DESIGN-memory-effectpath-kilo.md` §B (RunTool bez S6.2 + proc.Spawn za sve).
 
 ```go
-// --- enumi (S0 contracts; default 0 = INVALID, fail-closed) ---
+// KANONSKI tipovi su u DESIGN-S0 (contracts): ExecutionKind{ExecInProcess,ExecProcess},
+// EffectPhase{PhaseBeforeCommit,PhaseAfterCommit,PhaseUnknown}, CommitReceipt, ToolResult.Commit,
+// ToolCall.ExecutionKind. Ovdje SAMO Decision + effect-path sučelja.
 type Decision uint8
-const ( DecisionInvalid Decision = iota; DecisionAllow; DecisionAsk; DecisionDeny )
-type ExecutionKind uint8
-const ( ExecKindInvalid ExecutionKind = iota; ExecInProcess; ExecProcess )
-type EffectPhase uint8
-const ( PhaseInvalid EffectPhase = iota; PhaseBeforeCommit; PhaseAfterCommit; PhaseUnknown )
-
-// ToolSpec (S4 4.1) PEČATI ExecutionKind; ToolCall nosi resolved kopiju iz zapečaćenog spec-a
-// (dopuna kanonskom ToolCall u DESIGN-S0 — polje `ExecutionKind ExecutionKind`; ne od modela). Fix V-K1.
+const ( DecisionInvalid Decision = iota; DecisionAllow; DecisionAsk; DecisionDeny ) // 0=INVALID fail-closed
 
 // --- sučelja s JEDNIM potpisom (fix R5-C01: OnError uvijek `error`) ---
 type ToolExecutor interface { Execute(ctx context.Context, c contracts.ToolCall) (contracts.ToolResult, error) }
@@ -29,17 +24,22 @@ type Middleware interface {
 }
 type RetryOwner interface {
     Record(g s7.AttemptGrant, r contracts.ToolResult, e error) (contracts.ToolResult, error)
-    RecordVeto(g s7.AttemptGrant, ph EffectPhase, e error) (contracts.ToolResult, error) // AFTER_COMMIT/UNKNOWN→RECONCILING
+    RecordVeto(g s7.AttemptGrant, ph contracts.EffectPhase, e error) (contracts.ToolResult, error) // AFTER_COMMIT/UNKNOWN→RECONCILING
 }
-// classifyEffectPhase: BEFORE_COMMIT ako učinak nije počeo; AFTER_COMMIT ako je potvrđen; UNKNOWN inače.
-func classifyEffectPhase(c contracts.ToolCall, r contracts.ToolResult) EffectPhase
+// classifyEffectPhase DETERMINISTIČKI iz executor-atestacije (fix N4-C03):
+func classifyEffectPhase(c contracts.ToolCall, r contracts.ToolResult) contracts.EffectPhase {
+    if r.Commit.Valid { return r.Commit.Value.Phase }          // executor atestirao commit-fazu (receipt)
+    if c.Effect == contracts.EffectIrreversible { return contracts.PhaseUnknown } // ireverzibilan bez potvrde → RECONCILING
+    return contracts.PhaseBeforeCommit                          // read-only/reverzibilan bez commita: ništa nije trajno
+}
 
 type SandboxedProcessExecutor struct { sandbox sandbox.Backend; proc *s1.ProcessTracker } // S6.2 obavezan; S1.2 UNUTAR Launch
 type InProcessExecutor struct{ /* edit/read/grep/archmap/memory — čista Go funkcija */ }
 
 type EffectPath struct {
     pep    *s6.PEP; mw Middleware
-    inproc ToolExecutor; sbproc ToolExecutor   // sbproc = *SandboxedProcessExecutor (sandbox u sebi)
+    inproc *InProcessExecutor        // KONKRETNI tipovi (fix V-K1): nemoguće injektirati nesandboxiran executor
+    sbproc *SandboxedProcessExecutor // sandbox membrana je u samom tipu, ne opcionalna
     retry  RetryOwner
 }
 
@@ -56,8 +56,8 @@ func (p EffectPath) RunTool(ctx context.Context, call contracts.ToolCall, grant 
     }
     var exec ToolExecutor                                                    // 3) total switch po pečatu (N4-C02)
     switch call.ExecutionKind {
-    case ExecInProcess: exec = p.inproc
-    case ExecProcess:   exec = p.sbproc                                      //    → S6.2.Launch(S1.2 unutra)
+    case contracts.ExecInProcess: exec = p.inproc
+    case contracts.ExecProcess:   exec = p.sbproc                                      //    → S6.2.Launch(S1.2 unutra)
     default:            return contracts.ToolResult{}, p.mw.OnError(ctx, ErrUnknownExecKind) // reject, NE inproc
     }
     out, err := exec.Execute(ctx, call)                                      // 4) izvršenje
