@@ -218,6 +218,7 @@ const (
     PhaseAfterCommit                         // učinak potvrđen (commit-receipt)
     PhaseUnknown                             // ireverzibilan bez potvrde → RECONCILING
 )
+func (p EffectPhase) Valid() bool { return p >= PhaseBeforeCommit && p <= PhaseUnknown }
 
 type CommitReceipt struct {
     Phase       EffectPhase  // MORA biti Valid() (ne zero); executor atestira
@@ -225,8 +226,10 @@ type CommitReceipt struct {
     AttemptNo   uint32       // vezan na ovaj pokušaj
     ReceiptHash Digest       // veže ExecutionReceipt (pkg/attest); dokaz commita
 }
-// BoundTo: receipt vrijedi samo za svoj (call, attempt).
-func (cr CommitReceipt) BoundTo(c ToolCall) bool { return cr.CallID == c.ToolCallID && cr.AttemptNo == c.AttemptNo }
+// ValidFor: receipt vrijedi SAMO uz valjan phase + vezanost na (call,attempt) + atestiran (non-zero) hash.
+func (cr CommitReceipt) ValidFor(c ToolCall) bool {
+    return cr.Phase.Valid() && cr.CallID == c.ToolCallID && cr.AttemptNo == c.AttemptNo && cr.ReceiptHash != (Digest{})
+}
 
 type ToolCall struct {
     ToolCallID         ToolCallID

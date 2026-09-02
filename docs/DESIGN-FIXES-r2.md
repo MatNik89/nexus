@@ -28,11 +28,10 @@ type RetryOwner interface {
 }
 // classifyEffectPhase DETERMINISTIČKI iz executor-atestacije (fix N4-C03):
 func classifyEffectPhase(c contracts.ToolCall, r contracts.ToolResult) contracts.EffectPhase {
-    if r.Commit.Valid {                                        // receipt MORA biti valjan I vezan na ovaj (call,attempt)
-        cr := r.Commit.Value
-        if !cr.Phase.Valid() || !cr.BoundTo(c) { return contracts.PhaseUnknown } // nepoznat/tuđi receipt → UNKNOWN
-        return cr.Phase
+    if r.Commit.Valid && r.Commit.Value.ValidFor(c) {          // valjan phase + vezan (call,attempt) + atestiran hash
+        return r.Commit.Value.Phase
     }
+    if r.Commit.Valid { return contracts.PhaseUnknown }        // Commit prisutan ali nevaljan/tuđi/zero-hash → UNKNOWN
     if c.Effect == contracts.EffectReadOnly { return contracts.PhaseBeforeCommit } // SAMO read-only: ništa trajno nije moglo nastati
     return contracts.PhaseUnknown                              // svaki EFFECTFUL (reverzibilan ILI ireverzibilan) bez receipta → UNKNOWN→RECONCILING (fail-closed, N4-C03)
 }
