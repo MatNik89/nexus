@@ -24,7 +24,7 @@ build tags (`proc_*.go`, `sandbox_*.go`). Non-Go world tools NEVER in-process �
 subprocess sidecar, pure-Go replacement, or descope (each choice explicit, no free "adapter").
 → HARNESS-PLAN header, S1.2, A9 component strategy; PLAN-HOLES C4.
 
-## E2 — One kernel, two profiles; assistant FIRST (decided) + no self-modification
+## E2 — One kernel, two profiles; assistant FIRST (PENDING product approval) + no self-modification
 `AssistantProfile` = the everyday face (chat/memory/obligations/channels); `CodingProfile` =
 strongest branch (P1), not the purpose. Same S0–S9 kernel, same TurnLoop — only gating differs
 per profile. Linux first. Proposed and written into PRD v1; **formal product approval is
