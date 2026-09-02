@@ -28,10 +28,14 @@ prošao. **Fix:** `hmac.New(sha256.New, key)` ili `ed25519.Sign`. Isto vrijedi z
 mapiranje je diff-linija→coverage-blok→test (line-overlap), ne diff→simbol. OK za v1, ali "diff×coverage
 →simbol" tvrdnja je jača od implementacije. `fmt.Sscanf` na `file:start-end` puca na Windows `C:\` pathove.
 
-## PREOSTAJE PRIJE KODA
-- **D1 symedit** — fokusiran dizajn-pass (diferencijator, ne smije biti stub).
-- **D2 crypto-fix** — trivijalan ali sigurnosno-obavezan (HMAC/ed25519 svugdje gdje piše "potpis").
-- **#3 stvarni-OS probe** — Win/macOS hardver (tvoj).
-- **#6 PRD** — tvoja presuda (identitet + brutalni P0-scope).
+## RIJEŠENO (claude, DESIGN-symedit-crypto-claude.md)
+- **D1 symedit RESOLVED** — Go-native `go/types` (exact, v1 primarni) + LSP-adapter (ostali jezici),
+  refuse-on-ambiguous/collision/build-broken, preview-only, NIKAD text-fallback. 8 RED. Zamjenjuje agy stub.
+- **D2 crypto RESOLVED** — `Signer` (HMAC lokalno + ed25519 vanjski-anchor) + kanonska serijalizacija +
+  `Verify`; ključ nikad u artefaktu; constant-time. 6 RED. Veže 15.3/6.8/S6.4.
 
-Ostalo (S0/sandbox/effect-path/memorija-P0/checker/TIA/edit-nonsymedit) = dizajn-spremno za kod.
+## PREOSTAJE PRIJE KODA (samo tvoje)
+- **#3 stvarni-OS probe** — Win/macOS hardver (W0-W10 / M0-M9 matrice spremne u codex dizajnu).
+- **#6 PRD** — tvoja presuda (identitet "jedna jezgra/dva profila" + brutalni P0-scope).
+
+Sve ostalo dizajn-spremno za kod. Preostale 2 stavke traže tvoj hardver / tvoju odluku — ne mogu ja.
