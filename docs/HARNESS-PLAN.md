@@ -1128,3 +1128,38 @@ Pravilo: KOMPONENTE se biraju laganom matricom (URL/licenca/radi-li-X) KAD gradi
 
 **PLAN JE SAD POTPUN I CODE-GROUNDED.** Sljedeće: PRD (korisnik) + Essentials → hard-questions review
 → CLAUDE/AGENTS + scaffold → gradnja P0. Komponente (vector/OCR backend) biraju se u gradnji sekcije.
+
+---
+
+# ADDENDUM A10 — GAPOVI RIJEŠENI (buildable Go dizajn; puni u docs/GAPFIX-*.md)
+
+Svi gapovi iz 29-harness audita sad imaju BUILDABLE Go dizajn (struct/interface skice + salvage +
+RED + paket-placement) u `docs/GAPFIX-{codex,kilo,agy}.md`. Index + sekcija-placement:
+
+## Orkestracija (GAPFIX-codex) — paketi `internal/orchestration/{graph,superstep,flow,board}`, `internal/fleet/{registry,placement,pairing,transport}`
+- **12.2 BSP/Pregel superstep-mode** — `EdgeSequential` default / `BSPSuperstep` kad paralelni nodeovi
+  dijele reducirano stanje; kanali immutable u koraku, atomski reduce+checkpoint (S7.3), dijeli
+  validator+S7-grantove+journal s našim typed S0 envelope (ne LangGraph `Any`). RED gate.
+- **7.2 ingress-queue** ostaje JEDINI lease-owner + DLQ + refresh/reclaim + fencing (OpenClaw-obrazac).
+- **12.x flows + boards** — workflow + kanban kao nove `multi-agent` podsekcije; board/fleet tablice transakcijske (journal owner).
+- **18.x fleet + device-pairing** — `internal/fleet` identitet uređaja/nodea; fleet NIJE drugi retry-owner.
+
+## Asistent (GAPFIX-kilo) — Hermes G1-G5 + OpenClaw
+- **G1 computer-use** → S4.5+13.1+6.9/6.1+P1.4: `InputInject` KEY/MOUSE/TYPE=RED-tier, SCREENSHOT=YELLOW/
+  CONFIDENTIAL; bez EffectIntent-approval→6.9 odbij; keystroke u password-polje→6.1 DENY. RED.
+- **G2 PersonalProfile** (posao/privatno/obitelj) → `ProfileRegistry` deny-default izolacija (memory/
+  secrets/channels/cache); write u `work`→query u `family`=0 hitova. RED.
+- **G3 voice-runtime** → S13.3+S7+6.7: barge-in/wake/consent; audio prije consent→odbij. Salvage Hermes voice.
+- **G4 ObligationStore** → SQLite spine + 3.6 trigger; `MarkDone` SAMO uz Evidence (done-def git-diff/exit). RED.
+- **G5 control-plane** + **exec-auto-reviewer** (exec pregledan NAKON) + **identity-dubina** (per-channel-prefix/human-delay).
+
+## Efikasnost/Provider/Plugin (GAPFIX-agy)
+- **jcode RAM-lifecycle** → `ImmutableMessageList` (Go ekvivalent Arc), static/dynamic prompt-cache
+  split, single-flight route-resolver, drop-dup. RED: `go test -race` 50 gorutina; static-prefix SHA
+  invariant; single-flight 100→1 izvršenje.
+- **2.2 AccountFleet** → account-failover + credential-cache-invalidate + tiered cost-model
+  (curated→OpenRouter→models.dev, unknown≠free).
+- **17.1 Cordis DI-kernel** → everything-is-plugin obrazac.
+
+**SVI GAPOVI RIJEŠENI** (design-level). Puni Go dizajn: GAPFIX-*.md (commitani). Plan je sad
+POTPUN i code-grounded. **SLJEDEĆE: PRD (korisnik) + Essentials → hard-questions → scaffold → kod.**
