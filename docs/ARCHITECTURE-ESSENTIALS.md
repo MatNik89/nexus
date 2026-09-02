@@ -5,10 +5,13 @@ DESIGN-* + DESIGN-FIXES-r2 + 3-agent review REVIEW-ESSENTIALS-*). Daily referenc
 the full source always wins. Open preconditions are listed at the bottom — this document does
 NOT claim go/no-go has been granted.
 
-**Source precedence (when documents disagree):** HARNESS-SPEC.md (normative Annex A) >
-DESIGN-FIXES-r2 / DESIGN-*.md (they supersede named older parts) > HARNESS-PLAN.md >
-SECTION-MAP / PLAN-HOLES (status docs; some claims are stale — e.g. PLAN-HOLES C3 predates
-Annex A P0.5–P0.13, which now EXIST at HARNESS-SPEC:1534+).
+**Source precedence (when documents disagree):** PRD.md owns product decisions
+(identity/scope — the user adjudicates) > **HARNESS-SPEC Annex A contracts** (the contracts
+only — the SPEC body still carries stale salvage references that the greenfield decision
+C1/HARNESS-PLAN:3 deleted; never revive them via "SPEC wins") > DESIGN-FIXES-r2 /
+DESIGN-*.md (they supersede named older parts) > DESIGN-STATUS (dated status ledger) >
+HARNESS-PLAN.md > SECTION-MAP / PLAN-HOLES (some claims stale — e.g. PLAN-HOLES C3 predates
+Annex A P0.5–P0.13, which EXIST at HARNESS-SPEC:1534+).
 
 Format: **DECISION → why → source**.
 
@@ -24,7 +27,9 @@ subprocess sidecar, pure-Go replacement, or descope (each choice explicit, no fr
 ## E2 — One kernel, two profiles; assistant FIRST (decided) + no self-modification
 `AssistantProfile` = the everyday face (chat/memory/obligations/channels); `CodingProfile` =
 strongest branch (P1), not the purpose. Same S0–S9 kernel, same TurnLoop — only gating differs
-per profile. Linux first. Decided in PRD (approved); C7's profile listing is corrected per A8:
+per profile. Linux first. Proposed and written into PRD v1; **formal product approval is
+still PENDING** (PRD:66 "awaits your confirmation"; DESIGN-STATUS #6 OPEN — see Open list).
+C7's profile listing is corrected per A8:
 coding USP trio = TIA + evidence-gate + AST-symedit (shadow-git was disproven as unique).
 **Golden rule:** NEXUS never modifies its own source autonomously — anomaly → scrubbed
 RepairBundle → user opt-in → Claude fixes via git → `nexus upgrade`.
@@ -43,9 +48,11 @@ from them; state/log/trace/transcript/audit/metrics are PROJECTIONS (fold), neve
 writers; no projection allocates event_id/sequence. State is RECONSTRUCTED by folding events;
 checkpoint = journal offset. Secrets redacted BEFORE the journal. ObligationStore writes
 THROUGH the journal. Scope limit (do not over-read): workspace files, memory spine, backups
-are separate durable side-effects behind their effect-path owners — each write uses
-`AtomicWriter` (tmp → fsync → rename, never in-place) with a snapshot taken BEFORE every FS
-effect; rollback is byte-identical and never touches non-staged user changes (P0.11).
+are separate durable side-effects behind their effect-path owners. File/workspace mutations
+(S5.1/5.3 scope, P0.11) use `AtomicWriter` (tmp → fsync → rename, never in-place) with a
+snapshot taken BEFORE every FS effect; rollback is byte-identical and never touches
+non-staged user changes. Persistence engines (SQLite-WAL spine) provide their own durable
+atomicity contract — do NOT wrap per-record writes in rename.
 Self-DoS exception: debug telemetry may best-effort drop; state/security/audit classes never.
 → HARNESS-SPEC P0.3/P0.11; S1.3, S5.3, S15; DESIGN-FIXES ownership fix.
 
@@ -58,15 +65,18 @@ Self-DoS exception: debug telemetry may best-effort drop; state/security/audit c
 - **Queue lease/fencing = S7.2** (CAS claim, fencing_token++, stale → `STALE_FENCING_TOKEN`).
 → SECTION-MAP owner invariants; S7; DESIGN-FIXES-r2.
 
-## E6 — Build order is normative: K0 → K1 → L → M–P
-K0 primitives first (S0 types/journal, config/paths/process-identity, ContextBudget-min,
-Assembler-min, **S16.6-det minimal checker**), then K1 security+reliability+workspace
-(PEP/perm/sandbox/lifecycle, S7, S5), only then L executable path (provider → core loop →
-tools). Implementing the 15 locally-correct rules in the wrong order creates bypasses or a
-premature executor. Sandbox (S6.2) lands BEFORE tools/exec (S4).
-→ SECTION-MAP §1 dependency DAG.
+## E6 — Build order: two documents, two roles — do not conflate
+**SECTION-MAP §1 (K0 → K1 → L → M–P) is the dependency DAG** — topological constraints on
+what must exist before what (cycles broken via -min contracts; REVIEW2 K4). **HARNESS-SPEC
+"Redoslijed gradnje" (P0–P6) is the vertical delivery-slice plan** — what each shippable
+slice contains. They are NOT the same ordering (e.g. SPEC's P1 minimal slice ships
+provider/loop/tool/sandbox before full S7/S5; SECTION-MAP places S7/S5 edges in K1): a P0
+task plan must satisfy SECTION-MAP dependency edges WITHIN the SPEC's vertical slices.
+Invariants that hold either way: S16.6-det minimal checker is a K0/P0-phase primitive;
+sandbox (S6.2) lands BEFORE tools/exec (S4). Residual ordering conflicts → hard-questions.
+→ SECTION-MAP §1; HARNESS-SPEC:1020–1056.
 
-## E7 — Two-phase capability activation (atomic activation is impossible)
+## E7 — Transactional capability activation (atomic activation is impossible)
 Gates with OS/external side-effects cannot activate atomically. Immutable
 `ActivationPlan` (+PlanHash) → `Prepare → Commit → Activate` + `RollbackToken` + explicit
 `PREPARING / FAILED / ROLLING_BACK` states; partially ACTIVE set is illegal; all gate
@@ -92,10 +102,11 @@ exact-intent hash — a modified effect cannot ride an old approval.
 
 ## E10 — Linux sandbox: helper with no unsandboxed window (BIGGEST RISK)
 Self-reexec helper: ABI probe → `no_new_privs` → Landlock ruleset → per-arch seccomp-BPF →
-irreversible execve; FD/env sanitization; TOCTOU fail-closed. **Win/macOS in v1 =
+irreversible `execveat`; FD/env sanitization; TOCTOU fail-closed. **Win/macOS in v1 =
 `UNAVAILABLE` + high-risk exec BLOCKED — no silent weaker fallback ever.** The hostile
 conformance suite on a real Linux kernel is a **go/no-go preflight BEFORE production
-exec/scaffold code**, not an ordinary first task; Win/mac real-OS probes (W0–W10 / M0–M9)
+S6.2/arbitrary-exec implementation** (other P0 work may proceed; nothing may RELY on the
+sandbox boundary before the probe passes); Win/mac real-OS probes (W0–W10 / M0–M9)
 need the user's hardware and are deferred with those platforms. bwrap = optional external
 adapter, not a guarantee.
 → DESIGN-S0-sandbox-codex; DESIGN-STATUS #3; PLAN-HOLES C2; PRD §6 item 6, §7.
@@ -173,8 +184,12 @@ boards, GraphRAG/CAG, fleet/pairing, video, computer-use, voice-WebRTC, K8s, cal
 archmap layer, PROV-O, guardian-LLM. Coding USP trio = P1.
 
 ## Open before P0 code (verified against DESIGN-STATUS + HARNESS-SPEC)
-1. **Linux hostile-conformance preflight** on a real kernel — go/no-go before production
-   exec/scaffold code (E10).
-2. **P1.6 vs P0-Telegram closure tension** (E15) — resolve in hard-questions round.
-3. Win/mac real-OS probes — user hardware; deferred with those platforms (not a P0 blocker).
+1. **PRD formal approval** — identity (one kernel/two profiles) + P0 scope await the user's
+   sign-off (PRD:66; DESIGN-STATUS #6). Until recorded, E2 is a proposal, not a decision.
+2. **Linux hostile-conformance preflight** on a real kernel — go/no-go before production
+   S6.2/arbitrary-exec implementation (E10).
+3. **P1.6 vs P0-Telegram closure tension** (E15) — resolve in hard-questions round.
+4. **Build-order reconciliation** (E6) — SECTION-MAP DAG vs HARNESS-SPEC slices; confirm in
+   hard-questions, materializes in tasks-P0.md.
+5. Win/mac real-OS probes — user hardware; deferred with those platforms (not a P0 blocker).
 (Annex A P0.5–P0.13 contracts EXIST — HARNESS-SPEC:1534+; the older PLAN-HOLES C3 claim is stale.)
