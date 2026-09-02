@@ -29,9 +29,9 @@ bubbletea; desktop Wails/Fyne (odluka kasnije). Sve sigurnosne membrane pišu se
 
 ## Protokol (za agente)
 Svaki agent za dodijeljenu sekciju: pročita spec podsekciju + top-3 + Annex ugovor + NEXUS
-salvage kandidat. Napravi hibrid-sintezu po gornjem formatu u `PLAN-<sekcija>-<ime>.md`.
+kandidat. Napravi hibrid-sintezu po gornjem formatu u `PLAN-<sekcija>-<ime>.md`.
 Moderator spaja u ovaj dokument uz Pareto-floor sudca (odvojen od autora — barbell).
-Verifikacija aspekata: WebSearch/WebFetch za sporne tvrdnje; NEXUS kod za salvage.
+Verifikacija aspekata: WebSearch/WebFetch za sporne tvrdnje.
 
 ---
 
@@ -65,9 +65,9 @@ dobiva DUBLJI hibrid-sintezni pass od ostalih, s dodatnom rigoroznošću.
 KAO ZASEBAN produbljeni blok — svaka od te tri meta (Kilo/OpenHands/OpenCode) razložena na
 coding-aspekte, hibrid mora na SVAKOM aspektu biti ≥ najbolji od njih + naši diferencijatori nadgradnja.
 
-## PROVIDER MEHANIZAM (salvage-osnova za 2.1/2.2/2.6)
+## PROVIDER MEHANIZAM (izvor-osnova za 2.1/2.2/2.6)
 
-NEXUS spaja na modele DVA načina (llm/providers.py — potvrđeno čitanjem):
+NEXUS spaja na modele DVA načina (greenfield dizajn):
 1. **CLI-agent provideri** — subprocess na instalirani `codex`/`claude` CLI s UGAŠENIM alatima
  (`--tools ""`, ephemeral, ignore-config) → tuđi harness kao čisti text-in/out model, bez API ključa.
 2. **API provideri** — OpenAI-kompatibilan base_url+api_key HTTP (DeepSeek/LiteLLM/Local).
@@ -231,7 +231,7 @@ P0.8 hardware-fit-fail-closed. **Verifikacija:** svi kandidati stvarni (Kong web
 
 **Owner granica (P0.2, najvažnija S3 invarijanta):** S3 NIKAD ne retry-a — 3.4 classify-a→S7,
 3.3 emitira user-cancel, svaki pokušaj nosi `s7.AttemptGrant`. Kilo Code = "to-beat" meta (nema
-javnu licencu, ne salvage-izvor); OpenHands/OpenCode/SWE-agent = javni salvage-referenti.
+javnu licencu, ne izvor); OpenHands/OpenCode/SWE-agent = javni referenti.
 
 **3.1 plan-act-observe (MEHANIZAM, coding-jezgra):** `Loop{planner,executor,verifier,checker,
 state,journal}`: plan(adaptivan small/medium/large) → authorize(6.9) → execute(→Observation,
@@ -310,6 +310,8 @@ remote-https, peer-identity pin, scoped OAuth, tool-list size-limit + injection-
 lazy schema-fetch, mjeri schema-token + selection-miss-rate (Pi princip: manje alata pobjeđuje).
 **RED:** turn dobiva samo scoped set, ne cijeli registry. **Pareto:** pi-mono+MCP-discovery+ToolView (naš).
 
+**4.8 computer-use (`computer-use` flag, iz A4-G1):** OS-wide GUI input-injection; `InputInject` KEY/MOUSE/TYPE=RED-tier, SCREENSHOT=YELLOW; approval 6.9+P1.4; keystroke u password-polje→6.1 DENY. Dizajn: GAPFIX-kilo. **Scope: ODLUKA-PRD.**
+
 **S4 = 2 coding-diferencijatora:** edit-ladder+symedit (4.3), dev-inteligencija (4.4). gortex
 diff/exec/mcp = greenfield Go. **Honest gap:** 4.1/4.2/4.4/4.7 bez dediciranog Annex RED
 (posredno P1.1/P1.3/P2.2). **Verifikacija:** kandidati stvarni (Mentat izbačen — neaktivan).
@@ -381,7 +383,9 @@ audit+alert+rotacija+ljudska odluka (ne samo redakcija). **RED:** canary u izlaz
 **Pareto:** LlamaFirewall+NeMo+LLM-Guard+canary-failclosed (naš); AgentDojo mjeri.
 
 **6.6 authn/tenant (`service` flag):** channel-scoped allowlist deny-default, PKCE OAuth; multi-
-tenant RBAC. **6.7 data-governance:** BASELINE
+tenant RBAC.
+
+**6.7 data-governance:** BASELINE
 (jezgra, svaki store: retention/delete/export/PII — Presidio + vlastiti SQLite purge) + SERVICE
 dodatak (DSAR/legal-hold). **RED P2.1:** MEMORY_FORGET vs DATA_PURGE razdvojeni.
 
@@ -394,7 +398,9 @@ before_tool→after_tool→before_deliver` (jezgreni policy PRVI i ZADNJI, plugi
 draft→approve→commit→verify→compensate** za ireverzibilne side-effecte. **RED P1.4:** `test_approval_cannot_authorize_modified_effect`. **Pareto:** NEXUS-hooks+
 Claude-Code-referent+DeepSeek-Cordis+on_error-grana (naš).
 
-**S6 = membrane REUSE ne rewrite (gortex 1:1 + parity), per-OS build-tags, fail-closed svugdje.**
+**6.10 exec-auto-reviewer (`service`, iz A9/OpenClaw-O6):** exec pregledan NAKON izvršenja (host-node phase) — jača 6.9. Dizajn: GAPFIX-kilo. **Scope: ODLUKA-PRD.**
+
+**S6 = membrane GREENFIELD od nule + parity-suite, per-OS build-tags, fail-closed svugdje.**
 **Verifikacija:** kandidati stvarni; membrane greenfield (nema NEXUS izvora). **S6 STATUS: DIZAJN (salvage uklonjen; RESOLVED/UNRESOLVED po podsekciji → PLAN-HOLES-CONSOLIDATED.md).**
 
 ---
@@ -487,14 +493,18 @@ zabrana recalla) vs DATA_PURGE (ireverzibilno, S6.7 nadjačava, briše i tombsto
 PAŽNJA write_approval default OFF u Hermesu, MI ga uključujemo); reasonbank/reflexion/selfimprove
 quality-gated (promocija samo iz verificiranog). **Pareto:** Hermes+cognee+research-referenti.
 
-**9.4 konsolidacija/decay (`memorija`, veliki salvage):** `Consolidator.Dream(episodes)→gist+KG`
+**9.4 konsolidacija/decay (`memorija`; Decay+Audn P0, ostalo v2):** `Consolidator.Dream(episodes)→gist+KG`
 (offline sleep-time); `Decay` FSRS-lite mijenja RANG ne postojanje (LOSSLESS — original uvijek u
 hot/warm/cold arhivi); `Audn.Resolve` kontradikcije ADD/NOOP/SUPERSEDE na read (ne silent overwrite);
 `MemGit` verzionirani write (undo memorije); `MemAssoc` spreading-activation; temporalni upiti ("što
 sam znao TADA"). **RED:** decay NE briše bajtove; konsolidacija
 untrusted epizode→gist ostaje UNTRUSTED (P0.3). **Pareto:** letta+mem0+zep+sleep-time-decay-AUDN (naš).
 
-**S9 = najbogatiji NEXUS salvage (6 memorijskih modula) + forget/purge trust-razdvajanje.**
+**9.5 PersonalProfile (`profiles` flag, iz A4-G2):** izolacijska jedinica posao/privatno/obitelj; deny-default memory/secrets/channels/cache; write u `work`→query u `family`=0 hitova. Dizajn: GAPFIX-kilo. **Scope: ODLUKA-PRD.**
+
+**9.6 ObligationStore (asistent-jezgra, iz A4-G4):** trajni cilj s eksplicitnom done-definicijom, `MarkDone` SAMO uz Evidence; veže 9.1+3.6; odvojeno od 9.2 razgovorne memorije i 7.2 infra-queue. **Scope: ODLUKA-PRD.**
+
+**S9 = memorija GREENFIELD (Decay+Audn P0, Dream/MemGit/MemAssoc v2) + forget/purge trust-razdvajanje.**
 **Honest gap:** 9.1/9.3/9.4 bez dediciranog Annex RED (P0.13 "decay-never-destroys-bytes" kandidat).
 **Verifikacija:** kandidati stvarni; salvage interni (audit potvrdio). **S9 STATUS: DIZAJN (salvage uklonjen; RESOLVED/UNRESOLVED po podsekciji → PLAN-HOLES-CONSOLIDATED.md).**
 
@@ -505,13 +515,19 @@ untrusted epizode→gist ostaje UNTRUSTED (P0.3). **Pareto:** letta+mem0+zep+sle
 Većina ADAPTER (sučelje+primarni-pick, ne spajaj baze); ACL/provenance/freshness=MEHANIZAM jezgra.
 
 **10.1 ingestion (ADAPTER, READ-ONLY):** RAGFlow-deepdoc/docling/unstructured; runners-up Marker/
-MinerU/OCRmyPDF/Surya (obsidian). SurfSense live-konektori (typed REST + MCP tool). **10.2 chunking (ADAPTER):** semantic(cosine-drop)/parent-
-child/contextual usporedba; LlamaIndex+chonkie+RAGFlow. **10.3 hibrid+rerank (ADAPTER):** Qdrant
+MinerU/OCRmyPDF/Surya (obsidian). SurfSense live-konektori (typed REST + MCP tool).
+
+**10.2 chunking (ADAPTER):** semantic(cosine-drop)/parent-
+child/contextual usporedba; LlamaIndex+chonkie+RAGFlow.
+
+**10.3 hibrid+rerank (ADAPTER):** Qdrant
 (dense+sparse+RRF)+Haystack + **cross-encoder** (sentence-transformers/BGE) + LanceDB/sqlite-rag
 (file-based v1)+query-rewrite.
 
 **10.4 GraphRAG (`graph-retrieval`):** Microsoft-GraphRAG/LightRAG/cognee; NEXUS `core/kg.py`
-multi-hop. **10.5 CAG (`preload-cache`, MEHANIZAM decision-rule):** `CAGDecision.Decide(corpus,
+multi-hop.
+
+**10.5 CAG (`preload-cache`, MEHANIZAM decision-rule):** `CAGDecision.Decide(corpus,
 authz)→CAG|RAG|HYBRID` (mali/stabilni/AUTORIZIRAN→CAG preload; velik/dinamičan→RAG; neautoriziran→
 RAG). Top-3 IMPLEMENTACIJA **UNCLEAR** (infra vLLM/SGLang je 8.4). **RED:** neautoriziran korpus→RAG
 (ne preload). **Pareto:** decision-rule (top-3 pošteno prazno).
@@ -540,8 +556,9 @@ gate.** **Verifikacija:** kandidati stvarni (obsidian runners-up matrica). **S10
 mutacije, `allowLegacyEdits:false` provodi kernel 6.1/6.9. Source-grounded synthesis: skill nosi
 source-manifest+citate+expiry+eval. **Pareto:** goose+Agent-Skills+Codex+Reversa.
 
-**11.3 projektne-instrukcije:** AGENTS.md standard (Codex/OpenCode/Cline .clinerules). **11.4
-prompt-optimizacija:** DSPy+TextGrad+promptfoo.
+**11.3 projektne-instrukcije:** AGENTS.md standard (Codex/OpenCode/Cline .clinerules).
+
+**11.4 prompt-optimizacija:** DSPy+TextGrad+promptfoo.
 
 **11.5 skill-lifecycle/governance (MEHANIZAM jezgra, `extensions`):** `install→scan→pin→activate→
 measure→update→rollback→archive`; scan=injection/exfil/tool-chain/install-skripte (pre-install);
@@ -569,7 +586,9 @@ wins). solo/parallel/sequential; fenced handoff envelope. **Pareto:** LangGraph+
 
 **12.2 workflow/DAG (MEHANIZAM):** DAG scheduler + cycle-guard + wave-scheduler; deterministički +
 model-led koraci (Google ADK obrazac). **Pareto:** LangGraph+
-Temporal+ADK. **12.3 routing:** POTROŠAČ 2.6 (jezgra owner tamo); ovdje samo "koji subagent koji model".
+Temporal+ADK.
+
+**12.3 routing:** POTROŠAČ 2.6 (jezgra owner tamo); ovdje samo "koji subagent koji model".
 
 **12.4 HITL (MEHANIZAM):** `core/gate.py` persistira jednokratnu ljudsku odluku (preživi procesnu
 granicu); durable approval token (P1.6): exact-intent+expiring+single-use, ne može proširiti kernel
@@ -589,6 +608,10 @@ bez adjudication-recorda; quorum+budget hard-gate; council NE promovira sam ni n
 checker. **RED P2.7:** `test_council_cannot_drop_
 sealed_material_dissent`. **Pareto:** NEXUS-council+MAF+CrewAI-hierarchical+dissent-očuvan (naš).
 
+**12.7 flows (`multi-agent`, iz A10/OpenClaw-O9):** workflow-graf; ide u 12.2 DAG owner (superstep-mode). **Scope: ODLUKA-PRD.**
+
+**12.8 boards (`service`, iz A10/OpenClaw-O10):** kanban/task-board; transakcijske tablice (journal owner P0.3). **Scope: ODLUKA-PRD.**
+
 **S12 = worktree-per-subagent + A2A-card-nije-autorizacija + council-dissent-očuvan.**
 **Verifikacija:** A2A-spec/MAF/ADK stvarni. **S12 STATUS: DIZAJN (salvage uklonjen; RESOLVED/UNRESOLVED po podsekciji → PLAN-HOLES-CONSOLIDATED.md).**
 
@@ -603,7 +626,9 @@ Većina ADAPTER (backend iza sučelja) + MEHANIZAM (input-validation/MIME-size-c
 + **canvas** strukturirani-dijagram-JSON→SVG/PNG (schema-validiran + sandboxiran render, NE "injection-
 proof" tvrdnja — SVG sanitizacija obavezna).
 
-**13.3 voice (`voice`):** pipecat/LiveKit-Agents/speaches STT+TTS. **13.4 video (`video`):** FFmpeg (deterministička obrada)/WhisperX (word-level+diarizacija)/ComfyUI;
+**13.3 voice (`voice`):** pipecat/LiveKit-Agents/speaches STT+TTS.
+
+**13.4 video (`video`):** FFmpeg (deterministička obrada)/WhisperX (word-level+diarizacija)/ComfyUI;
 runner-up Remotion/HyperFrames (HTML→MP4).
 
 **13.5 dokument-mutacija (`documents`, INSTANCA Artifact-transformer ugovora):** typed-op → preview/
@@ -623,9 +648,13 @@ OCRmyPDF/pyHanko + NEXUS `core/pdf.py` adapteri (nakon parity). Read-ingestion o
 logike u UI-ju). Minimalni CLI/TUI rano (P1); puni UX kasno (P4).
 
 **14.1 CLI/TUI (jezgra minimum):** bubbletea TUI (garantiran single-binary) + Codex-stil dispatcher;
-crush ♦ referent. Desktop Wails/Fyne (odluka kasnije — WebView vs pure-Go toolchain). **14.2 headless/API/embeddable-SDK (`full-UX`):** OpenAI-kompatibilan REST/SSE +
+crush ♦ referent. Desktop Wails/Fyne (odluka kasnije — WebView vs pure-Go toolchain).
+
+**14.2 headless/API/embeddable-SDK (`full-UX`):** OpenAI-kompatibilan REST/SSE +
 **embeddable SDK isti S0/6.9/7.x put** (dry-run default, ne poseban nereentrantan executor — NEXUS
-audit dug). **14.3 web-UI:** Open-WebUI/LibreChat/OpenHands +
+audit dug).
+
+**14.3 web-UI:** Open-WebUI/LibreChat/OpenHands +
 serve-dashboard (loopback+Host-check, read-only, XSS-safe).
 
 **14.4 IDE/ACP:** Agent-Client-Protocol standard (wire+capability-negotiation, Rust/TS/Py/Java/
@@ -651,12 +680,16 @@ ToS rizik) — ide u 2.1 kao preset, ne u UX jezgru.
 
 **15.1 tracing (MEHANIZAM):** OTel-GenAI semantika (span/log/metrika, correlation run/turn/tool/
 attempt/parent/sequence); OTLP exporter=adapter, stabilan ID-mapping (replay ne mijenja trace-ID).
-Langfuse/Phoenix=backendovi. **15.2 cost-dashboardi:**
+Langfuse/Phoenix=backendovi.
+
+**15.2 cost-dashboardi:**
 LiteLLM/Langfuse/Helicone spend po ključu/trace.
 
 **15.3 transcript/audit (MEHANIZAM):** **tamper-evident** append-only hash-lanac + verify() (tamper
 blokira UPDATE/DELETE) + **vanjski potpisani checkpoint** (lokalni lanac SAM nije dokaz protiv
-potpunog rewritea — Sigstore-Rekor/immudb/Trillian). **15.4 metrics/SLO:** Prometheus/Grafana/OTel-Collector; latency/error/
+potpunog rewritea — Sigstore-Rekor/immudb/Trillian).
+
+**15.4 metrics/SLO:** Prometheus/Grafana/OTel-Collector; latency/error/
 availability SLI (izveden iz journala).
 
 **15.5 semantic-agent-health (MEHANIZAM jezgra):** distinktno od 15.4-SLO i 18.3-liveness — hvata
@@ -678,15 +711,21 @@ Zahtjevi: versioniran task-corpus, holdout, deterministic-fixtures, snapshot-ide
 (0.1/0.2/7.2 se ne kompenziraju perifernim IMA).
 
 **16.1 task-benchmark (MEHANIZAM):** SWE-bench (benchmark)/Aider-suite/Inspect + **app-contract**
-deliverable-level (ekrani/tokovi/persistence, ne test-count). **16.2 ratchet:** promptfoo/DeepEval/Opik + baseline; retrieval-ratchet cross-ref
-10.7. **16.3 red-team:** garak/PyRIT/promptfoo-redteam +
+deliverable-level (ekrani/tokovi/persistence, ne test-count).
+
+**16.2 ratchet:** promptfoo/DeepEval/Opik + baseline; retrieval-ratchet cross-ref
+10.7.
+
+**16.3 red-team:** garak/PyRIT/promptfoo-redteam +
 **STRIX** (usestrix/strix — dinamički pentest agent, PoC-validacija) + Shannon; kandidat `security-
 audit` skill-pack.
 
 **16.4 feedback-flywheel + credit-ledger (MEHANIZAM, kanonski owner):** provenance-aware credit —
 memorija/skill/ruta prima kredit SAMO iz revision-bound VERIFICIRANOG ishoda (test-gate/loop-judge,
 NIKAD self-report); epsilon-greedy; feeds 2.6/9.3/11.5. Dormantan jezgreni ugovor dok potrošač ne
-aktivira (Q3). Langfuse/Opik/AgentOps annotations. **16.5 trajectory-export (`destilacija`):** SWE-gym/Axolotl/ShareGPT-JSONL.
+aktivira (Q3). Langfuse/Opik/AgentOps annotations.
+
+**16.5 trajectory-export (`destilacija`):** SWE-gym/Axolotl/ShareGPT-JSONL.
 
 **16.6 anti-sycophancy/neovisna-provjera (MEHANIZAM jezgra + `multi-agent`):** minimalni checker=
 jezgra, council=multi-agent strategija. Checker OBARA premisu+zaključak na ARTEFAKTIMA (git-diff+
@@ -705,8 +744,12 @@ matrica-hard-limit.** **Verifikacija:** kandidati stvarni (strix 36k aktivan). *
 
 **17.1 plugin-sustav (`extensions`):** DeepSeek-Harness Cordis DI "everything-is-a-plugin" (najdublji
 pristup) + goose-MCP + OpenCode; **pluginovi iza 6.8/11.5 gatea** (signature/scan/permission-delta
-PRIJE učitavanja — P1.5). **17.2 update/kanali:** Codex-kanali + goose-self-update + Aider-višekanalni;
-**TUF sigurnosna-osnova** (rollback/freeze zaštita metadata lanca). **17.3 packaging:** goose-Go-single-binary + **dist/cargo-dist** (reusable
+PRIJE učitavanja — P1.5).
+
+**17.2 update/kanali:** Codex-kanali + goose-self-update + Aider-višekanalni;
+**TUF sigurnosna-osnova** (rollback/freeze zaštita metadata lanca).
+
+**17.3 packaging:** goose-Go-single-binary + **dist/cargo-dist** (reusable
 cross-platform artefakt) + uv (Python-strane). Naš cilj: `CGO_ENABLED=0` single-binary.
 
 **17.4 field-diagnostics/upgrade-bridge (`service`):** opt-in scrubban reproducibilan bundle (verzije
@@ -716,11 +759,19 @@ upgrade). **RED P1.5:** `test_post_signature_artifact_tamper_blocks_publish`.
 # S18 — KANONSKA SINTEZA (Deployment/operacije; `service` flag; 3-way, Pareto PASS)
 
 **18.1 worker/queue/scaling:** OpenHands konkurentne-sesije + Dify multi-worker + Temporal queue-
-lease (iz S7 — P2.3 fencing). headless worker/API razdvajanje. **18.2 multi-tenant-gateway:** LiteLLM-proxy per-tenant ključevi/budgeti +
-Portkey + Dify-kvote; non-null tenant_id na svakom persistentnom envelopeu (codex#5). **18.3 health/
+lease (iz S7 — P2.3 fencing). headless worker/API razdvajanje.
+
+**18.2 multi-tenant-gateway:** LiteLLM-proxy per-tenant ključevi/budgeti +
+Portkey + Dify-kvote; non-null tenant_id na svakom persistentnom envelopeu (codex#5).
+
+**18.3 health/
 rollout/canary:** Kubernetes/Argo-Rollouts/Flagger (komponente); SHA-pinned canary (NEXUS live-canary
-obrazac). **18.4 state-migracije/backup:** UNCLEAR dok S0.4 ne odabere persistence backend; kandidati
+obrazac).
+
+**18.4 state-migracije/backup:** UNCLEAR dok S0.4 ne odabere persistence backend; kandidati
 alembic/yoyo-migrations + point-in-time backup (Litestream za SQLite).
+
+**18.5 fleet + device-pairing (`service`, iz A10/OpenClaw-O11):** identitet uređaja/nodea + pairing; fleet NIJE drugi retry-owner (S7 ostaje jedini). Dizajn: GAPFIX-codex. **Scope: ODLUKA-PRD.**
 
 **S17+S18 = plugin-iza-supply-chain-gatea + TUF-update + single-binary + service-deployment.**
 **Verifikacija:** DeepSeek-Harness (rc, matrica), dist/TUF/K8s/Argo stvarni. **S17+S18 STATUS: DIZAJN (salvage uklonjen; RESOLVED/UNRESOLVED po podsekciji → PLAN-HOLES-CONSOLIDATED.md).**
@@ -730,7 +781,7 @@ alembic/yoyo-migrations + point-in-time backup (Litestream za SQLite).
 # ═══ SVIH 19 SEKCIJA (S0-S18) DIZAJNIRANO — PLAN DIZAJN-POTPUN, IZVOR-NEPOTPUN ═══
 
 **Datum:** 2026-09-01. Metoda: hibrid-hibrida sinteza po podsekciji (3 agenta neovisno → moderator
-Pareto-floor merge). **82 podsekcije**, svaka: Tip · aspekti+izvor · Go sinteza · salvage · RED · Pareto.
+Pareto-floor merge). **82 podsekcije**, svaka: Tip · aspekti+izvor · Go sinteza · RED · Pareto.
 
 **Coding-diferencijatori (bolji od Kilo/OpenHands/OpenCode):** evidence-graded loop (3.1/16.6),
 stuck-detection (3.4), TIA (3.5), edit-ladder+symedit (4.3), dev-inteligencija (4.4), shadow-git (5.1).
@@ -1062,9 +1113,9 @@ questions review → CLAUDE/AGENTS + scaffold → gradnja. USP je sad 4 code-dok
 - **S10** ← Haystack BM25+dense+rerank komponentna dubina (adapter-referenca).
 
 ## KOMPONENTNA STRATEGIJA (RAG/OCR/vector/baza/memorija) — ZAŠTO nisu full-audited:
-Ove su ADAPTERI iza sučelja (adaptiramo, ne kopiramo kod) + NEXUS salvage — NE trebaju 300 full-code
+Ove su ADAPTERI iza sučelja (adaptiramo, ne kopiramo kod) (greenfield) — NE trebaju 300 full-code
 audita, nego laganu capability-potvrdu PO ADAPTERU u trenutku gradnje te sekcije:
-- **MEMORIJA (S9):** ponajviše NEXUS salvage (dream/sleeptime/audn/memgit/recall/memassoc + spine) →
+- **MEMORIJA (S9):** greenfield (Decay+Audn P0; Dream/MemGit/MemAssoc v2; letta/mem0/zep referenca) →
  Go port. letta/mem0/zep = referenca. NAJDUBLJI naš dio.
 - **BAZA:** `modernc.org/sqlite` pure-Go spine (memorija/journal/queue/FTS5), bez cgo → single-binary.
  Postgres samo za `service`. (S9.1 + S0.4)
@@ -1080,7 +1131,7 @@ Pravilo: KOMPONENTE se biraju laganom matricom (URL/licenca/radi-li-X) KAD gradi
 
 # ADDENDUM A10 — GAPOVI RIJEŠENI (buildable Go dizajn; puni u docs/GAPFIX-*.md)
 
-Svi gapovi iz 29-harness audita sad imaju BUILDABLE Go dizajn (struct/interface skice + salvage +
+Svi gapovi iz 29-harness audita sad imaju BUILDABLE Go dizajn (struct/interface skice +
 RED + paket-placement) u `docs/GAPFIX-{codex,kilo,agy}.md`. Index + sekcija-placement:
 
 ## Orkestracija (GAPFIX-codex) — paketi `internal/orchestration/{graph,superstep,flow,board}`, `internal/fleet/{registry,placement,pairing,transport}`
