@@ -68,8 +68,9 @@ process-tree=S1.2 · retry/cancel=S7 · journal-write=S0.3 (jedini writer, sve o
 | A9 fold-gapovi | **12.2/7.2/17.1** | superstep/ingress-queue/Cordis |
 | A10 GAPFIX | **12.x flows/boards + 18.x fleet+pairing** | NOVE `multi-agent`/`service` podsekcije |
 
-**Nove podsekcije iz addenduma (dodati u kanonski popis):** 4.8 computer-use, 9.5 PersonalProfile,
-9.6 ObligationStore, 12.7 flows, 12.8 boards, 18.5 fleet+device-pairing, 6.10 exec-auto-reviewer.
+**Nove podsekcije iz addenduma — UBAČENE u plan (commit 257e01b), sve `Scope: ODLUKA-PRD`:**
+4.8 computer-use, 6.10 exec-auto-reviewer, 9.5 PersonalProfile, 9.6 ObligationStore,
+12.7 flows, 12.8 boards, 18.5 fleet+device-pairing. Numeracija kontiguirana u svih 19 sekcija.
 
 ---
 
