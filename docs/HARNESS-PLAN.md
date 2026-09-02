@@ -1033,3 +1033,23 @@ Roo, Goose, Kilo) — PROVJERA naših "nitko nema" tvrdnji protiv STVARNOG koda.
 3. **Metodološka pouka (za korisnika):** README/git-tree razina proizvela je 3 lažne "unikat"
    tvrdnje od 6. Full-code audit je JEDINI pošten put. Preostali Tier-A (frameworks + landscape) tek
    slijede — ali coding-tvrdnje su sad code-provjerene.
+
+---
+
+# ADDENDUM A7 — landscape nastavak (jcode, ruflo) — trojka i dalje stoji
+
+**jcode** (Rust, 27.8MB RAM-efikasan coding harness): NE obara našu trojku (nema TIA/evidence-gate/
+symedit; loop zreo ali "pliće na coding gateovima"). Naša S6 sigurnost DUBLJA (jcode classifier sam
+priznaje "nije sandbox", nema Landlock/egress). **Uzeti obrasce:** RAM-lifecycle (Arc-shared immutable
+messages, static/dynamic prompt-cache split, drop-dup-provider-transcript, single-flight route-memo) —
+meta za naš Go binary; account-failover + cost-model (curated→OpenRouter→models.dev, unknown≠free) —
+za A4 G8 account-fleet. MCP child ne nasljeđuje credential env (least-authority — dobar detalj).
+
+**ruflo** (Rust meta-harness, 66k★): NIJE stub ali MALEN (~2000 lin swarm/authz + watermarking) i
+**marketing-težak** (5× više doc-bajtova nego koda — "star=warning" djelomično opravdan). Stvaran samo
+u security/provenance niši (CASA envelope + watermarking crate); coding/memorija/dubina TANKI. NE obara
+trojku. **Uzeti:** watermarking/provenance obrazac (minorno). Potvrđuje A6 lekciju: reputacija laže.
+
+**Stanje trojke nakon 14 full-code audita** (Hermes/OpenClaw/OpenHands/Aider/OpenCode/Codex/Cline/
+Continue/Roo/Goose/Kilo/jcode/ruflo + Hermes): **TIA, evidence-git-diff-gate, AST-symedit — NITKO nema.
+Trojka STOJI.** (Frameworks tier + landscape još slijede za S9/S12 who-has-what.)
