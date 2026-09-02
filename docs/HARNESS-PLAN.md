@@ -2,9 +2,9 @@
 
 > **⚠ SALVAGE UKLONJEN (2026-09-02):** nexus je ČIST GREENFIELD Go — nula porta/reusea iz ijednog repa.
 > Svi `Salvage:`/GORTEX/NEXUSv2 oslonci obrisani. Izvor po podsekciji = full-code-auditani svjetski
-> kandidat ILI napisan Go-dizajn. Rupe + RESOLVED/UNRESOLVED: `PLAN-HOLES-CONSOLIDATED.md`. 82 podsekcije.
+> kandidat ILI napisan Go-dizajn. Rupe + RESOLVED/UNRESOLVED: `PLAN-HOLES-CONSOLIDATED.md`. 108 podsekcija.
 
-**Što je ovo:** buildable dizajn-plan. Za SVAKU podsekciju spec-a (S0–S18, 82 podsekcije (greenfield, nula salvagea))
+**Što je ovo:** buildable dizajn-plan. Za SVAKU podsekciju spec-a (S0–S18, **108 podsekcija** = 100 spec v0.9 + 8 novih addendum (greenfield, nula salvagea))
 prolazi se HIBRID-HIBRIDA sinteza nad njezinim top-3 kandidatima (merge-skill princip):
 razloži svaki kandidat na aspekte → po aspektu uzmi najbolje iz sva tri → graftaj u JEDAN
 sintetizirani dizajn → sudac (Pareto floor: sinteza ≥ najbolji kandidat na svakom aspektu) →
@@ -39,7 +39,10 @@ Verifikacija aspekata: WebSearch/WebFetch za sporne tvrdnje.
 
 ---
 
-## DIREKTIVA: `coding` profil = PRVORAZREDNI CILJ (bolji od Kilo Code / OpenHands / OpenCode)
+## IDENTITET: NEXUS = OSOBNI AI ASISTENT s vrhunskom coding-jezgrom (JEDNA JEZGRA, DVA PROFILA)
+
+Asistent-prvo (A3.1). `AssistantProfile` = prvorazredno lice; `CodingProfile` = najjača grana znanja
+(mora nadmašiti Kilo Code / OpenHands / OpenCode). Isti kernel (S0-S9), gating ovisi o profilu.
 
 Korisnički zahtjev: NEXUS mora biti ODLIČAN coding harness — cilj nadmašiti Kilo Code,
 OpenHands, OpenCode. `coding` profil (3.5 + 4.2–4.4 + S5 + 8.3 + TIA + app-contract + Reversa)
@@ -54,7 +57,8 @@ dobiva DUBLJI hibrid-sintezni pass od ostalih, s dodatnom rigoroznošću.
 - **OpenCode/Kilo** — LSP-integrirana simbolička navigacija → 4.4 (LSP + AST + callgraph).
 
 **Naši DIFERENCIJATORI (što ostali NEMAJU — iz NEXUS audita + obsidiana):**
-- **Evidence-graded loop** (loop_engine): checker ocjenjuje git-diff + realan exit-code, NE prozu
+- **Evidence-graded loop**: checker ocjenjuje generički `AcceptanceContract`+`EvidenceBundle`
+  (coding=git-diff+exit; asistent=delivery-receipt/calendar/grounding), NIKAD prozu
  workera (anti-sycophancy strukturno) → 3.1 + 16.6. Nijedan od tri konkurenta to nema.
 - **TIA** (3.5): coverage × git-diff → samo pogođeni testovi (sekunde umjesto minuta).
 - **app-contract** (16.1): deliverable-level acceptance (ekrani/tokovi/persistence), ne test-count.
@@ -521,11 +525,10 @@ MinerU/OCRmyPDF/Surya (obsidian). SurfSense live-konektori (typed REST + MCP too
 child/contextual usporedba; LlamaIndex+chonkie+RAGFlow.
 
 **10.3 hibrid+rerank (ADAPTER):** Qdrant
-(dense+sparse+RRF)+Haystack + **cross-encoder** (sentence-transformers/BGE) + LanceDB/sqlite-rag
+(dense+sparse+RRF)+Haystack + **cross-encoder** (BGE preko subprocess-sidecara — ne in-process Go) + LanceDB/sqlite-vec
 (file-based v1)+query-rewrite.
 
-**10.4 GraphRAG (`graph-retrieval`):** Microsoft-GraphRAG/LightRAG/cognee; NEXUS `core/kg.py`
-multi-hop.
+**10.4 GraphRAG (`graph-retrieval`):** Microsoft-GraphRAG/LightRAG/cognee obrazac; greenfield Go KG-store (multi-hop nad spine).
 
 **10.5 CAG (`preload-cache`, MEHANIZAM decision-rule):** `CAGDecision.Decide(corpus,
 authz)→CAG|RAG|HYBRID` (mali/stabilni/AUTORIZIRAN→CAG preload; velik/dinamičan→RAG; neautoriziran→
@@ -590,7 +593,7 @@ Temporal+ADK.
 
 **12.3 routing:** POTROŠAČ 2.6 (jezgra owner tamo); ovdje samo "koji subagent koji model".
 
-**12.4 HITL (MEHANIZAM):** `core/gate.py` persistira jednokratnu ljudsku odluku (preživi procesnu
+**12.4 HITL (MEHANIZAM):** greenfield `Gate` persistira jednokratnu ljudsku odluku (preživi procesnu
 granicu); durable approval token (P1.6): exact-intent+expiring+single-use, ne može proširiti kernel
 policy. **Pareto:** LangGraph+OpenAI-SDK+MAF.
 
@@ -633,8 +636,8 @@ runner-up Remotion/HyperFrames (HTML→MP4).
 
 **13.5 dokument-mutacija (`documents`, INSTANCA Artifact-transformer ugovora):** typed-op → preview/
 dry-run → atomic-staging (5.3) → output-verify → commit/rollback; MIME/size caps; NE anatomija-po-
-formatu (isti ugovor za PDF/DOCX/spreadsheet/sliku — novi format = adapter, ne podsekcija). pypdf/
-OCRmyPDF/pyHanko + NEXUS `core/pdf.py` adapteri (nakon parity). Read-ingestion odvojen (10.1).
+formatu (isti ugovor za PDF/DOCX/spreadsheet/sliku — novi format = adapter, ne podsekcija). Pure-Go pdfcpu/rsc.io-pdf; teški formati (OCR/potpis)
+kroz subprocess-sidecar (OCRmyPDF/pyHanko), nikad in-process. Read-ingestion odvojen (10.1).
 **RED:** sign/edit bez consent/atomic→odbij.
 
 **S13 = generički Artifact-transformer (ne format-anatomija) + canvas-sandboxiran + input-caps jezgra.**
@@ -769,9 +772,11 @@ rollout/canary:** Kubernetes/Argo-Rollouts/Flagger (komponente); SHA-pinned cana
 obrazac).
 
 **18.4 state-migracije/backup:** UNCLEAR dok S0.4 ne odabere persistence backend; kandidati
-alembic/yoyo-migrations + point-in-time backup (Litestream za SQLite).
+golang-migrate/embedded-SQL migracije + point-in-time backup (Litestream za SQLite).
 
-**18.5 fleet + device-pairing (`service`, iz A10/OpenClaw-O11):** identitet uređaja/nodea + pairing; fleet NIJE drugi retry-owner (S7 ostaje jedini). Dizajn: GAPFIX-codex. **Scope: ODLUKA-PRD.**
+**18.5 fleet (`service`, iz A10/OpenClaw-O11):** placement/registry nodova; fleet NIJE drugi retry-owner (S7 jedini). ID-ovi iz `internal/fleet/ids` (K3 anti-cikl). Dizajn: GAPFIX-codex. **Scope: ODLUKA-PRD.**
+
+**18.6 device-pairing (`service`, iz A10/OpenClaw-O11):** identitet+pairing uređaja; ovisi o `fleet/ids`, ne o `fleet` (K3). Dizajn: GAPFIX-codex. **Scope: ODLUKA-PRD.**
 
 **S17+S18 = plugin-iza-supply-chain-gatea + TUF-update + single-binary + service-deployment.**
 **Verifikacija:** DeepSeek-Harness (rc, matrica), dist/TUF/K8s/Argo stvarni. **S17+S18 STATUS: DIZAJN (salvage uklonjen; RESOLVED/UNRESOLVED po podsekciji → PLAN-HOLES-CONSOLIDATED.md).**
@@ -781,7 +786,7 @@ alembic/yoyo-migrations + point-in-time backup (Litestream za SQLite).
 # ═══ SVIH 19 SEKCIJA (S0-S18) DIZAJNIRANO — PLAN DIZAJN-POTPUN, IZVOR-NEPOTPUN ═══
 
 **Datum:** 2026-09-01. Metoda: hibrid-hibrida sinteza po podsekciji (3 agenta neovisno → moderator
-Pareto-floor merge). **82 podsekcije**, svaka: Tip · aspekti+izvor · Go sinteza · RED · Pareto.
+Pareto-floor merge). **108 podsekcija** (100 spec + 8 addendum), svaka: Tip · aspekti+izvor · Go sinteza · RED · Pareto.
 
 **Coding-diferencijatori (bolji od Kilo/OpenHands/OpenCode):** evidence-graded loop (3.1/16.6),
 stuck-detection (3.4), TIA (3.5), edit-ladder+symedit (4.3), dev-inteligencija (4.4), shadow-git (5.1).

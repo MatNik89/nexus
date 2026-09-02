@@ -1521,3 +1521,45 @@ podsekciji mora dokazati pripadni ugovor. Bez Annexa spec je 'lista projekata'; 
 - **Stanja:** `FORMED→INPUTS_SEALED→INDEPENDENT_REVIEW→CROSS_REVIEW→SYNTHESIS→{VERIFIED|FAILED_QUORUM|REJECTED}`; član ne vidi tuđe zapise prije vlastitog sealed commita.
 - **Invarijante:** svi članovi rade nad istim artifact hashom; cross-review skriva identitet; chair ne smije mijenjati evidence ref ni izbaciti materijalni dissent bez eksplicitnog adjudication recorda; quorum i budget su hard gate; output nosi majority, dissent i unresolved; council ne može sam promovirati niti zamijeniti 16.6 checker.
 - **RED — `test_council_cannot_drop_sealed_material_dissent`:** jedan sealed review s materijalnim dokazom proturječi većini, a chair synthesis ga izostavi; verifier MUST vratiti `DISSENT_DROPPED`, council ostaje `REJECTED` i promotion gate ne smije dobiti success signal.
+
+---
+
+# Annex A — dopuna: ugovori P0.5–P0.13 (formalizacija citiranih gate-ova; REVIEW2 G1)
+
+Ovih 7 ugovora plan je citirao kao gate a nisu bili u Annexu (agy GATE-01). Sad formalizirani.
+(Numeracija nekontiguirana — P0.10/P0.12 namjerno prazni; zadržani IDovi kako ih plan citira.)
+
+## P0.5 — Capability-matrix fail-closed (dizajn: DESIGN-S0-sandbox-codex)
+- **Vlasnik:** S0.3 negotiation. `Effective()=min(declared,measured)`; nepoznato → error, NE pretpostavka.
+- **MUST:** measurement nosi target/version/config + measured-vector + probe-id/rev + evidence + expiry + hash; promjena bilo čega invalidira grant.
+- **RED — `test_capability_unknown_fails_closed`:** provider bez izmjerene sposobnosti → route/dispatch odbijen, nula pretpostavljenih sposobnosti.
+
+## P0.6 — Config-bounds + process-identity
+- **Vlasnik:** S1.1 config, S1.2 proc.
+- **MUST:** config NE smije proširiti kernel floor (egress/sandbox/budget); reload nevaljan → stara generacija ostaje. Proces se identificira PID+start-token (PID sam nije dokaz vlasništva).
+- **RED — `test_config_cannot_widen_kernel_floor`** + **`test_process_identity_requires_start_token`**.
+
+## P0.7 — Structured-output nikad tiho prihvaćen
+- **Vlasnik:** S2.3.
+- **MUST:** nevalidan T → salvage/re-ask (re-ask nosi S7 AttemptGrant, P0.2); NIKAD tiho prihvati. Za security/effect payload nema tolerantnog accepta.
+- **RED — `test_structured_output_never_silent_accept`.**
+
+## P0.8 — Hardware-fit fail-closed
+- **Vlasnik:** S2.4.
+- **MUST:** model > izmjereni RAM/VRAM → `Fits=false`+prijedlog kvantizacije, NIKAD OOM-pokušaj.
+- **RED — `test_model_over_capacity_refused_not_oom`.**
+
+## P0.9 — In-turn verify nikad tiho
+- **Vlasnik:** S3.5.
+- **MUST:** dijagnostika (lint/test/exit) vraća se U ISTOM turnu; korak se NE prihvaća dok ne prođe; TIA nije completion-gate dok paired full-suite ne dokaže 0 promašenih regresija.
+- **RED — `test_verify_failure_blocks_step_same_turn`.**
+
+## P0.11 — Shadow-checkpoint integritet
+- **Vlasnik:** S5.1/5.3.
+- **MUST:** `Rollback` vraća byte-identično pre-stanje za podržani scope (content+eksplicitna metadata); NE dira ne-staged korisničke promjene; snapshot PRIJE svakog FS-efekta; atomic write = stari ILI novi, nikad pola. Potpis receipta = HMAC/ed25519 (ne raw concat, DESIGN-symedit-crypto D2).
+- **RED — `test_rollback_byte_identical`** + **`test_atomic_write_no_partial`.**
+
+## P0.13 — Decay nikad ne briše bajtove
+- **Vlasnik:** S9.4.
+- **MUST:** `Decay` mijenja RANG ne postojanje; original UVIJEK u hot/warm/cold arhivi; konsolidacija untrusted epizode → gist ostaje UNTRUSTED (P0.3 lineage). `Forget`=tombstone (reverzibilno) ≠ `DATA_PURGE` (P2.1).
+- **RED — `test_decay_never_destroys_bytes`.**
