@@ -782,6 +782,14 @@ type PrepareRecovery struct {
     Token       contracts.Optional[RollbackToken]
 }
 
+type GateDescriptor struct {
+    Ref                  GateRef
+    ImplementationID     string
+    ImplementationHash   contracts.Digest
+    ReversiblePrepare     bool
+    ReconcilePrepare      bool
+}
+
 type ActiveSet struct {
     Generation uint64
     PlanHash   contracts.Digest
@@ -795,7 +803,7 @@ type Resolver interface {
 }
 
 type Gate interface {
-    Ref() GateRef
+    Descriptor() GateDescriptor
     Prepare(context.Context, ActivationPlan, ActivationStep) (GateAttestation, RollbackToken, error)
     ReconcilePrepare(context.Context, ActivationPlan, ActivationStep) (PrepareRecovery, error)
     Rollback(context.Context, RollbackToken) error
