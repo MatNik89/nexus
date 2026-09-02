@@ -220,9 +220,13 @@ const (
 )
 
 type CommitReceipt struct {
-    Phase       EffectPhase
-    ReceiptHash Digest        // veže ExecutionReceipt (pkg/attest); dokaz commita
+    Phase       EffectPhase  // MORA biti Valid() (ne zero); executor atestira
+    CallID      ToolCallID   // vezan na TOČNO ovaj poziv (anti-replay)
+    AttemptNo   uint32       // vezan na ovaj pokušaj
+    ReceiptHash Digest       // veže ExecutionReceipt (pkg/attest); dokaz commita
 }
+// BoundTo: receipt vrijedi samo za svoj (call, attempt).
+func (cr CommitReceipt) BoundTo(c ToolCall) bool { return cr.CallID == c.ToolCallID && cr.AttemptNo == c.AttemptNo }
 
 type ToolCall struct {
     ToolCallID         ToolCallID

@@ -28,9 +28,13 @@ type RetryOwner interface {
 }
 // classifyEffectPhase DETERMINISTIČKI iz executor-atestacije (fix N4-C03):
 func classifyEffectPhase(c contracts.ToolCall, r contracts.ToolResult) contracts.EffectPhase {
-    if r.Commit.Valid { return r.Commit.Value.Phase }          // executor atestirao commit-fazu (receipt)
-    if c.Effect == contracts.EffectIrreversible { return contracts.PhaseUnknown } // ireverzibilan bez potvrde → RECONCILING
-    return contracts.PhaseBeforeCommit                          // read-only/reverzibilan bez commita: ništa nije trajno
+    if r.Commit.Valid {                                        // receipt MORA biti valjan I vezan na ovaj (call,attempt)
+        cr := r.Commit.Value
+        if !cr.Phase.Valid() || !cr.BoundTo(c) { return contracts.PhaseUnknown } // nepoznat/tuđi receipt → UNKNOWN
+        return cr.Phase
+    }
+    if c.Effect == contracts.EffectReadOnly { return contracts.PhaseBeforeCommit } // SAMO read-only: ništa trajno nije moglo nastati
+    return contracts.PhaseUnknown                              // svaki EFFECTFUL (reverzibilan ILI ireverzibilan) bez receipta → UNKNOWN→RECONCILING (fail-closed, N4-C03)
 }
 
 type SandboxedProcessExecutor struct { sandbox sandbox.Backend; proc *s1.ProcessTracker } // S6.2 obavezan; S1.2 UNUTAR Launch
