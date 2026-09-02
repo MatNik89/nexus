@@ -1,125 +1,180 @@
-# ARCHITECTURE-ESSENTIALS — 15 kritičnih odluka (cheat-sheet)
+# ARCHITECTURE-ESSENTIALS — 15 critical decisions (cheat-sheet)
 
-Destilat zaključane arhitekture (HARNESS-PLAN 108 podsekcija + DESIGN-* + DESIGN-FIXES-r2,
-9 rundi red-teama → 0 blokera). Ovo je dnevna referenca pri kodiranju; puni izvor uvijek pobjeđuje.
-Format: **ODLUKA → zašto → gdje piše**.
+Distillation of the current design (HARNESS-PLAN 108 subsections + HARNESS-SPEC Annex A +
+DESIGN-* + DESIGN-FIXES-r2 + 3-agent review REVIEW-ESSENTIALS-*). Daily reference while coding;
+the full source always wins. Open preconditions are listed at the bottom — this document does
+NOT claim go/no-go has been granted.
+
+**Source precedence (when documents disagree):** HARNESS-SPEC.md (normative Annex A) >
+DESIGN-FIXES-r2 / DESIGN-*.md (they supersede named older parts) > HARNESS-PLAN.md >
+SECTION-MAP / PLAN-HOLES (status docs; some claims are stale — e.g. PLAN-HOLES C3 predates
+Annex A P0.5–P0.13, which now EXIST at HARNESS-SPEC:1534+).
+
+Format: **DECISION → why → source**.
 
 ---
 
-## E1 — Go, `CGO_ENABLED=0`, single-binary
-Jedna jezgra = jedan statički binary. SQLite spine = `modernc.org/sqlite` (pure-Go, WAL).
-Per-OS kod isključivo build-tagged (`proc_*.go`, `sandbox_*.go`). Ne-Go svjetski alati NIKAD
-in-process — svjestan subprocess-sidecar ili pure-Go zamjena ili descope (C4).
-→ HARNESS-PLAN header, S1.2, A9; PLAN-HOLES C4.
+## E1 — Go, `CGO_ENABLED=0`, single binary
+One kernel = one self-contained binary (no cgo; static linking is the goal, verified by a CI
+check, not assumed). SQLite spine = `modernc.org/sqlite` (pure Go, WAL). Per-OS code only via
+build tags (`proc_*.go`, `sandbox_*.go`). Non-Go world tools NEVER in-process — deliberate
+subprocess sidecar, pure-Go replacement, or descope (each choice explicit, no free "adapter").
+→ HARNESS-PLAN header, S1.2, A9 component strategy; PLAN-HOLES C4.
 
-## E2 — Jedna jezgra, dva profila; asistent PRVO
-`AssistantProfile` = svakodnevno lice (razgovor/pamćenje/obveze/kanali); `CodingProfile` =
-najjača grana (TIA/evidence-gate/symedit), ne svrha. Isti kernel S0-S9, isti TurnLoop —
-razlika je samo gating po profilu. Linux-prvo.
-→ A3.1, PLAN-HOLES C7, PRD §3.
+## E2 — One kernel, two profiles; assistant FIRST (decided) + no self-modification
+`AssistantProfile` = the everyday face (chat/memory/obligations/channels); `CodingProfile` =
+strongest branch (P1), not the purpose. Same S0–S9 kernel, same TurnLoop — only gating differs
+per profile. Linux first. Decided in PRD (approved); C7's profile listing is corrected per A8:
+coding USP trio = TIA + evidence-gate + AST-symedit (shadow-git was disproven as unique).
+**Golden rule:** NEXUS never modifies its own source autonomously — anomaly → scrubbed
+RepairBundle → user opt-in → Claude fixes via git → `nexus upgrade`.
+→ PRD §3–5, A3.1/A3.2, A8; PLAN-HOLES C7.
 
-## E3 — EventJournal = JEDINI trajni write-owner (P0.3)
-`EventJournal.Append` jedini piše trajno stanje. State/log/trace/transcript/audit/metrics =
-PROJEKCIJE (fold), nikad paralelni pisci; nijedna projekcija ne alocira event_id/sequence.
-State se REKONSTRUIRA fold-om eventa (ne mutable polje); checkpoint = journal offset.
-Redakcija secreta PRIJE journala. ObligationStore piše KROZ journal, ne izravni sqlite.
-Iznimka self-DoS: debug-telemetry smije best-effort drop; state/security/audit klase NIKAD.
-→ S0 sinteza, S1.3, S15, DESIGN-FIXES vlasništvo-fix; codex#21.
+## E3 — Hand-written typed Go contracts are the source of truth
+JSON-Schema/OpenAPI/protobuf are derived projections, never the source. No `map[string]any`
+in kernel APIs; opaque payload = `json.RawMessage` + closed discriminator validation
+(default-reject enum branches compensate for missing sum types). `Content` XOR `ContentRef`
+enforced in constructors.
+→ HARNESS-PLAN S0 synthesis.
 
-## E4 — Owner-invarijante (jedan owner po brizi, bez iznimke)
-- **Policy ALLOW/ASK/DENY = S6.0 PEP** (`Decide`, total switch, default-deny; ASK≠ALLOW).
-- **Lifecycle ORDER = S6.9** (before/after/on_error grana) — 6.9 NIKAD ne odlučuje policy.
-- **Retry/deadline/cancel/failover = S7 JEDINI** — svaki fizički pokušaj nosi `AttemptGrant`;
-  2.2/2.3-re-ask/3.3/3.4/fleet/AccountFleet samo klasificiraju ili predlažu.
-- **Process-identity = S1.2** (PID+start-token; killpg/Job-Object) — konzumira ga S6.2.Launch.
-- **Queue lease/fencing = S7.2** (CAS claim, fencing_token++, stale→`STALE_FENCING_TOKEN`).
-→ SECTION-MAP owner-invarijante; S7; DESIGN-FIXES.
+## E4 — Persistence: EventJournal owns canonical events; everything else atomic behind owners
+`EventJournal.Append` is the ONLY writer of canonical domain events and the state derived
+from them; state/log/trace/transcript/audit/metrics are PROJECTIONS (fold), never parallel
+writers; no projection allocates event_id/sequence. State is RECONSTRUCTED by folding events;
+checkpoint = journal offset. Secrets redacted BEFORE the journal. ObligationStore writes
+THROUGH the journal. Scope limit (do not over-read): workspace files, memory spine, backups
+are separate durable side-effects behind their effect-path owners — each write uses
+`AtomicWriter` (tmp → fsync → rename, never in-place) with a snapshot taken BEFORE every FS
+effect; rollback is byte-identical and never touches non-staged user changes (P0.11).
+Self-DoS exception: debug telemetry may best-effort drop; state/security/audit classes never.
+→ HARNESS-SPEC P0.3/P0.11; S1.3, S5.3, S15; DESIGN-FIXES ownership fix.
 
-## E5 — Jedan effect-path, sandbox U tipu
+## E5 — Owner invariants (one owner per concern, no exceptions)
+- **Policy ALLOW/ASK/DENY = S6.0 PEP** (`Decide`, total switch, default-deny; ASK ≠ ALLOW).
+- **Lifecycle ORDER = S6.9** (before/after/on_error branch) — 6.9 NEVER decides policy.
+- **Retry/deadline/cancel/failover = S7 ONLY** — every physical attempt carries an
+  `AttemptGrant`; 2.2 / 2.3 re-ask / 3.3 / 3.4 / fleet / AccountFleet only classify or propose.
+- **Process identity = S1.2** (PID + start-token; killpg/Job Object) — consumed by S6.2.Launch.
+- **Queue lease/fencing = S7.2** (CAS claim, fencing_token++, stale → `STALE_FENCING_TOKEN`).
+→ SECTION-MAP owner invariants; S7; DESIGN-FIXES-r2.
+
+## E6 — Build order is normative: K0 → K1 → L → M–P
+K0 primitives first (S0 types/journal, config/paths/process-identity, ContextBudget-min,
+Assembler-min, **S16.6-det minimal checker**), then K1 security+reliability+workspace
+(PEP/perm/sandbox/lifecycle, S7, S5), only then L executable path (provider → core loop →
+tools). Implementing the 15 locally-correct rules in the wrong order creates bypasses or a
+premature executor. Sandbox (S6.2) lands BEFORE tools/exec (S4).
+→ SECTION-MAP §1 dependency DAG.
+
+## E7 — Two-phase capability activation (atomic activation is impossible)
+Gates with OS/external side-effects cannot activate atomically. Immutable
+`ActivationPlan` (+PlanHash) → `Prepare → Commit → Activate` + `RollbackToken` + explicit
+`PREPARING / FAILED / ROLLING_BACK` states; partially ACTIVE set is illegal; all gate
+attestations bind the SAME config_hash; `Effective() = min(declared, measured)` and any
+config change invalidates the grant (P0.5). RED: `test_every_flag_fails_when_one_gate_is_ablated`.
+→ DESIGN-S0-sandbox-codex; HARNESS-SPEC P0.4/P0.5; DESIGN-STATUS #2.
+
+## E8 — One effect-path, sandbox IN the type
 `S3.Loop → sealed ToolSpec.ExecutionKind → S6.0.Decide → S6.9.Before →
 {InProcessExecutor | SandboxedProcessExecutor(S6.2.Launch + S1.2)} → S6.9.After/OnError → S7`.
-Grananje po zapečaćenom `ExecutionKind`; nepoznat kind → REJECT, ne inproc. Read-only shell
-je i dalje proces → sandbox. In-process alat NIKAD ne spawna. Konkretni executor-tipovi u
-`EffectPath` structu — nesandboxiran executor se ne može injektirati.
-→ DESIGN-FIXES-r2 K1/K2 (kanonski kod).
+Branch on the sealed `ExecutionKind`; unknown kind → REJECT, never inproc. Read-only shell is
+still a process → sandboxed. In-process tools NEVER spawn. Concrete executor types inside the
+`EffectPath` struct — an unsandboxed executor cannot be injected.
+→ DESIGN-FIXES-r2 K1/K2 (canonical code).
 
-## E6 — Effect-taxonomy umjesto nemogućeg cancela
-"Cancel usred toola → nikakav side-effect" NE POSTOJI. Umjesto toga `CommitReceipt` +
-faze `BEFORE_COMMIT / AFTER_COMMIT / UNKNOWN`; svaki EFFECTFUL bez valjanog receipta →
-UNKNOWN → RECONCILING (nikad slijepi retry, nikad ravno READY). Ireverzibilni efekti kroz
-P1.4 draft→approve→commit→verify→compensate; approval veže exact-intent hash.
-→ DESIGN-FIXES classifyEffectPhase; S7.1/7.2; codex duboki nalaz.
+## E9 — Effect taxonomy instead of the impossible cancel
+"Cancel mid-tool → no side-effect" DOES NOT EXIST. Instead: `CommitReceipt` + phases
+`BEFORE_COMMIT / AFTER_COMMIT / UNKNOWN`; every EFFECTFUL call without a valid receipt →
+UNKNOWN → RECONCILING (never blind retry, never straight back to READY). Irreversible effects
+go through P1.4 draft → approve → commit → verify → compensate; approval binds the
+exact-intent hash — a modified effect cannot ride an old approval.
+→ DESIGN-FIXES classifyEffectPhase; S7.1/7.2; HARNESS-SPEC P1.4.
 
-## E7 — Sandbox Linux: helper bez unsandboxed prozora (NAJVEĆI RIZIK)
+## E10 — Linux sandbox: helper with no unsandboxed window (BIGGEST RISK)
 Self-reexec helper: ABI probe → `no_new_privs` → Landlock ruleset → per-arch seccomp-BPF →
-nepovratni execve; FD/env sanitizacija; TOCTOU fail-closed. **Win/macOS u v1 = `UNAVAILABLE`
-+ high-risk exec BLOKIRAN — nikakav tihi weaker-fallback.** Sandbox se NE koristi kao granica
-dok hostile conformance suite ne prođe na stvarnom kernelu (probe-neverificiran = prvi
-implement-zadatak P0). bwrap = opcionalni vanjski adapter, ne garancija.
-→ DESIGN-S0-sandbox-codex; PLAN-HOLES C2; PRD §6.6/§7.
+irreversible execve; FD/env sanitization; TOCTOU fail-closed. **Win/macOS in v1 =
+`UNAVAILABLE` + high-risk exec BLOCKED — no silent weaker fallback ever.** The hostile
+conformance suite on a real Linux kernel is a **go/no-go preflight BEFORE production
+exec/scaffold code**, not an ordinary first task; Win/mac real-OS probes (W0–W10 / M0–M9)
+need the user's hardware and are deferred with those platforms. bwrap = optional external
+adapter, not a guarantee.
+→ DESIGN-S0-sandbox-codex; DESIGN-STATUS #3; PLAN-HOLES C2; PRD §6 item 6, §7.
 
-## E8 — Fail-closed je zadani odgovor na nepoznato
-Enum default-reject grana (nema Go sum-types); nepoznata schema-verzija → QUARANTINE (ne
-downcast, ne tihi odbij); capability `Resolve` nepoznatog → error; config ne smije PROŠIRITI
-kernel floor (`ValidateBounds`); route ispod capability floora → error; SSRF metadata-IP u
-svakom kodiranju → block prije diala; canary u izlazu → blok CIJELE isporuke.
-→ S0.1/0.3/0.4, S1.1, S2.6, S6.3, S6.5.
+## E11 — Fail-closed is the default answer to the unknown; egress is a real dialer boundary
+Unknown enum → reject; unknown schema version → QUARANTINE (no downcast, no silent drop);
+unknown capability `Resolve` → error; config must not WIDEN the kernel floor
+(`ValidateBounds`); route below capability floor → error; canary token in output → block the
+ENTIRE delivery. Egress is NOT string filtering: policy-aware resolver + dialer that pins
+every resolved IP before connect (DNS-rebinding/multi-A safe), metadata-IP blocked in every
+encoding, redirect re-check, proxy-env sanitization, child-socket containment, egress receipt.
+Crypto primitives are distinct and never improvised: HMAC (`hmac.New`) = keyed MAC for local
+integrity; Ed25519 = digital signature for external anchor; plain pinned hash for skill-lock
+verify-on-load; NEVER `hash.Sum(key)` (key leaks into output — forgeable).
+→ S0.1/0.3/0.4, S1.1, S2.6, S6.3, S6.5; PLAN-HOLES codex egress finding; DESIGN-symedit-crypto (D2).
 
-## E9 — Ručni Go tipovi = izvor istine; nema `map[string]any` u kernelu
-JSON-Schema/OpenAPI/protobuf su izvedene projekcije. Opaque payload = `json.RawMessage` +
-zatvorena validacija discriminatora. `Content` XOR `ContentRef` u konstruktoru.
-→ S0 kanonska sinteza.
+## E12 — Trust/lineage monotone; untrusted NEVER becomes instruction
+`trust_class(summary) = MAX(sources)`, `sensitivity = MAX`, `lineage = union` — compaction
+must not launder untrusted content (P0.1 RED `test_s0_rejects_provenance_laundering`).
+Prompt-assembler trust fencing; every search hit datamarked untrusted; remote A2A peer =
+UNTRUSTED (card is not authorization).
+→ HARNESS-SPEC P0.1 (:1383); S8.2, S11.1, S12.5, S4.4.
 
-## E10 — Trust/lineage monotoni; untrusted NIKAD ne postaje instrukcija
-`trust_class(sažetak)=MAX(izvori)`, `sensitivity=MAX`, `lineage=union` — kompakcija ne smije
-oprati untrusted (P0.3 provenance-laundering RED). Prompt-assembler trust-fencing; svaki
-search-hit datamarked-untrusted; remote A2A peer = UNTRUSTED (card nije autorizacija).
-→ S8.2, S11.1, S12.5, S4.4.
+## E13 — Evidence-graded completion: checker ≠ worker; minimal checker is P0, trio is P1
+`Checker.Grade` grades ARTIFACTS (git diff + real exit code + deterministic signals), NEVER
+the worker's prose. Generic `AcceptanceContract` + `EvidenceBundle` (coding = diff+exit;
+assistant = delivery receipt / calendar / grounding). **The minimal deterministic checker
+(S16.6-det) is a K0 primitive and a P0 dependency** — `ObligationStore.MarkDone` accepts only
+Evidence, so P0 obligations cannot ship without it. The full coding USP trio — TIA (USP #2),
+AST-symedit (USP #3), deep evidence-gate (USP #1) — is the P1 coding branch. Credit (16.4)
+only from verified outcomes, never self-report.
+→ SECTION-MAP K0; S3.1, S16.6, S9.6; DESIGN-checker-tia-edit-agy; A8.
 
-## E11 — Evidence-graded completion: checker ≠ worker
-`Checker.Grade` ocjenjuje ARTEFAKTE (git-diff + realan exit-code + deterministički signali),
-NIKAD prozu workera. Generic `AcceptanceContract`+`EvidenceBundle` (coding=diff+exit;
-asistent=delivery-receipt/calendar/grounding). `ObligationStore.MarkDone` SAMO uz Evidence.
-Kredit (16.4) samo iz verificiranog ishoda, nikad self-report. Ovo je USP #1 — ne razvodniti.
-→ S3.1, S16.6, S9.6, DESIGN-checker-tia-edit-agy.
+## E14 — Memory: spine + FORGET ≠ PURGE + profile isolation
+SQLite-WAL spine; P0 ships only Decay (FSRS-lite — changes RANK, never existence) + Audn
+(supersede-on-read, no silent overwrite); Dream/MemGit/MemAssoc = v2 descope.
+**MEMORY_FORGET (reversible, recall ban) ≠ DATA_PURGE (irreversible, S6.7 overrides, deletes
+the tombstone too)** — USP #4, the only P0-shipped differentiator. `PersonalProfile` =
+deny-default isolation of memory/secrets/channels/cache: write in `work` → query in
+`private` = 0 hits. Memory write-approval DEFAULT ON.
+→ S9.2/9.4/9.5; HARNESS-SPEC P2.1; GAPFIX-kilo.
 
-## E12 — Provider = interface s 4 auth-moda; adapteri ne retry-aju
-`Provider{Chat/Stream/Capabilities}` + `AuthMode`: APIKey (default) · OAuth (sankcioniran) ·
-CLIAgent (subprocess `codex`/`claude` s `--tools ""` — NEXUS drži petlju) · SubscriptionOAuth
-(NIKAD default, fail-closed bez `acknowledged_tos`). Petlja ne zna mod. Structured output:
-validate→re-ask→salvage (re-ask nosi AttemptGrant), nikad tihi prihvat nevalidnog.
-→ S2.1/2.2/2.3.
-
-## E13 — Memorija: spine + FORGET≠PURGE + profil-izolacija
-SQLite-WAL spine; P0 samo Decay(FSRS-lite, mijenja RANG ne postojanje)+Audn (Dream/MemGit/
-MemAssoc = v2 descope). **MEMORY_FORGET (reverzibilno, zabrana recalla) ≠ DATA_PURGE
-(ireverzibilno, S6.7, briše i tombstone)** — USP #4. `PersonalProfile` = deny-default
-izolacija memory/secrets/channels/cache: write u `work` → query u `private` = 0 hitova.
-Write-approval DEFAULT ON.
-→ S9.2/9.4/9.5, P2.1, GAPFIX-kilo.
-
-## E14 — Kanali: durable-delivery + udaljeni-HITL
-Gateway jezgra (identity, deny-default allowlist, threading, receipt, idempotent-retry);
-adapteri tanki (Telegram prvi). `run_done ≠ result_delivered` — dva trajna stanja,
-transactional outbox: gateway crash ne gubi odgovor niti ponavlja side-effect. Udaljeni-HITL:
-agent pita na mobitel, run čeka; approval token = exact-intent + expiring + single-use
-(replay → `APPROVAL_REPLAY`).
-→ S14.5, S7.3 (N9), S12.4, P1.6.
-
-## E15 — Kripto i potpisi: nikad `hash.Sum(key)`
-Keyed-MAC = `hmac.New(sha256.New, key)` ili `ed25519.Sign`; kanonska serijalizacija;
-constant-time compare; ključ nikad u artefaktu. Vrijedi za SVE potpisano: ExecutionReceipt,
-shadow-checkpoint, audit hash-lanac (15.3 + vanjski anchor), skill-lock (P1.1 hash-on-load).
-→ DESIGN-symedit-crypto-claude (D2 fix).
+## E15 — Channels: durable delivery + remote HITL; S7 owns the retries
+Gateway core (identity, deny-default allowlist, threading, receipts); adapters thin
+(Telegram first). `run_done ≠ result_delivered` — two durable states, transactional outbox:
+a gateway crash neither loses the reply nor repeats the side-effect. The gateway provides
+idempotency keys and receipts; **S7 alone authorizes and schedules delivery retries** (no
+second retry owner). Remote HITL: agent asks on the phone, run waits durably; approval token
+= exact-intent + expiring + single-use (replay → `APPROVAL_REPLAY`).
+**OPEN (hard-questions):** P1.6 declares `channels requires extensions` closure
+(`INCOMPLETE_CAPABILITY_CLOSURE` fail-closed), but `extensions` is cut from P0 while Telegram
+is IN P0 — resolve as built-in channel (Phase O stdio-built-in path) vs plugin channels
+(Phase P), or amend P1.6. Do not code around it silently.
+→ S14.5, S7.3 (N9), S12.4; HARNESS-SPEC P1.6; SECTION-MAP Phase O.
 
 ---
 
-## P0 scope-rez (podsjetnik — što NE graditi sad)
-P0 = 6 sposobnosti iz PRD §4 (razgovor · spine-pamćenje · obveze · Telegram · profili ·
-Linux sandbox). **Izbačeno iz v1:** learned-router, council/flows/boards, GraphRAG/CAG,
-fleet/pairing, video, computer-use, desktop-GUI, voice-WebRTC, K8s. Coding-USP trojka
-(TIA/symedit/evidence-gate puni) = P1. → PRD §4-5, PLAN-HOLES C6.
+## Provider layer (compressed — not one of the 15, but P0-relevant)
+One `Provider` interface (`Chat/Stream/Capabilities/DataDescriptor`); auth is pluggable:
+APIKey (default) · OAuth (sanctioned) · CLIAgent (subprocess `codex`/`claude` with
+`--tools ""` — NEXUS keeps the loop). SubscriptionOAuth is **cut from P0** (ToS/ban risk;
+opt-in later, fail-closed without `acknowledged_tos`). The loop never knows the mode.
+Structured output: validate → re-ask (carries AttemptGrant) → salvage; never silently accept
+invalid output. → S2.1/2.2/2.3; PLAN-HOLES C6.
 
-## Otvoreno prije P0 koda (iz DESIGN-STATUS)
-1. **Sandbox live-probe na stvarnom Linux kernelu** (hostile conformance suite) — prvi zadatak.
-2. Annex A P0.x ugovori koji se citiraju moraju POSTOJATI prije citiranja kao gate (C3).
+## P0 scope (precise labels — "not in P0" ≠ "out of v1")
+P0 = 6 capabilities from PRD §4 (conversation · spine memory · obligations · Telegram ·
+profiles · Linux sandbox) with the six done-criteria of PRD §6 as the acceptance contract
+(memory survives restart; reminder survives shutdown and fires on time; Telegram irreversible
+action pre-approved; zero profile leakage; sandbox denies `/etc/shadow` and network under
+hostile test). **Out of v1 entirely (PRD §5):** multi-user SaaS, autonomous self-repair,
+Win/mac isolation promises, ToS-bypass defaults, desktop GUI. **Cut from P0, lives in P1/P2
+or awaits PRD decision (PLAN-HOLES C6):** learned router, subscription-OAuth, council/flows/
+boards, GraphRAG/CAG, fleet/pairing, video, computer-use, voice-WebRTC, K8s, callgraph/
+archmap layer, PROV-O, guardian-LLM. Coding USP trio = P1.
+
+## Open before P0 code (verified against DESIGN-STATUS + HARNESS-SPEC)
+1. **Linux hostile-conformance preflight** on a real kernel — go/no-go before production
+   exec/scaffold code (E10).
+2. **P1.6 vs P0-Telegram closure tension** (E15) — resolve in hard-questions round.
+3. Win/mac real-OS probes — user hardware; deferred with those platforms (not a P0 blocker).
+(Annex A P0.5–P0.13 contracts EXIST — HARNESS-SPEC:1534+; the older PLAN-HOLES C3 claim is stale.)
