@@ -212,6 +212,7 @@ type ToolCall struct {
     Arguments          CanonicalJSON
     ArgumentsSchemaHash Digest
     Effect             EffectClass
+    ExecutionKind      ExecutionKind   // ExecInProcess|ExecProcess — resolved iz zapečaćenog S4 ToolSpec (REVIEW2 V-K1)
     Deadline           time.Time
     AttemptNo          uint32
     IdempotencyKey     Optional[IdempotencyKey]

@@ -1,4 +1,4 @@
-> **⚠ DJELOMIČNO SUPERSEDED (REVIEW2/3):** fleet↔pairing cross-import (ExecutionNode.Device↔RemoteInvoke.Node) je ZAMIJENJEN `internal/fleet/ids` layoutom iz **`DESIGN-FIXES-r2.md` §K3** (PlacementGrant ostaje u `fleet`, ne `ids`). Za effect-path/vlasništvo vidi DESIGN-FIXES-r2.
+> **⚠ DJELOMIČNO SUPERSEDED (REVIEW2/3):** fleet↔pairing cross-import (ExecutionNode.Device↔RemoteInvoke.Node) je ZAMIJENJEN `internal/fleet/ids` layoutom iz **`DESIGN-FIXES-r2.md` §K3** (PlacementGrant u `internal/fleet/placement` — nizvodni paket, ne bazni `contracts` ni `ids`; fix N5-01). Za effect-path/vlasništvo vidi DESIGN-FIXES-r2.
 
 GAPFIX codex
 

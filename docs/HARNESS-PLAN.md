@@ -171,7 +171,7 @@ može opteretiti journal → filter PRIJE payload konstrukcije, ali sampling/dro
 NIKAD ne obuhvaća state/security/audit klase; throughput floor MJERI se (proof ceiling do benchmarka).
 **Pareto PASS.**
 
-**S1 honest gap:** 1.1 i 1.2 nemaju dedicirani Annex RED (kao 0.3) — gate posredno kroz P1.2/P0.4 +
+**S1 gate:** 1.1/1.2 pokriva **P0.6** (config-bounds+process-identity, u Annexu A); dodatno P1.2/P0.4 +
 kod-vs-data načelo. Ugovori **P0.6** (config-bounds+process-identity) i P0.5 su u Annexu A. **Verifikacija:** svi kandidati stvarni (Codex/Aider/Continue/goose Apache-2.0; OTel
 CNCF; structlog/tracing/OpenHands MIT). **S1 STATUS: DIZAJN (salvage uklonjen; RESOLVED/UNRESOLVED po podsekciji → PLAN-HOLES-CONSOLIDATED.md).**
 
@@ -223,7 +223,7 @@ po fazi) = jezgra; `LearnedRouter{bandit}` epsilon-greedy OPT-IN, reward SAMO iz
 (nikad self-report). Route fail-closed: kandidat ispod capability floora (S0.3) odbijen. **RED:** Route na model ispod floora→error. **Pareto:** RouteLLM+
 semantic-router+LiteLLM+barbell+verified-bandit.
 
-**S2 honest gap:** 2.1/2.3/2.4/2.5 bez dediciranog Annex RED — gate posredno (P2.5 za 2.1, S0.1 za
+**S2 gate:** 2.3→**P0.7**, 2.4→**P0.8** (u Annexu A); 2.1/2.5 posredno (P2.5 za 2.1, S0.1 za
 2.3, hardware-fit za 2.4, P2.2 za 2.5). U Annexu A: P0.7 structured-never-silent, P0.8 hardware-fit-fail-closed. **Verifikacija:** svi kandidati stvarni (Kong webfetch-verificiran).
 **S2 STATUS: DIZAJN (salvage uklonjen; RESOLVED/UNRESOLVED po podsekciji → PLAN-HOLES-CONSOLIDATED.md).** Auth-mod dizajn (a-d) odgovara korisnikovom OAuth/subscription pitanju.
 
@@ -272,8 +272,7 @@ missed-run/overlap. **RED P2.6:** `test_zagreb_dst_fold_runs_
 once_across_restart`. **Pareto:** NEXUS-admission+Temporal-DST+APScheduler.
 
 **S3 = 3 CODING-DIFERENCIJATORA gdje POBJEĐUJEMO:** evidence-graded checker (3.1), stuck-detection
-(3.4), TIA (3.5) — nijedan od Kilo/OpenHands/OpenCode nema. **Honest gap:** 3.2/3.3/3.5 bez
-dediciranog Annex RED (P0.9 "verify-never-silent" — u Annexu A). **Verifikacija:** svi
+(3.4), TIA (3.5) — nijedan od Kilo/OpenHands/OpenCode nema. **Gate:** 3.5→**P0.9** (verify-never-silent, u Annexu A); 3.2/3.3 posredno (P0.2). **Verifikacija:** svi
 javni kandidati stvarni; Kilo Code = to-beat meta bez javne licence. **S3 STATUS: DIZAJN (salvage uklonjen; RESOLVED/UNRESOLVED po podsekciji → PLAN-HOLES-CONSOLIDATED.md).**
 
 ---
@@ -283,7 +282,7 @@ javni kandidati stvarni; Kilo Code = to-beat meta bez javne licence. **S3 STATUS
 **4.1 tool-registry (MEHANIZAM):** typed schema po alatu (`ToolSpec{ID,SchemaHash,EffectClass,ExecutionKind}`; ExecutionKind∈{ExecInProcess,ExecProcess} pečati grananje za effect-path),
 dispatch, timeout, result-envelope, permission-wrapper. **RED:** poziv bez validne sheme→reject. **Pareto:** FastMCP+smolagents+OpenAI-SDK.
 
-**4.2 shell/exec (MEHANIZAM, coding):** bash-sesija koja drži stanje, rlimits, tree-kill.
+**4.2 shell/exec (MEHANIZAM, coding):** structured one-shot exec kao v1; per-OS shell-sesija iza capability-probea. `ExecutionKind=ExecProcess`. Tree-kill NIJE ovdje — predaje exec-spec; kill je UNUTAR S6.2.Launch/S1.2 (owner-invarijanta).
 **RED:** timeout→cijelo procesno stablo ubijeno (P1.2). **Pareto:** OpenHands+
 Codex-sandbox+gptme + gortex-reuse.
 
@@ -347,8 +346,7 @@ korisnički sadržaj sačuvan; atomic write usred pada→stari ili novi, nikad p
 Codex+Cline+sandbox-atestor-PROV-O (naš).
 
 **S5 diferencijator:** shadow-git izvan stabla (byte-identičan undo bez zagađenja povijesti) +
-worktree-per-subagent (S12 temelj) + sandbox-neutralni atestor. **Honest gap:** 5.1/5.3 bez
-dediciranog Annex RED (P0.11 u Annexu A). **Verifikacija:** kandidati stvarni; atomic-write greenfield Go. **S5 STATUS: DIZAJN (salvage uklonjen; RESOLVED/UNRESOLVED po podsekciji → PLAN-HOLES-CONSOLIDATED.md).**
+worktree-per-subagent (S12 temelj) + sandbox-neutralni atestor. **Gate:** 5.1/5.3→**P0.11** (shadow-checkpoint integritet, u Annexu A). **Verifikacija:** kandidati stvarni; atomic-write greenfield Go. **S5 STATUS: DIZAJN (salvage uklonjen; RESOLVED/UNRESOLVED po podsekciji → PLAN-HOLES-CONSOLIDATED.md).**
 
 ---
 
@@ -503,7 +501,7 @@ untrusted epizode→gist ostaje UNTRUSTED (P0.3). **Pareto:** letta+mem0+zep+sle
 
 **9.5 PersonalProfile (`profiles` flag, iz A4-G2):** izolacijska jedinica posao/privatno/obitelj; deny-default memory/secrets/channels/cache; write u `work`→query u `family`=0 hitova. Dizajn: GAPFIX-kilo. **Scope: ODLUKA-PRD.**
 
-**9.6 ObligationStore (asistent-jezgra, iz A4-G4):** trajni cilj s eksplicitnom done-definicijom, `MarkDone` SAMO uz Evidence; veže 9.1+3.6; odvojeno od 9.2 razgovorne memorije i 7.2 infra-queue. **Scope: ODLUKA-PRD.**
+**9.6 ObligationStore (asistent-jezgra, iz A4-G4):** trajni cilj s eksplicitnom done-definicijom, `MarkDone` SAMO uz Evidence; **write kroz EventJournal.Append (P0.3), ne izravni sqlite**; veže 9.1+3.6; odvojeno od 9.2 memorije i 7.2 queue. **Scope: ODLUKA-PRD.**
 
 **S9 = memorija GREENFIELD (Decay+Audn P0, Dream/MemGit/MemAssoc v2) + forget/purge trust-razdvajanje.**
 **Honest gap:** 9.1/9.3/9.4 bez dediciranog Annex RED (P0.13 "decay-never-destroys-bytes" — u Annexu A).
@@ -762,7 +760,7 @@ upgrade). **RED P1.5:** `test_post_signature_artifact_tamper_blocks_publish`.
 lease (iz S7 — P2.3 fencing). headless worker/API razdvajanje.
 
 **18.2 multi-tenant-gateway:** LiteLLM-proxy per-tenant ključevi/budgeti +
-Portkey + Dify-kvote; non-null tenant_id na svakom persistentnom envelopeu (codex#5).
+Portkey + Dify-kvote; non-null tenant_id na svakom persistentnom envelopeu (codex#5 — Tier-3 BACKLOG, ne formalni Annex).
 
 **18.3 health/
 rollout/canary:** Kubernetes/Argo-Rollouts/Flagger (komponente); SHA-pinned canary (NEXUS live-canary
