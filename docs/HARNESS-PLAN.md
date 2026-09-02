@@ -1053,3 +1053,42 @@ trojku. **Uzeti:** watermarking/provenance obrazac (minorno). Potvrđuje A6 lekc
 **Stanje trojke nakon 14 full-code audita** (Hermes/OpenClaw/OpenHands/Aider/OpenCode/Codex/Cline/
 Continue/Roo/Goose/Kilo/jcode/ruflo + Hermes): **TIA, evidence-git-diff-gate, AST-symedit — NITKO nema.
 Trojka STOJI.** (Frameworks tier + landscape još slijede za S9/S12 who-has-what.)
+
+---
+
+# ADDENDUM A8 — FINALNI code-grounded ispravak (29 harnessa auditano; master u MASTER-LANDSCAPE.md)
+
+29 full-code audita gotovo (svi Tier-A + Hermes/OpenClaw). Master who-has-what: `docs/MASTER-LANDSCAPE.md`.
+Ovo je KONAČNA iskrena slika koja zamjenjuje README-tvrdnje.
+
+## NAŠ STVARNI USP — 4 diferencijatora (NITKO od 29 nema, code-provjereno):
+1. **Evidence-graded diff+exit-code completion GATE** (checker≠worker, ne prompt-tekst) — svi 29 NEMA
+2. **TIA** (coverage×diff→pogođeni testovi) — svi 29 NEMA
+3. **AST/LSP symedit** (symbol-scoped edit, ne text-match) — svi 29 NEMA
+4. **Formal MEMORY_FORGET vs DATA_PURGE** (P2.1 reverzibilno vs ireverzibilno) — svi 29 NEMA
++ KOMBINACIJA: sve u JEDNOM hardened Go single-binary osobni-asistent+coding harnessu — nijedan
+harness ima SVE; svaki ima komadiće.
+
+## OBORENO DEFINITIVNO (bilo lažno u planu; sad referencirano):
+stuck-detection (Cline/Codex/Roo/Kilo), edit-ladder (OpenCode 9-st./Aider), shadow-git (OpenClaw/Kilo/
+DeepSeek), OS-sandbox (Codex Seatbelt), queue-fencing (OpenClaw ingress-queue/DeepSeek cron-fence).
+Sve to OSTAJE naš zahtjev, ali s REFERENCAMA (uči od njih), NE kao "nitko nema".
+
+## GAPOVI ZA FOLD (iz 29 audita — što uzeti u plan/gradnju):
+- **LangGraph BSP/Pregel superstep** (deterministički multi-agent + atomski reduce+checkpoint) → S12.2
+- **OpenClaw ingress-queue** (claim/refresh/stale-CAS-reclaim/DLQ = pravi lease, dublje od NEXUS) → S7.2 referenca
+- **OpenClaw O1-14** (commitments/flows/boards/fleet+pairing/exec-auto-reviewer) → asistentske podsekcije
+- **DeepSeek-Harness Cordis** (everything-is-plugin DI) → S17.1 obrazac (potvrditi iz A5-nasljeđa)
+- **jcode RAM-lifecycle** (Arc-shared/static-dynamic-cache-split/drop-dup) → Go single-binary efikasnost
+- **jcode account-failover + cost-model** (curated→OpenRouter→models.dev) → A4-G8 account-fleet
+- **MAF nativni A2A+MCP hosting** (potvrđeno; MAF `go/` je STUB — nismo u Go-konkurenciji) → S12.5
+- **Haystack RAG pipeline dubina** (BM25+dense+rerank komponente) → S10 adapteri
+- **CrewAI/AutoGen/MetaGPT team-role obrasci** → S12.1 (role-as-data već imamo, potvrđeno)
+
+## METODOLOŠKA POUKA (za korisnika — dokazano):
+README/git-tree/reputacija razina proizvela je LAŽNE "unikat" tvrdnje (stuck/barbell/edit-ladder/
+shadow-git). SAMO full-code audit (29 harnessa) dao je iskrenu sliku: 4 stvarna diferencijatora,
+ne 6. Ovo je bio ispravan pristup od početka (korisnikova vizija). Plan je sad code-grounded.
+
+**SLJEDEĆE:** plan je iskren i potpun → PRD.md (korisnik vodi) + ARCHITECTURE-ESSENTIALS → hard-
+questions review → CLAUDE/AGENTS + scaffold → gradnja. USP je sad 4 code-dokazana + kombinacija.
