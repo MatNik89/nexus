@@ -30,6 +30,8 @@ Osobni AI asistent (asistent-PRVO; coding = najjača grana, ne svrha). Greenfiel
 5. **`tasks-P0.md`** — SAMO za P0 slice, granularno + traceable na PRD + acceptance po tasku + jedan-po-jedan.
 6. **Implement P0** (walking-skeleton), test-first (RED iz Annex A + DESIGN-*).
 
+## TUI REFERENCA: `REF-brainless-tui.md` — component-checklist za S14.1 (message/thinking/tool-call/diff/ASK-approval/slash/todo); brainless = P2 web-UI kandidat, NE TUI kod.
+
 ## P0 SCOPE (asistent-lice vertikala, Linux) — 6 sposobnosti
 1. Razgovor (TUI/CLI + provider) · 2. Pamćenje preko sesija (spine) · 3. Podsjetnici/obveze (ObligationStore)
 4. Telegram kanal (+ udaljeni-HITL) · 5. Odvojeni profili posao/privatno (PersonalProfile) · 6. Siguran
