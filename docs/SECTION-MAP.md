@@ -89,7 +89,7 @@ journal-write=**P0.3/EventJournal paket** (jedini writer; NE S0.3). Effect-path 
 Nove nose ✅+🟠 = DIZAJN-GOTOV (GAPFIX) + scope-flag ODLUKA-PRD (NE "tanko"; fix D4/R2-14).
 Inline pod-stavke sad nose status (fix D3/SEC-03).
 
-**S0** ✅ 0.1 0.2 0.3 0.4 0.5 (codex) · P0.5-0.13 → dodati u Annex (G1)
+**S0** ✅ 0.1 0.2 0.3 0.4 0.5 (codex) · P0.5-0.13 → u Annexu A (dodani; G1 zatvoren)
 **S1** 🟡 1.1 config · 1.3 telemetry · ✅ 1.2 proc+process-identity
 **S2** 🟡 2.1 auth · 2.2 fallback(+AccountFleet classify-only) · ✅ 2.3 structured · 🟡 2.4 local(+A1/A2) · 2.5 cost · 🟠 2.6 learned-router(→P)
 **S3** ✅ 3.1 loop · 3.3 cancel · 3.4 stuck · 3.5 TIA · 🟡 3.2 streaming · 3.6 trigger-plane
@@ -109,7 +109,7 @@ Inline pod-stavke sad nose status (fix D3/SEC-03).
 **S17** 🔵 17.1 plugin(Cordis) · 🟡 17.4 self-diag-bridge+A3.2 · 🟡 17.2 update(TUF) · 17.3 packaging
 **S18** 🔵 18.1 worker/queue · **✅🟠 18.5 fleet · ✅🟠 18.6 pairing** (GAPFIX-codex; fleet/ids anti-cikl K3) · 🟡 18.2 tenant-gw · 18.3 canary · 18.4 backup(Litestream sada; premisa "S0.4" bila kriva — backend već SQLite-WAL)
 
-**Zbroj (107):** ✅ ~24 dizajn-gotovih (uklj. 7 novih GAPFIX) · 🔵 9 auditanih · 🟡 ~40 dizajn-treba · 🟠 ~15 odluka-PRD · ⬇ 3 descope.
+**Zbroj (108):** ✅ ~24 dizajn-gotovih (uklj. 8 novih GAPFIX) · 🔵 9 auditanih · 🟡 ~40 dizajn-treba · 🟠 ~15 odluka-PRD · ⬇ 3 descope.
 
 ---
 

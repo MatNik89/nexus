@@ -1,3 +1,5 @@
+> **⚠ DJELOMIČNO SUPERSEDED (REVIEW2/3):** `ObligationStore{store *sqlite.Store}` (izravni write) je ZAMIJENJEN write-kroz-`EventJournal.Append` (P0.3) iz **`DESIGN-FIXES-r2.md`**. Fold-target G1→4.8/G2→9.5/G4→9.6/O6→6.10 je kanonski u HARNESS-PLAN (ne self-mapping ovdje).
+
 GAPFIX kilo
 
 # GAPFIX — ASISTENT klaster (buildable Go dizajn, ne bilješke)

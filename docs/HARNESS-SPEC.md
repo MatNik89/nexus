@@ -1349,6 +1349,13 @@ podsekciji mora dokazati pripadni ugovor. Bez Annexa spec je 'lista projekata'; 
 | P2.5 Provider data-processing/rezidencija | 0.3/2.1 (6.7/6.9) | codex#13 |
 | P2.6 Automation clock/DST/missed-run | 3.6 | codex#33 |
 | P2.7 Council formalni ugovor | nova S12.6 | agy#5 |
+| P0.5 Capability-matrix fail-closed | S0.3 | REVIEW2 G1 |
+| P0.6 Config-bounds + process-identity | S1.1/1.2 | REVIEW2 G1 |
+| P0.7 Structured-output never-silent | S2.3 | REVIEW2 G1 |
+| P0.8 Hardware-fit fail-closed | S2.4 | REVIEW2 G1 |
+| P0.9 In-turn verify never-silent | S3.5 | REVIEW2 G1 |
+| P0.11 Shadow-checkpoint integritet | S5.1/5.3 | REVIEW2 G1 |
+| P0.13 Decay-never-destroys-bytes | S9.4 | REVIEW2 G1 |
 
 
 

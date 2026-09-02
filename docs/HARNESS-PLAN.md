@@ -106,7 +106,7 @@ polje); checkpoint = journal offset. `UNKNOWN`→samo reconciliation event. **RE
 **0.3 capability negotiation (MEHANIZAM):** `CapabilityFloor{ToolCalling,StructuredOutput,
 Streaming,ContextLimit}`; `Effective()=min(declared,measured)`; `Resolve` nepoznatog → error
 (fail-closed, "mjeri ne pretpostavljaj"). **HONEST GAP (kilo+moderator):** 0.3 JEDINA S0
-podsekcija bez dedicated Annex RED — RJEŠENJE: dodati **P0.5 "capability-matrix fail-closed"** u
+podsekcija — ugovor **P0.5 "capability-matrix fail-closed"** je u Annexu A (dodan);
 Tier-3 (matrix-prep) ILI vezati na capability-floor načelo kao gate. Odluka: dodati P0.5 ugovor.
 **Pareto:** cap-as-data (LiteLLM)+declared-on-adapter (PydanticAI)+cap-routing (Portkey)+fail-closed (naš).
 
@@ -148,7 +148,7 @@ stara generacija ostaje. **RED:** config proširi kernel max
 **1.2 cross-platform paths+procesi (MEHANIZAM, cross-platform JEZGRA):** putanje preko stdlib
 `os.UserConfigDir/CacheDir` (bez build-tagova). Procesi build-tagged: `proc_unix.go`
 (`SysProcAttr{Setpgid:true}`, killpg `-pgid` SIGTERM→GracePeriod→SIGKILL→Wait; NE Pdeathsig — smrt
-Go threada ≠ smrt procesa, lease je kanonski recovery), `proc_windows.go`
+Go threada ≠ smrt procesa; S1.2 daje PROCESS-IDENTITY primitiv (PID+start-token), a lease-owner je S7 koji ga konzumira — S1.2 NE ovisi o S7), `proc_windows.go`
 (`CREATE_NEW_PROCESS_GROUP` + Job Object `KILL_ON_JOB_CLOSE`; taskkill `/T /F` preko
 `GetSystemDirectory` NE PATH — bounded fallback, NIJE ownership dokaz), `proc_darwin.go`=killpg.
 PID+**start-token** identitet (P1.2 orphan-sweep; PID sam nije dokaz). PTY: `creack/pty` pure-Go,
@@ -201,7 +201,7 @@ acknowledged_tos→error; (c) bez `--tools ""`→odbij. **Pareto:** LiteLLM+Pyda
 
 **2.2 fallback (MEHANIZAM, TANKI — NE retry petlja):** `FallbackPlanner.Plan(err,cur)→
 (Target, s7.FallbackProposal)` — vraća PRIJEDLOG, puni `s7.ExecutionPolicy.fallback_targets[]` +
-mapira provider-error→kategorični kod; retry je S7. Cooldown/KeyPool rotacija. **RED P0.2:** `test_adapter_cannot_self_retry` (2× isti
+mapira provider-error→kategorični kod; retry je S7. AccountFleet SAMO klasificira (candidate+cooldownHint); S7 JEDINI izdaje grant/backoff/failover. **RED P0.2:** `test_adapter_cannot_self_retry` (2× isti
 AttemptGrant→`ATTEMPT_NOT_AUTHORIZED`, counter=1). **Pareto:** LiteLLM+Portkey+Kong + no-self-retry.
 
 **2.3 structured output (MEHANIZAM):** `StructuredOutput[T].Validate→re-ask→salvage`, NIKAD tiho
@@ -238,7 +238,7 @@ P0.8 hardware-fit-fail-closed. **Verifikacija:** svi kandidati stvarni (Kong web
 javnu licencu, ne izvor); OpenHands/OpenCode/SWE-agent = javni referenti.
 
 **3.1 plan-act-observe (MEHANIZAM, coding-jezgra):** `Loop{planner,executor,verifier,checker,
-state,journal}`: plan(adaptivan small/medium/large) → authorize(6.9) → execute(→Observation,
+state,journal}`: plan(adaptivan small/medium/large) → S6.0.Decide→S6.9.Before (policy pa order) → execute(→Observation,
 3.4) → verify(3.5 in-turn) → **GRADE(16.6 checker)** → re-plan s dokazom. **DIFERENCIJATOR
 evidence-graded:** `Checker.Grade` ocjenjuje **git-diff + realan exit-code + determinističke
 signale, NIKAD prozu workera** (anti-sycophancy strukturno) — NITKO od Kilo/OpenHands/OpenCode
@@ -255,7 +255,7 @@ token, pause/resume=journal offset (replay fold, ne mutable state); CANCELLED te
 
 **3.4 error recovery (MEHANIZAM, coding-jezgra):** tool-pad → `TypedError` PAKIRAN u observation
 (model vidi, korigira se — alat pao ≠ petlja pala); classify→retryable(S7)/terminal(re-plan).
-**DIFERENCIJATOR stuck-detection** (`circuit.py`): STAGNATION (isti tool/arg N puta) + NO_PROGRESS
+**DIFERENCIJATOR stuck-detection** (`internal/circuit`): STAGNATION (isti tool/arg N puta) + NO_PROGRESS
 (verify ne zelena M puta) → breaker prije lažno-zdravog vrtenja. NITKO nema. **RED P0.2:** tool-pad→obs nosi error, loop
 ne crasha; STAGNATION→breaker. **Pareto:** error-u-obs (OpenHands) + checkpoint (LangGraph) +
 razumljiv-format (SWE-agent) + stuck-detection (naš).
@@ -275,7 +275,7 @@ once_across_restart`. **Pareto:** NEXUS-admission+Temporal-DST+APScheduler.
 
 **S3 = 3 CODING-DIFERENCIJATORA gdje POBJEĐUJEMO:** evidence-graded checker (3.1), stuck-detection
 (3.4), TIA (3.5) — nijedan od Kilo/OpenHands/OpenCode nema. **Honest gap:** 3.2/3.3/3.5 bez
-dediciranog Annex RED (P0.9 "verify-never-silent" kandidat za matrix-prep). **Verifikacija:** svi
+dediciranog Annex RED (P0.9 "verify-never-silent" — u Annexu A). **Verifikacija:** svi
 javni kandidati stvarni; Kilo Code = to-beat meta bez javne licence. **S3 STATUS: DIZAJN (salvage uklonjen; RESOLVED/UNRESOLVED po podsekciji → PLAN-HOLES-CONSOLIDATED.md).**
 
 ---
@@ -314,7 +314,7 @@ remote-https, peer-identity pin, scoped OAuth, tool-list size-limit + injection-
 lazy schema-fetch, mjeri schema-token + selection-miss-rate (Pi princip: manje alata pobjeđuje).
 **RED:** turn dobiva samo scoped set, ne cijeli registry. **Pareto:** pi-mono+MCP-discovery+ToolView (naš).
 
-**4.8 computer-use (`computer-use` flag, iz A4-G1):** OS-wide GUI input-injection; `InputInject` KEY/MOUSE/TYPE=RED-tier, SCREENSHOT=YELLOW; approval 6.9+P1.4; keystroke u password-polje→6.1 DENY. Dizajn: GAPFIX-kilo. **Scope: ODLUKA-PRD.**
+**4.8 computer-use (`computer-use` flag, iz A4-G1):** OS-wide GUI input-injection; `InputInject` KEY/MOUSE/TYPE=RED-tier, SCREENSHOT=YELLOW; approval S6.0.Decide→6.9+P1.4; keystroke u nepoznato polje = approval-po-tipu-znaka (NE password-auto-detekcija — neizvodiva). Dizajn: GAPFIX-kilo. **Scope: ODLUKA-PRD.**
 
 **S4 = 2 coding-diferencijatora:** edit-ladder+symedit (4.3), dev-inteligencija (4.4). gortex
 diff/exec/mcp = greenfield Go. **Honest gap:** 4.1/4.2/4.4/4.7 bez dediciranog Annex RED
@@ -363,7 +363,7 @@ Membrane greenfield u Go, fail-closed, non-bypassable (GORTEX ne postoji — pi�
 **6.0 trust/PEP (MEHANIZAM):** OPA-stil policy decision point ("smije li subjekt X alat Y nad Z"),
 executor fail-closed provodi. **Pareto:** Codex-approval+OpenHands-analyzer+OPA.
 
-**6.1 permission gating (MEHANIZAM):** `permissions.py` shlex-token analiza po argumentu (GREEN/
+**6.1 permission gating (MEHANIZAM):** `internal/security/perm` shlex-token analiza po argumentu (GREEN/
 YELLOW/RED, 5-tier), hooks pre_tool deny. **RED:** RED-regex komanda→deny. **Pareto:** Codex+goose+gptme+per-argument.
 
 **6.2 sandbox (MEHANIZAM, per-OS build-tag, GREENFIELD od nule — NAJVEĆI BLOKER):** `Boundary` interface;
@@ -379,7 +379,7 @@ identično NEXUS membrani; bez dopuštenog patha→fail-closed. **Pareto:** Code
 octal/mapped-IPv6 → REFUSE PRIJE diala) + redirect re-check + `netjail filtered_jail` (bwrap prazan
 netns, jedini izlaz UDS→FilterProxy). **RED:** metadata-IP u bilo kojem kodiranju→block. **Pareto:** Codex+microsandbox+OpenHands+SSRF-hardening (naš).
 
-**6.4 secrets (MEHANIZAM):** keyring, `broker.py` redact (entropija+shape), SECRET_ARGS. **RED:** secret u izlazu→redigiran prije journala (P0.3).
+**6.4 secrets (MEHANIZAM):** keyring, `internal/security/secrets` redact (entropija+shape), SECRET_ARGS. **RED:** secret u izlazu→redigiran prije journala (P0.3).
 
 **6.5 injection-obrana + canary (MEHANIZAM):** datamark fence + guardian judge + deny-list;
 **canary tripwire** per-install token, detekcija u izlazu→**FAIL-CLOSED blok cijele isporuke** +
@@ -394,7 +394,7 @@ tenant RBAC.
 dodatak (DSAR/legal-hold). **RED P2.1:** MEMORY_FORGET vs DATA_PURGE razdvojeni.
 
 **6.8 supply-chain (`extensions` flag):** Sigstore/cosign potpis + OSV-Scanner + in-toto provenance;
-`core/supplychain.py` OSV + trust-by-hash. **RED P1.5:** post-signature artefakt tamper→publish blok.
+`internal/security/supplychain` OSV + trust-by-hash. **RED P1.5:** post-signature artefakt tamper→publish blok.
 
 **6.9 lifecycle enforcement (MEHANIZAM, jezgra):** `MiddlewareChain` success-faze `before_run→
 before_tool→after_tool→before_deliver` (jezgreni policy PRVI i ZADNJI, plugin hook samo SUZI);
@@ -470,7 +470,7 @@ po token-budžetu. **Pareto:** Aider+Repomix+Continue+archmap-PPR (naš).
 **8.4 cache (MEHANIZAM, dva sloja):** (a) API `cache-control` propagacija; (b) lokalni prefix/
 RadixAttention (SAMO self-hosted). **Cache-key MORA nositi (codex#19):** namespace/tenant/principal-
 scope/authz-policy-version/sensitivity/corpus-version/model/prompt-hash/purge-generation — bez
-wildcard fallbacka; SECRET=NO_STORE; purge/revocation povećava generation. **RED codex#19:** `test_cross_tenant_cache_key_cannot_alias`.
+wildcard fallbacka; SECRET=NO_STORE; purge/revocation povećava generation. **RED P2.4 (codex#19):** `test_cross_tenant_cache_key_cannot_alias`.
 **Pareto:** LiteLLM+vLLM+SGLang+tenant-scoped-key (naš).
 
 **8.5 observation-pruning (MEHANIZAM):** filter-PA-komprimiraj tipiziran adapter PO ALATU — test
@@ -489,7 +489,7 @@ pokriva 8.4). **Verifikacija:** kandidati stvarni (RTK/Headroom obsidian, matric
 **9.1 sesije (JEZGRA):** save/resume=svaki stateful harness (naslanja 7.3); branch/user-visible=
 profil. Memory-SPINE=SQLite-WAL (`modernc.org/sqlite`, bez cgo). **Pareto:** goose+OpenHands+Codex+spine.
 
-**9.2 perzistentna memorija (`memorija`):** 5-scope spine (`core/memory.py`), memvec+kg+entres;
+**9.2 perzistentna memorija (`memorija`):** 5-scope spine (`internal/memory`), memvec+kg+entres;
 write-approval DEFAULT ON, untrusted-context labeling (P0.3). **P2.1 MEMORY_FORGET (reverzibilno,
 zabrana recalla) vs DATA_PURGE (ireverzibilno, S6.7 nadjačava, briše i tombstone).** **RED P2.1:** `test_purge_cannot_complete_with_residual_copy`. **Pareto:** letta+mem0+zep+forget/purge-split.
 
@@ -509,7 +509,7 @@ untrusted epizode→gist ostaje UNTRUSTED (P0.3). **Pareto:** letta+mem0+zep+sle
 **9.6 ObligationStore (asistent-jezgra, iz A4-G4):** trajni cilj s eksplicitnom done-definicijom, `MarkDone` SAMO uz Evidence; veže 9.1+3.6; odvojeno od 9.2 razgovorne memorije i 7.2 infra-queue. **Scope: ODLUKA-PRD.**
 
 **S9 = memorija GREENFIELD (Decay+Audn P0, Dream/MemGit/MemAssoc v2) + forget/purge trust-razdvajanje.**
-**Honest gap:** 9.1/9.3/9.4 bez dediciranog Annex RED (P0.13 "decay-never-destroys-bytes" kandidat).
+**Honest gap:** 9.1/9.3/9.4 bez dediciranog Annex RED (P0.13 "decay-never-destroys-bytes" — u Annexu A).
 **Verifikacija:** kandidati stvarni; salvage interni (audit potvrdio). **S9 STATUS: DIZAJN (salvage uklonjen; RESOLVED/UNRESOLVED po podsekciji → PLAN-HOLES-CONSOLIDATED.md).**
 
 ---
@@ -532,13 +532,13 @@ child/contextual usporedba; LlamaIndex+chonkie+RAGFlow.
 
 **10.5 CAG (`preload-cache`, MEHANIZAM decision-rule):** `CAGDecision.Decide(corpus,
 authz)→CAG|RAG|HYBRID` (mali/stabilni/AUTORIZIRAN→CAG preload; velik/dinamičan→RAG; neautoriziran→
-RAG). Top-3 IMPLEMENTACIJA **UNCLEAR** (infra vLLM/SGLang je 8.4). **RED:** neautoriziran korpus→RAG
+RAG). CAG-izvršitelj (KV-preload) je `reserved` u v1 — ako executor ne postoji, odluka `CAG` DEGRADIRA u RAG (ne dangling). Puni preload prati 8.4 self-hosted infra. **RED:** neautoriziran korpus→RAG
 (ne preload). **Pareto:** decision-rule (top-3 pošteno prazno).
 
 **10.6 retrieval-auth (MEHANIZAM jezgra + ADAPTER):** **ACL PRIJE candidate-generation** (deny-
 default, NE post-filter); `RetrievalRequest{principal,tenant,corpus_version,policy_version}`; cache
 invalidacija nakon revocationa; nedopušten dokument NIKAD u candidate/rerank/trace. Qdrant-payload-
-filter/OpenSearch-doc-security/Vespa. **RED codex#2 (Tier-3):** nedopušten dokument ne uđe.
+filter/OpenSearch-doc-security/Vespa. **RED codex#2 (Tier-3 BACKLOG — ne formalni Annex):** nedopušten dokument ne uđe.
 **10.7 quality-gate (`vector-retrieval`, MEHANIZAM):** golden-queries + Recall@k/MRR/nDCG +
 freshness-SLA + citat-do-izvornog-chunka + stale-index-detekcija; odgovor NIJE grounded ako retrieval
 nije izmjeren. Ragas/BEIR/Phoenix. Cross-ref 16.2 (generički ratchet). **RED:** grounding-tvrdnja bez
@@ -602,7 +602,7 @@ policy. **Pareto:** LangGraph+OpenAI-SDK+MAF.
 parsea, allowlist/SSRF obrana pri discoveryju (6.3 metadata-IP/redirect-recheck), AuthN/AuthZ (P1.3),
 timeout/cancel (S7), idempotent task-ID, audit-korelacija (15.3); remote agent=UNTRUSTED peer
 (P0.1 trust_class, izlaz ne postaje instrukcija). Referencira 0.1 sheme + 0.3 capability.
-**RED codex#3 (Tier-3):** A2A adapter conformance (version-negotiation/revocation/replay/bypass).
+**RED codex#3 (Tier-3 BACKLOG — ne formalni Annex):** A2A adapter conformance (version-negotiation/revocation/replay/bypass).
 **Pareto:** A2A-spec+MAF+ADK+sigurnosni-conformance (naš).
 
 **12.6 council (MEHANIZAM, P2.7):** `CouncilRequest` sealed nezavisni review → anonimni cross-review
@@ -771,7 +771,7 @@ Portkey + Dify-kvote; non-null tenant_id na svakom persistentnom envelopeu (code
 rollout/canary:** Kubernetes/Argo-Rollouts/Flagger (komponente); SHA-pinned canary (NEXUS live-canary
 obrazac).
 
-**18.4 state-migracije/backup:** UNCLEAR dok S0.4 ne odabere persistence backend; kandidati
+**18.4 state-migracije/backup:** backend je već SQLite-WAL (Postgres samo `service`) — NE čeka S0.4 (S0.4=schema-verzioniranje, ne backend). Single-user backup = Litestream/WAL-snapshot SADA; Postgres backup prati `service`. Migracije
 golang-migrate/embedded-SQL migracije + point-in-time backup (Litestream za SQLite).
 
 **18.5 fleet (`service`, iz A10/OpenClaw-O11):** placement/registry nodova; fleet NIJE drugi retry-owner (S7 jedini). ID-ovi iz `internal/fleet/ids` (K3 anti-cikl). Dizajn: GAPFIX-codex. **Scope: ODLUKA-PRD.**
@@ -924,7 +924,7 @@ Kako je identitet sad "asistent prvo" (A3.1), foldam materijalne rupe:
 **G1 — OS-wide computer-use (MATERIJALNO, NOVO):** asistent bez rada u lokalnim DESKTOP aplikacijama
 ostaje browser/terminal-only. Nije samo `vision` (13.1) — input-injection (klik/tipkanje) je
 side-effect s DRUGAČIJIM approvalom/replayom/focusom/OS-permissionima. → nova podsekcija u S4/S13,
-`computer-use` flag; approval kroz 6.9 + P1.4 (ireverzibilni GUI side-effect). Obrazac-ideja (NE kod): Hermes
+`computer-use` flag; approval kroz S6.0.Decide→6.9 + P1.4 (ireverzibilni GUI side-effect). Obrazac-ideja (NE kod): Hermes
 computer_use obrazac (ne kod — Go rebuild).
 
 **G2 — Izolirani osobni PROFIL (MATERIJALNO):** "posao"/"privatno"/"obitelj" NE smiju dijeliti
@@ -1149,7 +1149,7 @@ RED + paket-placement) u `docs/GAPFIX-{codex,kilo,agy}.md`. Index + sekcija-plac
 
 ## Asistent (GAPFIX-kilo) — Hermes G1-G5 + OpenClaw
 - **G1 computer-use** → S4.5+13.1+6.9/6.1+P1.4: `InputInject` KEY/MOUSE/TYPE=RED-tier, SCREENSHOT=YELLOW/
- CONFIDENTIAL; bez EffectIntent-approval→6.9 odbij; keystroke u password-polje→6.1 DENY. RED.
+ CONFIDENTIAL; bez EffectIntent-approval→S6.0 odbij; keystroke u nepoznato polje→approval-po-tipu (P1.4). RED.
 - **G2 PersonalProfile** (posao/privatno/obitelj) → `ProfileRegistry` deny-default izolacija (memory/
  secrets/channels/cache); write u `work`→query u `family`=0 hitova. RED.
 - **G3 voice-runtime** → S13.3+S7+6.7: barge-in/wake/consent; audio prije consent→odbij. Obrazac-ideja (NE kod): Hermes voice.

@@ -1,3 +1,5 @@
+> **⚠ EffectPath SUPERSEDED (REVIEW2/3):** `RunTool` iz §B je ZAMIJENJEN verzijom u **`DESIGN-FIXES-r2.md` §K1/K2** (dodaje S6.2 sandbox u put + InProcess/Sandboxed grananje po `ExecutionKind` + ASK-switch + AfterTool-fail-closed). Owner-tablica i cancel-taxonomy iz §B ostaju važeći.
+
 # DESIGN — memorija-descope + archmap + effect-path (greenfield Go, CGO_ENABLED=0)
 
 ## A) S9.4 P0 (Decay+Audn) + S8.3 archmap
