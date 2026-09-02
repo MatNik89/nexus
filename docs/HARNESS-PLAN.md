@@ -349,7 +349,7 @@ reuse. **S5 STATUS: DIZAJN (salvage uklonjen; RESOLVED/UNRESOLVED po podsekciji 
 
 ---
 
-# S6 — KANONSKA SINTEZA (Sigurnost; NAJKRITIČNIJA — membrane salvage 1:1, ne rewrite; 3-way, Pareto PASS)
+# S6 — KANONSKA SINTEZA (Sigurnost; NAJKRITIČNIJA — membrane GREENFIELD od nule + parity-suite; 3-way, Pareto PASS)
 
 **Načelo (audit-konsenzus):** izbrušene membrane se PRESAĐUJU s parity testom, ne pišu iznova.
 Membrane greenfield u Go, fail-closed, non-bypassable (GORTEX ne postoji — piše se od nule).
