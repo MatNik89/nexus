@@ -43,6 +43,10 @@ const (
 	// it still lands as FAILED_TERMINAL (no-retry policy, HARDQ A2).
 	OutcomeFailedRetryable
 	OutcomeFailedTerminal
+	// OutcomeUnknown: an effectful attempt without a valid commit receipt —
+	// the attempt parks in UNKNOWN and ONLY reconciliation (E9, later
+	// owner) may exit it; Report refuses everything from UNKNOWN.
+	OutcomeUnknown
 )
 
 // ErrAttemptNotAuthorized is the SPEC P0.2 literal refusal.
@@ -161,6 +165,8 @@ func (a *Authority) Report(op contracts.OperationID, outcome Outcome) error {
 		ev = machine.EvAttemptSucceeded
 	case OutcomeFailedRetryable, OutcomeFailedTerminal:
 		ev = machine.EvAttemptFailed
+	case OutcomeUnknown:
+		ev = machine.EvAttemptLost
 	default:
 		return fmt.Errorf("s7min report: unknown outcome %d (fail closed)", outcome)
 	}

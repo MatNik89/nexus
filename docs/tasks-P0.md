@@ -156,7 +156,7 @@ Trace: HARDQ A2; HARNESS-SPEC P0.2 single-owner half; E5; REVIEW-TASKS order fix
 Acceptance: every physical attempt carries a grant.
 RED: `test_adapter_cannot_self_retry` — second use of one grant → `ATTEMPT_NOT_AUTHORIZED`.
 
-**[ ] T14 — PEP (S6.0) + lifecycle chain (S6.9) + EffectPath.**
+**[x] T14 — PEP (S6.0) + lifecycle chain (S6.9) + EffectPath.**
 `Decide` total switch default-deny, ASK≠ALLOW; `MiddlewareChain` before/after/on_error;
 `EffectPath` per DESIGN-FIXES-r2 K1/K2 (concrete executor types; unknown kind → reject;
 `classifyEffectPhase` fail-closed). Sandbox executor = contract FAKE here; real backend

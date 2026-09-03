@@ -178,3 +178,22 @@ func TestGrantHygiene(t *testing.T) {
 		t.Fatal("outcome accepted without a consumed grant")
 	}
 }
+
+// OutcomeUnknown parks the attempt in UNKNOWN; Report cannot exit it —
+// only the reconciliation owner (E9) may (P0.1 UNKNOWN discipline).
+func TestUnknownOutcomeParksForReconciliation(t *testing.T) {
+	a := NewAuthority(fixedClock(time.Unix(1000, 0)), time.Minute)
+	g, _ := a.Issue("op-1", "provider-a")
+	if err := a.Consume(g); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Report("op-1", OutcomeUnknown); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := a.State("op-1"); st != contracts.AttemptUnknown {
+		t.Fatalf("state %v, want UNKNOWN", st)
+	}
+	if err := a.Report("op-1", OutcomeSucceeded); err == nil {
+		t.Fatal("Report exited UNKNOWN (reconciliation-only exit violated)")
+	}
+}
