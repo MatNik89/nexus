@@ -18,7 +18,11 @@ import (
 // a string without mutating it (r3 codex #2: structural-field rejection is
 // part of the required contract, not an optional extra interface).
 type Redactor interface {
-	Redact([]byte) []byte
+	// Redact returns the redacted bytes or an ERROR when it cannot redact
+	// soundly (r4 codex #6: an over-budget valid-JSON input must be
+	// rejected by the caller, never silently byte-matched — byte matching
+	// cannot see decoded escape spellings).
+	Redact([]byte) ([]byte, error)
 	Touches(string) bool
 }
 
@@ -134,23 +138,33 @@ func (r *KnownRefs) redactValue(v interface{}, depth int, out *bytes.Buffer) err
 	return nil
 }
 
-// Redact processes b: valid JSON within budget is parsed ONCE and redacted
-// on decoded string values; anything else (invalid, over-budget, transform
-// failure) falls back to raw byte replacement — fail SAFE, never fail open.
-func (r *KnownRefs) Redact(b []byte) []byte {
+// Redact processes b. Valid JSON within budget: parsed once, redacted on
+// decoded string values. Valid JSON OVER budget (bytes or depth): typed
+// ERROR — byte matching cannot see decoded escape spellings, so falling
+// back would fail open (r4 codex #6). Non-JSON input: raw byte replacement
+// (no decoded form exists to miss).
+func (r *KnownRefs) Redact(b []byte) ([]byte, error) {
 	if len(r.entries) == 0 {
-		return b
+		return b, nil
 	}
-	if len(b) <= maxJSONBytes && json.Valid(b) {
+	if json.Valid(b) {
+		if len(b) > maxJSONBytes {
+			return nil, fmt.Errorf("redact: json input exceeds the %d-byte budget (rejected, not byte-matched)", maxJSONBytes)
+		}
 		dec := json.NewDecoder(bytes.NewReader(b))
 		dec.UseNumber()
 		var v interface{}
-		if err := dec.Decode(&v); err == nil {
-			var out bytes.Buffer
-			if err := r.redactValue(v, 0, &out); err == nil && json.Valid(out.Bytes()) {
-				return out.Bytes()
-			}
+		if err := dec.Decode(&v); err != nil {
+			return nil, fmt.Errorf("redact: decode: %w", err)
 		}
+		var out bytes.Buffer
+		if err := r.redactValue(v, 0, &out); err != nil {
+			return nil, fmt.Errorf("redact: %w", err)
+		}
+		if !json.Valid(out.Bytes()) {
+			return nil, fmt.Errorf("redact: transform produced invalid json")
+		}
+		return out.Bytes(), nil
 	}
 	out := b
 	for _, e := range r.entries {
@@ -158,7 +172,7 @@ func (r *KnownRefs) Redact(b []byte) []byte {
 			out = bytes.ReplaceAll(out, []byte(e.value), []byte(fmt.Sprintf("[REDACTED:%s]", e.name)))
 		}
 	}
-	return out
+	return out, nil
 }
 
 // Touches reports whether any known secret occurs in s (decoded-string
@@ -178,5 +192,5 @@ func (r *KnownRefs) Touches(s string) bool {
 // there is simply nothing to match.
 type None struct{}
 
-func (None) Redact(b []byte) []byte { return b }
-func (None) Touches(string) bool    { return false }
+func (None) Redact(b []byte) ([]byte, error) { return b, nil }
+func (None) Touches(string) bool             { return false }

@@ -14,7 +14,7 @@ import (
 
 // Clock is the single time source.
 type Clock interface {
-	Now() time.Time            // wall clock
+	Now() time.Time                  // wall clock
 	Since(t time.Time) time.Duration // monotonic-backed elapsed
 }
 

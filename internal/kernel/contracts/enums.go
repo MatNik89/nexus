@@ -333,60 +333,64 @@ var (
 	resultSpec      = newEnumSpec(resultStatusNames)
 )
 
-func (v Role) Valid() bool          { return roleSpec.valid(v) }
-func (v Role) String() string       { return roleSpec.str(v, "ROLE") }
+func (v Role) Valid() bool             { return roleSpec.valid(v) }
+func (v Role) String() string          { return roleSpec.str(v, "ROLE") }
 func ParseRole(s string) (Role, error) { return roleSpec.parse(s, "role") }
 
-func (v EffectClass) Valid() bool    { return effectSpec.valid(v) }
-func (v EffectClass) String() string { return effectSpec.str(v, "EFFECT_CLASS") }
+func (v EffectClass) Valid() bool                    { return effectSpec.valid(v) }
+func (v EffectClass) String() string                 { return effectSpec.str(v, "EFFECT_CLASS") }
 func ParseEffectClass(s string) (EffectClass, error) { return effectSpec.parse(s, "effect_class") }
 
-func (v TrustClass) Valid() bool    { return trustSpec.valid(v) }
-func (v TrustClass) String() string { return trustSpec.str(v, "TRUST_CLASS") }
+func (v TrustClass) Valid() bool                   { return trustSpec.valid(v) }
+func (v TrustClass) String() string                { return trustSpec.str(v, "TRUST_CLASS") }
 func ParseTrustClass(s string) (TrustClass, error) { return trustSpec.parse(s, "trust_class") }
 
-func (v Sensitivity) Valid() bool    { return sensitivitySpec.valid(v) }
-func (v Sensitivity) String() string { return sensitivitySpec.str(v, "SENSITIVITY") }
+func (v Sensitivity) Valid() bool                    { return sensitivitySpec.valid(v) }
+func (v Sensitivity) String() string                 { return sensitivitySpec.str(v, "SENSITIVITY") }
 func ParseSensitivity(s string) (Sensitivity, error) { return sensitivitySpec.parse(s, "sensitivity") }
 
 func (v ErrorCategory) Valid() bool    { return errCatSpec.valid(v) }
 func (v ErrorCategory) String() string { return errCatSpec.str(v, "ERROR_CATEGORY") }
-func ParseErrorCategory(s string) (ErrorCategory, error) { return errCatSpec.parse(s, "error_category") }
+func ParseErrorCategory(s string) (ErrorCategory, error) {
+	return errCatSpec.parse(s, "error_category")
+}
 
-func (v Retryability) Valid() bool    { return retrySpec.valid(v) }
-func (v Retryability) String() string { return retrySpec.str(v, "RETRYABILITY") }
+func (v Retryability) Valid() bool                     { return retrySpec.valid(v) }
+func (v Retryability) String() string                  { return retrySpec.str(v, "RETRYABILITY") }
 func ParseRetryability(s string) (Retryability, error) { return retrySpec.parse(s, "retryability") }
 
 func (v ExecutionKind) Valid() bool    { return execKindSpec.valid(v) }
 func (v ExecutionKind) String() string { return execKindSpec.str(v, "EXECUTION_KIND") }
-func ParseExecutionKind(s string) (ExecutionKind, error) { return execKindSpec.parse(s, "execution_kind") }
+func ParseExecutionKind(s string) (ExecutionKind, error) {
+	return execKindSpec.parse(s, "execution_kind")
+}
 
-func (v EffectPhase) Valid() bool    { return phaseSpec.valid(v) }
-func (v EffectPhase) String() string { return phaseSpec.str(v, "EFFECT_PHASE") }
+func (v EffectPhase) Valid() bool                    { return phaseSpec.valid(v) }
+func (v EffectPhase) String() string                 { return phaseSpec.str(v, "EFFECT_PHASE") }
 func ParseEffectPhase(s string) (EffectPhase, error) { return phaseSpec.parse(s, "effect_phase") }
 
-func (v Decision) Valid() bool    { return decisionSpec.valid(v) }
-func (v Decision) String() string { return decisionSpec.str(v, "DECISION") }
+func (v Decision) Valid() bool                 { return decisionSpec.valid(v) }
+func (v Decision) String() string              { return decisionSpec.str(v, "DECISION") }
 func ParseDecision(s string) (Decision, error) { return decisionSpec.parse(s, "decision") }
 
-func (v PolicyMode) Valid() bool    { return policyModeSpec.valid(v) }
-func (v PolicyMode) String() string { return policyModeSpec.str(v, "POLICY_MODE") }
+func (v PolicyMode) Valid() bool                   { return policyModeSpec.valid(v) }
+func (v PolicyMode) String() string                { return policyModeSpec.str(v, "POLICY_MODE") }
 func ParsePolicyMode(s string) (PolicyMode, error) { return policyModeSpec.parse(s, "policy_mode") }
 
-func (v RunState) Valid() bool    { return runStateSpec.valid(v) }
-func (v RunState) String() string { return runStateSpec.str(v, "RUN_STATE") }
+func (v RunState) Valid() bool                 { return runStateSpec.valid(v) }
+func (v RunState) String() string              { return runStateSpec.str(v, "RUN_STATE") }
 func ParseRunState(s string) (RunState, error) { return runStateSpec.parse(s, "run_state") }
 
-func (v TurnState) Valid() bool    { return turnStateSpec.valid(v) }
-func (v TurnState) String() string { return turnStateSpec.str(v, "TURN_STATE") }
+func (v TurnState) Valid() bool                  { return turnStateSpec.valid(v) }
+func (v TurnState) String() string               { return turnStateSpec.str(v, "TURN_STATE") }
 func ParseTurnState(s string) (TurnState, error) { return turnStateSpec.parse(s, "turn_state") }
 
-func (v AttemptState) Valid() bool    { return attemptSpec.valid(v) }
-func (v AttemptState) String() string { return attemptSpec.str(v, "ATTEMPT_STATE") }
+func (v AttemptState) Valid() bool                     { return attemptSpec.valid(v) }
+func (v AttemptState) String() string                  { return attemptSpec.str(v, "ATTEMPT_STATE") }
 func ParseAttemptState(s string) (AttemptState, error) { return attemptSpec.parse(s, "attempt_state") }
 
-func (v ResultStatus) Valid() bool    { return resultSpec.valid(v) }
-func (v ResultStatus) String() string { return resultSpec.str(v, "RESULT_STATUS") }
+func (v ResultStatus) Valid() bool                     { return resultSpec.valid(v) }
+func (v ResultStatus) String() string                  { return resultSpec.str(v, "RESULT_STATUS") }
 func ParseResultStatus(s string) (ResultStatus, error) { return resultSpec.parse(s, "result_status") }
 
 func (v Role) MarshalJSON() ([]byte, error) { return roleSpec.marshalJSON(v, "role") }
@@ -419,7 +423,9 @@ func (v *TrustClass) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-func (v Sensitivity) MarshalJSON() ([]byte, error) { return sensitivitySpec.marshalJSON(v, "sensitivity") }
+func (v Sensitivity) MarshalJSON() ([]byte, error) {
+	return sensitivitySpec.marshalJSON(v, "sensitivity")
+}
 func (v *Sensitivity) UnmarshalJSON(b []byte) error {
 	x, err := sensitivitySpec.unmarshalJSON(b, "sensitivity")
 	if err != nil {
@@ -429,7 +435,9 @@ func (v *Sensitivity) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-func (v ErrorCategory) MarshalJSON() ([]byte, error) { return errCatSpec.marshalJSON(v, "error_category") }
+func (v ErrorCategory) MarshalJSON() ([]byte, error) {
+	return errCatSpec.marshalJSON(v, "error_category")
+}
 func (v *ErrorCategory) UnmarshalJSON(b []byte) error {
 	x, err := errCatSpec.unmarshalJSON(b, "error_category")
 	if err != nil {
@@ -449,7 +457,9 @@ func (v *Retryability) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-func (v ExecutionKind) MarshalJSON() ([]byte, error) { return execKindSpec.marshalJSON(v, "execution_kind") }
+func (v ExecutionKind) MarshalJSON() ([]byte, error) {
+	return execKindSpec.marshalJSON(v, "execution_kind")
+}
 func (v *ExecutionKind) UnmarshalJSON(b []byte) error {
 	x, err := execKindSpec.unmarshalJSON(b, "execution_kind")
 	if err != nil {
@@ -479,7 +489,9 @@ func (v *Decision) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-func (v PolicyMode) MarshalJSON() ([]byte, error) { return policyModeSpec.marshalJSON(v, "policy_mode") }
+func (v PolicyMode) MarshalJSON() ([]byte, error) {
+	return policyModeSpec.marshalJSON(v, "policy_mode")
+}
 func (v *PolicyMode) UnmarshalJSON(b []byte) error {
 	x, err := policyModeSpec.unmarshalJSON(b, "policy_mode")
 	if err != nil {
@@ -509,7 +521,9 @@ func (v *TurnState) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-func (v AttemptState) MarshalJSON() ([]byte, error) { return attemptSpec.marshalJSON(v, "attempt_state") }
+func (v AttemptState) MarshalJSON() ([]byte, error) {
+	return attemptSpec.marshalJSON(v, "attempt_state")
+}
 func (v *AttemptState) UnmarshalJSON(b []byte) error {
 	x, err := attemptSpec.unmarshalJSON(b, "attempt_state")
 	if err != nil {
@@ -519,7 +533,9 @@ func (v *AttemptState) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-func (v ResultStatus) MarshalJSON() ([]byte, error) { return resultSpec.marshalJSON(v, "result_status") }
+func (v ResultStatus) MarshalJSON() ([]byte, error) {
+	return resultSpec.marshalJSON(v, "result_status")
+}
 func (v *ResultStatus) UnmarshalJSON(b []byte) error {
 	x, err := resultSpec.unmarshalJSON(b, "result_status")
 	if err != nil {
@@ -529,8 +545,8 @@ func (v *ResultStatus) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-func (v ActorType) Valid() bool    { return actorTypeSpec.valid(v) }
-func (v ActorType) String() string { return actorTypeSpec.str(v, "ACTOR_TYPE") }
+func (v ActorType) Valid() bool                  { return actorTypeSpec.valid(v) }
+func (v ActorType) String() string               { return actorTypeSpec.str(v, "ACTOR_TYPE") }
 func ParseActorType(s string) (ActorType, error) { return actorTypeSpec.parse(s, "actor_type") }
 func (v ActorType) MarshalJSON() ([]byte, error) { return actorTypeSpec.marshalJSON(v, "actor_type") }
 func (v *ActorType) UnmarshalJSON(b []byte) error {

@@ -10,14 +10,14 @@ import (
 // (HARDQ B3) and therefore validated everywhere it appears.
 
 type (
-	SchemaID   string
-	EventID    string
-	RunID      string
-	TurnID     string
-	ToolCallID string
-	MessageID  string
-	BlockID    string
-	ActorID    string
+	SchemaID    string
+	EventID     string
+	RunID       string
+	TurnID      string
+	ToolCallID  string
+	MessageID   string
+	BlockID     string
+	ActorID     string
 	PrincipalID string
 	TenantID    string
 	WorkspaceID string

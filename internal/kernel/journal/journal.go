@@ -17,6 +17,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -112,6 +113,7 @@ var (
 	testPauseAfterCommit func()
 	testPauseBeforeReply func()
 	testFailCommit       func() error
+	testFailLeaseDelete  func() error
 )
 
 func selfStartToken() (int, string, error) {
@@ -201,9 +203,6 @@ func Open(path string, profile contracts.ProfileID, r redact.Redactor, events ma
 		return fail(fmt.Errorf("journal open commit: %w", err))
 	}
 
-	// The chain is verified BEFORE ownership is published (r3 codex #3:
-	// a failed open must not leave a live lease behind) — a tampered
-	// journal never starts serving nor claims the lease.
 	j := &Journal{
 		db: db, profile: profile, redact: r,
 		reqs: make(chan appendReq), done: make(chan struct{}), actorDone: make(chan struct{}),
@@ -218,12 +217,6 @@ func Open(path string, profile contracts.ProfileID, r redact.Redactor, events ma
 		}
 		j.events[name] = v
 	}
-	lastOffset, lastHash, err := j.verifyChainFull()
-	if err != nil {
-		db.Close()
-		return nil, fmt.Errorf("journal open: %w", err)
-	}
-
 	// Single-writer lease (B7): value = pid:starttime:nonce. A LIVE holder
 	// (any pid, incl. our own other handle — the NONCE distinguishes
 	// handles, r3 codex #3) blocks this open; a dead one is taken over.
@@ -273,6 +266,19 @@ func Open(path string, profile contracts.ProfileID, r redact.Redactor, events ma
 		return nil, fmt.Errorf("journal open lease commit: %w", err)
 	}
 	j.leaseToken = token
+	releaseLease := func() {
+		db.Exec(`DELETE FROM journal_meta WHERE key='writer' AND value=?`, token)
+	}
+	// Recovery runs UNDER our ownership (r4 codex #3: verify-before-lease
+	// allowed a live writer to append between snapshot and handoff — stale
+	// actor state). Any failure releases the exact acquired token.
+	lastOffset, lastHash, err := j.verifyChainFull()
+	if err != nil {
+		releaseLease()
+		db.Close()
+		return nil, fmt.Errorf("journal open: %w", err)
+	}
+
 	go j.actor(lastOffset, lastHash)
 	return j, nil
 }
@@ -347,7 +353,11 @@ func (j *Journal) appendOne(p contracts.EnvelopeParams, offset uint64, prevHash 
 	}
 	// Redact the payload SEMANTICALLY, then recompute its hash so integrity
 	// describes the stored bytes (r1 kilo #2).
-	p.Payload = json.RawMessage(j.redact.Redact([]byte(p.Payload)))
+	redacted, rerr := j.redact.Redact([]byte(p.Payload))
+	if rerr != nil {
+		return fail(fmt.Errorf("journal append: %w", rerr))
+	}
+	p.Payload = json.RawMessage(redacted)
 	sum := sha256.Sum256(p.Payload)
 	p.PayloadHash = hex.EncodeToString(sum[:])
 	if validator != nil {
@@ -525,10 +535,15 @@ func (j *Journal) Close() error {
 	j.closeOnce.Do(func() {
 		close(j.done)
 		<-j.actorDone
+		var leaseErr error
 		if j.leaseToken != "" {
-			j.db.Exec(`DELETE FROM journal_meta WHERE key='writer' AND value=?`, j.leaseToken)
+			if testFailLeaseDelete != nil {
+				leaseErr = testFailLeaseDelete()
+			} else if _, err := j.db.Exec(`DELETE FROM journal_meta WHERE key='writer' AND value=?`, j.leaseToken); err != nil {
+				leaseErr = fmt.Errorf("journal close: releasing writer lease: %w", err)
+			}
 		}
-		j.closeErr = j.db.Close()
+		j.closeErr = errors.Join(leaseErr, j.db.Close())
 	})
 	return j.closeErr
 }

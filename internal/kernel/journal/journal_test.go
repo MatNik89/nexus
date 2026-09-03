@@ -7,8 +7,8 @@ package journal
 
 import (
 	"context"
-	"database/sql"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -172,21 +172,31 @@ func TestPayloadHashMatchesStoredPayload(t *testing.T) {
 func TestSecretInStructuralFieldRejected(t *testing.T) {
 	secret := "tok-9988776655"
 	fields := map[string]func(*contracts.EnvelopeParams){
-		"actor_id":       func(p *contracts.EnvelopeParams) { p.ActorID = contracts.ActorID("a-" + secret) },
-		"event_id":       func(p *contracts.EnvelopeParams) { p.EventID = contracts.EventID("e-" + secret) },
-		"run_id":         func(p *contracts.EnvelopeParams) { p.RunID = contracts.RunID("r-" + secret) },
-		"event_type":     func(p *contracts.EnvelopeParams) { p.EventType = "x-" + secret },
-		"principal_id":   func(p *contracts.EnvelopeParams) { p.PrincipalID = contracts.PrincipalID("p-" + secret) },
-		"workspace_id":   func(p *contracts.EnvelopeParams) { p.WorkspaceID = contracts.WorkspaceID("w-" + secret) },
+		"actor_id": func(p *contracts.EnvelopeParams) { p.ActorID = contracts.ActorID("a-" + secret) },
+		"event_id": func(p *contracts.EnvelopeParams) { p.EventID = contracts.EventID("e-" + secret) },
+		"run_id":   func(p *contracts.EnvelopeParams) { p.RunID = contracts.RunID("r-" + secret) },
+		// event_type is registered below so admission reaches the
+		// structural-secret check (r4 codex #2: an unregistered name was
+		// rejected earlier, making this subtest non-causal).
+		"event_type":      func(p *contracts.EnvelopeParams) { p.EventType = "x-" + secret },
+		"principal_id":    func(p *contracts.EnvelopeParams) { p.PrincipalID = contracts.PrincipalID("p-" + secret) },
+		"workspace_id":    func(p *contracts.EnvelopeParams) { p.WorkspaceID = contracts.WorkspaceID("w-" + secret) },
 		"parent_event_id": func(p *contracts.EnvelopeParams) { id := contracts.EventID("pe-" + secret); p.ParentEventID = &id },
-		"turn_id":        func(p *contracts.EnvelopeParams) { id := contracts.TurnID("t-" + secret); p.TurnID = &id },
-		"tool_call_id":   func(p *contracts.EnvelopeParams) { id := contracts.ToolCallID("tc-" + secret); p.ToolCallID = &id },
+		"turn_id":         func(p *contracts.EnvelopeParams) { id := contracts.TurnID("t-" + secret); p.TurnID = &id },
+		"tool_call_id":    func(p *contracts.EnvelopeParams) { id := contracts.ToolCallID("tc-" + secret); p.ToolCallID = &id },
 		"idempotency_key": func(p *contracts.EnvelopeParams) { k := "k-" + secret; p.IdempotencyKey = &k },
 	}
 	for name, mutate := range fields {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
-			j := open(t, dir, redact.NewKnownRefs(map[string]string{"tg": secret}))
+			ev := manyEvents()
+			ev["x-"+secret] = nil // registered: rejection must come from Touches
+			j, err := Open(filepath.Join(dir, "journal.db"), "work",
+				redact.NewKnownRefs(map[string]string{"tg": secret}), ev)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer j.Close()
 			p := params("run-a", "x")
 			mutate(&p)
 			if _, err := j.Append(context.Background(), p); err == nil {
@@ -364,6 +374,14 @@ func TestCancelBetweenCommitAndReplyStillDefinitive(t *testing.T) {
 	}()
 	<-inWindow // actor has committed, reply not yet delivered
 	cancel()   // cancellation lands exactly in the forbidden window
+	// Revert-proof (r4 codex #7): while the actor is STILL blocked, a
+	// wrong implementation selecting ctx.Done() would return NOW — prove
+	// nothing returns before release.
+	select {
+	case r := <-res:
+		t.Fatalf("Append returned during the blocked window: %+v (cancel must not preempt a committed result)", r)
+	case <-time.After(300 * time.Millisecond):
+	}
 	close(release)
 	r := <-res
 	if r.err != nil {
@@ -397,7 +415,9 @@ func TestPayloadValidatorEnforced(t *testing.T) {
 	dir := t.TempDir()
 	j, err := Open(filepath.Join(dir, "journal.db"), "work", redact.None{},
 		map[string]PayloadValidator{"typed.event": func(p json.RawMessage) error {
-			var v struct{ Must string `json:"must"` }
+			var v struct {
+				Must string `json:"must"`
+			}
 			if err := json.Unmarshal(p, &v); err != nil || v.Must == "" {
 				return fmt.Errorf("payload requires non-empty 'must'")
 			}
@@ -452,12 +472,12 @@ func TestChainTamperDetected(t *testing.T) {
 	// Tamper with each authenticated field class in turn (r2 codex #1:
 	// one-field hashing was implementation-derived).
 	mutations := map[string]string{
-		"envelope":  `UPDATE events SET envelope = replace(envelope, 'e1', 'eX') WHERE journal_offset = 2`,
-		"run_id":    `UPDATE events SET run_id = 'run-forged' WHERE journal_offset = 2`,
-		"sequence":  `UPDATE events SET sequence = 99 WHERE journal_offset = 2`,
-		"rpv":       `UPDATE events SET redaction_policy_version = 42 WHERE journal_offset = 2`,
-		"sealed":    `UPDATE events SET sealed_payload_ref = 'forged' WHERE journal_offset = 2`,
-		"event_id":  `UPDATE events SET event_id = 'ev-forged' WHERE journal_offset = 2`,
+		"envelope": `UPDATE events SET envelope = replace(envelope, 'e1', 'eX') WHERE journal_offset = 2`,
+		"run_id":   `UPDATE events SET run_id = 'run-forged' WHERE journal_offset = 2`,
+		"sequence": `UPDATE events SET sequence = 99 WHERE journal_offset = 2`,
+		"rpv":      `UPDATE events SET redaction_policy_version = 42 WHERE journal_offset = 2`,
+		"sealed":   `UPDATE events SET sealed_payload_ref = 'forged' WHERE journal_offset = 2`,
+		"event_id": `UPDATE events SET event_id = 'ev-forged' WHERE journal_offset = 2`,
 	}
 	for name, stmt := range mutations {
 		t.Run(name, func(t *testing.T) {
@@ -584,4 +604,24 @@ func sha256Sum(b []byte) []byte {
 	h := sha256.New()
 	h.Write(b)
 	return h.Sum(nil)
+}
+
+// A failed lease release surfaces as a Close error (r4 codex #3).
+func TestLeaseDeleteFailureSurfacesOnClose(t *testing.T) {
+	j := open(t, t.TempDir(), redact.None{})
+	testFailLeaseDelete = func() error { return fmt.Errorf("injected lease-delete failure") }
+	defer func() { testFailLeaseDelete = nil }()
+	if err := j.Close(); err == nil {
+		t.Fatal("Close swallowed the lease-release failure")
+	}
+}
+
+// Over-budget payload REJECTS the append (redaction cannot fail open).
+func TestOverBudgetPayloadRejected(t *testing.T) {
+	j := open(t, t.TempDir(), redact.NewKnownRefs(map[string]string{"k": "secret"}))
+	p := params("run-a", "e1")
+	p.Payload = json.RawMessage(`{"pad":"` + strings.Repeat("a", 1<<20) + `"}`)
+	if _, err := j.Append(context.Background(), p); err == nil {
+		t.Fatal("over-budget payload accepted")
+	}
 }

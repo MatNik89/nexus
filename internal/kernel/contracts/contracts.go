@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -89,9 +90,16 @@ func (e Envelope) MarshalJSON() ([]byte, error) {
 	}
 	// Remove EVERY known key from the preserved copy first — otherwise a
 	// cleared omitempty optional (turn_id…) would be resurrected from Wire
-	// (r3 codex #5). Only truly UNKNOWN fields survive from Wire.
-	for _, k := range envelopeKnownKeys {
-		delete(orig, k)
+	// (r3 codex #5). Deletion is CASE-INSENSITIVE because encoding/json
+	// matches struct tags case-insensitively: "TURN_ID" parses into TurnID
+	// and must not survive as a fake unknown field (r4 codex #5).
+	for k := range orig {
+		for _, known := range envelopeKnownKeys {
+			if strings.EqualFold(k, known) {
+				delete(orig, k)
+				break
+			}
+		}
 	}
 	for k, v := range kn {
 		orig[k] = v

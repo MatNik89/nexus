@@ -32,21 +32,21 @@ func TestEnvelopeConstructorAcceptsValid(t *testing.T) {
 
 func TestEnvelopeConstructorRejectsEachMissingMust(t *testing.T) {
 	cases := map[string]func(*EnvelopeParams){
-		"schema_id":     func(p *EnvelopeParams) { p.SchemaID = "" },
-		"event_id":      func(p *EnvelopeParams) { p.EventID = "" },
-		"event_type":    func(p *EnvelopeParams) { p.EventType = "" },
-		"run_id":        func(p *EnvelopeParams) { p.RunID = "" },
-		"emitted_at":    func(p *EnvelopeParams) { p.EmittedAt = time.Time{} },
-		"actor_type":    func(p *EnvelopeParams) { p.ActorType = ActorInvalid },
-		"actor_type_oob": func(p *EnvelopeParams) { p.ActorType = ActorType(99) },
-		"actor_id":      func(p *EnvelopeParams) { p.ActorID = "" },
-		"principal_id":  func(p *EnvelopeParams) { p.PrincipalID = "" },
-		"workspace_id":  func(p *EnvelopeParams) { p.WorkspaceID = "" },
-		"profile_id":    func(p *EnvelopeParams) { p.ProfileID = "" }, // B3: non-null always
-		"attempt_no":    func(p *EnvelopeParams) { p.AttemptNo = 0 },
-		"payload":       func(p *EnvelopeParams) { p.Payload = json.RawMessage(`{not json`) },
-		"payload_hash":  func(p *EnvelopeParams) { p.PayloadHash = "" },
-		"schema_version": func(p *EnvelopeParams) { p.SchemaVersion = 0 },
+		"schema_id":       func(p *EnvelopeParams) { p.SchemaID = "" },
+		"event_id":        func(p *EnvelopeParams) { p.EventID = "" },
+		"event_type":      func(p *EnvelopeParams) { p.EventType = "" },
+		"run_id":          func(p *EnvelopeParams) { p.RunID = "" },
+		"emitted_at":      func(p *EnvelopeParams) { p.EmittedAt = time.Time{} },
+		"actor_type":      func(p *EnvelopeParams) { p.ActorType = ActorInvalid },
+		"actor_type_oob":  func(p *EnvelopeParams) { p.ActorType = ActorType(99) },
+		"actor_id":        func(p *EnvelopeParams) { p.ActorID = "" },
+		"principal_id":    func(p *EnvelopeParams) { p.PrincipalID = "" },
+		"workspace_id":    func(p *EnvelopeParams) { p.WorkspaceID = "" },
+		"profile_id":      func(p *EnvelopeParams) { p.ProfileID = "" }, // B3: non-null always
+		"attempt_no":      func(p *EnvelopeParams) { p.AttemptNo = 0 },
+		"payload":         func(p *EnvelopeParams) { p.Payload = json.RawMessage(`{not json`) },
+		"payload_hash":    func(p *EnvelopeParams) { p.PayloadHash = "" },
+		"schema_version":  func(p *EnvelopeParams) { p.SchemaVersion = 0 },
 		"control-char-id": func(p *EnvelopeParams) { p.RunID = "run\x00evil" },
 	}
 	for name, mutate := range cases {
@@ -275,7 +275,6 @@ func TestParseEnvelopeWireObeysSameMusts(t *testing.T) {
 	}
 }
 
-
 func validBlock(t *testing.T) ContextBlock {
 	t.Helper()
 	c := "content"
@@ -332,7 +331,7 @@ func TestMessageRejectsForgedBlock(t *testing.T) {
 }
 
 func TestToolResultRejectsForgedCall(t *testing.T) {
-	if _, err := NewToolResult(ToolCall{}, ResultSucceeded, nil, nil, time.Unix(1,0), time.Unix(2,0), nil); err == nil {
+	if _, err := NewToolResult(ToolCall{}, ResultSucceeded, nil, nil, time.Unix(1, 0), time.Unix(2, 0), nil); err == nil {
 		t.Fatal("zero-value ToolCall accepted as the originating call")
 	}
 }
@@ -435,7 +434,6 @@ func TestManualRecoveryStatesExist(t *testing.T) {
 	}
 }
 
-
 // A cleared known optional must not be resurrected from Wire on marshal
 // (r3 codex #5).
 func TestClearedOptionalNotResurrectedFromWire(t *testing.T) {
@@ -458,5 +456,29 @@ func TestClearedOptionalNotResurrectedFromWire(t *testing.T) {
 	}
 	if strings.Contains(string(re), "turn-9") {
 		t.Fatalf("cleared turn_id resurrected from Wire: %s", re)
+	}
+}
+
+// A case-aliased known key must not survive as a fake unknown field
+// (r4 codex #5: encoding/json matches tags case-insensitively).
+func TestCaseAliasedOptionalNotResurrected(t *testing.T) {
+	p := validEnvelopeParams()
+	env, err := NewEnvelope(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(env)
+	aliased := strings.Replace(string(raw), `{`, `{"TURN_ID":"turn-9",`, 1)
+	back, err := ParseEnvelope([]byte(aliased))
+	if err != nil {
+		t.Fatal(err)
+	}
+	back.TurnID = nil
+	re, err := json.Marshal(back)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(re), "turn-9") {
+		t.Fatalf("case-aliased turn_id resurrected: %s", re)
 	}
 }
