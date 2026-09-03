@@ -74,7 +74,7 @@ budget hard-limit breach → refuse, not truncate-silently; injected clock/ID �
 the same scenario produce identical event timelines (determinism conformance);
 `Assembler.Base` composes a fixed block set deterministically (golden output).
 
-**[ ] T06 — EventJournal core (P0.3): durability + serialization.**
+**[x] T06 (this commit) — EventJournal core (P0.3): durability + serialization.**
 SQLite-WAL (`modernc.org/sqlite`), bounded `busy_timeout`; ONE serialized append actor owns
 Append + sequence; known-ref secret redaction BEFORE append (C1).
 Trace: HARNESS-SPEC P0.3; E4; HARDQ B7/C1.
