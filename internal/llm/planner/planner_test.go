@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
+	"github.com/MatNik89/nexus/internal/kernel/effectpath"
 	"github.com/MatNik89/nexus/internal/kernel/s7min"
 	"github.com/MatNik89/nexus/internal/llm/provider"
 )
@@ -218,5 +219,61 @@ func TestFailedPlanLandsHonestS7State(t *testing.T) {
 	_, perr := p3.Plan(context.Background(), []contracts.ContextBlock{b})
 	if perr == nil || !strings.Contains(perr.Error(), "S7 landing") {
 		t.Fatalf("landing failure not surfaced: %v", perr)
+	}
+}
+
+// Tool planning is SEALED-spec driven (Phase-3 codex #2/#3): the model
+// chooses tool_id+arguments only; effect/kind/schema come from the
+// registry, the profile from the session; an unknown tool_id is an ERROR;
+// prose replies stay finals.
+func TestToolPlanningSealedSpecs(t *testing.T) {
+	auth := s7min.NewAuthority(nil, time.Minute)
+	fc := &fakeChat{auth: auth, reply: `{"action":"tool","tool_id":"memory_remember","arguments":{"content":"x"}}`}
+	p, err := New(fc, auth, "provider:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.WithTools(map[contracts.ToolID]effectpath.ToolSpec{
+		"memory_remember": {Effect: contracts.EffectReversible, ExecutionKind: contracts.ExecInProcess,
+			ArgsSchemaHash: "v1", Description: "store"},
+	}, "work"); err != nil {
+		t.Fatal(err)
+	}
+	b := userBlockForPlan(t)
+	action, err := p.Plan(context.Background(), []contracts.ContextBlock{b})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action.Call == nil {
+		t.Fatalf("tool reply did not become a call: %+v", action)
+	}
+	c := *action.Call
+	if c.Effect != contracts.EffectReversible || c.ExecutionKind != contracts.ExecInProcess ||
+		c.ArgsSchemaHash != "v1" || c.ProfileID != "work" {
+		t.Fatalf("call not sealed from the registry: %+v", c)
+	}
+	if c.IdempotencyKey == nil || *c.IdempotencyKey == "" {
+		t.Fatal("effectful call minted without an idempotency key")
+	}
+	// Unknown tool id: ERROR, never silently downgraded to text.
+	fc.reply = `{"action":"tool","tool_id":"wipe_disk","arguments":{}}`
+	if _, err := p.Plan(context.Background(), []contracts.ContextBlock{b}); err == nil {
+		t.Fatal("unknown tool id accepted")
+	}
+	// Prose replies stay FINAL and are delivered in one piece.
+	delivered := ""
+	p2, _ := New(&fakeChat{auth: auth, reply: "just an answer"}, auth, "provider:test")
+	p2.deliver = func(d string) error { delivered = d; return nil }
+	if _, err := p2.WithTools(map[contracts.ToolID]effectpath.ToolSpec{
+		"t": {Effect: contracts.EffectReadOnly, ExecutionKind: contracts.ExecInProcess, ArgsSchemaHash: "v1"},
+	}, "work"); err != nil {
+		t.Fatal(err)
+	}
+	action, err = p2.Plan(context.Background(), []contracts.ContextBlock{b})
+	if err != nil || action.Final == nil || *action.Final != "just an answer" {
+		t.Fatalf("prose reply not final: %+v %v", action, err)
+	}
+	if delivered != "just an answer" {
+		t.Fatalf("final not delivered to the sink: %q", delivered)
 	}
 }

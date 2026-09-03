@@ -3,10 +3,13 @@
 package journal
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"regexp"
 	"strings"
+
+	"github.com/MatNik89/nexus/internal/kernel/contracts"
 )
 
 // ProjTx is the RESTRICTED transaction handed to projections: statements
@@ -173,3 +176,21 @@ func (p *Projector) Run(apply func(tx *ProjTx, ev Event) error) error {
 		return nil
 	})
 }
+
+// QueryProjection is the GUARDED read path for projection-owned tables:
+// SELECT-only, canonical tables rejected lexically like every projection
+// write (Phase-3 codex #1: projections living in the journal file need a
+// read seam that cannot touch the canon).
+func (j *Journal) QueryProjection(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	trimmed := strings.TrimSpace(strings.ToLower(query))
+	if !strings.HasPrefix(trimmed, "select") {
+		return nil, fmt.Errorf("NON_CANONICAL_WRITE: projection reads are SELECT-only (fail closed)")
+	}
+	if err := guardStatement(query); err != nil {
+		return nil, err
+	}
+	return j.db.QueryContext(ctx, query, args...)
+}
+
+// Profile reports the journal's bound profile (projections inherit it).
+func (j *Journal) Profile() contracts.ProfileID { return j.profile }

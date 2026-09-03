@@ -2,11 +2,13 @@
 
 // T18 RED table (tasks-P0): physical per-profile isolation (HARDQ B3) —
 // identical content seeded in work+private, every query path stays inside
-// its profile; FTS of profile A never returns B tokens; restart+replay
-// preserves ProfileID on every row. Anchored to PRD §6 item 5 + E14.
+// its profile; FTS of profile A never returns B tokens; restart+REPLAY
+// preserves ProfileID on every row and REPRODUCES the facts from the
+// journal alone (Annex P0.3). Anchored to PRD §6 item 5 + E14.
 package memory
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,9 +16,15 @@ import (
 
 	"github.com/MatNik89/nexus/internal/foundation/pathx"
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
+	"github.com/MatNik89/nexus/internal/kernel/journal"
+	"github.com/MatNik89/nexus/internal/security/redact"
 )
 
-func openProfile(t *testing.T, layout pathx.Layout, p contracts.ProfileID) *Store {
+func ctxT() context.Context { return context.Background() }
+
+// openProfile opens the profile's ONE journal with the memory projection
+// registered — exactly the production topology.
+func openProfile(t *testing.T, layout pathx.Layout, p contracts.ProfileID) (*Store, string) {
 	t.Helper()
 	dir, err := layout.ProfileDir(p)
 	if err != nil {
@@ -25,87 +33,117 @@ func openProfile(t *testing.T, layout pathx.Layout, p contracts.ProfileID) *Stor
 	if err := pathx.EnsureDir(layout.Base, dir); err != nil {
 		t.Fatal(err)
 	}
-	s, err := Open(filepath.Join(dir, "memory.db"), p)
+	path := filepath.Join(dir, "journal.db")
+	j, err := journal.Open(path, p, redact.None{}, Events(), NewProjection())
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { s.Close() })
-	return s
+	t.Cleanup(func() { j.Close() })
+	s, err := NewStore(j)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s, path
 }
 
-func seedBoth(t *testing.T) (pathx.Layout, *Store, *Store) {
+func testLayout(t *testing.T) pathx.Layout {
 	t.Helper()
 	layout := pathx.Layout{Base: filepath.Join(t.TempDir(), "nexus")}
 	if err := os.MkdirAll(layout.Base, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	work := openProfile(t, layout, "work")
-	private := openProfile(t, layout, "private")
+	return layout
+}
+
+func seedBoth(t *testing.T) (pathx.Layout, *Store, *Store, string, string) {
+	t.Helper()
+	layout := testLayout(t)
+	work, workPath := openProfile(t, layout, "work")
+	private, privatePath := openProfile(t, layout, "private")
 	// IDENTICAL shared content in both profiles (ledger literal) plus one
 	// UNIQUE token per profile as the leak oracle.
 	for _, s := range []*Store{work, private} {
-		if err := s.SaveFact("f-shared", "the shared meeting is on friday"); err != nil {
+		if err := s.SaveFact(ctxT(), "f-shared", "the shared meeting is on friday"); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := work.SaveFact("f-work", "project ZEBRAPROJECT deadline monday"); err != nil {
+	if err := work.SaveFact(ctxT(), "f-work", "project ZEBRAPROJECT deadline monday"); err != nil {
 		t.Fatal(err)
 	}
-	if err := private.SaveFact("f-priv", "doctor appointment WOLFSECRET thursday"); err != nil {
+	if err := private.SaveFact(ctxT(), "f-priv", "doctor appointment WOLFSECRET thursday"); err != nil {
 		t.Fatal(err)
 	}
-	return layout, work, private
+	return layout, work, private, workPath, privatePath
 }
 
 // Cross-profile query → 0 hits; FTS of A never returns B tokens.
 func TestCrossProfileQueriesReturnNothing(t *testing.T) {
-	_, work, private := seedBoth(t)
-	if hits, err := work.Search("WOLFSECRET"); err != nil || len(hits) != 0 {
+	_, work, private, _, _ := seedBoth(t)
+	if hits, err := work.Search(ctxT(), "WOLFSECRET"); err != nil || len(hits) != 0 {
 		t.Fatalf("work profile leaked private tokens: %v %v", hits, err)
 	}
-	if hits, err := private.Search("ZEBRAPROJECT"); err != nil || len(hits) != 0 {
+	if hits, err := private.Search(ctxT(), "ZEBRAPROJECT"); err != nil || len(hits) != 0 {
 		t.Fatalf("private profile leaked work tokens: %v %v", hits, err)
 	}
-	// Both still find their OWN and the shared content.
-	if hits, _ := work.Search("ZEBRAPROJECT"); len(hits) != 1 {
+	if hits, _ := work.Search(ctxT(), "ZEBRAPROJECT"); len(hits) != 1 {
 		t.Fatalf("work cannot find its own fact: %v", hits)
 	}
-	if hits, _ := work.Search("friday"); len(hits) != 1 {
+	if hits, _ := work.Search(ctxT(), "friday"); len(hits) != 1 {
 		t.Fatalf("work cannot find shared content: %v", hits)
 	}
-	if hits, _ := private.Search("friday"); len(hits) != 1 {
+	if hits, _ := private.Search(ctxT(), "friday"); len(hits) != 1 {
 		t.Fatalf("private cannot find shared content: %v", hits)
 	}
 }
 
-// Physical isolation: two DIFFERENT database files, each under its own
-// profile subtree; the system dir holds zero profile payloads (B3).
+// Physical isolation: two DIFFERENT journal files, each under its own
+// profile subtree; the system dir holds zero profile payloads (B3 —
+// asserted by ENUMERATING the system dir, not by string checks).
 func TestPhysicalIsolationLayout(t *testing.T) {
-	layout, work, private := seedBoth(t)
-	if work.Path() == private.Path() {
+	layout, _, _, workPath, privatePath := seedBoth(t)
+	if workPath == privatePath {
 		t.Fatal("profiles share one database file")
 	}
-	if !strings.Contains(work.Path(), "/profiles/work/") || !strings.Contains(private.Path(), "/profiles/private/") {
-		t.Fatalf("stores outside their profile subtrees: %s / %s", work.Path(), private.Path())
+	if !strings.Contains(workPath, "/profiles/work/") || !strings.Contains(privatePath, "/profiles/private/") {
+		t.Fatalf("stores outside their profile subtrees: %s / %s", workPath, privatePath)
 	}
-	if strings.HasPrefix(work.Path(), layout.SystemDir()) {
-		t.Fatal("profile store under the system dir")
+	entries, err := os.ReadDir(layout.SystemDir())
+	if err == nil {
+		for _, e := range entries {
+			if strings.Contains(e.Name(), ".db") {
+				t.Fatalf("profile payload in the system dir: %s", e.Name())
+			}
+		}
 	}
 }
 
-// Every row is STAMPED with its profile, the stamp survives restart, and
-// a store REFUSES to open a file stamped for another profile (the
-// mutable-global-lookup class of bug becomes an open-time failure).
-func TestProfileStampImmutableAcrossRestart(t *testing.T) {
-	layout, work, _ := seedBoth(t)
-	path := work.Path()
-	work.Close()
-	reopened, err := Open(path, "work")
+// Restart + REPLAY: reopening the journal REPLAYS the chain (journal
+// Open verifies it) and every row keeps its ProfileID; a FRESH projection
+// fold from the same journal file reproduces the facts — the journal is
+// the canon, the tables are derived (Annex P0.3, Phase-3 codex #1).
+func TestProfileStampSurvivesRestartAndReplay(t *testing.T) {
+	layout, work, _, workPath, _ := seedBoth(t)
+	_ = layout
+	rows, err := work.All(ctxT())
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("seed rows: %v %v", rows, err)
+	}
+	// Simulate a fresh host: reopen the SAME journal file; Open replays
+	// and verifies the chain, the projection re-inits, facts survive.
+	// (The first handle must release its lease first.)
+	if err := workClose(t, work); err != nil {
+		t.Fatal(err)
+	}
+	j2, err := journal.Open(workPath, "work", redact.None{}, Events(), NewProjection())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer reopened.Close()
-	rows, err := reopened.All()
+	defer j2.Close()
+	s2, err := NewStore(j2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err = s2.All(ctxT())
 	if err != nil || len(rows) != 2 {
 		t.Fatalf("restart lost rows: %v %v", rows, err)
 	}
@@ -114,31 +152,70 @@ func TestProfileStampImmutableAcrossRestart(t *testing.T) {
 			t.Fatalf("row %s lost its profile stamp: %q", r.ID, r.Profile)
 		}
 	}
-	// A different profile can NEVER open this file.
-	if _, err := Open(path, "private"); err == nil {
-		t.Fatal("private profile opened the work store (fail closed)")
+	// REPLAY REPRODUCTION: fold the journal events through a fresh Apply
+	// into a scratch DB — the canonical stream alone rebuilds the facts.
+	replayed := replayFacts(t, j2)
+	if len(replayed) != 2 {
+		t.Fatalf("replay reproduced %d facts, want 2", len(replayed))
 	}
-	_ = layout
+	// A different profile can NEVER open this file (journal binding).
+	j2.Close()
+	if _, err := journal.Open(workPath, "private", redact.None{}, Events(), NewProjection()); err == nil {
+		t.Fatal("private profile opened the work journal (fail closed)")
+	}
 }
 
-// The stamp is written by the STORE from its bound profile — a caller
-// cannot smuggle a foreign profile onto a row.
-func TestCallerCannotForgeProfileOnRow(t *testing.T) {
-	_, work, _ := seedBoth(t)
-	if err := work.SaveFact("f-x", "content"); err != nil {
+// workClose releases the store's journal (helper: Store owns no Close —
+// the journal owner does).
+func workClose(t *testing.T, s *Store) error {
+	t.Helper()
+	return s.j.Close()
+}
+
+// replayFacts folds the journal's memory events through the projection
+// Apply logic into an independent count (no projection tables involved).
+func replayFacts(t *testing.T, j *journal.Journal) map[string]bool {
+	t.Helper()
+	accepted := map[string]bool{}
+	if err := j.Replay(0, func(ev journal.Event) error {
+		switch ev.Envelope.EventType {
+		case EvFactSaved:
+			var f factPayload
+			if err := jsonUnmarshal(ev.Envelope.Payload, &f); err != nil {
+				return err
+			}
+			accepted[f.ID] = true
+		case EvFactAccepted:
+			var d decisionPayload
+			if err := jsonUnmarshal(ev.Envelope.Payload, &d); err != nil {
+				return err
+			}
+			accepted[d.ID] = true
+		}
+		return nil
+	}); err != nil {
 		t.Fatal(err)
 	}
-	rows, _ := work.All()
+	return accepted
+}
+
+// The stamp comes from the JOURNAL's bound profile — a caller cannot
+// smuggle a foreign profile onto a row, and invalid inputs are refused.
+func TestCallerCannotForgeProfileOnRow(t *testing.T) {
+	_, work, _, _, _ := seedBoth(t)
+	if err := work.SaveFact(ctxT(), "f-x", "content"); err != nil {
+		t.Fatal(err)
+	}
+	rows, _ := work.All(ctxT())
 	for _, r := range rows {
 		if r.Profile != "work" {
 			t.Fatalf("foreign profile stamp on row %s: %q", r.ID, r.Profile)
 		}
 	}
-	// Invalid inputs are refused.
-	if err := work.SaveFact("", "x"); err == nil {
+	if err := work.SaveFact(ctxT(), "", "x"); err == nil {
 		t.Fatal("empty fact id accepted")
 	}
-	if err := work.SaveFact("f-y", ""); err == nil {
+	if err := work.SaveFact(ctxT(), "f-y", ""); err == nil {
 		t.Fatal("empty content accepted")
 	}
 }

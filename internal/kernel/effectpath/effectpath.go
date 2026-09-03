@@ -461,3 +461,14 @@ func (p *EffectPath) RunTool(ctx context.Context, call contracts.ToolCall, grant
 		return contracts.ToolResult{}, p.report(ctx, op, s7min.OutcomeUnknown, p.onErr(ctx, cause))
 	}
 }
+
+// ToolSpec is a SEALED tool declaration: the planner builds ToolCalls
+// from the registry entry — effect class, execution kind and schema hash
+// are never provider-supplied (Phase-3 codex #3: a forged READ_ONLY
+// would dodge the commit-receipt rule).
+type ToolSpec struct {
+	Effect         contracts.EffectClass
+	ExecutionKind  contracts.ExecutionKind
+	ArgsSchemaHash string
+	Description    string
+}

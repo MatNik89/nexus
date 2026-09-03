@@ -147,9 +147,15 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemon.Daemon,
 	for _, n := range machine.EventTypes() {
 		events[n] = nil
 	}
+	for n, v := range memory.Events() {
+		events[n] = v
+	}
 	journalPath, _ := layout.ProfileJournal(profile)
 	redactor := redact.NewKnownRefs(knownSecretRefs(resolved.Config))
-	j, err := journal.Open(journalPath, profile, redactor, events)
+	// The ONE profile database: journal + memory projection together
+	// (Annex P0.3 — facts are journal events folded in the same
+	// transaction; no second SQLite file exists).
+	j, err := journal.Open(journalPath, profile, redactor, events, memory.NewProjection())
 	if err != nil {
 		return nil, nil, fmt.Errorf("journal: %w", err)
 	}
@@ -159,7 +165,7 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemon.Daemon,
 		j.Close()
 		return nil, nil, fmt.Errorf("provider: %w (conversation is a P0 core capability — fix the config and restart)", err)
 	}
-	memStore, err := memory.Open(filepath.Join(profileDir, "memory.db"), profile)
+	memStore, err := memory.NewStore(j)
 	if err != nil {
 		j.Close()
 		return nil, nil, fmt.Errorf("memory: %w", err)
@@ -170,12 +176,18 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemon.Daemon,
 		PlannerFactory: func(deliver func(string) error) (loop.Planner, error) {
 			// Streaming print: provider deltas flow to the client as they
 			// are produced (truncation-honest — the provider errors on an
-			// incomplete stream).
-			return planner.NewStreaming(prov, prov, authority, target, deliver)
+			// incomplete stream). With tools enabled the planner buffers
+			// (a tool-call JSON never streams raw) and delivers finals in
+			// one piece.
+			pl, err := planner.NewStreaming(prov, prov, authority, target, deliver)
+			if err != nil {
+				return nil, err
+			}
+			return pl.WithTools(memory.Specs(), profile)
 		},
 		Authority: authority, Profile: profile,
 		Rules:    memory.Rules(), // memory_remember=ASK, memory_recall=ALLOW
-		Tools:    memory.Tools(memStore),
+		Tools:    memory.Tools(memStore, redactor),
 		Audit:    &journalAudit{j: j, profile: profile},
 		Redactor: redactor,
 	})

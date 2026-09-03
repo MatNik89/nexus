@@ -51,6 +51,9 @@ type Deps struct {
 type Daemon struct {
 	deps    Deps
 	session atomic.Uint64
+	// nonce distinguishes daemon INCARNATIONS: turn/run/event ids must
+	// stay unique across restarts over the same journal.
+	nonce int64
 }
 
 func New(d Deps) (*Daemon, error) {
@@ -60,7 +63,7 @@ func New(d Deps) (*Daemon, error) {
 	if !d.Profile.Valid() {
 		return nil, fmt.Errorf("daemon: a profile is required (fail closed)")
 	}
-	return &Daemon{deps: d}, nil
+	return &Daemon{deps: d, nonce: time.Now().UnixNano()}, nil
 }
 
 // frame is the newline-delimited JSON wire unit, both directions.
@@ -185,8 +188,8 @@ func (d *Daemon) handle(ctx context.Context, conn net.Conn) {
 			writeFrame(conn, frame{Type: "error", Text: "invalid input"})
 			continue
 		}
-		turn := contracts.TurnID(fmt.Sprintf("turn-%d-%d", session, msgN))
-		run := contracts.RunID(fmt.Sprintf("run-%d-%d", session, msgN))
+		turn := contracts.TurnID(fmt.Sprintf("turn-%d-%d-%d", d.nonce, session, msgN))
+		run := contracts.RunID(fmt.Sprintf("run-%d-%d-%d", d.nonce, session, msgN))
 		final, terr := l.RunTurn(ctx, turn, run, d.deps.Profile, []contracts.ContextBlock{block})
 		if terr != nil {
 			// Typed sentinels keep their names (NEEDS_APPROVAL etc.);
