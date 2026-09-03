@@ -208,7 +208,7 @@ CLI clients → zero surfaced `SQLITE_BUSY`; heartbeat stops → detectable with
 
 ## Phase 3 — memory + profiles
 
-**[ ] T18 — Profiles: physical isolation + admission stamping.**
+**[x] T18 — Profiles: physical isolation + admission stamping.**
 Per-profile SQLite file + `system.db` (zero profile payloads); non-null `ProfileID` at
 admission, immutable through the chain; no post-admission mutable global lookup.
 Trace: PRD §6 item 5; HARDQ B3; E14.
