@@ -61,7 +61,7 @@ Trace: HARNESS-SPEC P0.1; E3; DESIGN-FIXES-r2.
 Acceptance: constructors reject every malformed case in the P0.1 MUST lists.
 RED: unknown discriminator accepted → fail; XOR violation accepted → fail.
 
-**[ ] T05 — K0 seams: clock/ID injection · AtomicWriter (s5-min) · ContextBudget-min · Assembler-min.**
+**[x] T05 (this commit) — K0 seams: clock/ID injection · AtomicWriter (s5-min) · ContextBudget-min · Assembler-min.**
 Injectable wall+monotonic clock and ID-generator seams (deterministic tests everywhere
 downstream); `AtomicWriter` tmp→fsync→rename, never in-place (the s5-min cut);
 `ContextBudget.Measure+HardLimit` (S8.1-min); `Assembler.Base` (S11.1-min) skeleton.
