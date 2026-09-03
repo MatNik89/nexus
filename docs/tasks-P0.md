@@ -23,7 +23,7 @@ Trace: E1; HARNESS-PLAN S0/S1 layout.
 Acceptance: `CGO_ENABLED=0 go build ./...` + `go vet ./...` clean; static-check GREEN.
 RED: static-check against a deliberately cgo-tainted build fails.
 
-**[x] T02 (this commit) — Sandbox feasibility probe + hostile conformance suite v0 (bwrap).**
+**[x] T02 (6fc4b1e..17888b3) — Sandbox feasibility probe + hostile conformance suite v0 (bwrap).**
 Standalone probe on the REAL deployment host: five capability columns
 (FS_RO/FS_RW/NET_DENY/SYSCALL-floor/PROC_TREE). Hostile cases: `/etc/shadow` read denied;
 any egress denied; workspace RW allowed; dynamic ELF (`/bin/ls`) runs (B4 closure); shebang
@@ -38,7 +38,7 @@ test-owned dir (never recursive real `/etc`); net control reaches only a test-ow
 sink (never uncontrolled egress); process control escapes into a test-owned process tree.
 Each loosened profile MUST turn its boundary check RED.
 
-**[x] T03 (this commit) — `nexus doctor` preflight (minimal).**
+**[x] T03 (6fc4b1e..17888b3) — `nexus doctor` preflight (minimal).**
 Checks: kernel/ABI floor · bwrap · data-dir exists/0700/writable · provider key · Telegram
 token. Missing → exact instruction or consented one-command install. Capability-scoped
 results (no key → conversation off; no token → Telegram off; no bwrap → exec off; bad
