@@ -137,7 +137,7 @@ Acceptance: snapshot lists compiled P0 capabilities; extensible probe registry.
 RED: ablated gate (bwrap missing) → capability OFF, conversation-only start continues;
 unknown capability name in config → reject.
 
-**[ ] T12 — Minimal deterministic checker (S16.6-det).**
+**[x] T12 (this commit) — Minimal deterministic checker (S16.6-det).**
 Generic `AcceptanceContract` + `EvidenceBundle`; graders: exit-code · file-diff/hash ·
 delivery-receipt+ack correlated to occurrence ID (B5). Checker ≠ worker principal; prose is
 never evidence.
