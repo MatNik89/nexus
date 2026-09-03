@@ -3,12 +3,14 @@
 NEXUS: personal AI assistant. Go greenfield, Linux-first, single user, single binary.
 Assistant-first; coding = strongest branch (P1). P0 scope is user-approved (PRD §4/§6).
 
-## Language
+## Language (explicit user directive, 2026-09-03)
 Everything you produce here is **English** — code, comments, docs, review files, commits.
 
 ## Before acting
 1. Read `docs/ARCHITECTURE-ESSENTIALS.md` (15 locked decisions + P0 additions).
-2. Read the owner document for the slice you touch (Annex A contract / DESIGN-* / GAPFIX-*).
+2. Read the owner document for the slice you touch: the Annex A contract and/or the current
+   DESIGN-* doc. Raw `GAPFIX-*` files are NOT owners — a GAPFIX clause binds only where a
+   higher-ranked owner incorporates it.
 3. Source precedence when documents disagree: PRD > user-approved HARDQ-CONSOLIDATED >
    HARNESS-SPEC Annex A CONTRACTS (ignore stale salvage refs in the SPEC body) >
    DESIGN-FIXES-r2 / DESIGN-* > DESIGN-STATUS > HARNESS-PLAN > SECTION-MAP / PLAN-HOLES.
@@ -17,27 +19,55 @@ Everything you produce here is **English** — code, comments, docs, review file
 ## Hard rules (violations are review-blockers, not style notes)
 - Owner invariants: S6.0 = only policy decision point (default-deny; ASK ≠ ALLOW); S6.9 =
   order only; S7 = only retry/cancel owner (`AttemptGrant` on every attempt); S1.2 = process
-  identity; single serialized journal append actor (P0.3).
-- Fail-closed on anything unknown. Unknown `ExecutionKind` → reject, never in-process.
-- Every subprocess through S6.2 sandbox (bwrap P0); nothing relies on the sandbox before the
-  hostile conformance suite passes.
+  identity; journal single-write-owner (P0.3) via one serialized append actor (HARDQ B7).
+- Approvals are exact-intent: expiring, single-use, profile-bound, hash over canonical tool
+  name + args + target resource + ProfileID (+ `(device,inode)` for destructive FS ops);
+  any change invalidates; never a reusable "approve this tool" (HARDQ C4).
+- UNKNOWN effect → RECONCILING; no blind retry of irreversible/unknown outcomes (E9).
+- Fail-closed on unknown TYPED inputs: unknown enum/kind/capability → reject; unknown
+  schema ID/version → reject unprocessed in P0 (upcast+quarantine = v2 layer, HARDQ C7).
+- Every TOOL-executing subprocess (`ExecProcess`) through S6.2 sandbox (bwrap P0); unknown
+  `ExecutionKind` → reject, never in-process; nothing relies on the sandbox before the
+  hostile conformance suite passes. CLIAgent provider subprocess (S2.1, `--tools ""`) is a
+  provider-boundary concern, not tool-sandbox NET_DENY.
 - Untrusted content never becomes an instruction; lineage/trust monotone; secrets redacted
-  before the journal; non-null `ProfileID` from admission onward; one DB file per profile.
+  before the journal; non-null `ProfileID` from admission onward; one DB file per profile;
+  channel identity binds to a profile BEFORE admission (per-chat, deny-default) — never a
+  post-admission mutable global profile lookup (HARDQ B3).
+- Delivery honesty: exactly-once ADMISSION, at-least-once remote delivery; durable inbox
+  persists before the remote offset advances; `sent-but-unrecorded` → UNKNOWN →
+  RECONCILING; never claim exactly-once over a remote API (HARDQ B2).
 - No `map[string]any` in kernel APIs. No autonomous self-modification paths.
-- Completion = artifacts (diff/exit/receipt), never prose. Never weaken a test to pass.
+- Completion = artifacts, never prose. Never weaken a test to pass.
+
+## P0 scope guards (do NOT re-introduce what hard-questions cut)
+- Telegram = `channel:builtin` (compiled-in, release-signature attested, P1.5); the
+  `extensions`/S6.8 closure gates ONLY `channel:plugin` (HARDQ A1; P1.6 as amended).
+- No memory decay in P0 — explicit facts, append-only supersession; Decay+Audn = P1,
+  facts exempt even then (HARDQ B8).
+- Reminder evidence = durable delivery receipt + user ack; NEVER diff/exit for a Reminder;
+  two obligation types only (Reminder, typed Task) (HARDQ B5).
+- HITL waits are durable (`TurnSuspended` in the journal; resume rehydrates) — no
+  in-memory blocking wait (HARDQ B6).
+- No runtime capability activation in P0: fail-closed `Resolve` + sealed startup snapshot;
+  the transactional Activator/RollbackVault is forbidden until a dynamic consumer exists
+  (HARDQ B9). S7/S5 enter P0 only as -min contracts (`s7-min`, `s5-min`) (HARDQ A2).
+- Stuck-detection only WITHIN one interactive turn; scheduled/polling iterations exempt
+  via continuous-loop policy (HARDQ C3).
 
 ## Working style
-- Tests first where behavior changes: RED observed before the fix, GREEN after; assertions
-  anchored to Annex A RED names / PRD criteria, not to the implementation.
+- Behavioral change → red-capable detector observed RED before the fix, GREEN after;
+  assertions anchored to Annex A RED names / PRD criteria, not the implementation; stateful
+  tests own fresh temp fixtures (user's cross-project discipline).
 - Smallest causal diff; match local idiom; no speculative abstractions or dependencies.
 - Absolute paths in every cross-agent instruction and output file.
 - Reviews are adversarial, not rubber-stamps: a review with zero findings is usually a
-  failed review — if genuinely clean, name the top-3 weakest points. Tag findings
-  (`[BREAK|EDGE|OVERENG|FIDELITY|MISSING|UNFOLDED|NEW-ERROR|OK]`), cite file:line of the
-  source that proves each claim, end with a machine-checkable last line
-  (`VERDICT: PASS|FAIL` or `SUMMARY: ...` as requested).
+  failed review — if genuinely clean, name the top-3 weakest points. Use task-appropriate
+  finding tags, cite file:line of the source proving each claim, end with the
+  machine-checkable last line the dispatch asked for (`VERDICT:`/`SUMMARY:`).
 - Never mark another agent's claim correct without checking it against the sources.
 
 ## Task ledger
-`docs/tasks-P0.md` is the only task queue for P0. One task at a time; each has an
-acceptance criterion and a RED test. Do not invent scope beyond the task.
+`docs/tasks-P0.md` is the only task queue for P0, **once created** — until then no P0
+implementation is authorized. One task at a time; each has an acceptance criterion and a
+RED test. Do not invent scope beyond the task.
