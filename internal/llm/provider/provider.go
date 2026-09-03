@@ -130,17 +130,12 @@ func NewAPIKey(cfg config.Config, auth *s7min.Authority) (*APIKey, error) {
 	}
 	p.client = &http.Client{
 		Timeout: 120 * time.Second,
-		// Redirects re-apply the egress decision (Phase-2 codex #10): an
-		// allowed endpoint must not bounce conversation data — or the
-		// bearer key — to an unlisted or plaintext host.
+		// P0 refuses EVERY redirect (Phase-2-r3 codex #2): one grant
+		// authorizes exactly one physical request — an in-client redirect
+		// would be a second, differently-targeted request under the same
+		// consumed grant, even to an allowlisted host.
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if !p.allowed[req.URL.Host] {
-				return fmt.Errorf("provider: redirect off the egress allowlist (refused)")
-			}
-			if req.URL.Scheme != "https" && !loopbackHost(req.URL.Host) {
-				return fmt.Errorf("provider: redirect to plaintext http (refused)")
-			}
-			return nil
+			return fmt.Errorf("provider: redirects refused — one grant, one physical request (fail closed)")
 		},
 	}
 	return p, nil

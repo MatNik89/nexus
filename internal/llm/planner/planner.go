@@ -72,6 +72,25 @@ func NewStreaming(p ChatProvider, sp StreamProvider, auth *s7min.Authority,
 	return base, nil
 }
 
+// landFailure records the honest S7 terminal for a failed provider call:
+// an UNCONSUMED grant is cancelled (nothing physically ran — the adapter
+// refused locally); a CONSUMED one lands FAILED_TERMINAL. Landing errors
+// propagate (Phase-2-r3 codex #2: a discarded Report left AUTHORIZED
+// forever).
+func (c *ChatPlanner) landFailure(op contracts.OperationID) error {
+	if st, _ := c.auth.State(op); st == contracts.AttemptAuthorized {
+		return c.auth.Cancel(op)
+	}
+	return c.auth.Report(op, s7min.OutcomeFailedTerminal)
+}
+
+func errorsJoin(cause, landing error) error {
+	if landing == nil {
+		return cause
+	}
+	return fmt.Errorf("%w (and S7 landing: %v)", cause, landing)
+}
+
 func opID() (contracts.OperationID, error) {
 	b := make([]byte, 8)
 	if _, err := rand.Read(b); err != nil {
@@ -103,8 +122,7 @@ func (c *ChatPlanner) Plan(ctx context.Context, blocks []contracts.ContextBlock)
 			b.WriteString(d)
 			return c.deliver(d)
 		}); err != nil {
-			c.auth.Report(op, s7min.OutcomeFailedTerminal)
-			return loop.Action{}, fmt.Errorf("planner: %w", err)
+			return loop.Action{}, errorsJoin(fmt.Errorf("planner: %w", err), c.landFailure(op))
 		}
 		// A success the S7 authority refuses to record is a claim from an
 		// UNGOVERNED transport — the answer is rejected (Phase-2-r2 codex
@@ -117,8 +135,7 @@ func (c *ChatPlanner) Plan(ctx context.Context, blocks []contracts.ContextBlock)
 	}
 	out, err := c.chat.Chat(ctx, msgs, g)
 	if err != nil {
-		c.auth.Report(op, s7min.OutcomeFailedTerminal)
-		return loop.Action{}, fmt.Errorf("planner: %w", err)
+		return loop.Action{}, errorsJoin(fmt.Errorf("planner: %w", err), c.landFailure(op))
 	}
 	if rerr := c.auth.Report(op, s7min.OutcomeSucceeded); rerr != nil {
 		return loop.Action{}, fmt.Errorf("planner: transport did not consume its grant — reply refused (fail closed): %w", rerr)

@@ -174,8 +174,8 @@ func TestTransportConsumesGrantExactlyOnce(t *testing.T) {
 	}
 }
 
-// Redirects re-apply the egress decision: an allowed endpoint bouncing to
-// an unlisted host is refused (Phase-2 codex #10).
+// EVERY redirect is refused in P0 — even to an allowlisted host: one
+// grant authorizes exactly one physical request (Phase-2-r3 codex #2).
 func TestRedirectOffAllowlistRefused(t *testing.T) {
 	evil := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"stolen"}}]}`)
@@ -534,5 +534,35 @@ func TestReaskStateNeverLeaks(t *testing.T) {
 	}
 	if st, _ := auth2.State("op-b"); st != contracts.AttemptCancelled {
 		t.Fatalf("ungoverned re-ask operation in state %v (want CANCELLED)", st)
+	}
+}
+
+// A redirect to a host ON the allowlist is refused too: it would be a
+// second physical request under one consumed grant.
+func TestAllowlistedRedirectStillRefused(t *testing.T) {
+	backendCalls := 0
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backendCalls++
+		fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"two-hops"}}]}`)
+	}))
+	t.Cleanup(backend.Close)
+	bouncer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, backend.URL+"/v1/chat/completions", http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(bouncer.Close)
+	t.Setenv("NEXUS_TEST_KEY", "sk-test")
+	auth := newAuth()
+	cfg := testConfig(t, bouncer.URL)
+	cfg.EgressAllow = append(cfg.EgressAllow, strings.TrimPrefix(backend.URL, "http://")) // BOTH allowlisted
+	p, err := NewAPIKey(cfg, auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = p.Chat(context.Background(), []ChatMessage{{Role: "user", Content: "x"}}, issue(t, auth, "op-1", p.Target()))
+	if err == nil {
+		t.Fatal("allowlisted redirect followed (two physical requests on one grant)")
+	}
+	if backendCalls != 0 {
+		t.Fatalf("redirect target received %d requests under one grant", backendCalls)
 	}
 }

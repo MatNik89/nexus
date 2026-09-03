@@ -114,7 +114,8 @@ func build(t *testing.T, mode PolicyMode, rules map[contracts.ToolID]Decision) *
 	})
 	sb := &fakeSandbox{}
 	mw := &recordingMW{}
-	grants := s7min.NewAuthority(func() time.Time { return time.Unix(1000, 0) }, time.Minute)
+	// Real clock: grant expiry participates in the S7 attempt context.
+	grants := s7min.NewAuthority(nil, time.Minute)
 	path, err := NewEffectPath(pep, mw, inproc, NewSandboxedProcessExecutor(sb), grants)
 	if err != nil {
 		t.Fatal(err)
@@ -415,7 +416,7 @@ func TestOnErrorCannotEraseRefusal(t *testing.T) {
 			return contracts.ToolResult{}, fmt.Errorf("tool exploded")
 		},
 	})
-	grants := s7min.NewAuthority(func() time.Time { return time.Unix(1000, 0) }, time.Minute)
+	grants := s7min.NewAuthority(nil, time.Minute)
 	mw := &nilSwallowMW{}
 	path, err := NewEffectPath(pep, mw, inproc, NewSandboxedProcessExecutor(&fakeSandbox{}), grants)
 	if err != nil {
@@ -451,7 +452,7 @@ func TestResultValidationAndEffectfulReceiptRule(t *testing.T) {
 		audit := &fakeAudit{}
 		pep, _ := NewPEP(map[contracts.ToolID]Decision{"w": DecisionAllow},
 			NewApprovals(func() time.Time { return time.Unix(1000, 0) }, time.Minute), audit, ModeDefault)
-		grants := s7min.NewAuthority(func() time.Time { return time.Unix(1000, 0) }, time.Minute)
+		grants := s7min.NewAuthority(nil, time.Minute)
 		path, _ := NewEffectPath(pep, &recordingMW{}, NewInProcessExecutor(map[contracts.ToolID]InProcFunc{"w": fn}),
 			NewSandboxedProcessExecutor(&fakeSandbox{}), grants)
 		return path, grants
@@ -547,7 +548,7 @@ func TestCallDeadlinePropagatedIntoExecution(t *testing.T) {
 	audit := &fakeAudit{}
 	pep, _ := NewPEP(map[contracts.ToolID]Decision{"slow": DecisionAllow},
 		NewApprovals(func() time.Time { return time.Unix(1000, 0) }, time.Minute), audit, ModeDefault)
-	grants := s7min.NewAuthority(func() time.Time { return time.Unix(1000, 0) }, time.Minute)
+	grants := s7min.NewAuthority(nil, time.Minute)
 	var sawDeadline time.Time
 	inproc := NewInProcessExecutor(map[contracts.ToolID]InProcFunc{
 		"slow": func(ctx context.Context, c contracts.ToolCall) (contracts.ToolResult, error) {
@@ -572,5 +573,52 @@ func TestCallDeadlinePropagatedIntoExecution(t *testing.T) {
 	}
 	if st, _ := grants.State("op-1"); st != contracts.AttemptCancelled {
 		t.Fatalf("deadline-killed read-only attempt in state %v (want CANCELLED)", st)
+	}
+}
+
+// A failed pre-dispatch STARTED append CANCELS the attempt (legal from
+// AUTHORIZED in the durable stream) — never LOST/UNKNOWN, which would
+// replay illegally (Phase-2-r3 codex #7 literal).
+func TestStartObserverFailureCancelsNeverLoses(t *testing.T) {
+	h := build(t, ModeDefault, map[contracts.ToolID]Decision{"read": DecisionAllow})
+	h.path.SetStartObserver(func(ctx context.Context, op contracts.OperationID) error {
+		return fmt.Errorf("journal write failed")
+	})
+	c := call(t, "read", contracts.EffectReadOnly, contracts.ExecInProcess)
+	if _, err := h.path.RunTool(context.Background(), c, grantFor(t, h, "op-1", c)); err == nil {
+		t.Fatal("undurable start dispatched anyway")
+	}
+	if *h.inprocN != 0 {
+		t.Fatal("executor ran without a durable STARTED record")
+	}
+	if st, _ := h.grants.State("op-1"); st != contracts.AttemptCancelled {
+		t.Fatalf("state %v — must be CANCELLED (LOST would replay illegally from AUTHORIZED)", st)
+	}
+}
+
+// The execution context is S7-OWNED: the authority supplies the earlier
+// of call deadline and grant expiry, and refuses a non-RUNNING operation.
+func TestAttemptContextIsS7Owned(t *testing.T) {
+	auth := s7min.NewAuthority(func() time.Time { return time.Unix(1000, 0) }, time.Minute)
+	if _, _, err := auth.AttemptContext(context.Background(), "op-never", time.Now().Add(time.Hour)); err == nil {
+		t.Fatal("attempt context granted for an unknown operation")
+	}
+	g, _ := auth.Issue("op-1", "t")
+	if _, _, err := auth.AttemptContext(context.Background(), "op-1", time.Now().Add(time.Hour)); err == nil {
+		t.Fatal("attempt context granted before consume (not RUNNING)")
+	}
+	if err := auth.Consume(g); err != nil {
+		t.Fatal(err)
+	}
+	// Grant expiry (issue+1m from the pinned clock) caps a longer call
+	// deadline.
+	dctx, cancel, err := auth.AttemptContext(context.Background(), "op-1", time.Unix(999999, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+	dl, ok := dctx.Deadline()
+	if !ok || !dl.Equal(g.ExpiresAt) {
+		t.Fatalf("S7 did not cap the deadline at grant expiry: %v (want %v)", dl, g.ExpiresAt)
 	}
 }

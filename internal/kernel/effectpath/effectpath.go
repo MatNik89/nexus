@@ -383,19 +383,27 @@ func (p *EffectPath) RunTool(ctx context.Context, call contracts.ToolCall, grant
 		return contracts.ToolResult{}, p.onErr(ctx, err)
 	}
 	op := grant.OperationID
-	// 4b) Durable STARTED before dispatch: consumption without its record
-	// is uncertainty — park UNKNOWN rather than run unrecorded.
+	// 4b) Durable STARTED before dispatch. If the record cannot be made
+	// durable, NOTHING has dispatched — the attempt is CANCELLED (legal
+	// from AUTHORIZED in the durable stream and from RUNNING in S7), never
+	// LOST/UNKNOWN, which would replay illegally from AUTHORIZED
+	// (Phase-2-r3 codex #7).
 	if p.onStarted != nil {
 		if serr := p.onStarted(ctx, op); serr != nil {
-			cause := fmt.Errorf("effectpath: attempt start not durable — dispatch refused: %w", serr)
-			return contracts.ToolResult{}, p.report(ctx, op, s7min.OutcomeUnknown, p.onErr(ctx, cause))
+			cause := fmt.Errorf("effectpath: attempt start not durable — dispatch refused, attempt cancelled: %w", serr)
+			if cerr := p.grants.Cancel(op); cerr != nil {
+				cause = errors.Join(cause, cerr)
+			}
+			return contracts.ToolResult{}, p.onErr(ctx, cause)
 		}
 	}
-	// 5) Execute under the CALL's deadline (propagated — a call admitted
-	// just before expiry cannot run unbounded). topknot ceiling: the
-	// attempt_timeout/backoff vector is the full S7 engine's (P2/P3); P0
-	// enforces the call deadline at this boundary.
-	execCtx, cancelExec := context.WithDeadline(ctx, call.Deadline)
+	// 5) Execute under the S7-OWNED attempt context (SPEC P0.2: deadline/
+	// cancel derivation belongs to S7 — the authority supplies the
+	// earlier of the call deadline and the grant expiry).
+	execCtx, cancelExec, cerr := p.grants.AttemptContext(ctx, op, call.Deadline)
+	if cerr != nil {
+		return contracts.ToolResult{}, p.report(ctx, op, s7min.OutcomeUnknown, p.onErr(ctx, cerr))
+	}
 	out, err := exec.Execute(execCtx, call)
 	execCause := context.Cause(execCtx) // read BEFORE our own cancel below
 	cancelExec()

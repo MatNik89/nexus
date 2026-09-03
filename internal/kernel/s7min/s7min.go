@@ -10,6 +10,7 @@
 package s7min
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
@@ -200,6 +201,33 @@ func (a *Authority) Cancel(op contracts.OperationID) error {
 	}
 	rec.state = state
 	return nil
+}
+
+// AttemptContext derives the execution context for a CONSUMED attempt —
+// S7 owns deadline and cancel (SPEC P0.2, -min): the attempt runs under
+// the EARLIER of the caller-supplied call deadline and the grant expiry.
+// Refused for operations that are not RUNNING (nothing may execute
+// outside a consumed grant). The full attempt_timeout/backoff vector is
+// the P2/P3 engine's.
+func (a *Authority) AttemptContext(ctx context.Context, op contracts.OperationID, callDeadline time.Time) (context.Context, context.CancelFunc, error) {
+	a.mu.Lock()
+	rec, ok := a.ops[op]
+	state := contracts.AttemptInvalid
+	var expires time.Time
+	if ok {
+		state = rec.state
+		expires = rec.expires
+	}
+	a.mu.Unlock()
+	if !ok || state != contracts.AttemptRunning {
+		return nil, nil, fmt.Errorf("s7min attempt-context: operation is not RUNNING: %w", ErrAttemptNotAuthorized)
+	}
+	deadline := callDeadline
+	if callDeadline.IsZero() || (!expires.IsZero() && expires.Before(callDeadline)) {
+		deadline = expires
+	}
+	dctx, cancel := context.WithDeadline(ctx, deadline)
+	return dctx, cancel, nil
 }
 
 // Attempts reports how many PHYSICAL attempts the operation spent.
