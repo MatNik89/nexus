@@ -64,6 +64,8 @@ outcome + nonzero `--strict` exit; all five green → `prerequisites-ready`.
 
 ## Phase 1 — K0 primitives
 
+**DONE 2026-09-03** — merged to main (723b227); Phase-1A 5 review rounds + Phase-1B 4 rounds (codex/kilo/agy), final 3× PASS zero findings.
+
 **[x] T04 (1bdae45..6cbc2c1) — Typed contracts (S0.1).**
 `Envelope/Message/ContextBlock/ToolCall/ToolResult/TypedError` per Annex P0.1 + `ProfileID`
 (B3) + `ExecutionKind`/`EffectPhase`/`CommitReceipt` (DESIGN-FIXES). Enums default-reject;
