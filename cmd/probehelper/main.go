@@ -59,8 +59,13 @@ func main() {
 		secs, _ := strconv.Atoi(arg(2))
 		time.Sleep(time.Duration(secs) * time.Second)
 	case "syscall-ptrace": // attempts PTRACE_TRACEME; exit 0 = allowed, 1 = denied
-		if err := ptraceTraceme(); err != nil {
-			fail("ptrace denied: %v", err)
+		sentinel, err := ptraceTraceme()
+		if err != nil {
+			if sentinel != "" {
+				fmt.Fprintln(os.Stderr, sentinel)
+				os.Exit(1)
+			}
+			fail("ptrace failed differently: %v", err)
 		}
 		fmt.Println("ptrace ok")
 	case "hang": // never exits — timeout/cleanup fixture. NOT select{}: an

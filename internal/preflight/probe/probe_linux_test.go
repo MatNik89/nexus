@@ -40,6 +40,18 @@ func mustDetect(t *testing.T) Availability {
 	return av
 }
 
+// wdir returns a guard-compliant disposable workdir (0700 under TempDir):
+// t.TempDir() subdirs are 0775 on umask-002 hosts and the guard now rejects
+// group-writable grants.
+func wdir(t *testing.T) string {
+	t.Helper()
+	d := filepath.Join(t.TempDir(), "wd")
+	if err := os.Mkdir(d, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return d
+}
+
 func run(t *testing.T, av Availability, spec Spec) (string, error) {
 	t.Helper()
 	if spec.Timeout == 0 {
@@ -88,7 +100,7 @@ func TestShadowNotReadableInsideSandbox(t *testing.T) {
 		t.Fatalf("precondition: /etc/shadow must exist on the host: %v", err)
 	}
 	hp := helperPath(t)
-	out, err := run(t, av, Spec{Target: hp, Args: []string{"readfile", "/etc/shadow"}, WorkDir: t.TempDir()})
+	out, err := run(t, av, Spec{Target: hp, Args: []string{"readfile", "/etc/shadow"}, WorkDir: wdir(t)})
 	if err == nil {
 		t.Fatalf("/etc/shadow READABLE inside the sandbox:\n%s", out)
 	}
@@ -104,7 +116,7 @@ func TestCanaryOutsideClosureNotReadable(t *testing.T) {
 	if err := os.WriteFile(canary, []byte("CANARY"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	out, err := run(t, av, Spec{Target: hp, Args: []string{"readfile", canary}, WorkDir: t.TempDir()})
+	out, err := run(t, av, Spec{Target: hp, Args: []string{"readfile", canary}, WorkDir: wdir(t)})
 	if err == nil {
 		t.Fatalf("canary outside the closure was readable — FS isolation broken:\n%s", out)
 	}
@@ -120,7 +132,7 @@ func TestNegativeControlCanaryReadableWhenROLoosened(t *testing.T) {
 	if err := os.WriteFile(canary, []byte("CANARY"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	spec := Spec{Target: hp, Args: []string{"readfile", canary}, WorkDir: t.TempDir()}
+	spec := Spec{Target: hp, Args: []string{"readfile", canary}, WorkDir: wdir(t)}
 	spec.loosen.roBind = canaryDir
 	out, err := run(t, av, spec)
 	if err != nil {
@@ -133,7 +145,7 @@ func TestNegativeControlCanaryReadableWhenROLoosened(t *testing.T) {
 func TestWorkdirWritable(t *testing.T) {
 	av := mustDetect(t)
 	hp := helperPath(t)
-	wd := t.TempDir()
+	wd := wdir(t)
 	out, err := run(t, av, Spec{Target: hp, Args: []string{"writefile", "/work/out.txt", "hello"}, WorkDir: wd})
 	if err != nil {
 		t.Fatalf("write in bound workdir must succeed: %v\n%s", err, out)
@@ -153,7 +165,7 @@ func TestNetworkDeniedInsideSandbox(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ln.Close()
-	out, err := run(t, av, Spec{Target: hp, Args: []string{"dial", ln.Addr().String()}, WorkDir: t.TempDir()})
+	out, err := run(t, av, Spec{Target: hp, Args: []string{"dial", ln.Addr().String()}, WorkDir: wdir(t)})
 	if err == nil {
 		t.Fatalf("sandboxed dial SUCCEEDED — egress boundary broken:\n%s", out)
 	}
@@ -176,7 +188,7 @@ func TestNegativeControlDialSucceedsWhenNetLoosened(t *testing.T) {
 			c.Close()
 		}
 	}()
-	spec := Spec{Target: hp, Args: []string{"dial", ln.Addr().String()}, WorkDir: t.TempDir()}
+	spec := Spec{Target: hp, Args: []string{"dial", ln.Addr().String()}, WorkDir: wdir(t)}
 	spec.loosen.net = true
 	out, err := run(t, av, spec)
 	if err != nil {
@@ -189,19 +201,19 @@ func TestNegativeControlDialSucceedsWhenNetLoosened(t *testing.T) {
 func TestSyscallFloorDeniesPtrace(t *testing.T) {
 	av := mustDetect(t)
 	hp := helperPath(t)
-	out, err := run(t, av, Spec{Target: hp, Args: []string{"syscall-ptrace"}, WorkDir: t.TempDir()})
+	out, err := run(t, av, Spec{Target: hp, Args: []string{"syscall-ptrace"}, WorkDir: wdir(t)})
 	if err == nil {
 		t.Fatalf("ptrace ALLOWED under the syscall floor:\n%s", out)
 	}
-	if !strings.Contains(out, "denied") {
-		t.Fatalf("expected an in-sandbox denial, got: %v\n%s", err, out)
+	if !strings.Contains(out, PtraceDeniedSentinel) {
+		t.Fatalf("expected the exact denial sentinel, got: %v\n%s", err, out)
 	}
 }
 
 func TestNegativeControlPtraceAllowedWhenSeccompLoosened(t *testing.T) {
 	av := mustDetect(t)
 	hp := helperPath(t)
-	spec := Spec{Target: hp, Args: []string{"syscall-ptrace"}, WorkDir: t.TempDir()}
+	spec := Spec{Target: hp, Args: []string{"syscall-ptrace"}, WorkDir: wdir(t)}
 	spec.loosen.seccomp = true
 	out, err := run(t, av, spec)
 	if err != nil {
@@ -213,7 +225,7 @@ func TestNegativeControlPtraceAllowedWhenSeccompLoosened(t *testing.T) {
 
 func TestDynamicELFRuns(t *testing.T) {
 	av := mustDetect(t)
-	out, err := run(t, av, Spec{Target: "/bin/ls", Args: []string{"/"}, WorkDir: t.TempDir()})
+	out, err := run(t, av, Spec{Target: "/bin/ls", Args: []string{"/"}, WorkDir: wdir(t)})
 	if err != nil {
 		t.Fatalf("dynamically linked /bin/ls must run under the pinned closure: %v\n%s", err, out)
 	}
@@ -235,7 +247,7 @@ func TestShebangRejectedBeforeSandbox(t *testing.T) {
 func TestUndeclaredChildExecFailsForUsrBinary(t *testing.T) {
 	av := mustDetect(t)
 	hp := helperPath(t)
-	out, err := run(t, av, Spec{Target: hp, Args: []string{"exec", "/usr/bin/id"}, WorkDir: t.TempDir()})
+	out, err := run(t, av, Spec{Target: hp, Args: []string{"exec", "/usr/bin/id"}, WorkDir: wdir(t)})
 	if err == nil {
 		t.Fatalf("undeclared /usr/bin/id EXECUTED inside the sandbox — closure too wide:\n%s", out)
 	}
@@ -252,7 +264,7 @@ func TestTargetSwapAfterPrepareIsInert(t *testing.T) {
 	} else if err := os.WriteFile(copyPath, b, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	h, err := Prepare(av, Spec{Target: copyPath, Args: []string{"writefile", "/work/x", "ok"}, WorkDir: t.TempDir(), Timeout: 15 * time.Second})
+	h, err := Prepare(av, Spec{Target: copyPath, Args: []string{"writefile", "/work/x", "ok"}, WorkDir: wdir(t), Timeout: 15 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -334,7 +346,7 @@ func stillAlive(keys map[string]bool) []string {
 func TestKillReapsWholeTree(t *testing.T) {
 	av := mustDetect(t)
 	hp := helperPath(t)
-	h, err := Prepare(av, Spec{Target: hp, Args: []string{"spawn-sleep", "30"}, WorkDir: t.TempDir(), Timeout: 60 * time.Second})
+	h, err := Prepare(av, Spec{Target: hp, Args: []string{"spawn-sleep", "30"}, WorkDir: wdir(t), Timeout: 60 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -357,7 +369,7 @@ func TestKillReapsWholeTree(t *testing.T) {
 func TestNegativeControlChildSurvivesWhenPIDNSLoosened(t *testing.T) {
 	av := mustDetect(t)
 	hp := helperPath(t)
-	spec := Spec{Target: hp, Args: []string{"spawn-sleep", "30"}, WorkDir: t.TempDir(), Timeout: 60 * time.Second}
+	spec := Spec{Target: hp, Args: []string{"spawn-sleep", "30"}, WorkDir: wdir(t), Timeout: 60 * time.Second}
 	spec.loosen.pidNS = true
 	h, err := Prepare(av, spec)
 	if err != nil {
@@ -397,7 +409,7 @@ func TestHangingTargetCleanedUpWithinTimeout(t *testing.T) {
 	av := mustDetect(t)
 	hp := helperPath(t)
 	start := time.Now()
-	h, err := Prepare(av, Spec{Target: hp, Args: []string{"hang"}, WorkDir: t.TempDir(), Timeout: 3 * time.Second})
+	h, err := Prepare(av, Spec{Target: hp, Args: []string{"hang"}, WorkDir: wdir(t), Timeout: 3 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -420,7 +432,7 @@ func TestHangingTargetCleanedUpWithinTimeout(t *testing.T) {
 func TestMemfdSealedAgainstPostPrepareWrite(t *testing.T) {
 	av := mustDetect(t)
 	hp := helperPath(t)
-	h, err := Prepare(av, Spec{Target: hp, Args: []string{"sleep", "0"}, WorkDir: t.TempDir(), Timeout: 15 * time.Second})
+	h, err := Prepare(av, Spec{Target: hp, Args: []string{"sleep", "0"}, WorkDir: wdir(t), Timeout: 15 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -447,7 +459,7 @@ func countFDs(t *testing.T) int {
 func TestNoFDLeakAcrossRuns(t *testing.T) {
 	av := mustDetect(t)
 	hp := helperPath(t)
-	spec := Spec{Target: hp, Args: []string{"sleep", "0"}, WorkDir: t.TempDir()}
+	spec := Spec{Target: hp, Args: []string{"sleep", "0"}, WorkDir: wdir(t)}
 	if _, err := run(t, av, spec); err != nil { // warm-up
 		t.Fatal(err)
 	}
@@ -476,5 +488,130 @@ func TestWorkdirRootRefused(t *testing.T) {
 	}
 	if _, err := Prepare(av, Spec{Target: hp, Args: []string{"sleep", "0"}, WorkDir: link}); err == nil {
 		t.Fatal("symlink-to-/ workdir accepted")
+	}
+}
+
+// --- floor-probe sentinel strictness (r3 codex #1) ---
+
+// A bwrap that fails BEFORE launching the target — with "Permission denied"
+// in its diagnostics — must yield floor FAILURE, never success.
+func TestFloorProbeRejectsPrelaunchPermissionDenied(t *testing.T) {
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "bwrap")
+	script := "#!/bin/sh\necho 'bwrap: setup failed: Permission denied' >&2\nexit 1\n"
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	hp := helperPath(t)
+	av := Availability{BwrapPath: fake, BwrapVersion: "bubblewrap fake"}
+	if err := FloorProbe(av, hp, []string{"syscall-ptrace"}); err == nil {
+		t.Fatal("prelaunch 'Permission denied' diagnostics accepted as a floor pass")
+	}
+}
+
+// --- workdir guard: allowed-root + writability REDs (r3 codex #2) ---
+
+func TestWorkdirOutsideAllowedRootsRefused(t *testing.T) {
+	av := mustDetect(t)
+	hp := helperPath(t)
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("no home dir")
+	}
+	if _, err := Prepare(av, Spec{Target: hp, Args: []string{"sleep", "0"}, WorkDir: home}); err == nil {
+		t.Fatal("home directory accepted as a disposable RW grant")
+	}
+}
+
+func TestWorkdirGroupWritableRefused(t *testing.T) {
+	av := mustDetect(t)
+	hp := helperPath(t)
+	d := filepath.Join(t.TempDir(), "gw")
+	if err := os.Mkdir(d, 0o770); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Prepare(av, Spec{Target: hp, Args: []string{"sleep", "0"}, WorkDir: d}); err == nil {
+		t.Fatal("group-writable workdir accepted")
+	}
+}
+
+// --- handle lifecycle (r3 codex #5) ---
+
+func TestHandleRejectsRepeatStart(t *testing.T) {
+	av := mustDetect(t)
+	hp := helperPath(t)
+	h, err := Prepare(av, Spec{Target: hp, Args: []string{"sleep", "2"}, WorkDir: wdir(t), Timeout: 30 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Start(); err == nil {
+		t.Fatal("repeat Start accepted — first launch ownership lost")
+	}
+	if err := h.Wait(); err != nil { // first launch must still be reapable
+		t.Fatalf("first launch not cleanly reaped after rejected repeat Start: %v", err)
+	}
+}
+
+func TestHandleRejectsStartAfterClose(t *testing.T) {
+	av := mustDetect(t)
+	hp := helperPath(t)
+	h, err := Prepare(av, Spec{Target: hp, Args: []string{"sleep", "0"}, WorkDir: wdir(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.Close()
+	if err := h.Start(); err == nil {
+		t.Fatal("Start after Close accepted")
+	}
+}
+
+// --- resolver semantics (r3 codex #3 / kilo #9-#11) ---
+
+func TestExpandRunpathsSemantics(t *testing.T) {
+	got := expandRunpaths("/opt/app/bin", []string{"$ORIGIN/../lib:${ORIGIN}/x::/abs", "$LIB/z"})
+	want := []string{"/opt/app/lib", "/opt/app/bin/x", "/abs"}
+	if len(got) != len(want) {
+		t.Fatalf("want %v, got %v", want, got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("component %d: want %q, got %q", i, want[i], got[i])
+		}
+	}
+}
+
+// End-to-end $ORIGIN fixture (the r3 codex repro shape); needs a C compiler.
+func TestOriginRunpathBinaryResolves(t *testing.T) {
+	av := mustDetect(t)
+	cc, err := exec.LookPath("cc")
+	if err != nil {
+		t.Skip("no C compiler for the $ORIGIN fixture")
+	}
+	root := t.TempDir()
+	libDir := filepath.Join(root, "lib")
+	binDir := filepath.Join(root, "bin")
+	for _, d := range []string{libDir, binDir} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	libC := filepath.Join(root, "foo.c")
+	os.WriteFile(libC, []byte("int foo(void){return 42;}\n"), 0o644)
+	if out, err := exec.Command(cc, "-shared", "-fPIC", "-o", filepath.Join(libDir, "libnexusfoo.so"), libC).CombinedOutput(); err != nil {
+		t.Skipf("cc -shared failed: %v\n%s", err, out)
+	}
+	mainC := filepath.Join(root, "main.c")
+	os.WriteFile(mainC, []byte("int foo(void); int main(void){return foo()==42?0:1;}\n"), 0o644)
+	bin := filepath.Join(binDir, "app")
+	if out, err := exec.Command(cc, "-o", bin, mainC,
+		"-L", libDir, "-lnexusfoo", "-Wl,--enable-new-dtags,-rpath,$ORIGIN/../lib").CombinedOutput(); err != nil {
+		t.Skipf("cc link failed: %v\n%s", err, out)
+	}
+	out, err := run(t, av, Spec{Target: bin, WorkDir: wdir(t)})
+	if err != nil {
+		t.Fatalf("$ORIGIN RUNPATH binary must resolve and run: %v\n%s", err, out)
 	}
 }

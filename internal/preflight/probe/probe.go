@@ -61,21 +61,32 @@ func Detect() (Availability, error) {
 	return Availability{BwrapPath: path, BwrapVersion: ver}, nil
 }
 
+// PtraceDeniedSentinel is the EXACT line the floor-probe target must emit
+// after its ptrace syscall returns EPERM. A unique sentinel — never a
+// substring like "denied" — because ordinary bwrap setup diagnostics contain
+// "Permission denied" and must count as floor FAILURE, not success
+// (Phase-0 r3 codex #1: a fake prelaunch failure passed the old check).
+const PtraceDeniedSentinel = "NEXUS_PTRACE_DENIED:EPERM"
+
 // FloorProbe proves the WHOLE production launch path works on this host —
 // closure resolution, sealed memfds, bwrap namespaces AND the seccomp
 // syscall floor — by running a harmless static ELF that attempts
-// PTRACE_TRACEME and must be DENIED (Phase-0 r2 codex #1: a weaker separate
-// bwrap invocation proved nothing about real launches).
-// probeTarget must be an ELF whose given args attempt ptrace and print
-// "denied" on the denial path (nexus: `__probe-ptrace`; tests: probehelper
-// `syscall-ptrace`).
+// PTRACE_TRACEME and must be DENIED. probeTarget must emit
+// PtraceDeniedSentinel on its own line ONLY after observing EPERM from the
+// syscall (nexus: `__probe-ptrace`; tests: probehelper `syscall-ptrace`).
 func FloorProbe(av Availability, probeTarget string, args []string) error {
 	out, err := Run(av, Spec{Target: probeTarget, Args: args, Timeout: 15 * time.Second})
 	if err == nil {
 		return fmt.Errorf("SANDBOX_CAPABILITY_UNAVAILABLE: syscall floor INACTIVE (ptrace succeeded inside sandbox)")
 	}
-	if !strings.Contains(out, "denied") {
-		return fmt.Errorf("SANDBOX_CAPABILITY_UNAVAILABLE: confined launch failed on this host: %v: %s", err, strings.TrimSpace(out))
+	sentinelSeen := false
+	for _, line := range strings.Split(out, "\n") {
+		if strings.TrimSpace(line) == PtraceDeniedSentinel {
+			sentinelSeen = true
+		}
+	}
+	if !sentinelSeen {
+		return fmt.Errorf("SANDBOX_CAPABILITY_UNAVAILABLE: confined launch failed before the probe ran: %v: %s", err, strings.TrimSpace(out))
 	}
 	return nil
 }
@@ -104,8 +115,11 @@ type loosen struct {
 var ErrNotELF = fmt.Errorf("launch target is not a native ELF executable (scripts/shebang/foreign-arch rejected)")
 
 const (
-	maxClosureFiles = 64
-	maxClosureBytes = 256 << 20
+	maxClosureFiles   = 64
+	maxClosureBytes   = 256 << 20
+	maxClosureOneFile = 64 << 20
+	maxInterpLen      = 4096
+	maxDepQueue       = 256
 )
 
 type closureFile struct {
@@ -145,9 +159,51 @@ func openNativeELF(path string) (*elf.File, error) {
 	return ef, nil
 }
 
-// depSearchDirs returns the deterministic trusted library search order.
-func depSearchDirs(runpaths []string) []string {
-	dirs := append([]string{}, runpaths...)
+// expandRunpaths applies the dynamic-loader token rules the P0 contract
+// needs (Phase-0 r3 codex #3 / kilo #9-#11): $ORIGIN/${ORIGIN} expands to
+// the REFERRING object's directory; empty components and components with
+// unexpanded tokens are DROPPED (never resolved against the process cwd).
+func expandRunpaths(referrerDir string, raw []string) []string {
+	var out []string
+	for _, r := range raw {
+		for _, comp := range strings.Split(r, ":") {
+			if comp == "" {
+				continue
+			}
+			comp = strings.ReplaceAll(comp, "${ORIGIN}", referrerDir)
+			comp = strings.ReplaceAll(comp, "$ORIGIN", referrerDir)
+			if strings.Contains(comp, "$") { // $LIB/$PLATFORM etc.: drop, fail-closed
+				continue
+			}
+			out = append(out, filepath.Clean(comp))
+		}
+	}
+	return out
+}
+
+// elfDeps reads one ELF's DT_NEEDED plus its OWN search context:
+// DT_RUNPATH, with DT_RPATH as the legacy fallback when RUNPATH is absent.
+func elfDeps(path string) (needed []string, runpaths []string, err error) {
+	ef, err := elf.Open(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer ef.Close()
+	needed, err = ef.ImportedLibraries()
+	if err != nil {
+		return nil, nil, err
+	}
+	raw, rerr := ef.DynString(elf.DT_RUNPATH)
+	if rerr != nil || len(raw) == 0 {
+		raw, _ = ef.DynString(elf.DT_RPATH) // legacy old-dtags fallback
+	}
+	return needed, expandRunpaths(filepath.Dir(path), raw), nil
+}
+
+// depSearchDirs: per-referrer search order = the referrer's expanded
+// RUNPATH/RPATH first, then the deterministic trusted system directories.
+func depSearchDirs(referrerRunpaths []string) []string {
+	dirs := append([]string{}, referrerRunpaths...)
 	for _, d := range []string{"/lib", "/lib64", "/usr/lib", "/usr/lib64"} {
 		dirs = append(dirs, d)
 		if matches, _ := filepath.Glob(d + "/*-linux-gnu*"); matches != nil {
@@ -167,6 +223,8 @@ func resolveClosure(target string) (files []closureFile, insideTarget string, er
 		}
 	}
 	seen := map[string]bool{}
+	// Budgets are enforced BEFORE any large allocation (Phase-0 r3 codex #4):
+	// stat first, refuse oversize, then read.
 	add := func(hostPath, dest string) error {
 		if seen[dest] {
 			return nil
@@ -174,6 +232,13 @@ func resolveClosure(target string) (files []closureFile, insideTarget string, er
 		seen[dest] = true
 		if len(files) >= maxClosureFiles {
 			return fmt.Errorf("closure exceeds %d files", maxClosureFiles)
+		}
+		st, err := os.Stat(hostPath)
+		if err != nil || !st.Mode().IsRegular() {
+			return fmt.Errorf("closure file %s: not a regular file (%v)", hostPath, err)
+		}
+		if st.Size() > maxClosureOneFile || total+int(st.Size()) > maxClosureBytes {
+			return fmt.Errorf("closure file %s exceeds the size budget", hostPath)
 		}
 		buf, err := os.ReadFile(hostPath)
 		if err != nil {
@@ -199,18 +264,18 @@ func resolveClosure(target string) (files []closureFile, insideTarget string, er
 	interp := ""
 	for _, p := range ef.Progs {
 		if p.Type == elf.PT_INTERP {
+			if p.Filesz > maxInterpLen { // attacker-declared size: hard cap
+				ef.Close()
+				return nil, "", fmt.Errorf("PT_INTERP length %d exceeds cap", p.Filesz)
+			}
 			b := make([]byte, p.Filesz)
-			p.ReadAt(b, 0)
+			if _, err := p.ReadAt(b, 0); err != nil && err != io.EOF {
+				ef.Close()
+				return nil, "", fmt.Errorf("reading PT_INTERP: %w", err)
+			}
 			interp = strings.TrimRight(string(b), "\x00")
 		}
 	}
-	var runpaths []string
-	if rp, err := ef.DynString(elf.DT_RUNPATH); err == nil {
-		for _, r := range rp {
-			runpaths = append(runpaths, strings.Split(r, ":")...)
-		}
-	}
-	needed, _ := ef.ImportedLibraries()
 	ef.Close()
 
 	insideTarget = "/nexus-target"
@@ -224,20 +289,37 @@ func resolveClosure(target string) (files []closureFile, insideTarget string, er
 			return nil, "", err
 		}
 	}
-	// BFS over DT_NEEDED across trusted system libraries.
-	dirs := depSearchDirs(runpaths)
-	queue := append([]string{}, needed...)
+	// BFS over DT_NEEDED with PER-REFERRER search context: each dependency
+	// resolves against its referrer's expanded RUNPATH/RPATH first, then the
+	// trusted system dirs (Phase-0 r3 codex #3).
+	rootNeeded, rootRunpaths, err := elfDeps(target)
+	if err != nil {
+		closeAll()
+		return nil, "", fmt.Errorf("reading dependencies of %s: %w", target, err)
+	}
+	type depNode struct {
+		name     string
+		runpaths []string // referrer's expanded search context
+	}
+	var queue []depNode
+	for _, n := range rootNeeded {
+		queue = append(queue, depNode{name: n, runpaths: rootRunpaths})
+	}
 	resolvedNames := map[string]bool{}
 	for len(queue) > 0 {
-		name := queue[0]
+		if len(queue) > maxDepQueue {
+			closeAll()
+			return nil, "", fmt.Errorf("dependency graph exceeds %d pending nodes", maxDepQueue)
+		}
+		node := queue[0]
 		queue = queue[1:]
-		if resolvedNames[name] {
+		if resolvedNames[node.name] {
 			continue
 		}
-		resolvedNames[name] = true
+		resolvedNames[node.name] = true
 		found := ""
-		for _, d := range dirs {
-			cand := filepath.Join(d, name)
+		for _, d := range depSearchDirs(node.runpaths) {
+			cand := filepath.Join(d, node.name)
 			if st, err := os.Stat(cand); err == nil && st.Mode().IsRegular() {
 				found = cand
 				break
@@ -245,24 +327,38 @@ func resolveClosure(target string) (files []closureFile, insideTarget string, er
 		}
 		if found == "" {
 			closeAll()
-			return nil, "", fmt.Errorf("cannot resolve library %q for %s", name, target)
+			return nil, "", fmt.Errorf("cannot resolve library %q for %s", node.name, target)
 		}
 		if err := add(found, found); err != nil {
 			closeAll()
 			return nil, "", err
 		}
-		if lef, err := elf.Open(found); err == nil { // system lib: trusted parse
-			if sub, err := lef.ImportedLibraries(); err == nil {
-				queue = append(queue, sub...)
-			}
-			lef.Close()
+		sub, subRunpaths, err := elfDeps(found) // system lib: trusted parse
+		if err != nil {
+			closeAll()
+			return nil, "", fmt.Errorf("reading dependencies of %s: %w", found, err)
+		}
+		for _, n := range sub {
+			queue = append(queue, depNode{name: n, runpaths: subRunpaths})
 		}
 	}
 	return files, insideTarget, nil
 }
 
-// guardWorkDir canonicalizes and rejects hazardous RW grants: root, shallow
-// paths, foreign ownership, group/world-writable dirs.
+// allowedWorkRoots are the only trees a disposable RW grant may live under
+// (Phase-0 r3 codex #2: two-component depth still admitted /home/<user>
+// wholesale; a disposable dir belongs in a temp tree, full stop).
+func allowedWorkRoots() []string {
+	roots := []string{filepath.Clean(os.TempDir())}
+	if x := os.Getenv("XDG_RUNTIME_DIR"); x != "" {
+		roots = append(roots, filepath.Clean(x))
+	}
+	return roots
+}
+
+// guardWorkDir canonicalizes and rejects hazardous RW grants: anything
+// outside the allowed disposable roots, foreign ownership, or group/world
+// writability (0o022 — a shared-group dir is not single-user controlled).
 // topknot ceiling: bwrap still binds by PATH, so a same-user swap between
 // this check and namespace setup remains possible; the T25 backend closes it
 // with a policy-owned disposable-directory capability. Upgrade trigger: T25.
@@ -271,8 +367,15 @@ func guardWorkDir(dir string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("workdir: %w", err)
 	}
-	if wd == "/" || len(strings.Split(strings.Trim(wd, "/"), "/")) < 2 {
-		return "", fmt.Errorf("workdir %q refused: too broad for a disposable RW grant", wd)
+	inRoot := false
+	for _, root := range allowedWorkRoots() {
+		if wd != root && strings.HasPrefix(wd, root+string(filepath.Separator)) {
+			inRoot = true
+			break
+		}
+	}
+	if !inRoot {
+		return "", fmt.Errorf("workdir %q refused: disposable RW grants must live under %v", wd, allowedWorkRoots())
 	}
 	st, err := os.Stat(wd)
 	if err != nil || !st.IsDir() {
@@ -282,11 +385,8 @@ func guardWorkDir(dir string) (string, error) {
 	if !ok || int(sys.Uid) != os.Geteuid() {
 		return "", fmt.Errorf("workdir %s not owned by the current user", wd)
 	}
-	// World-writable is refused outright. Group-writable is tolerated because
-	// user-private-group distros (umask 002) create 0775 dirs by default;
-	// the T25 backend's policy-owned disposable dirs will be 0700 regardless.
-	if st.Mode().Perm()&0o002 != 0 {
-		return "", fmt.Errorf("workdir %s is world-writable", wd)
+	if st.Mode().Perm()&0o022 != 0 {
+		return "", fmt.Errorf("workdir %s is group/world-writable (%o)", wd, st.Mode().Perm())
 	}
 	return wd, nil
 }
@@ -301,6 +401,7 @@ type Handle struct {
 	closeOnce sync.Once
 	hashes    map[string]string
 	started   bool
+	closed    bool
 }
 
 // ClosureHashes returns a copy of the sha256-per-inside-path attestation.
@@ -329,8 +430,13 @@ func (h *Handle) Pid() int {
 	return h.cmd.Process.Pid
 }
 
-// Start begins execution.
+// Start begins execution. A handle starts at most once; a repeat Start or a
+// Start after Close is rejected WITHOUT touching the underlying command, so
+// a live first launch is never orphaned (Phase-0 r3 codex #5).
 func (h *Handle) Start() error {
+	if h.started || h.closed {
+		return fmt.Errorf("invalid handle state: already started or closed")
+	}
 	err := h.cmd.Start()
 	h.started = err == nil
 	if err != nil {
@@ -361,6 +467,7 @@ func (h *Handle) Wait() error {
 // Close releases owned resources; safe to call on every failure path.
 func (h *Handle) Close() {
 	h.closeOnce.Do(func() {
+		h.closed = true
 		for _, f := range h.closers {
 			f.Close()
 		}
@@ -386,12 +493,30 @@ func Prepare(av Availability, spec Spec) (*Handle, error) {
 		return nil, e
 	}
 
+	// The inside loader replays its OWN search (RUNPATH's $ORIGIN points at
+	// /nexus-target's dir, not the host location), so every pinned library
+	// dir is exported via LD_LIBRARY_PATH — which the loader consults for
+	// new-dtags binaries before DT_RUNPATH. Paths listed are exclusively our
+	// sealed binds.
+	var libDirs []string
+	seenDir := map[string]bool{}
+	for _, cf := range files {
+		if cf.dest == insideTarget {
+			continue
+		}
+		d := filepath.Dir(cf.dest)
+		if !seenDir[d] {
+			seenDir[d] = true
+			libDirs = append(libDirs, d)
+		}
+	}
 	args := []string{
 		"--proc", "/proc",
 		"--dev", "/dev",
 		"--tmpfs", "/tmp",
 		"--dir", "/work",
 		"--clearenv", "--setenv", "PATH", "/nowhere",
+		"--setenv", "LD_LIBRARY_PATH", strings.Join(libDirs, ":"),
 		"--new-session",
 	}
 	if spec.WorkDir != "" {
