@@ -173,7 +173,7 @@ executes without approval + journal carries ALLOWED_BY_YOLO; DENY still denied) 
 `TestYoloCannotBeSetByChannelInput` (mode is a session construct, not reachable from a
 message payload).
 
-**[ ] T15 — Provider (APIKey) + structured output (S2.1/S2.3-min).**
+**[x] T15 — Provider (APIKey) + structured output (S2.1/S2.3-min).**
 `Provider{Chat/Stream/Capabilities/DataDescriptor}`; OpenAI-compatible HTTP;
 `Validate → re-ask(with AttemptGrant) → salvage`. Tolerance is LIMITED to
 non-security/non-effect payloads (P0.7); security/effect/policy discriminators are strict.
