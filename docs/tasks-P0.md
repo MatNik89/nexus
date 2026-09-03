@@ -149,7 +149,7 @@ RED: "done" with empty EvidenceBundle → Grade=FAIL; ack for occurrence N gradi
 
 ## Phase 2 — safe conversation spine
 
-**[ ] T13 — s7-min (BEFORE the effect-path that consumes it).**
+**[x] T13 — s7-min (BEFORE the effect-path that consumes it).**
 `AttemptGrant{attempt_no,target,expires_at,nonce}` single-use + cancel token + no-retry
 policy (retryable → FAILED_TERMINAL in P0).
 Trace: HARDQ A2; HARNESS-SPEC P0.2 single-owner half; E5; REVIEW-TASKS order fix.
