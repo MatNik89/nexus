@@ -1,24 +1,25 @@
 //go:build linux
 
-// Hostile conformance suite v0 (tasks-P0 T02) against the REAL bwrap backend
-// on the REAL host. Spec anchors: PRD §6 item 6 (cannot read /etc/shadow,
-// cannot reach the network, proven by hostile test), HARDQ B4 (ELF-only
-// launch, minimal closure), HARDQ D1 (bwrap = P0 ENFORCED backend), T02 RED
-// (availability fail-closed + hazard-safe negative controls per boundary).
+// Hostile conformance suite v1 (tasks-P0 T02) against the REAL bwrap backend
+// on the REAL host, through the UNMODIFIED production Prepare/Start path.
+// Spec anchors: PRD §6 item 6, HARDQ B4 (synthetic content-pinned closure),
+// HARDQ D1, T02 RED (fail-closed availability + hazard-safe negative control
+// per boundary: FS canary, loopback sink, test-owned process tree, seccomp
+// loosening). Phase-0 review fixes: codex #1-#5, #7, #8, #12; kilo #2, #3.
 package probe
 
 import (
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 )
 
-// helperPath builds the static probehelper once per test run.
 func helperPath(t *testing.T) string {
 	t.Helper()
 	bin := filepath.Join(t.TempDir(), "probehelper")
@@ -34,7 +35,7 @@ func mustDetect(t *testing.T) Availability {
 	t.Helper()
 	av, err := Detect()
 	if err != nil {
-		t.Skipf("bwrap unavailable on this host (fail-closed path exercised elsewhere): %v", err)
+		t.Skipf("bwrap unavailable (fail-closed path covered by TestDetect*): %v", err)
 	}
 	return av
 }
@@ -42,194 +43,119 @@ func mustDetect(t *testing.T) Availability {
 func run(t *testing.T, av Availability, spec Spec) (string, error) {
 	t.Helper()
 	if spec.Timeout == 0 {
-		spec.Timeout = 10 * time.Second
+		spec.Timeout = 15 * time.Second
 	}
-	cmd, err := Command(av, spec)
-	if err != nil {
-		return "", err
-	}
-	out, err := cmd.CombinedOutput()
-	return string(out), err
+	return Run(av, spec)
 }
 
-// --- availability fail-closed (T02 RED a) ---
+// --- availability + floor fail-closed ---
 
 func TestDetectFailClosedWhenBwrapAbsent(t *testing.T) {
-	t.Setenv("PATH", t.TempDir()) // empty PATH dir — bwrap cannot be found
-	if _, err := Detect(); err == nil {
-		t.Fatal("Detect with no bwrap on PATH must fail closed (UNAVAILABLE), got nil error")
-	} else if !strings.Contains(err.Error(), "SANDBOX_CAPABILITY_UNAVAILABLE") {
-		t.Fatalf("want SANDBOX_CAPABILITY_UNAVAILABLE, got: %v", err)
+	t.Setenv("PATH", t.TempDir())
+	if _, err := Detect(); err == nil || !strings.Contains(err.Error(), "SANDBOX_CAPABILITY_UNAVAILABLE") {
+		t.Fatalf("want fail-closed UNAVAILABLE, got: %v", err)
 	}
 }
 
-// --- FS_RO boundary: /etc/shadow must not be readable (PRD §6 item 6) ---
+func TestDetectRejectsBelowFloorVersion(t *testing.T) {
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "bwrap")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\necho bubblewrap 0.5.0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	if _, err := Detect(); err == nil || !strings.Contains(err.Error(), "below floor") {
+		t.Fatalf("bwrap 0.5.0 must be rejected below floor %s, got: %v", MinBwrapVersion, err)
+	}
+}
 
+func TestFloorProbeFunctionalOnThisHost(t *testing.T) {
+	av := mustDetect(t)
+	if err := FloorProbe(av); err != nil {
+		t.Fatalf("kernel floor probe failed on the deployment host: %v", err)
+	}
+}
+
+// --- FS_RO boundary ---
+
+// The PRD-literal case: /etc/shadow must exist host-side (precondition, so
+// the test cannot pass vacuously on a shadow-less host) and be unreadable
+// from inside.
 func TestShadowNotReadableInsideSandbox(t *testing.T) {
 	av := mustDetect(t)
+	if _, err := os.Stat("/etc/shadow"); err != nil {
+		t.Fatalf("precondition: /etc/shadow must exist on the host: %v", err)
+	}
 	hp := helperPath(t)
-	spec := Spec{Target: hp, Args: []string{"readfile", "/etc/shadow"}, WorkDir: t.TempDir()}
-	// probehelper must be visible inside: bind its dir as the workdir target.
-	spec.WorkDir = filepath.Dir(hp)
-	spec.Target = "/work/" + filepath.Base(hp)
-	out, err := runBound(t, av, spec, hp)
+	out, err := run(t, av, Spec{Target: hp, Args: []string{"readfile", "/etc/shadow"}, WorkDir: t.TempDir()})
 	if err == nil {
-		t.Fatalf("/etc/shadow was READABLE inside the sandbox — boundary broken:\n%s", out)
+		t.Fatalf("/etc/shadow READABLE inside the sandbox:\n%s", out)
 	}
 }
 
-// runBound runs the helper by binding its host dir at /work and invoking
-// /work/probehelper, so the target path exists inside the mount namespace.
-func runBound(t *testing.T, av Availability, spec Spec, hostHelper string) (string, error) {
-	t.Helper()
-	// ELF check must run against the HOST path (the /work path does not exist
-	// in the runner's namespace), so validate first, then swap in the inside
-	// path. Command() re-checks; give it the host path via a symlink dir.
-	spec2 := spec
-	spec2.Target = hostHelper
-	cmd, err := Command(av, spec2)
-	if err != nil {
-		return "", err
-	}
-	// Replace the trailing host target with the inside path.
-	argv := cmd.Args
-	for i := len(argv) - 1; i >= 0; i-- {
-		if argv[i] == hostHelper {
-			argv[i] = "/work/" + filepath.Base(hostHelper)
-			break
-		}
-	}
-	c := exec.Command(argv[0], argv[1:]...)
-	out, err := c.CombinedOutput()
-	return string(out), err
-}
-
-// --- FS_RW: the bound workdir IS writable ---
-
-func TestWorkdirWritable(t *testing.T) {
+// The red-capable pair (codex #4): the SAME deny assertion against a
+// host-readable canary outside the closure...
+func TestCanaryOutsideClosureNotReadable(t *testing.T) {
 	av := mustDetect(t)
 	hp := helperPath(t)
-	spec := Spec{WorkDir: filepath.Dir(hp), Args: []string{"writefile", "/work/out.txt", "hello"}}
-	out, err := runBound(t, av, spec, hp)
-	if err != nil {
-		t.Fatalf("write inside bound workdir must succeed, got: %v\n%s", err, out)
-	}
-	b, err := os.ReadFile(filepath.Join(filepath.Dir(hp), "out.txt"))
-	if err != nil || string(b) != "hello" {
-		t.Fatalf("host must see the sandbox write: %v %q", err, b)
-	}
-}
-
-// --- NET_DENY: egress blocked, even to loopback outside the netns ---
-
-func TestNetworkDeniedInsideSandbox(t *testing.T) {
-	av := mustDetect(t)
-	hp := helperPath(t)
-	ln, err := net.Listen("tcp", "127.0.0.1:0") // test-owned sink
-	if err != nil {
+	canaryDir := t.TempDir()
+	canary := filepath.Join(canaryDir, "canary.txt")
+	if err := os.WriteFile(canary, []byte("CANARY"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
-	spec := Spec{WorkDir: filepath.Dir(hp), Args: []string{"dial", ln.Addr().String()}}
-	out, err := runBound(t, av, spec, hp)
+	out, err := run(t, av, Spec{Target: hp, Args: []string{"readfile", canary}, WorkDir: t.TempDir()})
 	if err == nil {
-		t.Fatalf("sandboxed dial to host sink SUCCEEDED — egress boundary broken:\n%s", out)
+		t.Fatalf("canary outside the closure was readable — FS isolation broken:\n%s", out)
 	}
 }
 
-// --- dynamic ELF closure: /bin/ls must run (HARDQ B4) ---
-
-func TestDynamicELFRuns(t *testing.T) {
-	av := mustDetect(t)
-	out, err := run(t, av, Spec{Target: "/bin/ls", Args: []string{"/"}, WorkDir: t.TempDir()})
-	if err != nil {
-		t.Fatalf("dynamically linked /bin/ls must run under the B4 closure, got: %v\n%s", err, out)
-	}
-}
-
-// --- shebang / non-ELF rejected by the launcher (B4 seed) ---
-
-func TestShebangRejectedBeforeSandbox(t *testing.T) {
-	av := mustDetect(t)
-	script := filepath.Join(t.TempDir(), "evil.sh")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\necho pwned\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := Command(av, Spec{Target: script}); err == nil {
-		t.Fatal("shebang script accepted as launch target — must be rejected (ELF-only)")
-	}
-}
-
-// --- undeclared child-exec: paths outside the closure are not visible ---
-
-func TestUndeclaredChildExecFails(t *testing.T) {
-	av := mustDetect(t)
-	hp := helperPath(t)
-	outside := filepath.Join(t.TempDir(), "outside-bin") // exists on host, NOT bound
-	if err := copyFile(hp, outside); err != nil {
-		t.Fatal(err)
-	}
-	spec := Spec{WorkDir: filepath.Dir(hp), Args: []string{"exec", outside, "sleep", "0"}}
-	out, err := runBound(t, av, spec, hp)
-	if err == nil {
-		t.Fatalf("exec of an undeclared host path SUCCEEDED inside the sandbox:\n%s", out)
-	}
-}
-
-// --- PROC_TREE: killing the sandbox kills everything inside ---
-
-func TestKillReapsWholeTree(t *testing.T) {
-	av := mustDetect(t)
-	hp := helperPath(t)
-	spec := Spec{WorkDir: filepath.Dir(hp), Args: []string{"spawn-sleep", "30"}}
-	specHost := spec
-	specHost.Target = hp
-	cmd, err := Command(av, specHost)
-	if err != nil {
-		t.Fatal(err)
-	}
-	argv := cmd.Args
-	argv[len(argv)-3] = "/work/" + filepath.Base(hp)
-	c := exec.Command(argv[0], argv[1:]...)
-	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := c.Start(); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(1 * time.Second) // let it spawn the inner child
-	syscall.Kill(-c.Process.Pid, syscall.SIGKILL)
-	c.Wait()
-	time.Sleep(500 * time.Millisecond)
-	// With --unshare-pid + --die-with-parent nothing survives; verify no
-	// probehelper processes remain.
-	out, _ := exec.Command("pgrep", "-f", filepath.Base(hp)).Output()
-	if len(strings.TrimSpace(string(out))) != 0 {
-		t.Fatalf("sandbox descendants survived kill: pids %s", out)
-	}
-}
-
-// --- hazard-safe NEGATIVE CONTROLS (T02 RED b): a loosened profile must be
-// DETECTED by the same assertions the suite uses. Test-owned resources only:
-// canary file, loopback sink, our own process tree — never real /etc, never
-// uncontrolled egress. ---
-
+// ...must flip to readable when the RO boundary is loosened (negative
+// control, test-owned dir only).
 func TestNegativeControlCanaryReadableWhenROLoosened(t *testing.T) {
 	av := mustDetect(t)
 	hp := helperPath(t)
 	canaryDir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(canaryDir, "canary.txt"), []byte("CANARY"), 0o644); err != nil {
+	canary := filepath.Join(canaryDir, "canary.txt")
+	if err := os.WriteFile(canary, []byte("CANARY"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	spec := Spec{
-		WorkDir:      filepath.Dir(hp),
-		Args:         []string{"readfile", filepath.Join(canaryDir, "canary.txt")},
-		LoosenROBind: canaryDir,
-	}
-	out, err := runBound(t, av, spec, hp)
+	spec := Spec{Target: hp, Args: []string{"readfile", canary}, WorkDir: t.TempDir()}
+	spec.loosen.roBind = canaryDir
+	out, err := run(t, av, spec)
 	if err != nil {
-		t.Fatalf("negative control broken: loosened RO-bind did NOT expose the canary "+
-			"(the FS assertion would pass vacuously): %v\n%s", err, out)
+		t.Fatalf("negative control broken — loosened RO did not expose the canary (deny assertion would be vacuous): %v\n%s", err, out)
 	}
-	_ = out
+}
+
+// --- FS_RW ---
+
+func TestWorkdirWritable(t *testing.T) {
+	av := mustDetect(t)
+	hp := helperPath(t)
+	wd := t.TempDir()
+	out, err := run(t, av, Spec{Target: hp, Args: []string{"writefile", "/work/out.txt", "hello"}, WorkDir: wd})
+	if err != nil {
+		t.Fatalf("write in bound workdir must succeed: %v\n%s", err, out)
+	}
+	if b, err := os.ReadFile(filepath.Join(wd, "out.txt")); err != nil || string(b) != "hello" {
+		t.Fatalf("host must observe the sandbox write: %v %q", err, b)
+	}
+}
+
+// --- NET_DENY ---
+
+func TestNetworkDeniedInsideSandbox(t *testing.T) {
+	av := mustDetect(t)
+	hp := helperPath(t)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	out, err := run(t, av, Spec{Target: hp, Args: []string{"dial", ln.Addr().String()}, WorkDir: t.TempDir()})
+	if err == nil {
+		t.Fatalf("sandboxed dial SUCCEEDED — egress boundary broken:\n%s", out)
+	}
 }
 
 func TestNegativeControlDialSucceedsWhenNetLoosened(t *testing.T) {
@@ -249,18 +175,240 @@ func TestNegativeControlDialSucceedsWhenNetLoosened(t *testing.T) {
 			c.Close()
 		}
 	}()
-	spec := Spec{WorkDir: filepath.Dir(hp), Args: []string{"dial", ln.Addr().String()}, LoosenNet: true}
-	out, err := runBound(t, av, spec, hp)
+	spec := Spec{Target: hp, Args: []string{"dial", ln.Addr().String()}, WorkDir: t.TempDir()}
+	spec.loosen.net = true
+	out, err := run(t, av, spec)
 	if err != nil {
-		t.Fatalf("negative control broken: loosened net did NOT allow the dial "+
-			"(the NET assertion would pass vacuously): %v\n%s", err, out)
+		t.Fatalf("negative control broken — loosened net did not allow the dial: %v\n%s", err, out)
 	}
 }
 
-func copyFile(src, dst string) error {
-	b, err := os.ReadFile(src)
-	if err != nil {
-		return err
+// --- SYSCALL floor ---
+
+func TestSyscallFloorDeniesPtrace(t *testing.T) {
+	av := mustDetect(t)
+	hp := helperPath(t)
+	out, err := run(t, av, Spec{Target: hp, Args: []string{"syscall-ptrace"}, WorkDir: t.TempDir()})
+	if err == nil {
+		t.Fatalf("ptrace ALLOWED under the syscall floor:\n%s", out)
 	}
-	return os.WriteFile(dst, b, 0o755)
+	if !strings.Contains(out, "denied") {
+		t.Fatalf("expected an in-sandbox denial, got: %v\n%s", err, out)
+	}
+}
+
+func TestNegativeControlPtraceAllowedWhenSeccompLoosened(t *testing.T) {
+	av := mustDetect(t)
+	hp := helperPath(t)
+	spec := Spec{Target: hp, Args: []string{"syscall-ptrace"}, WorkDir: t.TempDir()}
+	spec.loosen.seccomp = true
+	out, err := run(t, av, spec)
+	if err != nil {
+		t.Fatalf("negative control broken — without the filter ptrace must succeed: %v\n%s", err, out)
+	}
+}
+
+// --- ELF-only launcher + synthetic closure ---
+
+func TestDynamicELFRuns(t *testing.T) {
+	av := mustDetect(t)
+	out, err := run(t, av, Spec{Target: "/bin/ls", Args: []string{"/"}, WorkDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("dynamically linked /bin/ls must run under the pinned closure: %v\n%s", err, out)
+	}
+}
+
+func TestShebangRejectedBeforeSandbox(t *testing.T) {
+	av := mustDetect(t)
+	script := filepath.Join(t.TempDir(), "evil.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\necho pwned\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Prepare(av, Spec{Target: script}); err == nil {
+		t.Fatal("shebang script accepted as launch target — must be rejected (ELF-only)")
+	}
+}
+
+// The fixed hostile case (codex #2 repro): a binary that EXISTS on the host
+// under /usr is still not executable inside, because /usr is not bound.
+func TestUndeclaredChildExecFailsForUsrBinary(t *testing.T) {
+	av := mustDetect(t)
+	hp := helperPath(t)
+	out, err := run(t, av, Spec{Target: hp, Args: []string{"exec", "/usr/bin/id"}, WorkDir: t.TempDir()})
+	if err == nil {
+		t.Fatalf("undeclared /usr/bin/id EXECUTED inside the sandbox — closure too wide:\n%s", out)
+	}
+}
+
+// Content pinning: modifying the target after Prepare must not change what
+// runs (the bytes were pinned at hash time via --ro-bind-data).
+func TestTargetSwapAfterPrepareIsInert(t *testing.T) {
+	av := mustDetect(t)
+	hp := helperPath(t)
+	copyPath := filepath.Join(t.TempDir(), "target")
+	if b, err := os.ReadFile(hp); err != nil {
+		t.Fatal(err)
+	} else if err := os.WriteFile(copyPath, b, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	h, err := Prepare(av, Spec{Target: copyPath, Args: []string{"writefile", "/work/x", "ok"}, WorkDir: t.TempDir(), Timeout: 15 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Swap the file on disk between Prepare and Start.
+	if err := os.WriteFile(copyPath, []byte("#!/bin/sh\necho pwned\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Start(); err != nil {
+		t.Fatalf("pinned launch must still start: %v", err)
+	}
+	if err := h.Wait(); err != nil {
+		t.Fatalf("pinned bytes must run unaffected by the swap: %v", err)
+	}
+}
+
+// --- PROC_TREE: production kill path, host-side (pid,starttime) oracle ---
+
+// descendants returns host (pid, starttime) pairs for every live process
+// whose ancestry chain reaches root.
+func descendants(t *testing.T, root int) map[string]bool {
+	t.Helper()
+	type pinfo struct{ ppid int; start string }
+	procs := map[int]pinfo{}
+	entries, _ := os.ReadDir("/proc")
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+		if err != nil {
+			continue
+		}
+		// stat: pid (comm) state ppid ... field 22 = starttime
+		s := string(b)
+		close := strings.LastIndex(s, ")")
+		if close < 0 {
+			continue
+		}
+		fields := strings.Fields(s[close+1:])
+		if len(fields) < 20 {
+			continue
+		}
+		ppid, _ := strconv.Atoi(fields[1])
+		procs[pid] = pinfo{ppid: ppid, start: fields[19]}
+	}
+	out := map[string]bool{}
+	var mark func(int)
+	mark = func(p int) {
+		for pid, info := range procs {
+			if info.ppid == p {
+				out[fmt.Sprintf("%d:%s", pid, info.start)] = true
+				mark(pid)
+			}
+		}
+	}
+	mark(root)
+	return out
+}
+
+func stillAlive(keys map[string]bool) []string {
+	var alive []string
+	for k := range keys {
+		parts := strings.SplitN(k, ":", 2)
+		b, err := os.ReadFile("/proc/" + parts[0] + "/stat")
+		if err != nil {
+			continue
+		}
+		s := string(b)
+		close := strings.LastIndex(s, ")")
+		fields := strings.Fields(s[close+1:])
+		if len(fields) >= 20 && fields[19] == parts[1] {
+			alive = append(alive, k)
+		}
+	}
+	return alive
+}
+
+func TestKillReapsWholeTree(t *testing.T) {
+	av := mustDetect(t)
+	hp := helperPath(t)
+	h, err := Prepare(av, Spec{Target: hp, Args: []string{"spawn-sleep", "30"}, WorkDir: t.TempDir(), Timeout: 60 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Start(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1500 * time.Millisecond)
+	tree := descendants(t, h.Cmd.Process.Pid)
+	if len(tree) == 0 {
+		t.Fatal("oracle vacuous: no descendants observed before kill (spawn failed?)")
+	}
+	h.Kill()
+	h.Wait()
+	time.Sleep(500 * time.Millisecond)
+	if alive := stillAlive(tree); len(alive) != 0 {
+		t.Fatalf("descendants survived the production kill: %v", alive)
+	}
+}
+
+func TestNegativeControlChildSurvivesWhenPIDNSLoosened(t *testing.T) {
+	av := mustDetect(t)
+	hp := helperPath(t)
+	spec := Spec{Target: hp, Args: []string{"spawn-sleep", "30"}, WorkDir: t.TempDir(), Timeout: 60 * time.Second}
+	spec.loosen.pidNS = true
+	h, err := Prepare(av, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Start(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1500 * time.Millisecond)
+	tree := descendants(t, h.Cmd.Process.Pid)
+	if len(tree) == 0 {
+		t.Fatal("no descendants observed before kill")
+	}
+	h.Cmd.Process.Kill() // kill ONLY the leader, not the group
+	h.Cmd.Wait()
+	time.Sleep(500 * time.Millisecond)
+	alive := stillAlive(tree)
+	// Clean up the test-owned survivors regardless of outcome.
+	defer func() {
+		for _, k := range alive {
+			pid, _ := strconv.Atoi(strings.SplitN(k, ":", 2)[0])
+			if p, err := os.FindProcess(pid); err == nil {
+				p.Kill()
+			}
+		}
+	}()
+	if len(alive) == 0 {
+		t.Fatal("negative control broken — loosened PID isolation still reaped everything " +
+			"(the PROC_TREE assertion would be vacuous)")
+	}
+}
+
+// --- bounded cleanup of a hanging target (codex #12) ---
+
+func TestHangingTargetCleanedUpWithinTimeout(t *testing.T) {
+	av := mustDetect(t)
+	hp := helperPath(t)
+	start := time.Now()
+	h, err := Prepare(av, Spec{Target: hp, Args: []string{"hang"}, WorkDir: t.TempDir(), Timeout: 3 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Start(); err != nil {
+		t.Fatal(err)
+	}
+	tree := descendants(t, h.Cmd.Process.Pid)
+	h.Wait() // must return via context timeout, not hang
+	if elapsed := time.Since(start); elapsed > 15*time.Second {
+		t.Fatalf("hanging target not cleaned up within bounds: %v", elapsed)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if alive := stillAlive(tree); len(alive) != 0 {
+		t.Fatalf("hanging target left survivors: %v", alive)
+	}
 }

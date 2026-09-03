@@ -73,6 +73,12 @@ Two independent attacks, both adopted:
    delivery/approval never crosses.
 
 ### B4. Sandbox must define the runtime closure for real commands (codex#8, agy#3)
+> **REFINED 2026-09-03 (Phase-0 code review):** the dir-grant closure below proved
+> internally contradictory — with `/usr` bound as a dir, `exec /usr/bin/id` succeeded
+> (demonstrated), violating "undeclared child rejected". Binding closure is now SYNTHETIC
+> and content-pinned: only the promoted target + its resolved loader/libraries, memfd-copied
+> at Prepare and bound via `--ro-bind-data`; no `/etc` grants at all. Essentials E10 carries
+> the current wording; the paragraph below is kept as the original resolution record.
 Landlock is allowlist-only: workspace-only rules make every dynamic binary fail (`EACCES` on
 `ld.so`); naive `/etc` grant violates the `/etc/shadow` criterion. **P0 command contract is
 deliberately small:** promoted absolute ELF executables with a resolved, hash-bound

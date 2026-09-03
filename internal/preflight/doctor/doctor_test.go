@@ -28,6 +28,7 @@ func healthyEnv(t *testing.T) Env {
 		Detect: func() (probe.Availability, error) {
 			return probe.Availability{BwrapPath: "/usr/bin/bwrap", BwrapVersion: "bubblewrap test"}, nil
 		},
+		FloorProbe: func(probe.Availability) error { return nil },
 	}
 }
 
@@ -61,6 +62,11 @@ func TestEachBrokenPrerequisiteScopedOff(t *testing.T) {
 		{"bwrap-absent", func(e *Env) {
 			e.Detect = func() (probe.Availability, error) {
 				return probe.Availability{}, errors.New("SANDBOX_CAPABILITY_UNAVAILABLE: bwrap not found")
+			}
+		}, "exec"},
+		{"kernel-floor-forced-fail", func(e *Env) {
+			e.FloorProbe = func(probe.Availability) error {
+				return errors.New("SANDBOX_CAPABILITY_UNAVAILABLE: user namespaces disabled")
 			}
 		}, "exec"},
 		{"provider-key-missing", func(e *Env) {

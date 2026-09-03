@@ -33,9 +33,10 @@ type Check struct {
 // Env abstracts the host so the RED table can break each prerequisite
 // independently.
 type Env struct {
-	LookupEnv func(string) (string, bool)
-	DataDir   string // resolved nexus data directory
-	Detect    func() (probe.Availability, error)
+	LookupEnv  func(string) (string, bool)
+	DataDir    string // resolved nexus data directory
+	Detect     func() (probe.Availability, error)
+	FloorProbe func(probe.Availability) error
 }
 
 // DefaultEnv resolves the real host environment.
@@ -45,9 +46,10 @@ func DefaultEnv() (Env, error) {
 		return Env{}, fmt.Errorf("cannot resolve user config dir: %w", err)
 	}
 	return Env{
-		LookupEnv: os.LookupEnv,
-		DataDir:   filepath.Join(base, "nexus"),
-		Detect:    probe.Detect,
+		LookupEnv:  os.LookupEnv,
+		DataDir:    filepath.Join(base, "nexus"),
+		Detect:     probe.Detect,
+		FloorProbe: probe.FloorProbe,
 	}, nil
 }
 
@@ -56,12 +58,12 @@ func DefaultEnv() (Env, error) {
 func Run(e Env) []Check {
 	var checks []Check
 
-	// 1+2. Sandbox backend floor: bwrap present and answering. (The deep
-	// hostile suite is the T02 artifact; doctor verifies presence only.)
-	if av, err := e.Detect(); err != nil {
+	// 1. Sandbox backend present + at/above the published version floor.
+	av, detectErr := e.Detect()
+	if detectErr != nil {
 		checks = append(checks, Check{
 			Name: "sandbox-backend", Capability: "exec", Status: StatusOff,
-			Detail: err.Error(),
+			Detail: detectErr.Error(),
 			Fix:    "sudo apt install bubblewrap   # consented install; exec stays OFF until present",
 		})
 	} else {
@@ -69,6 +71,28 @@ func Run(e Env) []Check {
 			Name: "sandbox-backend", Capability: "exec", Status: StatusOK,
 			Detail: av.BwrapVersion + " at " + av.BwrapPath,
 		})
+	}
+
+	// 2. Kernel floor: the backend must actually be able to CREATE a sandbox
+	// (user namespaces usable). bwrap --version alone proves nothing
+	// (Phase-0 review kilo #1 / codex #6).
+	switch {
+	case detectErr != nil:
+		checks = append(checks, Check{
+			Name: "sandbox-floor", Capability: "exec", Status: StatusOff,
+			Detail: "not probed: backend unavailable",
+			Fix:    "install bubblewrap first, then re-run doctor",
+		})
+	default:
+		if err := e.FloorProbe(av); err != nil {
+			checks = append(checks, Check{
+				Name: "sandbox-floor", Capability: "exec", Status: StatusOff,
+				Detail: err.Error(),
+				Fix:    "enable unprivileged user namespaces (sysctl kernel.unprivileged_userns_clone=1 or distro equivalent)",
+			})
+		} else {
+			checks = append(checks, Check{Name: "sandbox-floor", Capability: "exec", Status: StatusOK, Detail: "confined launch succeeded"})
+		}
 	}
 
 	// 3. Data directory: exists (or creatable), private, writable.
@@ -103,27 +127,36 @@ func checkDataDir(dir string) Check {
 	off := func(detail, fix string) Check {
 		return Check{Name: "data-dir", Capability: "stateful-startup", Status: StatusOff, Detail: detail, Fix: fix}
 	}
-	info, err := os.Stat(dir)
+	// Lstat first: a symlinked data directory is rejected outright — a stale
+	// or hostile link would redirect every later store write (codex #10).
+	linfo, lerr := os.Lstat(dir)
 	switch {
-	case os.IsNotExist(err):
+	case os.IsNotExist(lerr):
 		if mkErr := os.MkdirAll(dir, 0o700); mkErr != nil {
 			return off("cannot create "+dir+": "+mkErr.Error(), "mkdir -p "+dir+" && chmod 700 "+dir)
 		}
 		return Check{Name: "data-dir", Capability: "stateful-startup", Status: StatusOK, Detail: dir + " (created, 0700)"}
-	case err != nil:
-		return off("cannot stat "+dir+": "+err.Error(), "check permissions on "+dir)
-	case !info.IsDir():
+	case lerr != nil:
+		return off("cannot lstat "+dir+": "+lerr.Error(), "check permissions on "+dir)
+	case linfo.Mode()&os.ModeSymlink != 0:
+		return off(dir+" is a symlink — refused", "remove the symlink and create a real directory")
+	case !linfo.IsDir():
 		return off(dir+" exists but is not a directory", "remove or rename it, then re-run doctor")
 	}
-	if info.Mode().Perm()&0o077 != 0 {
-		return off(fmt.Sprintf("%s permissions %o are too open (need 0700)", dir, info.Mode().Perm()),
+	if linfo.Mode().Perm()&0o077 != 0 {
+		return off(fmt.Sprintf("%s permissions %o are too open (need 0700)", dir, linfo.Mode().Perm()),
 			"chmod 700 "+dir)
 	}
-	probeFile := filepath.Join(dir, ".doctor-write-probe")
-	if err := os.WriteFile(probeFile, []byte("ok"), 0o600); err != nil {
+	// Randomized, exclusive, no-follow write probe; failed cleanup = OFF.
+	probeFile, err := os.CreateTemp(dir, ".doctor-probe-*")
+	if err != nil {
 		return off(dir+" is not writable: "+err.Error(), "chown/chmod the directory so your user can write")
 	}
-	os.Remove(probeFile)
+	name := probeFile.Name()
+	probeFile.Close()
+	if err := os.Remove(name); err != nil {
+		return off("cannot clean probe file in "+dir+": "+err.Error(), "check ownership of "+dir)
+	}
 	return Check{Name: "data-dir", Capability: "stateful-startup", Status: StatusOK, Detail: dir}
 }
 

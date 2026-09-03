@@ -58,6 +58,13 @@ func main() {
 	case "sleep":
 		secs, _ := strconv.Atoi(arg(2))
 		time.Sleep(time.Duration(secs) * time.Second)
+	case "syscall-ptrace": // attempts PTRACE_TRACEME; exit 0 = allowed, 1 = denied
+		if err := ptraceTraceme(); err != nil {
+			fail("ptrace denied: %v", err)
+		}
+		fmt.Println("ptrace ok")
+	case "hang": // never exits — timeout/cleanup fixture
+		select {}
 	default:
 		fail("unknown subcommand %q", os.Args[1])
 	}
