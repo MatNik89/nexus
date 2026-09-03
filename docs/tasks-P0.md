@@ -113,7 +113,7 @@ Trace: HARNESS-SPEC P0.1 states; E4.
 Acceptance: fold of a recorded run reproduces every intermediate state.
 RED: illegal transition (RUNNING→ADMITTED, SUCCEEDED→RUNNING) → reject.
 
-**[ ] T09 — Config (S1.1-min).**
+**[x] T09 (this commit) — Config (S1.1-min).**
 Typed `Config`; precedence Default<Global<Project<Env<CLI; schema validation before merge;
 `ValidateBounds` (config only NARROWS); restart-on-change, no hot reload (B9).
 Trace: HARNESS-PLAN 1.1; E11; HARDQ B9.
