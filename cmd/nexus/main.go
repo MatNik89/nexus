@@ -17,13 +17,13 @@ import (
 	"github.com/MatNik89/nexus/internal/foundation/config"
 	"github.com/MatNik89/nexus/internal/foundation/pathx"
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
-	"github.com/MatNik89/nexus/internal/kernel/effectpath"
 	"github.com/MatNik89/nexus/internal/kernel/journal"
 	"github.com/MatNik89/nexus/internal/kernel/loop"
 	"github.com/MatNik89/nexus/internal/kernel/machine"
 	"github.com/MatNik89/nexus/internal/kernel/s7min"
 	"github.com/MatNik89/nexus/internal/llm/planner"
 	"github.com/MatNik89/nexus/internal/llm/provider"
+	"github.com/MatNik89/nexus/internal/memory"
 	"github.com/MatNik89/nexus/internal/preflight/doctor"
 	"github.com/MatNik89/nexus/internal/security/redact"
 )
@@ -159,6 +159,11 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemon.Daemon,
 		j.Close()
 		return nil, nil, fmt.Errorf("provider: %w (conversation is a P0 core capability — fix the config and restart)", err)
 	}
+	memStore, err := memory.Open(filepath.Join(profileDir, "memory.db"), profile)
+	if err != nil {
+		j.Close()
+		return nil, nil, fmt.Errorf("memory: %w", err)
+	}
 	target := prov.Target() // the provider's OWN grant target — anything else never reaches the wire
 	d, err := daemon.New(daemon.Deps{
 		Journal: j,
@@ -169,8 +174,8 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemon.Daemon,
 			return planner.NewStreaming(prov, prov, authority, target, deliver)
 		},
 		Authority: authority, Profile: profile,
-		Rules:    map[contracts.ToolID]effectpath.Decision{}, // P0 conversation: no tools yet
-		Tools:    map[contracts.ToolID]effectpath.InProcFunc{},
+		Rules:    memory.Rules(), // memory_remember=ASK, memory_recall=ALLOW
+		Tools:    memory.Tools(memStore),
 		Audit:    &journalAudit{j: j, profile: profile},
 		Redactor: redactor,
 	})

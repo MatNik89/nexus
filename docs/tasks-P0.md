@@ -217,7 +217,7 @@ its profile. (Cross-profile delivery/approval integration REDs land in T24.)
 RED: cross-profile memory query → 0 hits; FTS of profile A never returns B tokens;
 restart+replay preserves ProfileID on every row.
 
-**[ ] T19 — Explicit memory (S9.2-min).**
+**[x] T19 — Explicit memory (S9.2-min).**
 "remember X" → exact preview → profile-bound fact (approval ON); inferred → review queue
 (not recallable until accepted); append-only supersession ("actually it's Y" corrects a
 fact in P0); retrieval recency+exact/tag; NO decay (B8). **MEMORY_FORGET and DATA_PURGE
