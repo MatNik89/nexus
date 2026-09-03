@@ -15,6 +15,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -199,6 +200,16 @@ func (l *Loop) RunTurn(ctx context.Context, turn contracts.TurnID, run contracts
 			return "", err
 		}
 		out, toolErr := l.path.RunTool(ctx, call, grant)
+		if errors.Is(toolErr, effectpath.ErrNeedsApproval) {
+			// HITL gate: the USER must act — never packed as an
+			// observation the model could talk itself past. Durable
+			// TurnSuspended (HARDQ B6) lands with its owner task; the
+			// -min turn surfaces the gate and fails closed.
+			if jerr := l.append(ctx, run, profile, turn, machine.EvAttemptFailed, next()); jerr != nil {
+				return "", jerr
+			}
+			return failTurn(fmt.Errorf("loop: tool %s: %w", call.ToolID, toolErr))
+		}
 		if toolErr != nil {
 			// Failure is an OBSERVATION; the turn continues.
 			if err := l.append(ctx, run, profile, turn, machine.EvAttemptFailed, next()); err != nil {

@@ -97,7 +97,17 @@ type harness struct {
 	toolErr *error
 }
 
+func buildWithRules(t *testing.T, ruleSpec map[string]string, actions []Action) *harness {
+	t.Helper()
+	return buildFull(t, PolicyInteractive, ruleSpec, actions)
+}
+
 func build(t *testing.T, policy Policy, actions []Action) *harness {
+	t.Helper()
+	return buildFull(t, policy, map[string]string{"read": "allow"}, actions)
+}
+
+func buildFull(t *testing.T, policy Policy, ruleSpec map[string]string, actions []Action) *harness {
 	t.Helper()
 	ev := map[string]journal.PayloadValidator{}
 	for _, n := range machine.EventTypes() {
@@ -120,7 +130,16 @@ func build(t *testing.T, policy Policy, actions []Action) *harness {
 				StartedAt: time.Unix(1, 0), FinishedAt: time.Unix(2, 0)}, nil
 		},
 	})
-	pep, err := effectpath.NewPEP(map[contracts.ToolID]effectpath.Decision{"read": effectpath.DecisionAllow},
+	rules := map[contracts.ToolID]effectpath.Decision{}
+	for tool, d := range ruleSpec {
+		switch d {
+		case "allow":
+			rules[contracts.ToolID(tool)] = effectpath.DecisionAllow
+		case "ask":
+			rules[contracts.ToolID(tool)] = effectpath.DecisionAsk
+		}
+	}
+	pep, err := effectpath.NewPEP(rules,
 		effectpath.NewApprovals(nil, time.Minute), nopAudit{}, effectpath.ModeDefault)
 	if err != nil {
 		t.Fatal(err)
@@ -281,5 +300,25 @@ func TestMalformedActionFailsTurn(t *testing.T) {
 	st, _, ferr := machine.TurnTable().Fold(contracts.TurnInvalid, turnEvents, nil)
 	if ferr != nil || st != contracts.TurnFailed {
 		t.Fatalf("malformed action must land TURN FAILED in the journal: %v (%v)", st, ferr)
+	}
+}
+
+// An ASK tool without approval is a HITL gate: the turn FAILS with the
+// NEEDS_APPROVAL sentinel surfaced to the user — never packed as an
+// observation the model could talk itself past (durable TurnSuspended is
+// the B6 owner's upgrade).
+func TestNeedsApprovalSurfacesNotObserved(t *testing.T) {
+	call := toolCall("read", "tc-1")
+	h := build(t, PolicyInteractive, []Action{{Call: &call}, {Final: strp("never")}})
+	// Rebuild the PEP side: register "read" as ASK by building a fresh
+	// harness whose rules gate it.
+	_ = h
+	hAsk := buildWithRules(t, map[string]string{"read": "ask"}, []Action{{Call: &call}, {Final: strp("never")}})
+	_, err := hAsk.loop.RunTurn(context.Background(), "turn-1", "run-1", "work", initialBlocks)
+	if err == nil || !strings.Contains(err.Error(), "NEEDS_APPROVAL") {
+		t.Fatalf("unapproved ASK tool did not surface the HITL gate: %v", err)
+	}
+	if len(hAsk.planner.seen) != 1 {
+		t.Fatal("the model got another planning round past the HITL gate")
 	}
 }

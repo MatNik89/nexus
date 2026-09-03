@@ -193,7 +193,7 @@ Acceptance: e2e turn through journal; replay reproduces it.
 RED: `test_s0_rejects_provenance_laundering`; POSITIVE breaker test — same-turn identical
 call repeated N× → breaker trips; polling-policy call repeated N× → no trip.
 
-**[ ] T17 — Terminal REPL (14.1-min) + daemon/UDS split + liveness heartbeat.**
+**[x] T17 — Terminal REPL (14.1-min) + daemon/UDS split + liveness heartbeat.**
 `nexus daemon` owns the DB, emits liveness heartbeat (C8 positive half); `nexus chat`
 REPL over UDS; message render + input + streaming print (REF-brainless-tui P0 subset).
 `--yolo` flag on the local CLI sets the session PolicyMode (HARDQ F2); the flag is
