@@ -43,3 +43,9 @@ rubber-stamp — only consensus counts; codex digs deepest.
 ## STANDING USER DIRECTIVES (memory-backed)
 - English-only repo; 3-agent review for every non-trivial deliverable; plain-language
   decision questions for the user; `nexus --yolo` = confirmations off, safety nets NEVER.
+
+## AGY UPGRADE (2026-09-03)
+agy reads ~/.gemini/GEMINI.md (global): anti-rubber-stamp review discipline + pointers to
+~/.gemini/skills/{code-review,ponytail}.md. Relaunched via `herdr agent start agy --kind agy
+--pane w8:p4 -- --dangerously-skip-permissions`; rules confirmed loaded. Watch whether its
+PASS-stamping stops in the next review batch.
