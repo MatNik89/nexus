@@ -10,6 +10,18 @@ PRD citations use "PRD §6 item N" (PRD §6 has numbered items, not subsections)
 
 Build order = HARDQ-CONSOLIDATED A2 (unanimous): vertical slices, SECTION-MAP DAG edges
 satisfied via -min contracts. Nothing relies on the sandbox boundary before T02 passes.
+
+**Review gates (MANDATORY — user directive 2026-09-03):**
+1. EVERY phase ends with a deep 3-agent adversarial review of THAT phase's batch, folded
+   to convergence, before the next phase starts.
+2. Three INTEGRATION deep-reviews cover everything-so-far at the seams where pieces first
+   join: (a) after Phase 2 — the whole first end-to-end path (loop→PEP→provider→journal→
+   REPL) as one chain; (b) after Phase 6 — the whole security surface together
+   (sandbox+exec+profiles+HITL+yolo); (c) T27 — full-P0 adversarial review (already in
+   the task).
+3. Retroactive trigger: a task that changes the behavior of earlier code pulls that
+   earlier code into its review scope. Unchanged, already-converged code is NOT re-reviewed
+   without a new proof surface (constitution rule).
 v2 folds REVIEW-TASKS round-1 (codex 15 + kilo 8 findings).
 
 ---
