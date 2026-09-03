@@ -70,7 +70,8 @@ invariant-preserving implementation goes through the normal task/review gate.
   for `channel:plugin` only (HARDQ A1; P1.6 as amended).
 - **No memory decay in P0**: explicit profile-bound facts, append-only supersession;
   Decay+Audn = P1 `memorija`, facts exempt even then (HARDQ B8).
-- **Reminder evidence is assistant-grade**: durable delivery receipt + user ack — never
+- **Reminder evidence is assistant-grade**: durable delivery receipt + user ack, both
+  correlated to the SAME occurrence ID (an ack for occurrence N never closes N+1) — never
   require diff/exit for a Reminder; two obligation types only (Reminder, typed Task); no
   generic "finish Y" claim without a verifier (HARDQ B5).
 - **HITL waits are durable**: `TurnSuspended` committed to the journal, loop exits, resume
@@ -102,6 +103,7 @@ pane_id; prompts in English; absolute paths.
 bounded busy_timeout); bwrap is a DECLARED install prerequisite checked by `nexus doctor` —
 never a silent dependency. Non-Go tools never in-process (sidecar / pure-Go / descope).
 
-## Git (convention)
+## Git (moderator convention — changeable without user approval)
 Docs iterate on `main`. Code slices: branch per slice, self-check + agent review before
-merge. Never commit secrets; `.gitignore` owns runtime artifacts.
+merge (mirrors the user's cross-project rule "branch first, review before push"). Never
+commit secrets; `.gitignore` owns runtime artifacts.

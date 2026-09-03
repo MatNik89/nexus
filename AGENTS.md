@@ -25,7 +25,8 @@ Everything you produce here is **English** — code, comments, docs, review file
   any change invalidates; never a reusable "approve this tool" (HARDQ C4).
 - UNKNOWN effect → RECONCILING; no blind retry of irreversible/unknown outcomes (E9).
 - Fail-closed on unknown TYPED inputs: unknown enum/kind/capability → reject; unknown
-  schema ID/version → reject unprocessed in P0 (upcast+quarantine = v2 layer, HARDQ C7).
+  schema ID/version → reject unprocessed in P0 with raw input preserved (upcast+quarantine
+  = v2 layer, HARDQ C7).
 - Every TOOL-executing subprocess (`ExecProcess`) through S6.2 sandbox (bwrap P0); unknown
   `ExecutionKind` → reject, never in-process; nothing relies on the sandbox before the
   hostile conformance suite passes. CLIAgent provider subprocess (S2.1, `--tools ""`) is a
@@ -45,13 +46,18 @@ Everything you produce here is **English** — code, comments, docs, review file
   `extensions`/S6.8 closure gates ONLY `channel:plugin` (HARDQ A1; P1.6 as amended).
 - No memory decay in P0 — explicit facts, append-only supersession; Decay+Audn = P1,
   facts exempt even then (HARDQ B8).
-- Reminder evidence = durable delivery receipt + user ack; NEVER diff/exit for a Reminder;
-  two obligation types only (Reminder, typed Task) (HARDQ B5).
+- Reminder evidence = durable delivery receipt + user ack, both correlated to the SAME
+  occurrence ID (an ack for occurrence N never closes N+1); NEVER diff/exit for a Reminder;
+  two obligation types only (Reminder, typed Task); no generic "finish Y" claim without a
+  handler-specific verifier (HARDQ B5).
 - HITL waits are durable (`TurnSuspended` in the journal; resume rehydrates) — no
   in-memory blocking wait (HARDQ B6).
-- No runtime capability activation in P0: fail-closed `Resolve` + sealed startup snapshot;
-  the transactional Activator/RollbackVault is forbidden until a dynamic consumer exists
-  (HARDQ B9). S7/S5 enter P0 only as -min contracts (`s7-min`, `s5-min`) (HARDQ A2).
+- No runtime capability activation in P0: fail-closed `Resolve` + sealed startup snapshot +
+  restart-on-config-change; the transactional Activator/RollbackVault is forbidden until an
+  explicitly selected dynamic consumer exists (HARDQ B9). S7/S5 enter P0 only as -min
+  contracts: `s7-min` = AttemptGrant + cancel + no-retry (retryable → FAILED_TERMINAL),
+  `s5-min` = AtomicWriter; full S7 taxonomy/budgets/fencing = P2, full S5
+  shadow-git/worktree = P3 (HARDQ A2).
 - Stuck-detection only WITHIN one interactive turn; scheduled/polling iterations exempt
   via continuous-loop policy (HARDQ C3).
 
@@ -59,10 +65,13 @@ Everything you produce here is **English** — code, comments, docs, review file
 - Behavioral change → red-capable detector observed RED before the fix, GREEN after;
   assertions anchored to Annex A RED names / PRD criteria, not the implementation; stateful
   tests own fresh temp fixtures (user's cross-project discipline).
-- Smallest causal diff; match local idiom; no speculative abstractions or dependencies.
-- Absolute paths in every cross-agent instruction and output file.
-- Reviews are adversarial, not rubber-stamps: a review with zero findings is usually a
-  failed review — if genuinely clean, name the top-3 weakest points. Use task-appropriate
+- Smallest causal diff; match local idiom; no speculative abstractions or dependencies
+  (user's cross-project topknot discipline).
+- Absolute paths in every cross-agent instruction and output file (HANDOFF operational
+  gotcha: agent cwd is unreliable).
+- Reviews are adversarial, not rubber-stamps (user's cross-project epistemic-honesty rule):
+  a review with zero findings is usually a failed review — if genuinely clean, name the
+  top-3 weakest points. Use task-appropriate
   finding tags, cite file:line of the source proving each claim, end with the
   machine-checkable last line the dispatch asked for (`VERDICT:`/`SUMMARY:`).
 - Never mark another agent's claim correct without checking it against the sources.
