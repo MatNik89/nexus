@@ -9,12 +9,14 @@ import (
 	"testing"
 )
 
+const cfgHash = "cfg-hash-1"
+
 func allProbesPass() []ProbeResult {
 	return []ProbeResult{
-		{Name: "provider", Passed: true},
-		{Name: "store", Passed: true},
-		{Name: "channel", Passed: true},
-		{Name: "sandbox", Passed: true},
+		{Name: "provider", Passed: true, ConfigHash: cfgHash},
+		{Name: "store", Passed: true, ConfigHash: cfgHash},
+		{Name: "channel", Passed: true, ConfigHash: cfgHash},
+		{Name: "sandbox", Passed: true, ConfigHash: cfgHash},
 	}
 }
 
@@ -76,10 +78,10 @@ func TestAblatedSandboxProbeTurnsOnlyExecOff(t *testing.T) {
 	probes := allProbesPass()
 	for i := range probes {
 		if probes[i].Name == "sandbox" {
-			probes[i] = ProbeResult{Name: "sandbox", Passed: false, Detail: "bwrap missing"}
+			probes[i] = ProbeResult{Name: "sandbox", Passed: false, Detail: "bwrap missing", ConfigHash: cfgHash}
 		}
 	}
-	snap, err := Seal(P0Capabilities(), allP0(), probes)
+	snap, err := Seal(P0Capabilities(), allP0(), probes, cfgHash)
 	if err != nil {
 		t.Fatalf("an ablated probe must not abort startup: %v", err)
 	}
@@ -100,12 +102,12 @@ func TestAblatedSandboxProbeTurnsOnlyExecOff(t *testing.T) {
 // an OFF capability go OFF with a dependency reason.
 func TestMissingProbeFailsClosedAndPropagates(t *testing.T) {
 	probes := []ProbeResult{
-		{Name: "store", Passed: true},
-		{Name: "channel", Passed: true},
-		{Name: "sandbox", Passed: true},
+		{Name: "store", Passed: true, ConfigHash: cfgHash},
+		{Name: "channel", Passed: true, ConfigHash: cfgHash},
+		{Name: "sandbox", Passed: true, ConfigHash: cfgHash},
 		// provider probe MISSING entirely
 	}
-	snap, err := Seal(P0Capabilities(), allP0(), probes)
+	snap, err := Seal(P0Capabilities(), allP0(), probes, cfgHash)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,11 +128,45 @@ func TestMissingProbeFailsClosedAndPropagates(t *testing.T) {
 // Unknown capability names queried against the sealed snapshot are OFF —
 // never a skippable error.
 func TestUnknownCapabilityQueriesOff(t *testing.T) {
-	snap, err := Seal(P0Capabilities(), allP0(), allProbesPass())
+	snap, err := Seal(P0Capabilities(), allP0(), allProbesPass(), cfgHash)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if snap.On("does-not-exist") {
 		t.Fatal("unknown capability reported ON")
+	}
+}
+
+// Duplicate probe names are rejected in BOTH orders — input order can never
+// decide capability state (codex #19 literal).
+func TestDuplicateProbeNamesRejectedBothOrders(t *testing.T) {
+	dup1 := append(allProbesPass(), ProbeResult{Name: "sandbox", Passed: false, ConfigHash: cfgHash})
+	if _, err := Seal(P0Capabilities(), allP0(), dup1, cfgHash); err == nil {
+		t.Fatal("duplicate probe (pass-then-fail) accepted")
+	}
+	dup2 := append([]ProbeResult{{Name: "sandbox", Passed: false, ConfigHash: cfgHash}}, allProbesPass()...)
+	if _, err := Seal(P0Capabilities(), allP0(), dup2, cfgHash); err == nil {
+		t.Fatal("duplicate probe (fail-then-pass) accepted")
+	}
+}
+
+// A probe measured under a DIFFERENT config hash is stale → its capability
+// stays OFF (codex #18: replay-after-config-change literal).
+func TestStaleProbeFromOtherConfigTurnsCapabilityOff(t *testing.T) {
+	probes := allProbesPass()
+	for i := range probes {
+		if probes[i].Name == "sandbox" {
+			probes[i].ConfigHash = "OLD-config"
+		}
+	}
+	snap, err := Seal(P0Capabilities(), allP0(), probes, cfgHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.On("exec") {
+		t.Fatal("exec ON from a stale probe measured under another config")
+	}
+	if _, err := Seal(P0Capabilities(), allP0(), allProbesPass(), ""); err == nil {
+		t.Fatal("empty config hash accepted")
 	}
 }

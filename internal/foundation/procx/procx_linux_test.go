@@ -108,3 +108,36 @@ func TestTokenNamesInstanceNotPid(t *testing.T) {
 		t.Fatal("dead process reported alive")
 	}
 }
+
+// Concurrent Wait+Terminate serialize safely (codex #16).
+func TestConcurrentWaitAndTerminate(t *testing.T) {
+	tr, err := Start(exec.Command("/bin/sleep", "300"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{}, 3)
+	go func() { tr.Wait(); done <- struct{}{} }()
+	go func() { tr.Wait(); done <- struct{}{} }()
+	go func() { tr.Terminate(200 * time.Millisecond); done <- struct{}{} }()
+	for i := 0; i < 3; i++ {
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatal("concurrent lifecycle calls deadlocked")
+		}
+	}
+}
+
+// A stale token never signals: Terminate on an already-dead instance is a
+// no-op success, not a shot at a reused pgid (codex #16).
+func TestStaleTokenNeverSignals(t *testing.T) {
+	tr, err := Start(exec.Command("/bin/sleep", "0.1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr.Wait()
+	time.Sleep(100 * time.Millisecond)
+	if err := tr.Terminate(100 * time.Millisecond); err != nil {
+		t.Fatalf("terminate of a dead instance must succeed as a no-op: %v", err)
+	}
+}

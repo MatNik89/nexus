@@ -19,18 +19,13 @@ func write(t *testing.T, dir, name, content string) string {
 	return p
 }
 
-func noEnv(string) (string, bool) { return "", false }
+var noEnv []string
 
 func TestPrecedenceTable(t *testing.T) {
 	dir := t.TempDir()
 	global := write(t, dir, "global.json", `{"provider_model":"from-global","provider_base_url":"https://g"}`)
 	project := write(t, dir, "project.json", `{"provider_model":"from-project"}`)
-	env := func(k string) (string, bool) {
-		if k == "NEXUS_CFG_PROVIDER_BASE_URL" {
-			return "https://env", true
-		}
-		return "", false
-	}
+	env := []string{"NEXUS_CFG_PROVIDER_BASE_URL=https://env", "UNRELATED=1"}
 	res, err := Resolve(global, project, env, map[string]string{"default_profile": "work"})
 	if err != nil {
 		t.Fatal(err)
@@ -110,5 +105,83 @@ func TestInvalidProfileRefused(t *testing.T) {
 	if _, err := Resolve("/nonexistent", "/nonexistent", noEnv,
 		map[string]string{"default_profile": "bad\x00id"}); err == nil {
 		t.Fatal("control-char profile id accepted")
+	}
+}
+
+// Unknown NEXUS_CFG_* env vars fail closed like every other layer
+// (Phase-1B codex #12: name-probing made them invisible).
+func TestUnknownEnvVarRefused(t *testing.T) {
+	_, err := Resolve("/nonexistent", "/nonexistent",
+		[]string{"NEXUS_CFG_TOTALLY_NEW=1"}, nil)
+	if err == nil {
+		t.Fatal("unknown NEXUS_CFG_ variable accepted")
+	}
+}
+
+// Per-key schema in EVERY layer (codex #11): wrong JSON types and
+// non-literal booleans are refused, never coerced.
+func TestPerKeySchemaStrict(t *testing.T) {
+	dir := t.TempDir()
+	cases := map[string]string{
+		"bool-as-model":     `{"provider_model": true}`,
+		"bool-as-egress":    `{"egress_allow": true}`,
+		"string-as-sandbox": `{"sandbox_disabled": "yes"}`,
+		"number-as-url":     `{"provider_base_url": 42}`,
+	}
+	for name, content := range cases {
+		t.Run(name, func(t *testing.T) {
+			g := write(t, dir, name+".json", content)
+			if _, err := Resolve(g, "/nonexistent", noEnv, nil); err == nil {
+				t.Fatalf("mistyped value accepted: %s", content)
+			}
+		})
+	}
+	// Env/CLI: "TRUE"/"1" are NOT booleans (previously silently false).
+	if _, err := Resolve("/nonexistent", "/nonexistent",
+		[]string{"NEXUS_CFG_SANDBOX_DISABLED=TRUE"}, nil); err == nil {
+		t.Fatal("non-literal boolean accepted from env")
+	}
+	if _, err := Resolve("/nonexistent", "/nonexistent", noEnv,
+		map[string]string{"sandbox_disabled": "1"}); err == nil {
+		t.Fatal("non-literal boolean accepted from CLI")
+	}
+}
+
+// Egress entries stay a real array: whitespace and empty entries refused
+// in every layer (codex #13 / kilo #3).
+func TestEgressListHygiene(t *testing.T) {
+	dir := t.TempDir()
+	g := write(t, dir, "g.json", `{"egress_allow":["api.telegram.org", " padded.example"]}`)
+	if _, err := Resolve(g, "/nonexistent", noEnv, nil); err == nil {
+		t.Fatal("whitespace-padded host accepted from file")
+	}
+	if _, err := Resolve("/nonexistent", "/nonexistent",
+		[]string{"NEXUS_CFG_EGRESS_ALLOW=a.example,, b.example"}, nil); err == nil {
+		t.Fatal("empty/padded CSV entries accepted from env")
+	}
+	res, err := Resolve("/nonexistent", "/nonexistent",
+		[]string{"NEXUS_CFG_EGRESS_ALLOW=a.example,b.example"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Config.EgressAllow) != 2 || res.Config.EgressAllow[1] != "b.example" {
+		t.Fatalf("clean CSV mis-parsed: %v", res.Config.EgressAllow)
+	}
+}
+
+// Bounds are enforced regardless of which layer supplied the value
+// (codex #20: file-only bounds REDs were too narrow).
+func TestBoundsEnforcedFromEveryLayer(t *testing.T) {
+	if _, err := Resolve("/nonexistent", "/nonexistent",
+		[]string{"NEXUS_CFG_EGRESS_ALLOW=*"}, nil); err == nil {
+		t.Fatal("egress wildcard accepted from env")
+	}
+	if _, err := Resolve("/nonexistent", "/nonexistent", noEnv,
+		map[string]string{"egress_allow": "api.x,*"}); err == nil {
+		t.Fatal("egress wildcard accepted from CLI")
+	}
+	if _, err := Resolve("/nonexistent", "/nonexistent",
+		[]string{"NEXUS_CFG_SANDBOX_DISABLED=true"}, nil); err == nil {
+		t.Fatal("sandbox_disabled accepted from env")
 	}
 }

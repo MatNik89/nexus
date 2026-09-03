@@ -107,17 +107,21 @@ func Resolve(manifests []Manifest, requested []string) ([]string, error) {
 // ProbeResult is one live probe outcome (accepted as data: the composing
 // root runs real probes — sandbox/provider/channel; tests pass
 // contract-valid fakes; T27 verifies the final all-live snapshot).
+// ConfigHash binds the measurement to the configuration it was taken under
+// (Annex P0.5: a changed config invalidates the grant — Phase-1B codex #18:
+// a stale result from another config must not turn a capability ON).
 type ProbeResult struct {
-	Name   string
-	Passed bool
-	Detail string
+	Name       string
+	Passed     bool
+	Detail     string
+	ConfigHash string
 }
 
 // CapabilityStatus is one sealed entry.
 type CapabilityStatus struct {
-	Name    string
-	On      bool
-	Reason  string // OFF reason (probe/dependency), empty when On
+	Name   string
+	On     bool
+	Reason string // OFF reason (probe/dependency), empty when On
 }
 
 // Snapshot is the SEALED startup capability state: immutable after Seal;
@@ -128,9 +132,15 @@ type Snapshot struct {
 }
 
 // Seal resolves the requested set and switches each capability ON only if
-// every required probe passed AND every required capability is ON. A
-// missing probe result counts as FAILED (fail closed).
-func Seal(manifests []Manifest, requested []string, probes []ProbeResult) (*Snapshot, error) {
+// every required probe passed UNDER THE SAME CONFIG HASH and every required
+// capability is ON. Missing probe = FAILED; duplicate probe names are
+// REJECTED (Phase-1B codex #19: last-write-wins let input order decide
+// capability state); a probe measured under a different config hash =
+// FAILED (codex #18).
+func Seal(manifests []Manifest, requested []string, probes []ProbeResult, configHash string) (*Snapshot, error) {
+	if configHash == "" {
+		return nil, fmt.Errorf("closure: a config hash binding is required (fail closed)")
+	}
 	order, err := Resolve(manifests, requested)
 	if err != nil {
 		return nil, err
@@ -141,6 +151,9 @@ func Seal(manifests []Manifest, requested []string, probes []ProbeResult) (*Snap
 	}
 	probeOK := map[string]ProbeResult{}
 	for _, p := range probes {
+		if _, dup := probeOK[p.Name]; dup {
+			return nil, fmt.Errorf("closure: duplicate probe result %q (fail closed)", p.Name)
+		}
 		probeOK[p.Name] = p
 	}
 	snap := &Snapshot{statuses: map[string]CapabilityStatus{}, order: order}
@@ -152,6 +165,11 @@ func Seal(manifests []Manifest, requested []string, probes []ProbeResult) (*Snap
 			if !present {
 				status.On = false
 				status.Reason = fmt.Sprintf("probe %q missing (fail closed)", probe)
+				break
+			}
+			if pr.ConfigHash != configHash {
+				status.On = false
+				status.Reason = fmt.Sprintf("probe %q measured under a different config (stale, fail closed)", probe)
 				break
 			}
 			if !pr.Passed {

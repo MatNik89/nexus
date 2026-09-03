@@ -86,17 +86,17 @@ func chainHash(input []byte) string {
 // Journal is the single-write-owner event log, BOUND to one profile — in
 // the DATABASE, not just process memory (r2 codex #3).
 type Journal struct {
-	db         *sql.DB
-	profile    contracts.ProfileID
-	redact     redact.Redactor
-	events     map[string]PayloadValidator
+	db              *sql.DB
+	profile         contracts.ProfileID
+	redact          redact.Redactor
+	events          map[string]PayloadValidator
 	syncProjections []SyncProjection
-	leaseToken string
-	reqs       chan appendReq
-	done       chan struct{}
-	actorDone  chan struct{}
-	closeOnce  sync.Once
-	closeErr   error
+	leaseToken      string
+	reqs            chan appendReq
+	done            chan struct{}
+	actorDone       chan struct{}
+	closeOnce       sync.Once
+	closeErr        error
 }
 
 type appendReq struct {
@@ -213,10 +213,6 @@ func Open(path string, profile contracts.ProfileID, r redact.Redactor, events ma
 			db.Close()
 			return nil, fmt.Errorf("journal open: invalid sync projection (fail closed)")
 		}
-		if err := sp.Init(db); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("journal open: sync projection %s init: %w", sp.Name(), err)
-		}
 	}
 	// Defensive copy: the closed event set must stay closed after Open
 	// (r3 codex #4 — a caller-held map is mutable and racy).
@@ -297,6 +293,16 @@ func Open(path string, profile contracts.ProfileID, r redact.Redactor, events ma
 		relErr := releaseLease()
 		closeErr := db.Close()
 		return nil, fmt.Errorf("journal open: %w", errors.Join(err, relErr, closeErr))
+	}
+	// Projection Init runs ONLY under our verified ownership (Phase-1B
+	// codex #5: a rejected second opener must never get a DB handle to
+	// mutate through Init).
+	for _, sp := range syncProjections {
+		if err := sp.Init(db); err != nil {
+			relErr := releaseLease()
+			closeErr := db.Close()
+			return nil, fmt.Errorf("journal open: sync projection %s init: %w", sp.Name(), errors.Join(err, relErr, closeErr))
+		}
 	}
 
 	go j.actor(lastOffset, lastHash)

@@ -626,7 +626,6 @@ func TestOverBudgetPayloadRejected(t *testing.T) {
 	}
 }
 
-
 // A failed Open with a FAILING lease release surfaces both errors
 // (r5 codex #2 — the sibling of the Close path).
 func TestFailedOpenSurfacesLeaseReleaseFailure(t *testing.T) {

@@ -11,8 +11,11 @@ import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/MatNik89/nexus/internal/kernel/contracts"
+	"github.com/MatNik89/nexus/internal/kernel/machine"
 	"github.com/MatNik89/nexus/internal/security/redact"
 )
 
@@ -31,7 +34,7 @@ func (f *fakeCounter) Init(db *sql.DB) error {
 		journal_offset INTEGER PRIMARY KEY, event_type TEXT NOT NULL)`)
 	return err
 }
-func (f *fakeCounter) Apply(tx *sql.Tx, ev Event) error {
+func (f *fakeCounter) Apply(tx *ProjTx, ev Event) error {
 	if f.failOnce && !f.failed {
 		f.failed = true
 		return fmt.Errorf("injected projection failure")
@@ -157,7 +160,7 @@ func TestProjectorOffsetNeverAdvancesPastDurableWork(t *testing.T) {
 		t.Fatal(err)
 	}
 	seen := 0
-	err = pr.Run(func(tx *sql.Tx, ev Event) error {
+	err = pr.Run(func(tx *ProjTx, ev Event) error {
 		seen++
 		if ev.JournalOffset == 2 {
 			return fmt.Errorf("injected apply failure")
@@ -173,7 +176,7 @@ func TestProjectorOffsetNeverAdvancesPastDurableWork(t *testing.T) {
 	}
 	// Re-run REPLAYS offset 2 (at-least-once, monotone).
 	replayed := []uint64{}
-	if err := pr.Run(func(tx *sql.Tx, ev Event) error {
+	if err := pr.Run(func(tx *ProjTx, ev Event) error {
 		replayed = append(replayed, ev.JournalOffset)
 		return nil
 	}); err != nil {
@@ -198,12 +201,118 @@ func TestProjectorsIndependent(t *testing.T) {
 	}
 	a, _ := j.NewProjector("a")
 	b, _ := j.NewProjector("b")
-	if err := a.Run(func(*sql.Tx, Event) error { return nil }); err != nil {
+	if err := a.Run(func(*ProjTx, Event) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
 	offA, _ := a.Offset()
 	offB, _ := b.Offset()
 	if offA != 2 || offB != 0 {
 		t.Fatalf("projector offsets not independent: a=%d b=%d", offA, offB)
+	}
+}
+
+// The P0.3 canary literal (codex #6): a projection attempting to write the
+// canonical events table gets NON_CANONICAL_WRITE and the append aborts —
+// no attacker event exists afterwards.
+type rogueProjection struct{}
+
+func (rogueProjection) Name() string       { return "rogue" }
+func (rogueProjection) Init(*sql.DB) error { return nil }
+func (rogueProjection) Apply(tx *ProjTx, ev Event) error {
+	_, err := tx.Exec(`INSERT INTO events(journal_offset, event_id, run_id, sequence, envelope,
+		redaction_policy_version, integrity_prev_hash, integrity_hash)
+		VALUES(999,'forged','run-x',1,'{}',1,'','')`)
+	return err
+}
+
+func TestProjectionCanaryWriteRejectedNonCanonical(t *testing.T) {
+	j := openWithProjection(t, t.TempDir(), rogueProjection{})
+	_, err := j.Append(context.Background(), params("run-a", "e1"))
+	if err == nil {
+		t.Fatal("append with a canonical-table-writing projection succeeded")
+	}
+	if !strings.Contains(err.Error(), "NON_CANONICAL_WRITE") {
+		t.Fatalf("want NON_CANONICAL_WRITE, got: %v", err)
+	}
+	count := 0
+	j.Replay(0, func(Event) error { count++; return nil })
+	if count != 0 {
+		t.Fatalf("attacker event exists after rejected canary write: %d", count)
+	}
+}
+
+// A rejected second opener's projections must NOT mutate the DB before the
+// lease check (codex #5): Init runs only under verified ownership.
+type canaryInit struct{ ran *bool }
+
+func (c canaryInit) Name() string { return "canary_init" }
+func (c canaryInit) Init(db *sql.DB) error {
+	*c.ran = true
+	return nil
+}
+func (c canaryInit) Apply(*ProjTx, Event) error { return nil }
+
+func TestSecondOpenerInitNeverRuns(t *testing.T) {
+	dir := t.TempDir()
+	j1 := open(t, dir, redact.None{})
+	defer j1.Close()
+	ran := false
+	_, err := Open(filepath.Join(dir, "journal.db"), "work", redact.None{}, manyEvents(), canaryInit{ran: &ran})
+	if err == nil {
+		t.Fatal("second live opener accepted")
+	}
+	if ran {
+		t.Fatal("rejected opener's projection Init mutDated/ran against the DB")
+	}
+}
+
+// T08 acceptance at the REAL boundary (Phase-1B codex #9): fold an actually
+// RECORDED run's journal events through the canonical table — every
+// intermediate state and the offset checkpoint reproduced.
+func TestFoldRecordedRunFromJournal(t *testing.T) {
+	dir := t.TempDir()
+	ev := map[string]PayloadValidator{}
+	for _, n := range machine.EventTypes() {
+		ev[n] = nil
+	}
+	j, err := Open(filepath.Join(dir, "journal.db"), "work", redact.None{}, ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.Close()
+	ctx := context.Background()
+	for _, ty := range []string{machine.EvRunCreated, machine.EvRunAdmitted, machine.EvRunStarted, machine.EvRunSucceeded} {
+		p := params("run-real", ty)
+		p.EventID = contracts.EventID("ev-" + ty)
+		if _, err := j.Append(ctx, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var folded []machine.FoldEvent
+	if err := j.Replay(0, func(e Event) error {
+		if e.Envelope.RunID == "run-real" {
+			folded = append(folded, machine.FoldEvent{Type: e.Envelope.EventType, Offset: e.JournalOffset})
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var intermediates []contracts.RunState
+	final, checkpoint, err := machine.RunTable().Fold(contracts.RunInvalid, folded,
+		func(s contracts.RunState, _ uint64) { intermediates = append(intermediates, s) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final != contracts.RunSucceeded {
+		t.Fatalf("recorded run folds to %v", final)
+	}
+	if checkpoint != folded[len(folded)-1].Offset {
+		t.Fatalf("checkpoint %d != last journal offset %d", checkpoint, folded[len(folded)-1].Offset)
+	}
+	want := []contracts.RunState{contracts.RunCreated, contracts.RunAdmitted, contracts.RunRunning, contracts.RunSucceeded}
+	for i := range want {
+		if intermediates[i] != want[i] {
+			t.Fatalf("intermediate %d: %v want %v", i, intermediates[i], want[i])
+		}
 	}
 }

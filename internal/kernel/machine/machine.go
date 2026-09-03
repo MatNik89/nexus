@@ -47,33 +47,46 @@ func NewTable[S comparable](name string, transitions []Transition[S]) (*Table[S]
 
 // Step applies one event to the current state. Unknown event or illegal
 // (event, from) pair → error, state unchanged (default-reject).
+// (Phase-1B codex #10: on reject the CURRENT state is returned unchanged —
+// the zero value let a careless caller overwrite valid state.)
 func (t *Table[S]) Step(current S, event string) (S, error) {
 	byFrom, ok := t.edges[event]
 	if !ok {
-		var zero S
-		return zero, fmt.Errorf("table %s: unknown transition event %q (fail closed)", t.name, event)
+		return current, fmt.Errorf("table %s: unknown transition event %q (fail closed)", t.name, event)
 	}
 	next, ok := byFrom[current]
 	if !ok {
-		var zero S
-		return zero, fmt.Errorf("table %s: event %q is illegal from state %v (fail closed)", t.name, event, current)
+		return current, fmt.Errorf("table %s: event %q is illegal from state %v (fail closed)", t.name, event, current)
 	}
 	return next, nil
 }
 
-// Fold reconstructs state by replaying events in order from an initial
-// state. Checkpoint = the journal offset of the last folded event; resume
-// means folding the remainder from the same initial state semantics.
-func (t *Table[S]) Fold(initial S, events []string) (S, error) {
+// FoldEvent is one journaled event as the fold consumes it: type plus its
+// JOURNAL OFFSET (checkpoint currency — Phase-1B codex #9).
+type FoldEvent struct {
+	Type   string
+	Offset uint64
+}
+
+// Fold replays journal events in order, returning the final state and the
+// CHECKPOINT (offset of the last applied event). observe receives every
+// intermediate state (nil to skip). An illegal step reports the exact
+// offset and returns the last legal state with the checkpoint BEFORE it.
+func (t *Table[S]) Fold(initial S, events []FoldEvent, observe func(state S, offset uint64)) (S, uint64, error) {
 	state := initial
-	for i, ev := range events {
-		next, err := t.Step(state, ev)
+	var checkpoint uint64
+	for _, ev := range events {
+		next, err := t.Step(state, ev.Type)
 		if err != nil {
-			return state, fmt.Errorf("fold step %d: %w", i, err)
+			return state, checkpoint, fmt.Errorf("fold at offset %d: %w", ev.Offset, err)
 		}
 		state = next
+		checkpoint = ev.Offset
+		if observe != nil {
+			observe(state, ev.Offset)
+		}
 	}
-	return state, nil
+	return state, checkpoint, nil
 }
 
 // --- Run lifecycle (P0.1): CREATED→ADMITTED→RUNNING→{SUCCEEDED|FAILED|
@@ -81,16 +94,16 @@ func (t *Table[S]) Fold(initial S, events []string) (S, error) {
 
 // Run event types (closed; these are journal event_type values).
 const (
-	EvRunCreated    = "run.created"
-	EvRunAdmitted   = "run.admitted"
-	EvRunStarted    = "run.started"
-	EvRunSucceeded  = "run.succeeded"
-	EvRunFailed     = "run.failed"
-	EvRunCancelled  = "run.cancelled"
-	EvRunLost       = "run.lost"        // → UNKNOWN
-	EvRunReconciled = "run.reconciled_ok"
+	EvRunCreated          = "run.created"
+	EvRunAdmitted         = "run.admitted"
+	EvRunStarted          = "run.started"
+	EvRunSucceeded        = "run.succeeded"
+	EvRunFailed           = "run.failed"
+	EvRunCancelled        = "run.cancelled"
+	EvRunLost             = "run.lost" // → UNKNOWN
+	EvRunReconciled       = "run.reconciled_ok"
 	EvRunReconciledFailed = "run.reconciled_failed"
-	EvRunManual     = "run.manual_recovery"
+	EvRunManual           = "run.manual_recovery"
 )
 
 // RunTable returns the canonical run-state table.
@@ -101,9 +114,13 @@ func RunTable() *Table[contracts.RunState] {
 		{EvRunStarted, contracts.RunAdmitted, contracts.RunRunning},
 		{EvRunSucceeded, contracts.RunRunning, contracts.RunSucceeded},
 		{EvRunFailed, contracts.RunRunning, contracts.RunFailed},
+		// ONE canonical cancel event, legal from every non-terminal state
+		// (per-event multi-from — Phase-1B kilo #1: alias names would make
+		// the real run.cancelled fail closed at emit time). Cancel-from-
+		// CREATED/ADMITTED = explicit owner amendment (SPEC P0.1 record).
 		{EvRunCancelled, contracts.RunCreated, contracts.RunCancelled},
-		{EvRunCancelled + ".admitted", contracts.RunAdmitted, contracts.RunCancelled},
-		{EvRunCancelled + ".running", contracts.RunRunning, contracts.RunCancelled},
+		{EvRunCancelled, contracts.RunAdmitted, contracts.RunCancelled},
+		{EvRunCancelled, contracts.RunRunning, contracts.RunCancelled},
 		{EvRunLost, contracts.RunRunning, contracts.RunUnknown},
 		// UNKNOWN exits ONLY via explicit reconciliation events (P0.1).
 		{EvRunReconciled, contracts.RunUnknown, contracts.RunSucceeded},
@@ -133,7 +150,7 @@ func TurnTable() *Table[contracts.TurnState] {
 		{EvTurnSucceeded, contracts.TurnRunning, contracts.TurnSucceeded},
 		{EvTurnFailed, contracts.TurnRunning, contracts.TurnFailed},
 		{EvTurnCancelled, contracts.TurnCreated, contracts.TurnCancelled},
-		{EvTurnCancelled + ".running", contracts.TurnRunning, contracts.TurnCancelled},
+		{EvTurnCancelled, contracts.TurnRunning, contracts.TurnCancelled},
 	})
 	if err != nil {
 		panic(err)
@@ -143,13 +160,13 @@ func TurnTable() *Table[contracts.TurnState] {
 
 // Attempt event types.
 const (
-	EvAttemptPlanned    = "attempt.planned"
-	EvAttemptAuthorized = "attempt.authorized"
-	EvAttemptStarted    = "attempt.started"
-	EvAttemptSucceeded  = "attempt.succeeded"
-	EvAttemptFailed     = "attempt.failed"
-	EvAttemptCancelled  = "attempt.cancelled"
-	EvAttemptLost       = "attempt.lost"
+	EvAttemptPlanned          = "attempt.planned"
+	EvAttemptAuthorized       = "attempt.authorized"
+	EvAttemptStarted          = "attempt.started"
+	EvAttemptSucceeded        = "attempt.succeeded"
+	EvAttemptFailed           = "attempt.failed"
+	EvAttemptCancelled        = "attempt.cancelled"
+	EvAttemptLost             = "attempt.lost"
 	EvAttemptReconciledOK     = "attempt.reconciled_ok"
 	EvAttemptReconciledFailed = "attempt.reconciled_failed"
 	EvAttemptManual           = "attempt.manual_recovery"
@@ -165,8 +182,8 @@ func AttemptTable() *Table[contracts.AttemptState] {
 		{EvAttemptSucceeded, contracts.AttemptRunning, contracts.AttemptSucceeded},
 		{EvAttemptFailed, contracts.AttemptRunning, contracts.AttemptFailed},
 		{EvAttemptCancelled, contracts.AttemptPlanned, contracts.AttemptCancelled},
-		{EvAttemptCancelled + ".authorized", contracts.AttemptAuthorized, contracts.AttemptCancelled},
-		{EvAttemptCancelled + ".running", contracts.AttemptRunning, contracts.AttemptCancelled},
+		{EvAttemptCancelled, contracts.AttemptAuthorized, contracts.AttemptCancelled},
+		{EvAttemptCancelled, contracts.AttemptRunning, contracts.AttemptCancelled},
 		{EvAttemptLost, contracts.AttemptRunning, contracts.AttemptUnknown},
 		{EvAttemptReconciledOK, contracts.AttemptUnknown, contracts.AttemptSucceeded},
 		{EvAttemptReconciledFailed, contracts.AttemptUnknown, contracts.AttemptFailed},
@@ -183,13 +200,10 @@ func AttemptTable() *Table[contracts.AttemptState] {
 func EventTypes() []string {
 	return []string{
 		EvRunCreated, EvRunAdmitted, EvRunStarted, EvRunSucceeded, EvRunFailed,
-		EvRunCancelled, EvRunCancelled + ".admitted", EvRunCancelled + ".running",
-		EvRunLost, EvRunReconciled, EvRunReconciledFailed, EvRunManual,
-		EvTurnCreated, EvTurnStarted, EvTurnSucceeded, EvTurnFailed,
-		EvTurnCancelled, EvTurnCancelled + ".running",
+		EvRunCancelled, EvRunLost, EvRunReconciled, EvRunReconciledFailed, EvRunManual,
+		EvTurnCreated, EvTurnStarted, EvTurnSucceeded, EvTurnFailed, EvTurnCancelled,
 		EvAttemptPlanned, EvAttemptAuthorized, EvAttemptStarted, EvAttemptSucceeded,
-		EvAttemptFailed, EvAttemptCancelled, EvAttemptCancelled + ".authorized",
-		EvAttemptCancelled + ".running", EvAttemptLost, EvAttemptReconciledOK,
+		EvAttemptFailed, EvAttemptCancelled, EvAttemptLost, EvAttemptReconciledOK,
 		EvAttemptReconciledFailed, EvAttemptManual,
 	}
 }

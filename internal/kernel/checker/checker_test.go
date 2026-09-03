@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-func intp(i int) *int { return &i }
+func intp(i int) *int       { return &i }
 func strp(s string) *string { return &s }
 
 func TestEmptyBundleFailsEveryCriterion(t *testing.T) {
@@ -34,25 +34,25 @@ func TestEmptyBundleFailsEveryCriterion(t *testing.T) {
 func TestCodingStyleContract(t *testing.T) {
 	contract := AcceptanceContract{ID: "build", Criteria: []Criterion{
 		{ExitCodeIs: intp(0)},
-		{FileHashIs: &FileHashCriterion{Path: "notes.txt", SHA256: "abc123"}},
+		{FileHashIs: &FileHashCriterion{Path: "notes.txt", SHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
 	}}
 	pass, err := Grade(contract, []Evidence{
-		{Exit: &ExitEvidence{Code: 0}},
-		{FileHash: &FileHashEvidence{Path: "notes.txt", SHA256: "abc123"}},
+		{Producer: "runner", Exit: &ExitEvidence{Code: 0}},
+		{Producer: "runner", FileHash: &FileHashEvidence{Path: "notes.txt", SHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
 	})
 	if err != nil || !pass.Pass {
 		t.Fatalf("valid coding evidence must pass: %+v %v", pass, err)
 	}
 	failV, _ := Grade(contract, []Evidence{
-		{Exit: &ExitEvidence{Code: 1}},
-		{FileHash: &FileHashEvidence{Path: "notes.txt", SHA256: "abc123"}},
+		{Producer: "runner", Exit: &ExitEvidence{Code: 1}},
+		{Producer: "runner", FileHash: &FileHashEvidence{Path: "notes.txt", SHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
 	})
 	if failV.Pass {
 		t.Fatal("nonzero exit graded PASS")
 	}
 	wrongHash, _ := Grade(contract, []Evidence{
-		{Exit: &ExitEvidence{Code: 0}},
-		{FileHash: &FileHashEvidence{Path: "notes.txt", SHA256: "OTHER"}},
+		{Producer: "runner", Exit: &ExitEvidence{Code: 0}},
+		{Producer: "runner", FileHash: &FileHashEvidence{Path: "notes.txt", SHA256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},
 	})
 	if wrongHash.Pass {
 		t.Fatal("wrong file hash graded PASS")
@@ -66,8 +66,8 @@ func TestAckForWrongOccurrenceFails(t *testing.T) {
 		{DeliveredAndAcked: strp("occ-2")},
 	}}
 	v, err := Grade(contract, []Evidence{
-		{Delivery: &DeliveryEvidence{OccurrenceID: "occ-2", DeliveredAt: time.Unix(1, 0)}},
-		{Ack: &AckEvidence{OccurrenceID: "occ-1", AckAt: time.Unix(2, 0)}}, // wrong occurrence
+		{Producer: "gateway", Delivery: &DeliveryEvidence{OccurrenceID: "occ-2", DeliveredAt: time.Unix(1, 0)}},
+		{Producer: "gateway", Ack: &AckEvidence{OccurrenceID: "occ-1", AckAt: time.Unix(2, 0)}}, // wrong occurrence
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -76,8 +76,8 @@ func TestAckForWrongOccurrenceFails(t *testing.T) {
 		t.Fatal("ack for occurrence 1 closed occurrence 2")
 	}
 	ok, _ := Grade(contract, []Evidence{
-		{Delivery: &DeliveryEvidence{OccurrenceID: "occ-2", DeliveredAt: time.Unix(1, 0)}},
-		{Ack: &AckEvidence{OccurrenceID: "occ-2", AckAt: time.Unix(2, 0)}},
+		{Producer: "gateway", Delivery: &DeliveryEvidence{OccurrenceID: "occ-2", DeliveredAt: time.Unix(1, 0)}},
+		{Producer: "gateway", Ack: &AckEvidence{OccurrenceID: "occ-2", AckAt: time.Unix(2, 0)}},
 	})
 	if !ok.Pass {
 		t.Fatal("correctly correlated receipt+ack failed")
@@ -90,7 +90,7 @@ func TestDeliveryAloneIsNotDone(t *testing.T) {
 		{DeliveredAndAcked: strp("occ-1")},
 	}}
 	v, _ := Grade(contract, []Evidence{
-		{Delivery: &DeliveryEvidence{OccurrenceID: "occ-1", DeliveredAt: time.Unix(1, 0)}},
+		{Producer: "gateway", Delivery: &DeliveryEvidence{OccurrenceID: "occ-1", DeliveredAt: time.Unix(1, 0)}},
 	})
 	if v.Pass {
 		t.Fatal("delivery receipt alone graded PASS")
@@ -110,5 +110,66 @@ func TestMalformedInputsRejected(t *testing.T) {
 	if _, err := Grade(AcceptanceContract{ID: "c", Criteria: []Criterion{{ExitCodeIs: intp(0)}}},
 		[]Evidence{empty}); err == nil {
 		t.Fatal("evidence with zero kinds accepted")
+	}
+}
+
+// checker != worker ENFORCED (codex #1 literal): the judged worker cannot
+// grade its own work.
+func TestWorkerCannotSupplyOwnEvidence(t *testing.T) {
+	contract := AcceptanceContract{ID: "c", Worker: "worker-1", Criteria: []Criterion{
+		{ExitCodeIs: intp(0)},
+	}}
+	_, err := Grade(contract, []Evidence{
+		{Producer: "worker-1", Exit: &ExitEvidence{Code: 0}},
+	})
+	if err == nil {
+		t.Fatal("self-produced evidence accepted — checker == worker")
+	}
+	ok, err := Grade(contract, []Evidence{
+		{Producer: "runner", Exit: &ExitEvidence{Code: 0}},
+	})
+	if err != nil || !ok.Pass {
+		t.Fatalf("trusted-producer evidence rejected: %v %v", ok, err)
+	}
+}
+
+// Contradictory duplicates FAIL in EVERY order (codex #3 + kilo #2: no
+// ordering games in either direction).
+func TestContradictoryEvidenceFailsBothOrders(t *testing.T) {
+	contract := AcceptanceContract{ID: "c", Criteria: []Criterion{{ExitCodeIs: intp(0)}}}
+	a := Evidence{Producer: "runner", Exit: &ExitEvidence{Code: 0}}
+	b := Evidence{Producer: "runner", Exit: &ExitEvidence{Code: 1}}
+	for _, bundle := range [][]Evidence{{a, b}, {b, a}} {
+		v, err := Grade(contract, bundle)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v.Pass {
+			t.Fatal("contradictory exit evidence graded PASS (order-dependent verdict)")
+		}
+	}
+}
+
+// Fabricated zero-value reminder evidence is rejected at validation
+// (codex #2 literal).
+func TestZeroValueDeliveryEvidenceRejected(t *testing.T) {
+	contract := AcceptanceContract{ID: "c", Criteria: []Criterion{{DeliveredAndAcked: strp("o1")}}}
+	if _, err := Grade(contract, []Evidence{
+		{Producer: "gateway", Delivery: &DeliveryEvidence{}},
+	}); err == nil {
+		t.Fatal("empty-occurrence delivery evidence accepted")
+	}
+	if _, err := Grade(contract, []Evidence{
+		{Delivery: &DeliveryEvidence{OccurrenceID: "o1", DeliveredAt: time.Unix(1, 0)}},
+	}); err == nil {
+		t.Fatal("producer-less evidence accepted")
+	}
+}
+
+// Hash SHAPE is validated (codex #4: "abc123" is not a sha256).
+func TestNonSha256HashRejected(t *testing.T) {
+	bad := Criterion{FileHashIs: &FileHashCriterion{Path: "f", SHA256: "abc123"}}
+	if _, err := Grade(AcceptanceContract{ID: "c", Criteria: []Criterion{bad}}, nil); err == nil {
+		t.Fatal("non-sha256 criterion accepted")
 	}
 }

@@ -5,7 +5,54 @@ package journal
 import (
 	"database/sql"
 	"fmt"
+	"regexp"
+	"strings"
 )
+
+// ProjTx is the RESTRICTED transaction handed to projections: statements
+// touching the journal's canonical tables (events, journal_meta,
+// projection_offsets) are rejected with NON_CANONICAL_WRITE (Annex P0.3 —
+// Phase-1B codex #6: raw *sql.Tx let a projection forge canonical events).
+// topknot ceiling: enforcement is lexical table-name matching, not SQL
+// parsing; the T18+ storage owner replaces it with per-projection schema
+// ownership. Upgrade trigger: T18.
+type ProjTx struct {
+	tx *sql.Tx
+}
+
+var canonicalTableRe = regexp.MustCompile(`(?i)\b(events|journal_meta|projection_offsets)\b`)
+
+func guardStatement(query string) error {
+	if canonicalTableRe.MatchString(strings.ToLower(query)) {
+		return fmt.Errorf("NON_CANONICAL_WRITE: projections may not touch the journal's canonical tables (fail closed)")
+	}
+	return nil
+}
+
+// Exec runs a statement against projection-owned tables only.
+func (p *ProjTx) Exec(query string, args ...any) (sql.Result, error) {
+	if err := guardStatement(query); err != nil {
+		return nil, err
+	}
+	return p.tx.Exec(query, args...)
+}
+
+// Query reads projection-owned tables only.
+func (p *ProjTx) Query(query string, args ...any) (*sql.Rows, error) {
+	if err := guardStatement(query); err != nil {
+		return nil, err
+	}
+	return p.tx.Query(query, args...)
+}
+
+// QueryRow reads projection-owned tables only. A guarded query returns a
+// row that errors on Scan.
+func (p *ProjTx) QueryRow(query string, args ...any) *sql.Row {
+	if err := guardStatement(query); err != nil {
+		return p.tx.QueryRow("SELECT 1 WHERE 1=0") // scan yields ErrNoRows
+	}
+	return p.tx.QueryRow(query, args...)
+}
 
 // T07 (HARDQ B7 core): synchronous projection harness + generic
 // transaction recipe. A SyncProjection folds core state in the SAME
@@ -24,13 +71,14 @@ import (
 type SyncProjection interface {
 	Name() string
 	Init(db *sql.DB) error
-	Apply(tx *sql.Tx, ev Event) error
+	Apply(tx *ProjTx, ev Event) error
 }
 
 // applySyncProjections is called by appendOne inside the open transaction.
 func (j *Journal) applySyncProjections(tx *sql.Tx, ev Event) error {
+	restricted := &ProjTx{tx: tx}
 	for _, p := range j.syncProjections {
-		if err := p.Apply(tx, ev); err != nil {
+		if err := p.Apply(restricted, ev); err != nil {
 			return fmt.Errorf("sync projection %s: %w", p.Name(), err)
 		}
 	}
@@ -73,8 +121,9 @@ func (p *Projector) Offset() (uint64, error) {
 
 // Run processes every event past the durable offset. For each event, apply
 // runs inside a transaction TOGETHER with the offset advance: apply's
-// writes and the offset commit atomically, or neither does.
-func (p *Projector) Run(apply func(tx *sql.Tx, ev Event) error) error {
+// writes and the offset commit atomically, or neither does. The handle is
+// RESTRICTED (see ProjTx).
+func (p *Projector) Run(apply func(tx *ProjTx, ev Event) error) error {
 	if apply == nil {
 		return fmt.Errorf("projector %s: nil apply", p.name)
 	}
@@ -88,7 +137,7 @@ func (p *Projector) Run(apply func(tx *sql.Tx, ev Event) error) error {
 			return fmt.Errorf("projector %s: begin: %w", p.name, err)
 		}
 		defer tx.Rollback()
-		if err := apply(tx, ev); err != nil {
+		if err := apply(&ProjTx{tx: tx}, ev); err != nil {
 			return fmt.Errorf("projector %s at offset %d: %w", p.name, ev.JournalOffset, err)
 		}
 		res, err := tx.Exec(`UPDATE projection_offsets SET current_offset=? WHERE name=? AND current_offset=?`,

@@ -30,7 +30,25 @@ type FileHashCriterion struct {
 	SHA256 string
 }
 
+func sha256Hex(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for _, r := range s {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 func (c Criterion) validate() error {
+	if c.FileHashIs != nil && (c.FileHashIs.Path == "" || !sha256Hex(c.FileHashIs.SHA256)) {
+		return fmt.Errorf("file-hash criterion requires a path and a 64-char hex sha256")
+	}
+	if c.DeliveredAndAcked != nil && *c.DeliveredAndAcked == "" {
+		return fmt.Errorf("delivered-and-acked criterion requires a non-empty occurrence id")
+	}
 	set := 0
 	if c.ExitCodeIs != nil {
 		set++
@@ -48,15 +66,24 @@ func (c Criterion) validate() error {
 }
 
 // AcceptanceContract names what "done" means — written from the SPEC side,
-// before the work.
+// before the work. Worker names the principal whose work is being judged:
+// evidence PRODUCED by that same principal is rejected outright
+// (checker != worker is enforced, not assumed — Phase-1B codex #1).
 type AcceptanceContract struct {
 	ID       string
+	Worker   string
 	Criteria []Criterion
 }
 
 // Evidence is one closed-kind artifact. Exactly one typed field set.
-// There is deliberately NO free-text kind.
+// There is deliberately NO free-text kind. Producer names the TRUSTED OWNER
+// that emitted the artifact (journal, delivery gateway, execution runner) —
+// never the worker; full provenance authentication arrives with the real
+// producers (T19/T21 emit journal-backed evidence). topknot ceiling:
+// producer strings are declared, not yet cryptographically attested;
+// upgrade when the journal-receipt evidence kind lands (T21).
 type Evidence struct {
+	Producer string
 	Exit     *ExitEvidence
 	FileHash *FileHashEvidence
 	Delivery *DeliveryEvidence
@@ -83,6 +110,18 @@ type AckEvidence struct {
 }
 
 func (e Evidence) validate() error {
+	if e.Producer == "" {
+		return fmt.Errorf("evidence requires a producer identity")
+	}
+	if e.Delivery != nil && (e.Delivery.OccurrenceID == "" || e.Delivery.DeliveredAt.IsZero()) {
+		return fmt.Errorf("delivery evidence requires a non-empty occurrence id and time")
+	}
+	if e.Ack != nil && (e.Ack.OccurrenceID == "" || e.Ack.AckAt.IsZero()) {
+		return fmt.Errorf("ack evidence requires a non-empty occurrence id and time")
+	}
+	if e.FileHash != nil && !sha256Hex(e.FileHash.SHA256) {
+		return fmt.Errorf("file-hash evidence requires a 64-char hex sha256")
+	}
 	set := 0
 	if e.Exit != nil {
 		set++
@@ -131,6 +170,11 @@ func Grade(contract AcceptanceContract, bundle []Evidence) (Verdict, error) {
 		if err := e.validate(); err != nil {
 			return Verdict{}, fmt.Errorf("checker: evidence %d: %w", i, err)
 		}
+		// checker != worker, ENFORCED: the judged principal cannot supply
+		// its own artifacts (codex #1 self-grading literal).
+		if contract.Worker != "" && e.Producer == contract.Worker {
+			return Verdict{}, fmt.Errorf("checker: evidence %d produced by the judged worker %q (rejected — checker != worker)", i, contract.Worker)
+		}
 	}
 	v := Verdict{Pass: true}
 	for i, c := range contract.Criteria {
@@ -149,25 +193,38 @@ func gradeOne(idx int, c Criterion, bundle []Evidence) CriterionResult {
 	}
 	switch {
 	case c.ExitCodeIs != nil:
+		// ALL exit evidence must agree — order-independent, so neither a
+		// favorable prepend (codex #3) nor an unfavorable one (kilo #2) can
+		// game the verdict; contradictions FAIL.
+		found := false
 		for _, e := range bundle {
-			if e.Exit != nil {
-				if e.Exit.Code == *c.ExitCodeIs {
-					return CriterionResult{Index: idx, Pass: true}
-				}
-				return fail(fmt.Sprintf("exit code %d, want %d", e.Exit.Code, *c.ExitCodeIs))
+			if e.Exit == nil {
+				continue
+			}
+			found = true
+			if e.Exit.Code != *c.ExitCodeIs {
+				return fail(fmt.Sprintf("exit code %d contradicts the contracted %d", e.Exit.Code, *c.ExitCodeIs))
 			}
 		}
-		return fail("no exit-code evidence in the bundle")
+		if !found {
+			return fail("no exit-code evidence in the bundle")
+		}
+		return CriterionResult{Index: idx, Pass: true}
 	case c.FileHashIs != nil:
+		found := false
 		for _, e := range bundle {
-			if e.FileHash != nil && e.FileHash.Path == c.FileHashIs.Path {
-				if e.FileHash.SHA256 == c.FileHashIs.SHA256 {
-					return CriterionResult{Index: idx, Pass: true}
-				}
-				return fail("file content hash does not match the contract")
+			if e.FileHash == nil || e.FileHash.Path != c.FileHashIs.Path {
+				continue
+			}
+			found = true
+			if e.FileHash.SHA256 != c.FileHashIs.SHA256 {
+				return fail("a file-hash record for the contracted path contradicts the contract")
 			}
 		}
-		return fail("no file-hash evidence for the contracted path")
+		if !found {
+			return fail("no file-hash evidence for the contracted path")
+		}
+		return CriterionResult{Index: idx, Pass: true}
 	case c.DeliveredAndAcked != nil:
 		occ := *c.DeliveredAndAcked
 		delivered, acked := false, false
