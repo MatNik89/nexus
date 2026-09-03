@@ -23,6 +23,8 @@ type (
 	WorkspaceID string
 	ProfileID   string
 	ToolID      string
+	OperationID string
+	TargetID    string
 )
 
 func validID(s string) bool {
@@ -45,6 +47,8 @@ func (v TenantID) Valid() bool    { return validID(string(v)) }
 func (v WorkspaceID) Valid() bool { return validID(string(v)) }
 func (v ProfileID) Valid() bool   { return validID(string(v)) }
 func (v ToolID) Valid() bool      { return validID(string(v)) }
+func (v OperationID) Valid() bool { return validID(string(v)) }
+func (v TargetID) Valid() bool    { return validID(string(v)) }
 
 func requireID(name, v string) error {
 	if !validID(v) {

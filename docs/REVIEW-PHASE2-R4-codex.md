@@ -1,0 +1,24 @@
+# Phase 2 verification round 4 (Codex)
+
+Target: `slice/p0-phase2` at `f1b9d3e0b9e94558660eaf5e25c54687966bc630`; scope restricted to `fbd8dc4..f1b9d3e`.
+
+1. **[OK] Redirect refusal is correctly folded.** `APIKey` now returns an error from every `CheckRedirect` invocation, before `net/http` sends the redirected request (`internal/llm/provider/provider.go:131-140`). `TestAllowlistedRedirectStillRefused` places both the bouncer and backend on the allowlist, uses a 307 redirect that would preserve the POST, and asserts zero backend hits (`internal/llm/provider/provider_test.go:540-568`). This closes the one-grant/two-physical-request counterexample.
+
+2. **[OK] Planner failure landing is correctly implemented.** `landFailure` inspects the authoritative state: `AUTHORIZED` is cancelled, while a consumed/RUNNING attempt is reported `FAILED_TERMINAL`; both transition errors reach the returned planner error (`internal/llm/planner/planner.go:66-82,120-138`). Concurrent or already-terminal state changes also fail closed because the attempted transition error is surfaced.
+
+3. **[NEW-ERROR] The planner landing RED is vacuous for every behavior it claims to prove.** `TestFailedPlanLandsHonestS7State` cannot observe the first random operation ID and therefore never asserts that it became `CANCELLED`; its second plan uses a different random ID, so it succeeds even under the old implementation that leaked the first operation in `AUTHORIZED` (`internal/llm/planner/planner_test.go:153-181`). Despite the test comment, there is no consumed-then-error leg and no induced landing-error assertion. Reverting both new `landFailure` calls to the prior ignored `Report` calls would leave this test green. Have the fake capture `g.OperationID`, assert its state directly, add a fake that consumes then fails and expects `FAILED`, and force an illegal/concurrent terminal transition to prove the landing error is present. This violates the repo's required red-capable behavioral detector (`CLAUDE.md:92-96`).
+
+4. **[UNFOLDED] `AttemptContext` makes S7 the deadline constructor but does not make S7 the cancel owner.** The minimum of call deadline and grant expiry and the non-RUNNING refusal are correct (`internal/kernel/s7min/s7min.go:205-228`). However, the returned context is only `context.WithDeadline(ctx, deadline)`; its cancel function is neither stored on the operation nor invoked by `Authority.Cancel` (`s7min.go:181-202`). Concrete failure: consume a grant, obtain `AttemptContext`, call `Authority.Cancel(op)` concurrently, and the authority becomes `CANCELLED` while the executor's `ctx.Done()` remains open until its parent/deadline. There is also a state-check/use race in which cancellation can land after `AttemptContext` unlocks but before dispatch. This violates Annex P0.2's “deadline and cancel propagate to all child tasks” and the constitution's S7-only owner rule; deferring `attempt_timeout` does not cover it. Store an S7-owned per-operation cancellation signal/context, trigger it inside `Cancel` under a race-safe handoff, and add the missing cancel-propagation RED. The current `TestAttemptContextIsS7Owned` checks only unknown/pre-consume refusal and deadline selection (`internal/kernel/effectpath/effectpath_test.go:599-624`).
+
+5. **[OK] STARTED-append failure is correctly folded.** After grant consumption but before dispatch, an observer failure calls `Authority.Cancel` and returns without invoking the executor (`internal/kernel/effectpath/effectpath.go:383-399`). The loop consequently appends `attempt.cancelled`; that transition is durable-legal from `AUTHORIZED`, while the in-memory cancellation is legal from `RUNNING`. `TestStartObserverFailureCancelsNeverLoses` causally asserts no execution and the `CANCELLED` authority state (`internal/kernel/effectpath/effectpath_test.go:579-597`). No `UNKNOWN`/`attempt.lost` path remains here.
+
+6. **[OK] No other material defect was introduced by the scoped production diff.** Redirect denial is fail-closed, planner failures preserve their causal error text, and the full suite exercises the production composition root from the preceding round. The stale provider comment that says the allowlist is enforced “on every redirect” is inaccurate after redirects became categorically forbidden, but it does not alter runtime behavior.
+
+Verification:
+
+- `CGO_ENABLED=0 go vet ./... && CGO_ENABLED=0 go test -count=1 ./...` — PASS; all 24 tested packages green. `internal/preflight/probe` completed in 32.593 s after the rest of the package output.
+- Focused redirect, planner-landing, STARTED-failure, and AttemptContext tests — PASS and confirmed discovered.
+
+Weakest link: S7's API now owns a deadline object, but its cancellation state and the live execution context can diverge. The green suite cannot detect that divergence.
+
+VERDICT: FAIL

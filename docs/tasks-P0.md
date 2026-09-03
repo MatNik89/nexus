@@ -149,14 +149,14 @@ RED: "done" with empty EvidenceBundle → Grade=FAIL; ack for occurrence N gradi
 
 ## Phase 2 — safe conversation spine
 
-**[ ] T13 — s7-min (BEFORE the effect-path that consumes it).**
+**[x] T13 — s7-min (BEFORE the effect-path that consumes it).**
 `AttemptGrant{attempt_no,target,expires_at,nonce}` single-use + cancel token + no-retry
 policy (retryable → FAILED_TERMINAL in P0).
 Trace: HARDQ A2; HARNESS-SPEC P0.2 single-owner half; E5; REVIEW-TASKS order fix.
 Acceptance: every physical attempt carries a grant.
 RED: `test_adapter_cannot_self_retry` — second use of one grant → `ATTEMPT_NOT_AUTHORIZED`.
 
-**[ ] T14 — PEP (S6.0) + lifecycle chain (S6.9) + EffectPath.**
+**[x] T14 — PEP (S6.0) + lifecycle chain (S6.9) + EffectPath.**
 `Decide` total switch default-deny, ASK≠ALLOW; `MiddlewareChain` before/after/on_error;
 `EffectPath` per DESIGN-FIXES-r2 K1/K2 (concrete executor types; unknown kind → reject;
 `classifyEffectPhase` fail-closed). Sandbox executor = contract FAKE here; real backend
@@ -173,7 +173,7 @@ executes without approval + journal carries ALLOWED_BY_YOLO; DENY still denied) 
 `TestYoloCannotBeSetByChannelInput` (mode is a session construct, not reachable from a
 message payload).
 
-**[ ] T15 — Provider (APIKey) + structured output (S2.1/S2.3-min).**
+**[x] T15 — Provider (APIKey) + structured output (S2.1/S2.3-min).**
 `Provider{Chat/Stream/Capabilities/DataDescriptor}`; OpenAI-compatible HTTP;
 `Validate → re-ask(with AttemptGrant) → salvage`. Tolerance is LIMITED to
 non-security/non-effect payloads (P0.7); security/effect/policy discriminators are strict.
@@ -183,7 +183,7 @@ Acceptance: live chat call OK; malformed-JSON paths exercised; probe registered.
 RED: `test_structured_output_never_silent_accept`; malformed/unknown EFFECT or POLICY
 discriminator → reaches no sink (strict reject, no repair).
 
-**[ ] T16 — One-turn loop (S3.1-min) + trust fencing + interactive stuck-breaker.**
+**[x] T16 — One-turn loop (S3.1-min) + trust fencing + interactive stuck-breaker.**
 plan→act→observe single turn; tool errors packed into observation; assembler enforces
 lineage/trust monotonicity. Identical-call stuck-breaker WITHIN one interactive turn
 (same tool+args N× → break); scheduled/polling iterations exempt via continuous-loop
@@ -193,7 +193,7 @@ Acceptance: e2e turn through journal; replay reproduces it.
 RED: `test_s0_rejects_provenance_laundering`; POSITIVE breaker test — same-turn identical
 call repeated N× → breaker trips; polling-policy call repeated N× → no trip.
 
-**[ ] T17 — Terminal REPL (14.1-min) + daemon/UDS split + liveness heartbeat.**
+**[x] T17 — Terminal REPL (14.1-min) + daemon/UDS split + liveness heartbeat.**
 `nexus daemon` owns the DB, emits liveness heartbeat (C8 positive half); `nexus chat`
 REPL over UDS; message render + input + streaming print (REF-brainless-tui P0 subset).
 `--yolo` flag on the local CLI sets the session PolicyMode (HARDQ F2); the flag is
