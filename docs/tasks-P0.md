@@ -147,12 +147,17 @@ RED: `test_adapter_cannot_self_retry` — second use of one grant → `ATTEMPT_N
 `EffectPath` per DESIGN-FIXES-r2 K1/K2 (concrete executor types; unknown kind → reject;
 `classifyEffectPhase` fail-closed). Sandbox executor = contract FAKE here; real backend
 binds in T26 (its integration RED lives there — no stub-skip in this task's own list).
-Trace: DESIGN-FIXES-r2; E5/E8/E9; REVIEW-TASKS fix (no unsatisfiable RED).
-Acceptance: 7 contract REDs GREEN with fakes.
+**Policy mode input (HARDQ F2):** `Decide` takes a session `PolicyMode{Default|Yolo}`;
+Yolo maps ASK → ALLOW and journals `ALLOWED_BY_YOLO`; DENY is unaffected by mode.
+Trace: DESIGN-FIXES-r2; E5/E8/E9; HARDQ F2; REVIEW-TASKS fix (no unsatisfiable RED).
+Acceptance: 7 contract REDs GREEN with fakes; yolo mode REDs GREEN.
 RED: `TestUnknownDecisionDenies` · `TestUnknownExecKindRejectsNotInproc` ·
 `TestAskRequiresExactApproval` · `TestInProcessToolNeverSpawns` ·
 `TestNoAttemptWithoutGrant` · `TestVetoThroughOnErrorReconciles` ·
-`TestExecErrorSkipsAfterToolAndOutput`.
+`TestExecErrorSkipsAfterToolAndOutput` · `TestYoloAllowsAskButNeverDeny` (yolo: ASK
+executes without approval + journal carries ALLOWED_BY_YOLO; DENY still denied) ·
+`TestYoloCannotBeSetByChannelInput` (mode is a session construct, not reachable from a
+message payload).
 
 **[ ] T15 — Provider (APIKey) + structured output (S2.1/S2.3-min).**
 `Provider{Chat/Stream/Capabilities/DataDescriptor}`; OpenAI-compatible HTTP;
@@ -177,7 +182,9 @@ call repeated N× → breaker trips; polling-policy call repeated N× → no tri
 **[ ] T17 — Terminal REPL (14.1-min) + daemon/UDS split + liveness heartbeat.**
 `nexus daemon` owns the DB, emits liveness heartbeat (C8 positive half); `nexus chat`
 REPL over UDS; message render + input + streaming print (REF-brainless-tui P0 subset).
-Trace: PRD §6 item 1; HARDQ B7 (UDS) / C8; REF-brainless-tui.
+`--yolo` flag on the local CLI sets the session PolicyMode (HARDQ F2); the flag is
+surfaced in the prompt/status line so the user always sees the mode.
+Trace: PRD §6 item 1; HARDQ B7 (UDS) / C8 / F2; REF-brainless-tui.
 Acceptance: PRD §6 item 1 — useful conversation from the terminal against the daemon.
 RED: scripted e2e conversation oracle with a DETERMINISTIC fake provider (input → expected
 rendered output through journal) + separately-labeled live-provider smoke; two concurrent
@@ -273,7 +280,10 @@ RED: approve-after-daemon-restart → completes exactly once; replay → `APPROV
 modified args under old approval → rejected (`test_approval_cannot_authorize_modified_
 effect`); **cross-profile (B3 chain):** occurrence/delivery/approval created in `work` can
 NEVER be seen, delivered, or approved via a `private`-bound chat (and vice versa),
-including across restart/replay.
+including across restart/replay; **yolo (F2):** in yolo the HITL path does not park (ASK
+auto-allows, journaled), but the sandbox/egress hostile checks still pass unchanged and a
+Telegram message can neither enable yolo nor piggyback on it to authorize a
+DENY-classified effect.
 
 ## Phase 6 — sandboxed exec (gated by T02)
 

@@ -241,6 +241,10 @@ synchronous core projections + transaction recipes + daemon-owns-DB/CLI-via-UDS 
 · known-ref secret redaction (C1) · non-text fail-closed reply (C2) · **stuck-detection
 scoped to WITHIN one interactive turn — scheduled/polling occurrences carry an explicit
 continuous-loop policy exempt from the identical-argument breaker (C3; RED in tasks-P0.md)**
+· **YOLO mode `nexus --yolo` (user directive 2026-09-03, HARDQ F2): ASK → ALLOW for the
+session, no prompts/HITL parking; DENY unchanged; sandbox/egress/journal/redaction/
+profile-isolation/golden-rule UNAFFECTED; local-CLI entry only; decisions journaled
+`ALLOWED_BY_YOLO` — yolo disables confirmations, never safety nets**
 · **P0 health = liveness heartbeat + last-occurrence-fired counter (C8)** · **doctor
 preflight (F1): checks kernel/ABI floor, bwrap, data-dir permissions, provider key, Telegram
 token; anything missing → consented install or exact instructions; results are

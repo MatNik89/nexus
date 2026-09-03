@@ -60,6 +60,9 @@ Everything you produce here is **English** — code, comments, docs, review file
   shadow-git/worktree = P3 (HARDQ A2).
 - Stuck-detection only WITHIN one interactive turn; scheduled/polling iterations exempt
   via continuous-loop policy (HARDQ C3).
+- YOLO mode (`nexus --yolo`, HARDQ F2): ASK → ALLOW only (journaled `ALLOWED_BY_YOLO`);
+  DENY/sandbox/egress/journal/redaction/profiles/golden-rule unaffected; local-CLI entry
+  only. Never wire yolo to a safety net.
 
 ## Working style
 - Behavioral change → red-capable detector observed RED before the fix, GREEN after;

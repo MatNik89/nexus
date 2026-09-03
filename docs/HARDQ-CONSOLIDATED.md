@@ -169,6 +169,15 @@ a DECLARED install prerequisite (see F1), never a silent dependency. No weaker f
 bwrap absent → exec capability OFF (conversation-only), everything else works.
 
 ## F. New user requirement (2026-09-03) — ADOPTED
+### F2. YOLO/bypass mode (user directive 2026-09-03) — P0
+`nexus --yolo`: session-scoped mode where S6.0 `Decide` maps ASK → ALLOW (no confirmation
+prompts, no HITL parking) — Hermes/claude/codex bypass parity. Bypass covers CONFIRMATIONS
+ONLY: DENY stays DENY; sandbox/egress/journal/redaction/profile-isolation/golden-rule stay
+active; entry is local-CLI-only (a channel message can never enable it); every yolo
+decision is journaled as `ALLOWED_BY_YOLO` (audit keeps the distinction). RED: yolo run
+still cannot read `/etc/shadow` or reach the network from the sandbox; yolo cannot
+authorize a DENY-classified effect; remote channel cannot toggle it.
+
 ### F1. Installer/doctor preflight with guided prerequisite install
 `nexus doctor` runs at install/first-start: checks OS/kernel floor (C5), bwrap presence,
 data-dir permissions, provider key, Telegram token; anything missing → offers CONSENTED
