@@ -176,9 +176,9 @@ machinery in P0** (hard-questions: FSRS on facts would "forget" the user's serve
 violate PRD §6.2): Decay(FSRS-lite) + Audn move to P1 `memorija`, activated only on a
 measured retrieval problem, and NEVER applied to explicit facts (fact type exempt, S=∞);
 Dream/MemGit/MemAssoc = v2. **MEMORY_FORGET (reversible, recall ban) ≠ DATA_PURGE
-(irreversible, S6.7 overrides, deletes the tombstone too)** — USP #4; FORGET ships in P0,
-the full DATA_PURGE contract lands with P2.1 (task-review fix — purge is not a PRD §6
-criterion and its Annex contract is P2). **Profile isolation is
+(irreversible, S6.7 overrides, deletes the tombstone too)** — USP #4; BOTH land with their
+normative Annex P2.1 contract (task-review fix — neither is a PRD §6 criterion; P0
+correction = append-only supersession). **Profile isolation is
 physical (HARDQ B3): one SQLite file per profile** (+ system DB with zero profile payloads);
 scope column stays only as a redundant tag; non-null `ProfileID` stamped at admission and
 carried immutably through the whole causal chain (envelope→run→tool→memory→obligation→

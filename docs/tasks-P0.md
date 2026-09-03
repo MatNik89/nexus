@@ -32,9 +32,11 @@ kernel/ABI floor (C5).
 Trace: PRD §6 item 6, §7; HARDQ D1/B4/C5; DESIGN-S0 suite shape.
 Acceptance: suite GREEN on deployment host; report committed. **Go/no-go gate for T25-T26.**
 RED: (a) bwrap absent → probe reports UNAVAILABLE, no weaker fallback; (b) negative
-controls — suite run against a DELIBERATELY loosened profile (recursive `/etc` grant /
-net enabled / no PID namespace) MUST go RED per boundary (proves the suite detects
-loosening, not only absence).
+controls per boundary, HAZARD-SAFE (they prove the suite detects loosening WITHOUT
+exposing real trust boundaries): FS control reads a non-secret CANARY file planted in a
+test-owned dir (never recursive real `/etc`); net control reaches only a test-owned local
+sink (never uncontrolled egress); process control escapes into a test-owned process tree.
+Each loosened profile MUST turn its boundary check RED.
 
 **[ ] T03 — `nexus doctor` preflight (minimal).**
 Checks: kernel/ABI floor · bwrap · data-dir exists/0700/writable · provider key · Telegram
@@ -65,9 +67,12 @@ downstream); `AtomicWriter` tmp→fsync→rename, never in-place (the s5-min cut
 `ContextBudget.Measure+HardLimit` (S8.1-min); `Assembler.Base` (S11.1-min) skeleton.
 Trace: HARDQ A2 (K0 step 2 + s5-min); SECTION-MAP K0 (S8.1-min/S11.1-min); E4/P0.11
 AtomicWriter clause.
-Acceptance: downstream tasks consume these seams (no local clock/ID/write inventions).
+Acceptance: task-local conformance tests for ALL FOUR seams pass (downstream import/use
+checks are additionally enforced by later tasks, not by this one).
 RED: `test_atomic_write_no_partial` (SIGKILL mid-write → old or new, never half);
-budget hard-limit breach → refuse, not truncate-silently.
+budget hard-limit breach → refuse, not truncate-silently; injected clock/ID → two runs of
+the same scenario produce identical event timelines (determinism conformance);
+`Assembler.Base` composes a fixed block set deterministically (golden output).
 
 **[ ] T06 — EventJournal core (P0.3): durability + serialization.**
 SQLite-WAL (`modernc.org/sqlite`), bounded `busy_timeout`; ONE serialized append actor owns
@@ -77,15 +82,17 @@ Acceptance: replay fold reproduces state; append is the only write path.
 RED: concurrent appends (two sources) → contiguous sequences, nothing lost; known secret in
 payload → never reaches any sink; SIGKILL at commit boundary → old-or-new.
 
-**[ ] T07 — Synchronous projections + transaction recipes (B7 integration).**
-Core-state projections (sessions, obligations, memory index) fold in the SAME
-`BEGIN IMMEDIATE` transaction as the append (read-your-own-writes); the three named
-recipes: inbox-admission+journal · occurrence+run-admission · terminal-result+outbox.
-Observability projections lag async via durable offsets.
-Trace: HARDQ B7; E4.
-Acceptance: a write is visible to the next same-process read, always.
+**[ ] T07 — Synchronous projection harness + generic transaction recipe (B7 core).**
+Generic harness: a core-state projection folds in the SAME `BEGIN IMMEDIATE` transaction
+as the append (read-your-own-writes), proven with contract-valid FAKE domain rows;
+observability projections lag async via durable offsets. The three CONCRETE recipes land
+with their first real consumers and carry their crash/visibility REDs there:
+inbox-admission+journal → T22 · occurrence+run-admission → T20 · terminal-result+outbox
+→ T22.
+Trace: HARDQ B7; E4; REVIEW-TASKS2 fix (no consumer-before-producer).
+Acceptance: harness passes with fake rows; recipe API sealed for consumers.
 RED: `test_projection_cannot_bypass_journal`; projector crash → offset not advanced past
-durable row; MarkDone-then-ListActive race (agy TOCTOU case) → new state visible.
+durable row; append-then-read of a core projection in the same process → new state visible.
 
 **[ ] T08 — State machine as fold (S0.2).**
 Transition table default-reject; state reconstructed by folding journal events;
@@ -187,16 +194,17 @@ its profile. (Cross-profile delivery/approval integration REDs land in T24.)
 RED: cross-profile memory query → 0 hits; FTS of profile A never returns B tokens;
 restart+replay preserves ProfileID on every row.
 
-**[ ] T19 — Explicit memory (S9.2-min) + MEMORY_FORGET.**
+**[ ] T19 — Explicit memory (S9.2-min).**
 "remember X" → exact preview → profile-bound fact (approval ON); inferred → review queue
-(not recallable until accepted); append-only supersession; retrieval recency+exact/tag;
-NO decay (B8). `MEMORY_FORGET` = reversible tombstone (recall ban + restore). **DATA_PURGE
-deferred to its full P2.1 contract** (backup disposition, post-delete probes, legal-hold —
-not a P0 criterion; see deferred ledger).
-Trace: PRD §6 item 2; HARDQ B8; E14 (FORGET half); REVIEW-TASKS purge-creep fix.
+(not recallable until accepted); append-only supersession ("actually it's Y" corrects a
+fact in P0); retrieval recency+exact/tag; NO decay (B8). **MEMORY_FORGET and DATA_PURGE
+both deferred to their Annex P2.1 contract** — neither is a PRD §6 criterion and P2.1 is
+their normative owner (REVIEW-TASKS2: no P0 authority exists for pulling FORGET forward);
+supersession covers P0 correction needs.
+Trace: PRD §6 item 2; HARDQ B8; HARNESS-SPEC P2.1 (deferral authority).
 Acceptance: PRD §6 item 2 — fact survives restart into a fresh session.
-RED: rejected inference not recallable; forget → recall blocked, restore works;
-superseded fact returns only its latest version.
+RED: rejected inference not recallable; superseded fact returns only its latest version;
+accepted fact recallable after restart, only in its profile.
 
 ## Phase 4 — scheduler + obligations
 
@@ -284,17 +292,20 @@ Scripted end-to-end checks for ALL SIX PRD §6 criteria + full hostile suite + m
 release signing (binary signed; built-in Telegram adapter integrity attested by that
 signature — HARDQ A1's second half) + doctor upgraded to grant `P0-capable` from live
 criteria. Acceptance harness lives OUTSIDE the ablated implementation.
-Trace: PRD §6; HARDQ A1 (attestation half); constitution review gate.
-Acceptance: six-for-six criteria GREEN on the deployment host; 3-agent adversarial review
-of the whole P0 before declaring done.
+Trace: PRD §6; HARDQ A1 (attestation half); T11 snapshot promise; constitution review gate.
+Acceptance: six-for-six criteria GREEN on the deployment host; final sealed capability
+snapshot contains LIVE sandbox+provider+channel probe attestations (fakes gone); 3-agent
+adversarial review of the whole P0 before declaring done.
 RED: per-criterion sensitivity — for EACH of the six criteria, a controlled feature-off
 switch or targeted mutation (never reverting the check itself) turns exactly that
-criterion's check RED; tampered binary → signature verification fails.
+criterion's check RED; tampered binary → signature verification fails; each live probe
+removed or stale-hashed → its capability OFF in the snapshot and no dispatch to it.
 
 ---
 
 Deferred ledger (do NOT build in P0): full S7 (P2) · full S5 shadow-git/worktree (P3) ·
-**DATA_PURGE full contract (P2.1 — FORGET ships in P0, purge completes USP #4 at P2)** ·
+**MEMORY_FORGET + DATA_PURGE (both P2.1 — their normative owner; P0 correction =
+supersession; USP #4 completes at P2)** ·
 Decay+Audn (P1) · transactional Activator (P4+) · entropy secret detection (P4) ·
 SemanticHealth evaluator (P2+; C8's two positive signals ARE in T17/T20) · upcast
 chain/quarantine (v2) · native sandbox helper (P1 hardening) · plugin channels (P) ·
