@@ -10,7 +10,7 @@ Moderator-verifikacija (ne rubber-stamp): svaki dizajn pregledan protiv rupe koj
 | 3 | Sandbox feasibility → platform odluka | **DESIGN RESOLVED / probe OPEN** | codex | Linux ENFORCED-nakon-live-probe (helper: no_new_privs→Landlock→per-arch-seccomp→execveat, bez pre-exec prozora, TOCTOU fail-closed); Win/macOS UNAVAILABLE+high-risk BLOKIRAN, nula weaker-fallback. **Stvarni-OS probe (W0-W10 / M0-M9) traži tvoj Windows/macOS hardver — ja nemam.** |
 | 4 | Go dizajn+RED za rupe bez izvora | **DELIMIČNO** | kilo+agy | memorija descope (Decay+Audn P0, Dream/MemGit/MemAssoc v2) ✓; archmap query-API ✓; evidence-checker generic (worker≠checker) ✓; TIA+full-suite-fallback ✓; edit-engine (preimage+refuse>1) ✓. **DVIJE RUPE OSTAJU (vidi dolje).** |
 | 5 | Jedan effect-path owner | **RESOLVED** | kilo | S6.0 policy / S6.9 lifecycle / S1.2 process / S7 retry = jedini owneri; effect-taxonomy (BEFORE/AFTER_COMMIT/UNKNOWN→RECONCILING) rješava nemogući cancel; 2.3 re-ask nosi AttemptGrant |
-| 6 | PRD identitet + P0-scope | **OPEN — TI VODIŠ** | — | "jedna jezgra, dva profila" prijedlog (agy) čeka tvoju presudu |
+| 6 | PRD identitet + P0-scope | **RESOLVED (user approved 2026-09-03)** | korisnik | "jedna jezgra, dva profila" + P0 = 6 sposobnosti potvrđeno; zapis u PRD.md |
 
 ## OTVORENE RUPE u #4 (moderator našao, nisu rubber-stampane)
 

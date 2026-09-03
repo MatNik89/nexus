@@ -24,12 +24,12 @@ build tags (`proc_*.go`, `sandbox_*.go`). Non-Go world tools NEVER in-process �
 subprocess sidecar, pure-Go replacement, or descope (each choice explicit, no free "adapter").
 → HARNESS-PLAN header, S1.2, A9 component strategy; PLAN-HOLES C4.
 
-## E2 — One kernel, two profiles; assistant FIRST (PENDING product approval) + no self-modification
+## E2 — One kernel, two profiles; assistant FIRST (approved 2026-09-03) + no self-modification
 `AssistantProfile` = the everyday face (chat/memory/obligations/channels); `CodingProfile` =
 strongest branch (P1), not the purpose. Same S0–S9 kernel, same TurnLoop — only gating differs
-per profile. Linux first. Proposed and written into PRD v1; **formal product approval is
-still PENDING** (PRD:66 "awaits your confirmation"; DESIGN-STATUS #6 OPEN — see Open list).
-C7's profile listing is corrected per A8:
+per profile. Linux first. Written into PRD v1 and **formally approved by the user
+2026-09-03** (recorded in PRD.md; DESIGN-STATUS #6 RESOLVED). C7's profile listing is
+corrected per A8:
 coding USP trio = TIA + evidence-gate + AST-symedit (shadow-git was disproven as unique).
 **Golden rule:** NEXUS never modifies its own source autonomously — anomaly → scrubbed
 RepairBundle → user opt-in → Claude fixes via git → `nexus upgrade`.
@@ -184,12 +184,11 @@ boards, GraphRAG/CAG, fleet/pairing, video, computer-use, voice-WebRTC, K8s, cal
 archmap layer, PROV-O, guardian-LLM. Coding USP trio = P1.
 
 ## Open before P0 code (verified against DESIGN-STATUS + HARNESS-SPEC)
-1. **PRD formal approval** — identity (one kernel/two profiles) + P0 scope await the user's
-   sign-off (PRD:66; DESIGN-STATUS #6). Until recorded, E2 is a proposal, not a decision.
-2. **Linux hostile-conformance preflight** on a real kernel — go/no-go before production
+1. **Linux hostile-conformance preflight** on a real kernel — go/no-go before production
    S6.2/arbitrary-exec implementation (E10).
-3. **P1.6 vs P0-Telegram closure tension** (E15) — resolve in hard-questions round.
-4. **Build-order reconciliation** (E6) — SECTION-MAP DAG vs HARNESS-SPEC slices; confirm in
+2. **P1.6 vs P0-Telegram closure tension** (E15) — resolve in hard-questions round.
+3. **Build-order reconciliation** (E6) — SECTION-MAP DAG vs HARNESS-SPEC slices; confirm in
    hard-questions, materializes in tasks-P0.md.
-5. Win/mac real-OS probes — user hardware; deferred with those platforms (not a P0 blocker).
+4. Win/mac real-OS probes — user hardware; deferred with those platforms (not a P0 blocker).
+(PRD formal approval — CLOSED 2026-09-03, recorded in PRD.md; DESIGN-STATUS #6 RESOLVED.)
 (Annex A P0.5–P0.13 contracts EXIST — HARNESS-SPEC:1534+; the older PLAN-HOLES C3 claim is stale.)

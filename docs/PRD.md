@@ -63,4 +63,5 @@ uključi se programerski način koji je jači od postojećih alata. Isti "mozak"
 
 **Sljedeće (6-datoteka redoslijed):** ARCHITECTURE.md (tech dizajn — imamo ga u HARNESS-PLAN/DESIGN-*) →
 ARCHITECTURE-ESSENTIALS.md (5-15 kritičnih odluka) → hard-questions → CLAUDE.md/AGENTS.md → scaffold.
-**Ovaj PRD čeka tvoju potvrdu/korekciju** (ti vodiš product-sloj).
+**APPROVED by the user 2026-09-03** (identity "one kernel, two profiles, assistant-first" +
+P0 = the 6 capabilities of §4 with §6 done-criteria). Product layer decision #6 (DESIGN-STATUS) closed.
