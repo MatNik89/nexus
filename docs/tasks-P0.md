@@ -52,7 +52,7 @@ outcome + nonzero `--strict` exit; all five green → `prerequisites-ready`.
 
 ## Phase 1 — K0 primitives
 
-**[ ] T04 — Typed contracts (S0.1).**
+**[x] T04 (this commit) — Typed contracts (S0.1).**
 `Envelope/Message/ContextBlock/ToolCall/ToolResult/TypedError` per Annex P0.1 + `ProfileID`
 (B3) + `ExecutionKind`/`EffectPhase`/`CommitReceipt` (DESIGN-FIXES). Enums default-reject;
 `Content` XOR `ContentRef`; no `map[string]any`; unknown schema ID/version → reject
