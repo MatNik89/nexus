@@ -149,6 +149,8 @@ RED: "done" with empty EvidenceBundle → Grade=FAIL; ack for occurrence N gradi
 
 ## Phase 2 — safe conversation spine
 
+**DONE 2026-09-03** — merged to main; deep+integration review 5 rounds (codex/kilo/agy), 22 findings folded, final 3× PASS zero findings.
+
 **[x] T13 — s7-min (BEFORE the effect-path that consumes it).**
 `AttemptGrant{attempt_no,target,expires_at,nonce}` single-use + cancel token + no-retry
 policy (retryable → FAILED_TERMINAL in P0).
