@@ -213,10 +213,14 @@ Persisted occurrence (UTC + IANA + `dst=ONCE_FIRST` + `missed_run=COALESCE`), st
 occurrence ID, T05 clock seams, single-process overlap rule; startup + wake (D-Bus
 PrepareForSleep where available) catch-up sweep — `EvaluateDue` range query, overdue fires
 with OVERDUE notice. Maintains `last_occurrence_fired` counter (C8 positive half).
-Trace: PRD §6 item 3; HARDQ B1/C8; HARNESS-SPEC P2.6 minimal subset.
+Owns the concrete B7 recipe **`occurrence+run-admission`**: firing an occurrence and
+admitting its run commit in ONE `BEGIN IMMEDIATE` transaction.
+Trace: PRD §6 item 3; HARDQ B1/B7/C8; HARNESS-SPEC P2.6 minimal subset.
 Acceptance: reminder fires on time across daemon restart; counter observable via doctor.
 RED: restart-before-due → once; restart-after-due → once with OVERDUE; Zagreb autumn
-fold → once; spring gap → policy applied; suspend-over-due → catch-up on wake.
+fold → once; spring gap → policy applied; suspend-over-due → catch-up on wake;
+recipe atomicity — SIGKILL between occurrence-fire and run-admission → on restart either
+BOTH are durable or NEITHER (never a fired occurrence without its admitted run).
 
 **[ ] T21 — ObligationStore (9.6-min): Reminder + ONE concrete typed Task.**
 Writes THROUGH journal; `Reminder`
@@ -237,12 +241,18 @@ RED: ACK for occurrence N does not close N+1; MarkDone without evidence → reje
 Durable inbox keyed `(adapter_id, channel_identity, update_id)`
 `RECEIVED→ADMITTED→TERMINAL` — normalized message persisted BEFORE offset advance, replay
 returns existing outcome; transactional outbox + stable delivery ID; at-least-once remote
-delivery; `sent-but-unrecorded` → UNKNOWN→RECONCILING (never blind retry). Uses T07
-recipes.
-Trace: HARDQ B2; E15.
+delivery; `sent-but-unrecorded` → UNKNOWN→RECONCILING (never blind retry). Owns the two
+concrete B7 channel recipes: **`inbox-admission+journal`** (normalized inbound row + its
+journal event in ONE `BEGIN IMMEDIATE` transaction) and **`terminal-result+outbox`**
+(terminal run result + outbox enqueue in ONE transaction).
+Trace: HARDQ B2/B7; E15.
 Acceptance: crash anywhere leaves exactly-once admission + reconciled-or-UNKNOWN delivery.
 RED: SIGKILL matrix — before insert / after insert / after admission / after effect /
-before offset advance / after remote accept (fake transport) → each converges correctly.
+before offset advance / after remote accept (fake transport) → each converges correctly;
+recipe atomicity — SIGKILL inside each of the two recipes → both halves durable or
+neither (no inbound row without its journal event; no terminal result without its outbox
+row, and vice versa); visibility — committed recipe rows readable in the next
+same-process read.
 
 **[ ] T23 — Telegram built-in adapter.**
 Long-poll on T22 core; per-chat profile binding deny-default (unbound chat → typed "which
