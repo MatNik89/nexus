@@ -266,17 +266,26 @@ func Open(path string, profile contracts.ProfileID, r redact.Redactor, events ma
 		return nil, fmt.Errorf("journal open lease commit: %w", err)
 	}
 	j.leaseToken = token
-	releaseLease := func() {
-		db.Exec(`DELETE FROM journal_meta WHERE key='writer' AND value=?`, token)
+	// releaseLease surfaces its own failure (r5 codex #2): a swallowed
+	// DELETE error would leave a live-token lease that blocks same-process
+	// retries with a misleading primary error.
+	releaseLease := func() error {
+		if testFailLeaseDelete != nil {
+			return testFailLeaseDelete()
+		}
+		if _, err := db.Exec(`DELETE FROM journal_meta WHERE key='writer' AND value=?`, token); err != nil {
+			return fmt.Errorf("releasing writer lease: %w", err)
+		}
+		return nil
 	}
 	// Recovery runs UNDER our ownership (r4 codex #3: verify-before-lease
 	// allowed a live writer to append between snapshot and handoff — stale
 	// actor state). Any failure releases the exact acquired token.
 	lastOffset, lastHash, err := j.verifyChainFull()
 	if err != nil {
-		releaseLease()
-		db.Close()
-		return nil, fmt.Errorf("journal open: %w", err)
+		relErr := releaseLease()
+		closeErr := db.Close()
+		return nil, fmt.Errorf("journal open: %w", errors.Join(err, relErr, closeErr))
 	}
 
 	go j.actor(lastOffset, lastHash)

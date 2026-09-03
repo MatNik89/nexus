@@ -625,3 +625,30 @@ func TestOverBudgetPayloadRejected(t *testing.T) {
 		t.Fatal("over-budget payload accepted")
 	}
 }
+
+
+// A failed Open with a FAILING lease release surfaces both errors
+// (r5 codex #2 — the sibling of the Close path).
+func TestFailedOpenSurfacesLeaseReleaseFailure(t *testing.T) {
+	dir := t.TempDir()
+	j := open(t, dir, redact.None{})
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		if _, err := j.Append(ctx, params("run-a", fmt.Sprintf("e%d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := j.db.Exec(`UPDATE events SET envelope = replace(envelope, 'e1', 'eX') WHERE journal_offset = 2`); err != nil {
+		t.Fatal(err)
+	}
+	j.Close()
+	testFailLeaseDelete = func() error { return fmt.Errorf("injected release failure") }
+	defer func() { testFailLeaseDelete = nil }()
+	_, err := Open(filepath.Join(dir, "journal.db"), "work", redact.None{}, manyEvents())
+	if err == nil {
+		t.Fatal("tampered journal opened")
+	}
+	if !strings.Contains(err.Error(), "injected release failure") {
+		t.Fatalf("lease-release failure swallowed on the failed-open path: %v", err)
+	}
+}
