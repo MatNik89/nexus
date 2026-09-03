@@ -1378,6 +1378,7 @@ podsekciji mora dokazati pripadni ugovor. Bez Annexa spec je 'lista projekata'; 
 - **`TypedError` MUST imati:** `code`, `category` (`VALIDATION|AUTHN|AUTHZ|POLICY|RESOURCE|TIMEOUT|CANCELLED|DEPENDENCY|CONFLICT|INTERNAL|UNKNOWN_EFFECT`), `retryability` (`NEVER|S7_POLICY|AFTER`), `safe_message`, nullable `retry_after`, `origin`, nullable `cause_event_id`; proizvoljni string ne smije upravljati retryjem.
 - **`ContextBlock` MUST imati:** `block_id`, `kind`, `content` ili `content_ref` (točno jedno), `content_hash`, `source_uri`, `producer`, `trust_class` (`SYSTEM|USER|TOOL_TRUSTED|UNTRUSTED_EXTERNAL`), `sensitivity` (`PUBLIC|INTERNAL|CONFIDENTIAL|SECRET`), `lineage[]`, `observed_at`, nullable `expires_at`.
 - **Stateovi MUST biti:** run `CREATED→ADMITTED→RUNNING→{SUCCEEDED|FAILED|CANCELLED|UNKNOWN}`; turn `CREATED→RUNNING→{SUCCEEDED|FAILED|CANCELLED}`; tool attempt `PLANNED→AUTHORIZED→RUNNING→{SUCCEEDED|FAILED|CANCELLED|UNKNOWN}`. `SUCCEEDED|FAILED|CANCELLED` su terminalni; `UNKNOWN` smije prijeći samo u `SUCCEEDED|FAILED|MANUAL_RECOVERY` putem eksplicitnog reconciliation događaja.
+  **AMENDMENT (Phase-1B review, 2026-09-03):** kanonski `*.cancelled` event je legalan iz SVAKOG ne-terminalnog stanja prije završetka (run: CREATED/ADMITTED/RUNNING; turn: CREATED/RUNNING; attempt: PLANNED/AUTHORIZED/RUNNING) — korisnik smije otkazati posao koji još čeka. Cancel iz `UNKNOWN` NIJE legalan (UNKNOWN izlazi samo rekoncilijacijom). Jedan event-tip, multi-from tablica; nema sufiksiranih alias imena.
 - **Migracija MUST:** čuvati immutable raw event; koristiti jedinstveni registry `schema_id/version`; upcastati monotono verziju-po-verziju; karantenirati nepoznati schema ID/verziju; zabraniti lossy downcast; zapisati `migration_from`, `migration_to`, `migration_id`, `input_hash`, `output_hash`. **P0-scope (HARDQ C7):** u P0 je dovoljan `schema_version` + reject-unknown-neobrađeno (raw input sačuvan); upcast-LANAC + karantena-sink aktiviraju se s prvom stvarnom migracijom (v2) i tada ovaj ugovor vrijedi u cijelosti.
 - **Invarijante:** `sequence` strogo raste po runu; ID i causal parent se ne mijenjaju kroz migraciju; transformacije S8/S9/S10/S11 MUST očuvati `lineage` te smiju samo pooštriti `trust_class`/`sensitivity`; unknown polje se očuva, unknown discriminator se odbija.
 - **RED — `test_s0_rejects_provenance_laundering`:** untrusted `ContextBlock` prođe kroz compaction/upcaster koji ukloni `lineage` i postavi `trust_class=SYSTEM`; prompt assembly MUST vratiti `PROVENANCE_DOWNGRADE`, run ne smije prijeći u `RUNNING`, a model sink mora imati 0 poziva.
@@ -1541,6 +1542,15 @@ Ovih 7 ugovora plan je citirao kao gate a nisu bili u Annexu (agy GATE-01). Sad 
 - **Vlasnik:** S0.3 negotiation. `Effective()=min(declared,measured)`; nepoznato → error, NE pretpostavka.
 - **MUST:** measurement nosi target/version/config + measured-vector + probe-id/rev + evidence + expiry + hash; promjena bilo čega invalidira grant.
 - **RED — `test_capability_unknown_fails_closed`:** provider bez izmjerene sposobnosti → route/dispatch odbijen, nula pretpostavljenih sposobnosti.
+
+  **AMENDMENT (Phase-1B r2 review, 2026-09-03) — P0-min attestation vector:** u P0
+  (T11 sealed startup snapshot, HARDQ B9: bez runtime aktivacije) measurement nosi
+  {probe name, passed, detail, config-hash}; config-hash MORA biti sha256 digest
+  RESOLVED konfiguracije (shape-validiran, ne proizvoljan string) i snapshot ga
+  TRAJNO nosi. Probe-id/rev, expiry i measured-vector stižu s pravim S0.3
+  negotiation vlasnikom (P1) — freshness je u P0 strukturalan: probe se mjeri
+  jednom pri startu, snapshot umire s procesom, promjena configa = restart =
+  novo mjerenje. Mismatch hash → capability OFF (stale, fail closed).
 
 ## P0.6 — Config-bounds + process-identity
 - **Vlasnik:** S1.1 config, S1.2 proc.

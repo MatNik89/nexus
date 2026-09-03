@@ -10,6 +10,18 @@ PRD citations use "PRD §6 item N" (PRD §6 has numbered items, not subsections)
 
 Build order = HARDQ-CONSOLIDATED A2 (unanimous): vertical slices, SECTION-MAP DAG edges
 satisfied via -min contracts. Nothing relies on the sandbox boundary before T02 passes.
+
+**Review gates (MANDATORY — user directive 2026-09-03):**
+1. EVERY phase ends with a deep 3-agent adversarial review of THAT phase's batch, folded
+   to convergence, before the next phase starts.
+2. Three INTEGRATION deep-reviews cover everything-so-far at the seams where pieces first
+   join: (a) after Phase 2 — the whole first end-to-end path (loop→PEP→provider→journal→
+   REPL) as one chain; (b) after Phase 6 — the whole security surface together
+   (sandbox+exec+profiles+HITL+yolo); (c) T27 — full-P0 adversarial review (already in
+   the task).
+3. Retroactive trigger: a task that changes the behavior of earlier code pulls that
+   earlier code into its review scope. Unchanged, already-converged code is NOT re-reviewed
+   without a new proof surface (constitution rule).
 v2 folds REVIEW-TASKS round-1 (codex 15 + kilo 8 findings).
 
 ---
@@ -52,7 +64,7 @@ outcome + nonzero `--strict` exit; all five green → `prerequisites-ready`.
 
 ## Phase 1 — K0 primitives
 
-**[ ] T04 — Typed contracts (S0.1).**
+**[x] T04 (1bdae45..6cbc2c1) — Typed contracts (S0.1).**
 `Envelope/Message/ContextBlock/ToolCall/ToolResult/TypedError` per Annex P0.1 + `ProfileID`
 (B3) + `ExecutionKind`/`EffectPhase`/`CommitReceipt` (DESIGN-FIXES). Enums default-reject;
 `Content` XOR `ContentRef`; no `map[string]any`; unknown schema ID/version → reject
@@ -61,7 +73,7 @@ Trace: HARNESS-SPEC P0.1; E3; DESIGN-FIXES-r2.
 Acceptance: constructors reject every malformed case in the P0.1 MUST lists.
 RED: unknown discriminator accepted → fail; XOR violation accepted → fail.
 
-**[ ] T05 — K0 seams: clock/ID injection · AtomicWriter (s5-min) · ContextBudget-min · Assembler-min.**
+**[x] T05 (d6dd454+r-folds) — K0 seams: clock/ID injection · AtomicWriter (s5-min) · ContextBudget-min · Assembler-min.**
 Injectable wall+monotonic clock and ID-generator seams (deterministic tests everywhere
 downstream); `AtomicWriter` tmp→fsync→rename, never in-place (the s5-min cut);
 `ContextBudget.Measure+HardLimit` (S8.1-min); `Assembler.Base` (S11.1-min) skeleton.
@@ -74,7 +86,7 @@ budget hard-limit breach → refuse, not truncate-silently; injected clock/ID �
 the same scenario produce identical event timelines (determinism conformance);
 `Assembler.Base` composes a fixed block set deterministically (golden output).
 
-**[ ] T06 — EventJournal core (P0.3): durability + serialization.**
+**[x] T06 (df64a23..6cbc2c1) — EventJournal core (P0.3): durability + serialization.**
 SQLite-WAL (`modernc.org/sqlite`), bounded `busy_timeout`; ONE serialized append actor owns
 Append + sequence; known-ref secret redaction BEFORE append (C1).
 Trace: HARNESS-SPEC P0.3; E4; HARDQ B7/C1.
@@ -82,7 +94,7 @@ Acceptance: replay fold reproduces state; append is the only write path.
 RED: concurrent appends (two sources) → contiguous sequences, nothing lost; known secret in
 payload → never reaches any sink; SIGKILL at commit boundary → old-or-new.
 
-**[ ] T07 — Synchronous projection harness + generic transaction recipe (B7 core).**
+**[x] T07 (this commit) — Synchronous projection harness + generic transaction recipe (B7 core).**
 Generic harness: a core-state projection folds in the SAME `BEGIN IMMEDIATE` transaction
 as the append (read-your-own-writes), proven with contract-valid FAKE domain rows;
 observability projections lag async via durable offsets. The three CONCRETE recipes land
@@ -94,28 +106,28 @@ Acceptance: harness passes with fake rows; recipe API sealed for consumers.
 RED: `test_projection_cannot_bypass_journal`; projector crash → offset not advanced past
 durable row; append-then-read of a core projection in the same process → new state visible.
 
-**[ ] T08 — State machine as fold (S0.2).**
+**[x] T08 (this commit) — State machine as fold (S0.2).**
 Transition table default-reject; state reconstructed by folding journal events;
 checkpoint = offset; UNKNOWN only via reconciliation event.
 Trace: HARNESS-SPEC P0.1 states; E4.
 Acceptance: fold of a recorded run reproduces every intermediate state.
 RED: illegal transition (RUNNING→ADMITTED, SUCCEEDED→RUNNING) → reject.
 
-**[ ] T09 — Config (S1.1-min).**
+**[x] T09 (this commit) — Config (S1.1-min).**
 Typed `Config`; precedence Default<Global<Project<Env<CLI; schema validation before merge;
 `ValidateBounds` (config only NARROWS); restart-on-change, no hot reload (B9).
 Trace: HARNESS-PLAN 1.1; E11; HARDQ B9.
 Acceptance: precedence table-driven test; invalid config → startup refuses.
 RED: config attempts egress `*` / sandbox below floor → reject.
 
-**[ ] T10 — Paths + process identity (S1.2-min).**
+**[x] T10 (this commit) — Paths + process identity (S1.2-min).**
 `os.UserConfigDir` layout; `proc_linux.go` Setpgid + killpg TERM→grace→KILL→Wait;
 PID + start-token identity.
 Trace: HARNESS-PLAN 1.2; E5.
 Acceptance: spawned tree fully terminates; identity survives PID-reuse check.
 RED: group terminate leaves orphan grandchild alive → fail.
 
-**[ ] T11 — Sealed capability snapshot (S0.5-min, sandbox-probe only at this phase).**
+**[x] T11 (this commit) — Sealed capability snapshot (S0.5-min, sandbox-probe only at this phase).**
 `Resolver.Resolve` fail-closed validation (unknown/cycle/conflict → REJECTED); sealed
 startup snapshot from config + the T02 sandbox probe + **contract-valid probe fakes** for
 provider/channel (live probes register in T15/T23; T27 verifies the final snapshot). NO
@@ -125,7 +137,7 @@ Acceptance: snapshot lists compiled P0 capabilities; extensible probe registry.
 RED: ablated gate (bwrap missing) → capability OFF, conversation-only start continues;
 unknown capability name in config → reject.
 
-**[ ] T12 — Minimal deterministic checker (S16.6-det).**
+**[x] T12 (this commit) — Minimal deterministic checker (S16.6-det).**
 Generic `AcceptanceContract` + `EvidenceBundle`; graders: exit-code · file-diff/hash ·
 delivery-receipt+ack correlated to occurrence ID (B5). Checker ≠ worker principal; prose is
 never evidence.

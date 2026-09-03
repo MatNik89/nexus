@@ -286,7 +286,10 @@ func TestTargetSwapAfterPrepareIsInert(t *testing.T) {
 // whose ancestry chain reaches root.
 func descendants(t *testing.T, root int) map[string]bool {
 	t.Helper()
-	type pinfo struct{ ppid int; start string }
+	type pinfo struct {
+		ppid  int
+		start string
+	}
 	procs := map[int]pinfo{}
 	entries, _ := os.ReadDir("/proc")
 	for _, e := range entries {

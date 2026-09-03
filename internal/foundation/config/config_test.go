@@ -1,0 +1,240 @@
+// T09 RED table (tasks-P0): table-driven precedence; invalid config →
+// startup refuses; bounds — egress "*" / sandbox-off attempts rejected
+// (config only NARROWS the kernel floor). Anchored to E11 and the ledger.
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func write(t *testing.T, dir, name, content string) string {
+	t.Helper()
+	p := filepath.Join(dir, name)
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+var noEnv []string
+
+func TestPrecedenceTable(t *testing.T) {
+	dir := t.TempDir()
+	global := write(t, dir, "global.json", `{"provider_model":"from-global","provider_base_url":"https://g"}`)
+	project := write(t, dir, "project.json", `{"provider_model":"from-project"}`)
+	env := []string{"NEXUS_CFG_PROVIDER_BASE_URL=https://env", "UNRELATED=1"}
+	res, err := Resolve(global, project, env, map[string]string{"default_profile": "work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// project beats global; env beats files; cli beats all; defaults fill.
+	if res.Config.ProviderModel != "from-project" {
+		t.Fatalf("project must beat global: %q", res.Config.ProviderModel)
+	}
+	if res.Config.ProviderBaseURL != "https://env" {
+		t.Fatalf("env must beat files: %q", res.Config.ProviderBaseURL)
+	}
+	if string(res.Config.DefaultProfile) != "work" {
+		t.Fatalf("cli must beat all: %q", res.Config.DefaultProfile)
+	}
+	if res.Config.ProviderKeyEnv != "NEXUS_API_KEY" {
+		t.Fatalf("default must survive: %q", res.Config.ProviderKeyEnv)
+	}
+	// Origin tracking.
+	if res.Origins["provider_model"] != OriginProject ||
+		res.Origins["provider_base_url"] != OriginEnv ||
+		res.Origins["default_profile"] != OriginCLI ||
+		res.Origins["provider_key_env"] != OriginDefault {
+		t.Fatalf("origin tracking wrong: %+v", res.Origins)
+	}
+}
+
+func TestUnknownKeyRefusedBeforeMerge(t *testing.T) {
+	dir := t.TempDir()
+	global := write(t, dir, "g.json", `{"totally_new_knob": true}`)
+	if _, err := Resolve(global, filepath.Join(dir, "missing.json"), noEnv, nil); err == nil {
+		t.Fatal("unknown config key accepted")
+	}
+	if _, err := Resolve(filepath.Join(dir, "missing.json"), filepath.Join(dir, "m2.json"), noEnv,
+		map[string]string{"nope": "x"}); err == nil {
+		t.Fatal("unknown CLI key accepted")
+	}
+}
+
+func TestInvalidJSONRefused(t *testing.T) {
+	dir := t.TempDir()
+	global := write(t, dir, "g.json", `{broken`)
+	if _, err := Resolve(global, filepath.Join(dir, "missing.json"), noEnv, nil); err == nil {
+		t.Fatal("invalid JSON accepted")
+	}
+}
+
+// The ledger's literal bounds cases: egress "*" and sandbox-below-floor.
+func TestBoundsEgressWildcardRejected(t *testing.T) {
+	dir := t.TempDir()
+	global := write(t, dir, "g.json", `{"egress_allow":["api.telegram.org","*"]}`)
+	_, err := Resolve(global, filepath.Join(dir, "missing.json"), noEnv, nil)
+	if err == nil || !strings.Contains(err.Error(), "widens the kernel floor") {
+		t.Fatalf("egress wildcard must be rejected as a floor widening: %v", err)
+	}
+}
+
+func TestBoundsSandboxCannotBeDisabled(t *testing.T) {
+	dir := t.TempDir()
+	global := write(t, dir, "g.json", `{"sandbox_disabled": true}`)
+	if _, err := Resolve(global, filepath.Join(dir, "missing.json"), noEnv, nil); err == nil {
+		t.Fatal("sandbox_disabled accepted — configuration widened the kernel floor")
+	}
+}
+
+func TestMissingFilesAreEmptyLayers(t *testing.T) {
+	dir := t.TempDir()
+	res, err := Resolve(filepath.Join(dir, "no1.json"), filepath.Join(dir, "no2.json"), noEnv, nil)
+	if err != nil {
+		t.Fatalf("missing files must be empty layers: %v", err)
+	}
+	if string(res.Config.DefaultProfile) != "private" {
+		t.Fatalf("defaults not applied: %+v", res.Config)
+	}
+}
+
+func TestInvalidProfileRefused(t *testing.T) {
+	if _, err := Resolve("/nonexistent", "/nonexistent", noEnv,
+		map[string]string{"default_profile": "bad\x00id"}); err == nil {
+		t.Fatal("control-char profile id accepted")
+	}
+}
+
+// Unknown NEXUS_CFG_* env vars fail closed like every other layer
+// (Phase-1B codex #12: name-probing made them invisible).
+func TestUnknownEnvVarRefused(t *testing.T) {
+	_, err := Resolve("/nonexistent", "/nonexistent",
+		[]string{"NEXUS_CFG_TOTALLY_NEW=1"}, nil)
+	if err == nil {
+		t.Fatal("unknown NEXUS_CFG_ variable accepted")
+	}
+}
+
+// Per-key schema in EVERY layer (codex #11): wrong JSON types and
+// non-literal booleans are refused, never coerced.
+func TestPerKeySchemaStrict(t *testing.T) {
+	dir := t.TempDir()
+	cases := map[string]string{
+		"bool-as-model":     `{"provider_model": true}`,
+		"bool-as-egress":    `{"egress_allow": true}`,
+		"string-as-sandbox": `{"sandbox_disabled": "yes"}`,
+		"number-as-url":     `{"provider_base_url": 42}`,
+	}
+	for name, content := range cases {
+		t.Run(name, func(t *testing.T) {
+			g := write(t, dir, name+".json", content)
+			if _, err := Resolve(g, "/nonexistent", noEnv, nil); err == nil {
+				t.Fatalf("mistyped value accepted: %s", content)
+			}
+		})
+	}
+	// Env/CLI: "TRUE"/"1" are NOT booleans (previously silently false).
+	if _, err := Resolve("/nonexistent", "/nonexistent",
+		[]string{"NEXUS_CFG_SANDBOX_DISABLED=TRUE"}, nil); err == nil {
+		t.Fatal("non-literal boolean accepted from env")
+	}
+	if _, err := Resolve("/nonexistent", "/nonexistent", noEnv,
+		map[string]string{"sandbox_disabled": "1"}); err == nil {
+		t.Fatal("non-literal boolean accepted from CLI")
+	}
+}
+
+// Egress entries stay a real array: whitespace and empty entries refused
+// in every layer (codex #13 / kilo #3).
+func TestEgressListHygiene(t *testing.T) {
+	dir := t.TempDir()
+	g := write(t, dir, "g.json", `{"egress_allow":["api.telegram.org", " padded.example"]}`)
+	if _, err := Resolve(g, "/nonexistent", noEnv, nil); err == nil {
+		t.Fatal("whitespace-padded host accepted from file")
+	}
+	if _, err := Resolve("/nonexistent", "/nonexistent",
+		[]string{"NEXUS_CFG_EGRESS_ALLOW=a.example,, b.example"}, nil); err == nil {
+		t.Fatal("empty/padded CSV entries accepted from env")
+	}
+	res, err := Resolve("/nonexistent", "/nonexistent",
+		[]string{"NEXUS_CFG_EGRESS_ALLOW=a.example,b.example"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Config.EgressAllow) != 2 || res.Config.EgressAllow[1] != "b.example" {
+		t.Fatalf("clean CSV mis-parsed: %v", res.Config.EgressAllow)
+	}
+}
+
+// Bounds are enforced regardless of which layer supplied the value
+// (codex #20: file-only bounds REDs were too narrow).
+func TestBoundsEnforcedFromEveryLayer(t *testing.T) {
+	if _, err := Resolve("/nonexistent", "/nonexistent",
+		[]string{"NEXUS_CFG_EGRESS_ALLOW=*"}, nil); err == nil {
+		t.Fatal("egress wildcard accepted from env")
+	}
+	if _, err := Resolve("/nonexistent", "/nonexistent", noEnv,
+		map[string]string{"egress_allow": "api.x,*"}); err == nil {
+		t.Fatal("egress wildcard accepted from CLI")
+	}
+	if _, err := Resolve("/nonexistent", "/nonexistent",
+		[]string{"NEXUS_CFG_SANDBOX_DISABLED=true"}, nil); err == nil {
+		t.Fatal("sandbox_disabled accepted from env")
+	}
+}
+
+// Env names are canonical uppercase, once each: case-folded aliases and
+// duplicates are refused in BOTH orders — no order-dependent overwrite
+// channel (Phase-1B-r2 codex #9).
+func TestEnvNamesCanonicalAndUnique(t *testing.T) {
+	if _, err := Resolve("/nonexistent", "/nonexistent",
+		[]string{"NEXUS_CFG_provider_model=b"}, nil); err == nil {
+		t.Fatal("non-uppercase NEXUS_CFG_ name accepted")
+	}
+	for _, environ := range [][]string{
+		{"NEXUS_CFG_PROVIDER_MODEL=a", "NEXUS_CFG_PROVIDER_MODEL=b"},
+		{"NEXUS_CFG_PROVIDER_MODEL=b", "NEXUS_CFG_PROVIDER_MODEL=a"},
+	} {
+		if _, err := Resolve("/nonexistent", "/nonexistent", environ, nil); err == nil {
+			t.Fatal("duplicate env variable accepted (last-write-wins)")
+		}
+	}
+}
+
+// Rejected raw values are NEVER echoed into diagnostics (Phase-1B-r2
+// codex #10): a secret mistyped into a config key must not appear in the
+// startup error.
+func TestRejectedValueNotEchoed(t *testing.T) {
+	const canary = "sk-SECRET-CANARY-VALUE"
+	cases := map[string]func() error{
+		"env-bool": func() error {
+			_, err := Resolve("/nonexistent", "/nonexistent",
+				[]string{"NEXUS_CFG_SANDBOX_DISABLED=" + canary}, nil)
+			return err
+		},
+		"cli-bool": func() error {
+			_, err := Resolve("/nonexistent", "/nonexistent", noEnv,
+				map[string]string{"sandbox_disabled": canary})
+			return err
+		},
+		"env-list-padded": func() error {
+			_, err := Resolve("/nonexistent", "/nonexistent",
+				[]string{"NEXUS_CFG_EGRESS_ALLOW=ok.example, " + canary}, nil)
+			return err
+		},
+	}
+	for name, do := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := do()
+			if err == nil {
+				t.Fatal("invalid value accepted")
+			}
+			if strings.Contains(err.Error(), canary) {
+				t.Fatalf("rejected raw value echoed into diagnostics: %v", err)
+			}
+		})
+	}
+}

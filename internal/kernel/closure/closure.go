@@ -1,0 +1,263 @@
+// Package closure owns capability-flag closure resolution, S0.5-min scope
+// (tasks-P0 T11; HARDQ B9): fail-closed Resolve VALIDATION (unknown, cycle,
+// conflict → REJECTED) plus the SEALED startup capability snapshot built
+// from config and live probe results. P0 has NO runtime activation: no
+// Activator, no RollbackVault — a config change means restart. The
+// transactional activation design (E7) activates with the first dynamic
+// consumer (extensions, P4+).
+package closure
+
+import (
+	"fmt"
+	"sort"
+)
+
+// Manifest declares one capability: what it requires (other capabilities),
+// what it conflicts with, and which PROBES must pass for it to switch on.
+type Manifest struct {
+	Name      string
+	Requires  []string
+	Conflicts []string
+	Probes    []string // probe names that must all PASS
+}
+
+// P0Capabilities is the compiled, closed P0 set (PRD §4 + yolo F2 is a
+// policy mode, not a capability).
+func P0Capabilities() []Manifest {
+	return []Manifest{
+		{Name: "conversation", Probes: []string{"provider"}},
+		{Name: "memory", Requires: []string{"conversation"}, Probes: []string{"store"}},
+		{Name: "obligations", Requires: []string{"memory"}, Probes: []string{"store"}},
+		{Name: "profiles", Probes: []string{"store"}},
+		{Name: "telegram", Requires: []string{"conversation", "profiles"}, Probes: []string{"channel"}},
+		{Name: "exec", Probes: []string{"sandbox"}},
+	}
+}
+
+// Resolve validates a requested capability set against manifests:
+// unknown names, dependency cycles, unknown requirements and conflicts are
+// all REJECTED (fail closed). On success it returns the transitive closure
+// in deterministic topological order.
+func Resolve(manifests []Manifest, requested []string) ([]string, error) {
+	byName := map[string]Manifest{}
+	for _, m := range manifests {
+		if m.Name == "" {
+			return nil, fmt.Errorf("closure: manifest with empty name")
+		}
+		if _, dup := byName[m.Name]; dup {
+			return nil, fmt.Errorf("closure: duplicate manifest %q", m.Name)
+		}
+		byName[m.Name] = m
+	}
+	// Every DECLARED conflict target must name a known capability — a typo
+	// would otherwise silently disarm the conflict (Phase-1B-r2 codex #14 /
+	// kilo #11: contract says unknown conflicts are rejected).
+	for _, m := range manifests {
+		for _, c := range m.Conflicts {
+			if _, ok := byName[c]; !ok {
+				return nil, fmt.Errorf("closure: %q declares a conflict with unknown capability %q (fail closed)", m.Name, c)
+			}
+		}
+	}
+	// Transitive closure with cycle detection (DFS, three-color).
+	const (
+		white = 0
+		gray  = 1
+		black = 2
+	)
+	color := map[string]int{}
+	var order []string
+	var visit func(name string, path []string) error
+	visit = func(name string, path []string) error {
+		m, ok := byName[name]
+		if !ok {
+			return fmt.Errorf("closure: unknown capability %q (fail closed)", name)
+		}
+		switch color[name] {
+		case black:
+			return nil
+		case gray:
+			return fmt.Errorf("closure: dependency cycle through %q (fail closed)", name)
+		}
+		color[name] = gray
+		reqs := append([]string{}, m.Requires...)
+		sort.Strings(reqs) // deterministic traversal
+		for _, r := range reqs {
+			if err := visit(r, append(path, name)); err != nil {
+				return err
+			}
+		}
+		color[name] = black
+		order = append(order, name)
+		return nil
+	}
+	req := append([]string{}, requested...)
+	sort.Strings(req)
+	for _, name := range req {
+		if err := visit(name, nil); err != nil {
+			return nil, err
+		}
+	}
+	// Conflicts checked over the RESOLVED set (a conflict pulled in
+	// transitively is still a conflict).
+	inSet := map[string]bool{}
+	for _, n := range order {
+		inSet[n] = true
+	}
+	for _, n := range order {
+		for _, c := range byName[n].Conflicts {
+			if inSet[c] {
+				return nil, fmt.Errorf("closure: %q conflicts with %q (fail closed)", n, c)
+			}
+		}
+	}
+	return order, nil
+}
+
+// ProbeResult is one live probe outcome (accepted as data: the composing
+// root runs real probes — sandbox/provider/channel; tests pass
+// contract-valid fakes; T27 verifies the final all-live snapshot).
+// ConfigHash binds the measurement to the configuration it was taken under
+// (Annex P0.5: a changed config invalidates the grant — Phase-1B codex #18:
+// a stale result from another config must not turn a capability ON).
+type ProbeResult struct {
+	Name       string
+	Passed     bool
+	Detail     string
+	ConfigHash string
+}
+
+// CapabilityStatus is one sealed entry.
+type CapabilityStatus struct {
+	Name   string
+	On     bool
+	Reason string // OFF reason (probe/dependency), empty when On
+}
+
+// ConfigBinding is the resolved-configuration digest seam. The config
+// OWNER implements it (config.Resolved computes sha256 over the canonical
+// resolved configuration) — Seal consumes the typed seam, never a
+// free-floating string (Phase-1B-r3 codex #10). topknot ceiling: Go cannot
+// stop a hostile local caller from implementing the interface with an
+// invented digest; the composing root passes the REAL config.Resolved and
+// T27 verifies the all-live snapshot. Upgrade trigger: T27.
+type ConfigBinding interface {
+	ConfigHash() string
+}
+
+// Snapshot is the SEALED startup capability state: immutable after Seal;
+// changing configuration means restarting the process (B9). It RETAINS the
+// config-hash binding it was sealed under, so a consumer can prove which
+// configuration the snapshot attests (Phase-1B-r2 codex #13).
+type Snapshot struct {
+	statuses   map[string]CapabilityStatus
+	order      []string
+	configHash string
+}
+
+// ConfigHash returns the resolved-config digest the snapshot is bound to.
+func (s *Snapshot) ConfigHash() string { return s.configHash }
+
+// sha256Hex validates the config-hash SHAPE: 64 lowercase hex chars —
+// arbitrary caller-invented strings are not a config binding (codex #13).
+func sha256Hex(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for _, r := range s {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// Seal resolves the requested set and switches each capability ON only if
+// every required probe passed UNDER THE SAME CONFIG HASH and every required
+// capability is ON. Missing probe = FAILED; duplicate probe names are
+// REJECTED (Phase-1B codex #19: last-write-wins let input order decide
+// capability state); a probe measured under a different config hash =
+// FAILED (codex #18).
+// topknot ceiling (recorded in the owner — SPEC P0.5 P0-min amendment):
+// the P0 attestation vector is {probe name, passed, detail, config hash};
+// probe id/revision, expiry, and a measured-capability vector arrive with
+// the S0.3 negotiation owner (P1). Freshness in P0 is structural: probes
+// run once at startup and the snapshot dies with the process (B9).
+func Seal(manifests []Manifest, requested []string, probes []ProbeResult, binding ConfigBinding) (*Snapshot, error) {
+	if binding == nil {
+		return nil, fmt.Errorf("closure: a resolved-config binding is required (fail closed)")
+	}
+	configHash := binding.ConfigHash()
+	if !sha256Hex(configHash) {
+		return nil, fmt.Errorf("closure: the config binding must be a sha256 hex digest of the resolved config (fail closed)")
+	}
+	order, err := Resolve(manifests, requested)
+	if err != nil {
+		return nil, err
+	}
+	byName := map[string]Manifest{}
+	for _, m := range manifests {
+		byName[m.Name] = m
+	}
+	probeOK := map[string]ProbeResult{}
+	for _, p := range probes {
+		if _, dup := probeOK[p.Name]; dup {
+			return nil, fmt.Errorf("closure: duplicate probe result %q (fail closed)", p.Name)
+		}
+		probeOK[p.Name] = p
+	}
+	snap := &Snapshot{statuses: map[string]CapabilityStatus{}, order: order, configHash: configHash}
+	for _, name := range order { // topological: dependencies decided first
+		m := byName[name]
+		status := CapabilityStatus{Name: name, On: true}
+		for _, probe := range m.Probes {
+			pr, present := probeOK[probe]
+			if !present {
+				status.On = false
+				status.Reason = fmt.Sprintf("probe %q missing (fail closed)", probe)
+				break
+			}
+			if pr.ConfigHash != configHash {
+				status.On = false
+				status.Reason = fmt.Sprintf("probe %q measured under a different config (stale, fail closed)", probe)
+				break
+			}
+			if !pr.Passed {
+				status.On = false
+				status.Reason = fmt.Sprintf("probe %q failed: %s", probe, pr.Detail)
+				break
+			}
+		}
+		if status.On {
+			for _, req := range m.Requires {
+				if !snap.statuses[req].On {
+					status.On = false
+					status.Reason = fmt.Sprintf("requires %q which is OFF", req)
+					break
+				}
+			}
+		}
+		snap.statuses[name] = status
+	}
+	return snap, nil
+}
+
+// On reports whether a capability is active in the sealed snapshot.
+// Unknown names are OFF (fail closed), never an error a caller could skip.
+func (s *Snapshot) On(name string) bool {
+	return s.statuses[name].On
+}
+
+// Status returns the full sealed entry (zero value for unknown names).
+func (s *Snapshot) Status(name string) CapabilityStatus {
+	return s.statuses[name]
+}
+
+// List returns all sealed entries in topological order.
+func (s *Snapshot) List() []CapabilityStatus {
+	out := make([]CapabilityStatus, 0, len(s.order))
+	for _, n := range s.order {
+		out = append(out, s.statuses[n])
+	}
+	return out
+}

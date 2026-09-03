@@ -602,7 +602,7 @@ func Prepare(av Availability, spec Spec) (*Handle, error) {
 		return nil, e
 	}
 
-		args := []string{
+	args := []string{
 		"--proc", "/proc",
 		"--dev", "/dev",
 		"--tmpfs", "/tmp",
