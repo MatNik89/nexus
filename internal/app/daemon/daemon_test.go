@@ -14,6 +14,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,12 +23,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MatNik89/nexus/internal/app/repl"
 	"github.com/MatNik89/nexus/internal/foundation/config"
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
 	"github.com/MatNik89/nexus/internal/kernel/effectpath"
 	"github.com/MatNik89/nexus/internal/kernel/journal"
 	"github.com/MatNik89/nexus/internal/kernel/loop"
 	"github.com/MatNik89/nexus/internal/kernel/machine"
+	"github.com/MatNik89/nexus/internal/kernel/s7min"
+	"github.com/MatNik89/nexus/internal/llm/planner"
 	"github.com/MatNik89/nexus/internal/llm/provider"
 	"github.com/MatNik89/nexus/internal/security/redact"
 )
@@ -62,10 +67,11 @@ type capturingAudit struct {
 	events []string
 }
 
-func (a *capturingAudit) Record(event string, call contracts.ToolCall) {
+func (a *capturingAudit) Record(event string, call contracts.ToolCall) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.events = append(a.events, event)
+	return nil
 }
 
 func testDaemon(t *testing.T, planner loop.Planner, audit effectpath.AuditSink) (*Daemon, string, *journal.Journal) {
@@ -84,8 +90,11 @@ func testDaemon(t *testing.T, planner loop.Planner, audit effectpath.AuditSink) 
 		audit = &capturingAudit{}
 	}
 	d, err := New(Deps{
-		Journal: j, Planner: planner, Profile: "work",
-		Rules: map[contracts.ToolID]effectpath.Decision{"asker": effectpath.DecisionAsk},
+		Journal:        j,
+		PlannerFactory: func(deliver func(string) error) (loop.Planner, error) { return planner, nil },
+		Authority:      s7min.NewAuthority(nil, time.Minute),
+		Profile:        "work",
+		Rules:          map[contracts.ToolID]effectpath.Decision{"asker": effectpath.DecisionAsk},
 		Tools: map[contracts.ToolID]effectpath.InProcFunc{
 			"asker": func(ctx context.Context, c contracts.ToolCall) (contracts.ToolResult, error) {
 				return contracts.ToolResult{ToolCallID: c.ToolCallID, AttemptNo: c.AttemptNo,
@@ -276,12 +285,100 @@ func TestLiveProviderSmoke(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p, err := provider.NewAPIKey(res.Config)
+	auth := s7min.NewAuthority(nil, time.Minute)
+	p, err := provider.NewAPIKey(res.Config, auth)
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := p.Chat(context.Background(), []provider.ChatMessage{{Role: "user", Content: "Reply with exactly: pong"}})
+	g, err := auth.Issue("op-live-smoke", "provider:live")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := p.Chat(context.Background(), []provider.ChatMessage{{Role: "user", Content: "Reply with exactly: pong"}}, g)
 	if err != nil || out.Content == "" {
 		t.Fatalf("live provider smoke failed: %q %v", out.Content, err)
+	}
+}
+
+// FULL-SPINE deterministic e2e (Phase-2 codex #12): real repl.Run → UDS →
+// daemon → loop → REAL planner → REAL provider transport (deterministic
+// local SSE fake) → journal. Streaming deltas reach the terminal (T17
+// streaming print), the reply renders, and the turn folds SUCCEEDED from
+// the journal alone.
+func TestFullSpineDeterministicTransport(t *testing.T) {
+	// Deterministic OpenAI-compatible SSE endpoint.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"deterministic \"}}]}\n\n")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"pong\"}}]}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	t.Cleanup(srv.Close)
+	host := strings.TrimPrefix(srv.URL, "http://")
+	t.Setenv("NEXUS_SPINE_KEY", "sk-spine")
+	cfg := config.Config{
+		ProviderBaseURL: srv.URL, ProviderKeyEnv: "NEXUS_SPINE_KEY",
+		ProviderModel: "spine-model", EgressAllow: []string{host}, DefaultProfile: "work",
+	}
+	dir := t.TempDir()
+	ev := map[string]journal.PayloadValidator{}
+	for _, n := range machine.EventTypes() {
+		ev[n] = nil
+	}
+	j, err := journal.Open(filepath.Join(dir, "journal.db"), "work", redact.None{}, ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { j.Close() })
+	authority := s7min.NewAuthority(nil, time.Minute)
+	prov, err := provider.NewAPIKey(cfg, authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := New(Deps{
+		Journal: j,
+		PlannerFactory: func(deliver func(string) error) (loop.Planner, error) {
+			return planner.NewStreaming(prov, prov, authority, "provider:spine", deliver)
+		},
+		Authority: authority, Profile: "work",
+		Rules: map[contracts.ToolID]effectpath.Decision{},
+		Tools: map[contracts.ToolID]effectpath.InProcFunc{},
+		Audit: &capturingAudit{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sock := filepath.Join(dir, "spine.sock")
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go d.Serve(ctx, sock)
+	for i := 0; i < 100; i++ {
+		if c, err := net.Dial("unix", sock); err == nil {
+			c.Close()
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// The REAL terminal client drives the whole spine.
+	var out strings.Builder
+	if err := repl.Run(strings.NewReader("hello nexus\n"), &out, sock, false); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "deterministic pong") {
+		t.Fatalf("full-spine reply not rendered: %q", got)
+	}
+	var turnEvents []machine.FoldEvent
+	if err := j.Replay(0, func(e journal.Event) error {
+		if strings.HasPrefix(e.Envelope.EventType, "turn.") {
+			turnEvents = append(turnEvents, machine.FoldEvent{Type: e.Envelope.EventType, Offset: e.JournalOffset})
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	st, _, err := machine.TurnTable().Fold(contracts.TurnInvalid, turnEvents, nil)
+	if err != nil || st != contracts.TurnSucceeded {
+		t.Fatalf("full-spine turn folds to %v (%v)", st, err)
 	}
 }

@@ -28,14 +28,18 @@ import (
 )
 
 // Deps are the daemon's collaborators — the composition root (cmd/nexus)
-// wires real ones; tests wire deterministic fakes.
+// wires real ones; tests wire deterministic fakes. PlannerFactory builds
+// the session planner around a DELTA SINK (streaming print, T17): a
+// planner that streams calls deliver per delta; deliver errors mean the
+// client is gone. Authority is the ONE process-wide S7 owner.
 type Deps struct {
-	Journal *journal.Journal
-	Planner loop.Planner
-	Profile contracts.ProfileID
-	Rules   map[contracts.ToolID]effectpath.Decision
-	Tools   map[contracts.ToolID]effectpath.InProcFunc
-	Audit   effectpath.AuditSink
+	Journal        *journal.Journal
+	PlannerFactory func(deliver func(delta string) error) (loop.Planner, error)
+	Authority      *s7min.Authority
+	Profile        contracts.ProfileID
+	Rules          map[contracts.ToolID]effectpath.Decision
+	Tools          map[contracts.ToolID]effectpath.InProcFunc
+	Audit          effectpath.AuditSink
 }
 
 // Daemon serves chat sessions over a UDS.
@@ -45,8 +49,8 @@ type Daemon struct {
 }
 
 func New(d Deps) (*Daemon, error) {
-	if d.Journal == nil || d.Planner == nil || d.Audit == nil {
-		return nil, fmt.Errorf("daemon: journal, planner and audit sink are required (fail closed)")
+	if d.Journal == nil || d.PlannerFactory == nil || d.Audit == nil || d.Authority == nil {
+		return nil, fmt.Errorf("daemon: journal, planner factory, S7 authority and audit sink are required (fail closed)")
 	}
 	if !d.Profile.Valid() {
 		return nil, fmt.Errorf("daemon: a profile is required (fail closed)")
@@ -137,7 +141,7 @@ func (d *Daemon) handle(ctx context.Context, conn net.Conn) {
 		writeFrame(conn, frame{Type: "error", Text: "session setup failed"})
 		return
 	}
-	grants := s7min.NewAuthority(nil, time.Minute)
+	grants := d.deps.Authority
 	path, err := effectpath.NewEffectPath(pep, orderOnlyMW{},
 		effectpath.NewInProcessExecutor(d.deps.Tools),
 		effectpath.NewSandboxedProcessExecutor(noSandbox{}), grants)
@@ -146,7 +150,15 @@ func (d *Daemon) handle(ctx context.Context, conn net.Conn) {
 		return
 	}
 	session := d.session.Add(1)
-	l, err := loop.New(d.deps.Planner, path, grants, d.deps.Journal, loop.PolicyInteractive, 16, 3)
+	// The session planner streams deltas straight onto this connection.
+	planner, err := d.deps.PlannerFactory(func(delta string) error {
+		return writeFrame(conn, frame{Type: "delta", Text: delta})
+	})
+	if err != nil {
+		writeFrame(conn, frame{Type: "error", Text: "session setup failed"})
+		return
+	}
+	l, err := loop.New(planner, path, grants, d.deps.Journal, loop.PolicyInteractive, 16, 3)
 	if err != nil {
 		writeFrame(conn, frame{Type: "error", Text: "session setup failed"})
 		return

@@ -76,13 +76,16 @@ func New(p Planner, path *effectpath.EffectPath, grants *s7min.Authority, j *jou
 		policy: policy, maxIters: maxIters, breakerN: breakerN}, nil
 }
 
-// append journals one lifecycle event for this turn's run.
+// append journals one lifecycle event. Attempt events carry their
+// ToolCallID so a multi-call turn REPLAYS per attempt (Phase-2 codex #7:
+// an undifferentiated attempt stream folds illegally past the first call).
 func (l *Loop) append(ctx context.Context, run contracts.RunID, profile contracts.ProfileID,
-	turn contracts.TurnID, eventType string, seq int) error {
+	turn contracts.TurnID, eventType string, seq int, toolCall *contracts.ToolCallID) error {
 	_, err := l.journal.Append(ctx, contracts.EnvelopeParams{
 		SchemaID: "nexus.event", SchemaVersion: 1,
 		EventID:   contracts.EventID(fmt.Sprintf("ev-%s-%s-%d", turn, eventType, seq)),
-		EventType: eventType, RunID: run, EmittedAt: time.Now().UTC(),
+		EventType: eventType, RunID: run, TurnID: &turn, ToolCallID: toolCall,
+		EmittedAt: time.Now().UTC(),
 		ActorType: contracts.ActorSystem, ActorID: "loop", PrincipalID: "nexus",
 		WorkspaceID: "local", ProfileID: profile, AttemptNo: 1,
 		Payload: json.RawMessage(fmt.Sprintf(`{"turn_id":%q}`, turn)), PayloadHash: "recomputed",
@@ -112,20 +115,33 @@ func observeGuard(call contracts.ToolCall, blocks []contracts.ContextBlock) erro
 		if !found {
 			return fmt.Errorf("loop: observation %s carries no lineage to its tool call (rejected — P0.1)", b.BlockID)
 		}
+		// Lying-metadata channel: a tool output claiming a reserved
+		// producer identity is rejected (Phase-2 kilo #5).
+		switch b.Producer {
+		case "user", "system", "repl", "loop":
+			return fmt.Errorf("loop: observation %s claims reserved producer %q (rejected)", b.BlockID, b.Producer)
+		}
 	}
 	return nil
 }
 
-// errorObservation packs a tool failure into a TOOL_TRUSTED observation —
-// failure is data the planner must see, never a hidden crash.
+// errorObservation packs a tool failure into an UNTRUSTED observation —
+// failure is data the planner must see, but error text is externally
+// influenced (subprocess stderr, upstream bodies) and goes to the model
+// ONLY inside the untrusted fence (Phase-2 codex #8: TOOL_TRUSTED error
+// text was an injection lane). Content is bounded.
 func errorObservation(call contracts.ToolCall, seq int, toolErr error) (contracts.ContextBlock, error) {
-	content := fmt.Sprintf("tool %s failed: %v", call.ToolID, toolErr)
+	msg := toolErr.Error()
+	if len(msg) > 1024 {
+		msg = msg[:1024] + "…(truncated)"
+	}
+	content := fmt.Sprintf("tool %s failed: %s", call.ToolID, msg)
 	sum := sha256.Sum256([]byte(content))
 	return contracts.NewContextBlock(contracts.ContextBlockParams{
 		BlockID: contracts.BlockID(fmt.Sprintf("obs-err-%s-%d", call.ToolCallID, seq)),
 		Kind:    "tool_error", Content: &content, ContentHash: hex.EncodeToString(sum[:]),
 		SourceURI: "nexus://loop/observation", Producer: "loop",
-		Trust: contracts.TrustToolTrusted, Sensitivity: contracts.Sensitivity(1),
+		Trust: contracts.TrustUntrustedExternal, Sensitivity: contracts.Sensitivity(1),
 		Lineage: []string{string(call.ToolCallID)}, ObservedAt: time.Now().UTC(),
 	})
 }
@@ -139,14 +155,14 @@ func (l *Loop) RunTurn(ctx context.Context, turn contracts.TurnID, run contracts
 	}
 	seq := 0
 	next := func() int { seq++; return seq }
-	if err := l.append(ctx, run, profile, turn, machine.EvTurnCreated, next()); err != nil {
+	if err := l.append(ctx, run, profile, turn, machine.EvTurnCreated, next(), nil); err != nil {
 		return "", err
 	}
-	if err := l.append(ctx, run, profile, turn, machine.EvTurnStarted, next()); err != nil {
+	if err := l.append(ctx, run, profile, turn, machine.EvTurnStarted, next(), nil); err != nil {
 		return "", err
 	}
 	failTurn := func(cause error) (string, error) {
-		if jerr := l.append(ctx, run, profile, turn, machine.EvTurnFailed, next()); jerr != nil {
+		if jerr := l.append(ctx, run, profile, turn, machine.EvTurnFailed, next(), nil); jerr != nil {
 			return "", fmt.Errorf("%w (and journal: %v)", cause, jerr)
 		}
 		return "", cause
@@ -165,7 +181,7 @@ func (l *Loop) RunTurn(ctx context.Context, turn contracts.TurnID, run contracts
 		}
 		switch {
 		case action.Final != nil && action.Call == nil:
-			if err := l.append(ctx, run, profile, turn, machine.EvTurnSucceeded, next()); err != nil {
+			if err := l.append(ctx, run, profile, turn, machine.EvTurnSucceeded, next(), nil); err != nil {
 				return "", err
 			}
 			return *action.Final, nil
@@ -184,37 +200,65 @@ func (l *Loop) RunTurn(ctx context.Context, turn contracts.TurnID, run contracts
 				return failTurn(fmt.Errorf("loop: stuck — identical call %s repeated %d times in one interactive turn", call.ToolID, identical[key]))
 			}
 		}
-		// One attempt per call, granted by S7 and journaled.
-		op := contracts.OperationID(fmt.Sprintf("%s/%s", turn, call.ToolCallID))
-		if err := l.append(ctx, run, profile, turn, machine.EvAttemptPlanned, next()); err != nil {
+		// One attempt per call, granted by S7 (target-BOUND to this exact
+		// call) and journaled FROM THE AUTHORITY'S ACTUAL STATE — the fold
+		// never records a physical attempt that never ran (Phase-2 codex
+		// #6 / kilo #2).
+		tcID := call.ToolCallID
+		op := contracts.OperationID(fmt.Sprintf("%s/%s", turn, tcID))
+		if err := l.append(ctx, run, profile, turn, machine.EvAttemptPlanned, next(), &tcID); err != nil {
 			return "", err
 		}
-		grant, err := l.grants.Issue(op, "local")
+		grant, err := l.grants.Issue(op, effectpath.ToolTarget(call))
 		if err != nil {
 			return failTurn(fmt.Errorf("loop: grant: %w", err))
 		}
-		if err := l.append(ctx, run, profile, turn, machine.EvAttemptAuthorized, next()); err != nil {
-			return "", err
-		}
-		if err := l.append(ctx, run, profile, turn, machine.EvAttemptStarted, next()); err != nil {
+		if err := l.append(ctx, run, profile, turn, machine.EvAttemptAuthorized, next(), &tcID); err != nil {
 			return "", err
 		}
 		out, toolErr := l.path.RunTool(ctx, call, grant)
+		// Journal the attempt lifecycle from the AUTHORITY state.
+		st, _ := l.grants.State(op)
+		switch st {
+		case contracts.AttemptAuthorized:
+			// Pre-execution refusal: the grant was never consumed —
+			// nothing physically ran. Cancel the operation and record the
+			// honest terminal.
+			l.grants.Cancel(op)
+			if jerr := l.append(ctx, run, profile, turn, machine.EvAttemptCancelled, next(), &tcID); jerr != nil {
+				return "", jerr
+			}
+		case contracts.AttemptSucceeded, contracts.AttemptFailed, contracts.AttemptUnknown:
+			if jerr := l.append(ctx, run, profile, turn, machine.EvAttemptStarted, next(), &tcID); jerr != nil {
+				return failTurn(fmt.Errorf("loop: journal append failed AFTER a physical attempt — treat attempt %s as UNKNOWN pending reconciliation: %w", op, jerr))
+			}
+			terminal := map[contracts.AttemptState]string{
+				contracts.AttemptSucceeded: machine.EvAttemptSucceeded,
+				contracts.AttemptFailed:    machine.EvAttemptFailed,
+				contracts.AttemptUnknown:   machine.EvAttemptLost,
+			}[st]
+			if jerr := l.append(ctx, run, profile, turn, terminal, next(), &tcID); jerr != nil {
+				return failTurn(fmt.Errorf("loop: journal append failed AFTER a physical attempt — treat attempt %s as UNKNOWN pending reconciliation: %w", op, jerr))
+			}
+		case contracts.AttemptCancelled:
+			if jerr := l.append(ctx, run, profile, turn, machine.EvAttemptCancelled, next(), &tcID); jerr != nil {
+				return "", jerr
+			}
+		}
 		if errors.Is(toolErr, effectpath.ErrNeedsApproval) {
 			// HITL gate: the USER must act — never packed as an
 			// observation the model could talk itself past. Durable
 			// TurnSuspended (HARDQ B6) lands with its owner task; the
 			// -min turn surfaces the gate and fails closed.
-			if jerr := l.append(ctx, run, profile, turn, machine.EvAttemptFailed, next()); jerr != nil {
-				return "", jerr
-			}
+			return failTurn(fmt.Errorf("loop: tool %s: %w", call.ToolID, toolErr))
+		}
+		if errors.Is(toolErr, effectpath.ErrEffectUnknown) {
+			// E9: UNKNOWN reconciles — the turn STOPS; no blind
+			// continuation past a possibly-committed effect.
 			return failTurn(fmt.Errorf("loop: tool %s: %w", call.ToolID, toolErr))
 		}
 		if toolErr != nil {
 			// Failure is an OBSERVATION; the turn continues.
-			if err := l.append(ctx, run, profile, turn, machine.EvAttemptFailed, next()); err != nil {
-				return "", err
-			}
 			obs, oerr := errorObservation(call, seq, toolErr)
 			if oerr != nil {
 				return failTurn(fmt.Errorf("loop: observation: %w", oerr))
@@ -224,13 +268,7 @@ func (l *Loop) RunTurn(ctx context.Context, turn contracts.TurnID, run contracts
 		}
 		if err := observeGuard(call, out.Output); err != nil {
 			// Laundered provenance NEVER enters the context.
-			if jerr := l.append(ctx, run, profile, turn, machine.EvAttemptFailed, next()); jerr != nil {
-				return "", jerr
-			}
 			return failTurn(err)
-		}
-		if err := l.append(ctx, run, profile, turn, machine.EvAttemptSucceeded, next()); err != nil {
-			return "", err
 		}
 		blocks = append(blocks, out.Output...)
 	}

@@ -137,17 +137,26 @@ func (t *Tracked) Terminate(grace time.Duration) error {
 		}
 		<-done
 	}
-	if err := signalGroup(syscall.SIGKILL); err != nil { // stragglers
-		return err
+	// Straggler phase: SIGKILL delivery is ASYNCHRONOUS — poll-and-rekill
+	// with a bounded deadline instead of a single racy check (Phase-2
+	// codex #15: one-shot verification flaked on still-dying members).
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if pgidRecycled() {
+			return nil // group provably empty
+		}
+		survivors := groupSurvivors(pgid)
+		if len(survivors) == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("procx terminate: %d group member(s) survived (group scope; tree containment is the sandbox owner's)", len(survivors))
+		}
+		if err := signalGroup(syscall.SIGKILL); err != nil {
+			return err
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	// Prove the GROUP is gone (not just the leader): any surviving member
-	// with a live start token is a failure, not a silent success. A
-	// recycled pgid means the group is empty — a pid-coincident unrelated
-	// group is never misreported as survivors.
-	if survivors := groupSurvivors(pgid); !pgidRecycled() && len(survivors) > 0 {
-		return fmt.Errorf("procx terminate: %d group member(s) survived (group scope; tree containment is the sandbox owner's)", len(survivors))
-	}
-	return nil
 }
 
 // groupSurvivors lists live pids still in pgid.

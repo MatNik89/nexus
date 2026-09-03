@@ -48,7 +48,7 @@ func (nopMW) OnError(ctx context.Context, e error) error                        
 
 type nopAudit struct{}
 
-func (nopAudit) Record(string, contracts.ToolCall) {}
+func (nopAudit) Record(string, contracts.ToolCall) error { return nil }
 
 type nopSandbox struct{}
 
@@ -80,7 +80,7 @@ func toolCall(tool, id string) contracts.ToolCall {
 		ToolCallID: contracts.ToolCallID(id), ToolID: contracts.ToolID(tool),
 		Arguments: json.RawMessage(`{"q":1}`), ArgsSchemaHash: "h1",
 		Effect: contracts.EffectReadOnly, ExecutionKind: contracts.ExecInProcess,
-		Deadline: time.Unix(9000, 0), AttemptNo: 1, ProfileID: "work",
+		Deadline: time.Now().Add(time.Minute), AttemptNo: 1, ProfileID: "work",
 	})
 	if err != nil {
 		panic(err)
@@ -186,25 +186,61 @@ func TestEndToEndTurnThroughJournalAndReplay(t *testing.T) {
 		t.Fatal("tool observation never reached the planner")
 	}
 	// Replay: fold the turn's journal events → SUCCEEDED reproduced.
-	var turnEvents, attemptEvents []machine.FoldEvent
-	if err := h.journal.Replay(0, func(e journal.Event) error {
+	turnEvents, attemptsByCall := foldStreams(t, h.journal)
+	st, _, err := machine.TurnTable().Fold(contracts.TurnInvalid, turnEvents, nil)
+	if err != nil || st != contracts.TurnSucceeded {
+		t.Fatalf("replayed turn folds to %v (%v)", st, err)
+	}
+	ast, _, err := machine.AttemptTable().Fold(contracts.AttemptInvalid, attemptsByCall["tc-1"], nil)
+	if err != nil || ast != contracts.AttemptSucceeded {
+		t.Fatalf("replayed attempt folds to %v (%v)", ast, err)
+	}
+}
+
+// foldStreams splits the journal into the turn stream and PER-TOOL-CALL
+// attempt streams (Phase-2 codex #7: attempts replay independently).
+func foldStreams(t *testing.T, j *journal.Journal) ([]machine.FoldEvent, map[string][]machine.FoldEvent) {
+	t.Helper()
+	var turnEvents []machine.FoldEvent
+	attempts := map[string][]machine.FoldEvent{}
+	if err := j.Replay(0, func(e journal.Event) error {
 		if strings.HasPrefix(e.Envelope.EventType, "turn.") {
 			turnEvents = append(turnEvents, machine.FoldEvent{Type: e.Envelope.EventType, Offset: e.JournalOffset})
 		}
 		if strings.HasPrefix(e.Envelope.EventType, "attempt.") {
-			attemptEvents = append(attemptEvents, machine.FoldEvent{Type: e.Envelope.EventType, Offset: e.JournalOffset})
+			if e.Envelope.ToolCallID == nil {
+				t.Fatalf("attempt event %s carries no ToolCallID correlation", e.Envelope.EventType)
+			}
+			key := string(*e.Envelope.ToolCallID)
+			attempts[key] = append(attempts[key], machine.FoldEvent{Type: e.Envelope.EventType, Offset: e.JournalOffset})
 		}
 		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
-	st, _, err := machine.TurnTable().Fold(contracts.TurnInvalid, turnEvents, nil)
-	if err != nil || st != contracts.TurnSucceeded {
-		t.Fatalf("replayed turn folds to %v (%v)", st, err)
+	return turnEvents, attempts
+}
+
+// TWO tool calls in one turn replay independently — each attempt stream
+// folds to its own terminal (Phase-2 codex #7 literal).
+func TestTwoToolCallsReplayPerAttempt(t *testing.T) {
+	c1, c2 := toolCall("read", "tc-1"), toolCall("read", "tc-2")
+	c2.Arguments = json.RawMessage(`{"q":2}`) // distinct: no breaker trip
+	h := build(t, PolicyInteractive, []Action{{Call: &c1}, {Call: &c2}, {Final: strp("both done")}})
+	*h.toolOut = []contracts.ContextBlock{}
+	final, err := h.loop.RunTurn(context.Background(), "turn-1", "run-1", "work", initialBlocks)
+	if err != nil || final != "both done" {
+		t.Fatalf("two-call turn failed: %q %v", final, err)
 	}
-	ast, _, err := machine.AttemptTable().Fold(contracts.AttemptInvalid, attemptEvents, nil)
-	if err != nil || ast != contracts.AttemptSucceeded {
-		t.Fatalf("replayed attempt folds to %v (%v)", ast, err)
+	_, attempts := foldStreams(t, h.journal)
+	if len(attempts) != 2 {
+		t.Fatalf("want 2 independent attempt streams, got %d", len(attempts))
+	}
+	for id, stream := range attempts {
+		st, _, err := machine.AttemptTable().Fold(contracts.AttemptInvalid, stream, nil)
+		if err != nil || st != contracts.AttemptSucceeded {
+			t.Fatalf("attempt %s folds to %v (%v)", id, st, err)
+		}
 	}
 }
 
@@ -221,7 +257,12 @@ func TestToolErrorPackedIntoObservation(t *testing.T) {
 	last := h.planner.seen[len(h.planner.seen)-1]
 	sawError := false
 	for _, b := range last {
-		if b.Content != nil && strings.Contains(*b.Content, "disk on fire") && b.Trust == contracts.TrustToolTrusted {
+		if b.Content != nil && strings.Contains(*b.Content, "disk on fire") {
+			// Error text is externally influenced: it must be UNTRUSTED
+			// (fenced), never TOOL_TRUSTED (Phase-2 codex #8).
+			if b.Trust != contracts.TrustUntrustedExternal {
+				t.Fatalf("tool error observation carries trust %v (injection lane)", b.Trust)
+			}
 			sawError = true
 		}
 	}
@@ -320,5 +361,19 @@ func TestNeedsApprovalSurfacesNotObserved(t *testing.T) {
 	}
 	if len(hAsk.planner.seen) != 1 {
 		t.Fatal("the model got another planning round past the HITL gate")
+	}
+	// Journal HONESTY (Phase-2 codex #6 / kilo #2): a pre-execution
+	// refusal never records a physical RUN — the attempt stream folds to
+	// CANCELLED, with no attempt.started event.
+	_, attempts := foldStreams(t, hAsk.journal)
+	stream := attempts["tc-1"]
+	for _, ev := range stream {
+		if ev.Type == machine.EvAttemptStarted {
+			t.Fatal("journal recorded a physical attempt that never ran")
+		}
+	}
+	st, _, ferr := machine.AttemptTable().Fold(contracts.AttemptInvalid, stream, nil)
+	if ferr != nil || st != contracts.AttemptCancelled {
+		t.Fatalf("pre-exec refusal folds to %v (%v), want CANCELLED", st, ferr)
 	}
 }
