@@ -139,30 +139,81 @@ func nativeMachine() (elf.Machine, error) {
 	}
 }
 
-// openNativeELF parses hdr and enforces native class+machine (Phase-0 r2
-// codex #7: a compat-arch ELF must never run under a filter keyed to the
-// native audit arch).
-func openNativeELF(path string) (*elf.File, error) {
-	ef, err := elf.Open(path)
+// loadBounded opens path ONCE, fstats the open descriptor, and reads at
+// most maxClosureOneFile+1 bytes from that same descriptor — validation and
+// allocation share one file, so a swap or grow between stat and read cannot
+// bypass the budget (Phase-0 r4 codex #2).
+func loadBounded(path string) ([]byte, error) {
+	f, err := os.Open(path)
 	if err != nil {
-		return nil, ErrNotELF
-	}
-	native, err := nativeMachine()
-	if err != nil {
-		ef.Close()
 		return nil, err
 	}
-	if ef.Machine != native || ef.Class != elf.ELFCLASS64 {
-		ef.Close()
-		return nil, ErrNotELF
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil || !st.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s: not a regular file (%v)", path, err)
 	}
-	return ef, nil
+	if st.Size() > maxClosureOneFile {
+		return nil, fmt.Errorf("%s exceeds the per-file budget", path)
+	}
+	buf, err := io.ReadAll(io.LimitReader(f, maxClosureOneFile+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(buf)) > maxClosureOneFile {
+		return nil, fmt.Errorf("%s grew past the per-file budget during read", path)
+	}
+	return buf, nil
+}
+
+// elfMeta describes one ELF, parsed FROM THE EXACT BYTES that get pinned —
+// the metadata can never describe different content than the sandbox runs.
+type elfMeta struct {
+	machine   elf.Machine
+	class     elf.Class
+	interp    string
+	needed    []string
+	paths     []string // expanded DT_RUNPATH (preferred) or DT_RPATH
+	isRunpath bool     // true when paths came from DT_RUNPATH
+}
+
+func parseELFMeta(buf []byte, hostDir string) (elfMeta, error) {
+	ef, err := elf.NewFile(bytes.NewReader(buf))
+	if err != nil {
+		return elfMeta{}, ErrNotELF
+	}
+	defer ef.Close()
+	m := elfMeta{machine: ef.Machine, class: ef.Class}
+	for _, prg := range ef.Progs {
+		if prg.Type == elf.PT_INTERP {
+			if prg.Filesz > maxInterpLen {
+				return elfMeta{}, fmt.Errorf("PT_INTERP length %d exceeds cap", prg.Filesz)
+			}
+			b := make([]byte, prg.Filesz)
+			if _, err := prg.ReadAt(b, 0); err != nil && err != io.EOF {
+				return elfMeta{}, fmt.Errorf("reading PT_INTERP: %w", err)
+			}
+			m.interp = strings.TrimRight(string(b), "\x00")
+		}
+	}
+	m.needed, err = ef.ImportedLibraries()
+	if err != nil {
+		return elfMeta{}, err
+	}
+	raw, rerr := ef.DynString(elf.DT_RUNPATH)
+	if rerr == nil && len(raw) > 0 {
+		m.isRunpath = true
+	} else {
+		raw, _ = ef.DynString(elf.DT_RPATH)
+	}
+	m.paths = expandRunpaths(hostDir, raw)
+	return m, nil
 }
 
 // expandRunpaths applies the dynamic-loader token rules the P0 contract
-// needs (Phase-0 r3 codex #3 / kilo #9-#11): $ORIGIN/${ORIGIN} expands to
-// the REFERRING object's directory; empty components and components with
-// unexpanded tokens are DROPPED (never resolved against the process cwd).
+// needs: $ORIGIN/${ORIGIN} expands to the REFERRING object's directory;
+// empty components, unexpanded-token components AND relative components are
+// DROPPED (never resolved against the process cwd — r4 kilo #6).
 func expandRunpaths(referrerDir string, raw []string) []string {
 	var out []string
 	for _, r := range raw {
@@ -175,35 +226,22 @@ func expandRunpaths(referrerDir string, raw []string) []string {
 			if strings.Contains(comp, "$") { // $LIB/$PLATFORM etc.: drop, fail-closed
 				continue
 			}
-			out = append(out, filepath.Clean(comp))
+			comp = filepath.Clean(comp)
+			if !filepath.IsAbs(comp) {
+				continue
+			}
+			out = append(out, comp)
 		}
 	}
 	return out
 }
 
-// elfDeps reads one ELF's DT_NEEDED plus its OWN search context:
-// DT_RUNPATH, with DT_RPATH as the legacy fallback when RUNPATH is absent.
-func elfDeps(path string) (needed []string, runpaths []string, err error) {
-	ef, err := elf.Open(path)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer ef.Close()
-	needed, err = ef.ImportedLibraries()
-	if err != nil {
-		return nil, nil, err
-	}
-	raw, rerr := ef.DynString(elf.DT_RUNPATH)
-	if rerr != nil || len(raw) == 0 {
-		raw, _ = ef.DynString(elf.DT_RPATH) // legacy old-dtags fallback
-	}
-	return needed, expandRunpaths(filepath.Dir(path), raw), nil
-}
-
-// depSearchDirs: per-referrer search order = the referrer's expanded
-// RUNPATH/RPATH first, then the deterministic trusted system directories.
-func depSearchDirs(referrerRunpaths []string) []string {
-	dirs := append([]string{}, referrerRunpaths...)
+// depSearchDirs: per-referrer order = the referrer's own paths, then the
+// inherited RPATH chain (old-dtags semantics: DT_RPATH applies through the
+// tree unless the object has DT_RUNPATH — r4 codex #1), then the trusted
+// system directories.
+func depSearchDirs(direct, inherited []string) []string {
+	dirs := append(append([]string{}, direct...), inherited...)
 	for _, d := range []string{"/lib", "/lib64", "/usr/lib", "/usr/lib64"} {
 		dirs = append(dirs, d)
 		if matches, _ := filepath.Glob(d + "/*-linux-gnu*"); matches != nil {
@@ -213,8 +251,14 @@ func depSearchDirs(referrerRunpaths []string) []string {
 	return dirs
 }
 
-// resolveClosure resolves target + interpreter + transitive DT_NEEDED
-// libraries by ELF metadata only, pinning each into a sealed memfd.
+// insideLibDir is where every pinned library lands (single RO directory;
+// the interpreter alone keeps its PT_INTERP path, which the kernel needs
+// verbatim). LD_LIBRARY_PATH points ONLY here.
+const insideLibDir = "/nexus-libs"
+
+// resolveClosure loads target + interpreter + transitive DT_NEEDED
+// libraries; each file is read once (bounded), hashed, sealed into a memfd,
+// and its metadata parsed from those same bytes.
 func resolveClosure(target string) (files []closureFile, insideTarget string, err error) {
 	total := 0
 	closeAll := func() {
@@ -223,26 +267,18 @@ func resolveClosure(target string) (files []closureFile, insideTarget string, er
 		}
 	}
 	seen := map[string]bool{}
-	// Budgets are enforced BEFORE any large allocation (Phase-0 r3 codex #4):
-	// stat first, refuse oversize, then read.
-	add := func(hostPath, dest string) error {
+	native, err := nativeMachine()
+	if err != nil {
+		return nil, "", err
+	}
+	// addBuf pins already-loaded bytes under dest.
+	addBuf := func(buf []byte, dest string) error {
 		if seen[dest] {
 			return nil
 		}
 		seen[dest] = true
 		if len(files) >= maxClosureFiles {
 			return fmt.Errorf("closure exceeds %d files", maxClosureFiles)
-		}
-		st, err := os.Stat(hostPath)
-		if err != nil || !st.Mode().IsRegular() {
-			return fmt.Errorf("closure file %s: not a regular file (%v)", hostPath, err)
-		}
-		if st.Size() > maxClosureOneFile || total+int(st.Size()) > maxClosureBytes {
-			return fmt.Errorf("closure file %s exceeds the size budget", hostPath)
-		}
-		buf, err := os.ReadFile(hostPath)
-		if err != nil {
-			return fmt.Errorf("closure file %s: %w", hostPath, err)
 		}
 		total += len(buf)
 		if total > maxClosureBytes {
@@ -251,66 +287,67 @@ func resolveClosure(target string) (files []closureFile, insideTarget string, er
 		sum := sha256.Sum256(buf)
 		mf, err := memfdWithContent(filepath.Base(dest), buf)
 		if err != nil {
-			return fmt.Errorf("pinning %s: %w", hostPath, err)
+			return fmt.Errorf("pinning %s: %w", dest, err)
 		}
 		files = append(files, closureFile{f: mf, dest: dest, hash: hex.EncodeToString(sum[:])})
 		return nil
 	}
 
-	ef, err := openNativeELF(target)
+	targetBuf, err := loadBounded(target)
 	if err != nil {
 		return nil, "", err
 	}
-	interp := ""
-	for _, p := range ef.Progs {
-		if p.Type == elf.PT_INTERP {
-			if p.Filesz > maxInterpLen { // attacker-declared size: hard cap
-				ef.Close()
-				return nil, "", fmt.Errorf("PT_INTERP length %d exceeds cap", p.Filesz)
-			}
-			b := make([]byte, p.Filesz)
-			if _, err := p.ReadAt(b, 0); err != nil && err != io.EOF {
-				ef.Close()
-				return nil, "", fmt.Errorf("reading PT_INTERP: %w", err)
-			}
-			interp = strings.TrimRight(string(b), "\x00")
-		}
+	rootMeta, err := parseELFMeta(targetBuf, filepath.Dir(target))
+	if err != nil {
+		return nil, "", err
 	}
-	ef.Close()
-
+	if rootMeta.machine != native || rootMeta.class != elf.ELFCLASS64 {
+		return nil, "", ErrNotELF
+	}
 	insideTarget = "/nexus-target"
-	if err := add(target, insideTarget); err != nil {
+	if err := addBuf(targetBuf, insideTarget); err != nil {
 		closeAll()
 		return nil, "", err
 	}
-	if interp != "" {
-		if err := add(interp, interp); err != nil {
+	if rootMeta.interp != "" {
+		ibuf, err := loadBounded(rootMeta.interp)
+		if err != nil {
+			closeAll()
+			return nil, "", err
+		}
+		if err := addBuf(ibuf, rootMeta.interp); err != nil {
 			closeAll()
 			return nil, "", err
 		}
 	}
-	// BFS over DT_NEEDED with PER-REFERRER search context: each dependency
-	// resolves against its referrer's expanded RUNPATH/RPATH first, then the
-	// trusted system dirs (Phase-0 r3 codex #3).
-	rootNeeded, rootRunpaths, err := elfDeps(target)
-	if err != nil {
-		closeAll()
-		return nil, "", fmt.Errorf("reading dependencies of %s: %w", target, err)
-	}
+
 	type depNode struct {
-		name     string
-		runpaths []string // referrer's expanded search context
+		name      string
+		direct    []string // referrer's own RUNPATH-or-RPATH
+		inherited []string // ancestor RPATH chain (old-dtags)
+	}
+	var rootInherited []string
+	if !rootMeta.isRunpath {
+		rootInherited = rootMeta.paths
 	}
 	var queue []depNode
-	for _, n := range rootNeeded {
-		queue = append(queue, depNode{name: n, runpaths: rootRunpaths})
+	push := func(nodes []depNode) error {
+		if len(queue)+len(nodes) > maxDepQueue {
+			return fmt.Errorf("dependency graph exceeds %d pending nodes", maxDepQueue)
+		}
+		queue = append(queue, nodes...)
+		return nil
+	}
+	var rootNodes []depNode
+	for _, n := range rootMeta.needed {
+		rootNodes = append(rootNodes, depNode{name: n, direct: rootMeta.paths, inherited: rootInherited})
+	}
+	if err := push(rootNodes); err != nil {
+		closeAll()
+		return nil, "", err
 	}
 	resolvedNames := map[string]bool{}
 	for len(queue) > 0 {
-		if len(queue) > maxDepQueue {
-			closeAll()
-			return nil, "", fmt.Errorf("dependency graph exceeds %d pending nodes", maxDepQueue)
-		}
 		node := queue[0]
 		queue = queue[1:]
 		if resolvedNames[node.name] {
@@ -318,7 +355,7 @@ func resolveClosure(target string) (files []closureFile, insideTarget string, er
 		}
 		resolvedNames[node.name] = true
 		found := ""
-		for _, d := range depSearchDirs(node.runpaths) {
+		for _, d := range depSearchDirs(node.direct, node.inherited) {
 			cand := filepath.Join(d, node.name)
 			if st, err := os.Stat(cand); err == nil && st.Mode().IsRegular() {
 				found = cand
@@ -329,17 +366,31 @@ func resolveClosure(target string) (files []closureFile, insideTarget string, er
 			closeAll()
 			return nil, "", fmt.Errorf("cannot resolve library %q for %s", node.name, target)
 		}
-		if err := add(found, found); err != nil {
+		lbuf, err := loadBounded(found)
+		if err != nil {
 			closeAll()
 			return nil, "", err
 		}
-		sub, subRunpaths, err := elfDeps(found) // system lib: trusted parse
+		lmeta, err := parseELFMeta(lbuf, filepath.Dir(found))
 		if err != nil {
 			closeAll()
-			return nil, "", fmt.Errorf("reading dependencies of %s: %w", found, err)
+			return nil, "", fmt.Errorf("parsing %s: %w", found, err)
 		}
-		for _, n := range sub {
-			queue = append(queue, depNode{name: n, runpaths: subRunpaths})
+		if err := addBuf(lbuf, filepath.Join(insideLibDir, node.name)); err != nil {
+			closeAll()
+			return nil, "", err
+		}
+		childInherited := node.inherited
+		if !lmeta.isRunpath && len(lmeta.paths) > 0 {
+			childInherited = append(append([]string{}, node.inherited...), lmeta.paths...)
+		}
+		var childNodes []depNode
+		for _, n := range lmeta.needed {
+			childNodes = append(childNodes, depNode{name: n, direct: lmeta.paths, inherited: childInherited})
+		}
+		if err := push(childNodes); err != nil {
+			closeAll()
+			return nil, "", err
 		}
 	}
 	return files, insideTarget, nil
@@ -349,10 +400,42 @@ func resolveClosure(target string) (files []closureFile, insideTarget string, er
 // (Phase-0 r3 codex #2: two-component depth still admitted /home/<user>
 // wholesale; a disposable dir belongs in a temp tree, full stop).
 func allowedWorkRoots() []string {
-	roots := []string{filepath.Clean(os.TempDir())}
-	if x := os.Getenv("XDG_RUNTIME_DIR"); x != "" {
-		roots = append(roots, filepath.Clean(x))
+	var roots []string
+	consider := func(p string) {
+		if p == "" {
+			return
+		}
+		canon, err := filepath.EvalSymlinks(filepath.Clean(p))
+		if err != nil {
+			return
+		}
+		st, err := os.Stat(canon)
+		if err != nil || !st.IsDir() {
+			return
+		}
+		sys, ok := st.Sys().(*syscall.Stat_t)
+		if !ok {
+			return
+		}
+		mode := st.Mode()
+		switch {
+		case int(sys.Uid) == os.Geteuid() && mode.Perm() == 0o700 &&
+			strings.HasPrefix(canon, "/run/"):
+			// Private per-user runtime root: ownership+0700 ALONE is not
+			// enough (a 0700 $HOME satisfies the shape — proven by the
+			// hostile-XDG RED), so the canonical path must also live under
+			// /run/, where the kernel/init own the tree.
+			roots = append(roots, canon)
+		case sys.Uid == 0 && mode&os.ModeSticky != 0:
+			// root-owned sticky world temp root (/tmp shape)
+			roots = append(roots, canon)
+		}
+		// Anything else (a plain home dir, a hostile TMPDIR/XDG value) is
+		// silently ignored — ambient environment cannot widen the allowlist
+		// (Phase-0 r4 codex #3).
 	}
+	consider(os.TempDir())
+	consider(os.Getenv("XDG_RUNTIME_DIR"))
 	return roots
 }
 
@@ -493,30 +576,19 @@ func Prepare(av Availability, spec Spec) (*Handle, error) {
 		return nil, e
 	}
 
-	// The inside loader replays its OWN search (RUNPATH's $ORIGIN points at
-	// /nexus-target's dir, not the host location), so every pinned library
-	// dir is exported via LD_LIBRARY_PATH — which the loader consults for
-	// new-dtags binaries before DT_RUNPATH. Paths listed are exclusively our
-	// sealed binds.
-	var libDirs []string
-	seenDir := map[string]bool{}
-	for _, cf := range files {
-		if cf.dest == insideTarget {
-			continue
-		}
-		d := filepath.Dir(cf.dest)
-		if !seenDir[d] {
-			seenDir[d] = true
-			libDirs = append(libDirs, d)
-		}
-	}
-	args := []string{
+		args := []string{
 		"--proc", "/proc",
 		"--dev", "/dev",
 		"--tmpfs", "/tmp",
 		"--dir", "/work",
 		"--clearenv", "--setenv", "PATH", "/nowhere",
-		"--setenv", "LD_LIBRARY_PATH", strings.Join(libDirs, ":"),
+		// The inside loader replays its OWN search ($ORIGIN points at
+		// /nexus-target, not the host location), so every pinned library
+		// lands in the single RO dir /nexus-libs and LD_LIBRARY_PATH points
+		// only there. The root filesystem is remounted read-only after all
+		// mounts (below), so the target cannot shadow a library by writing
+		// into a loader-searched directory (r4 kilo #7).
+		"--setenv", "LD_LIBRARY_PATH", insideLibDir,
 		"--new-session",
 	}
 	if spec.WorkDir != "" {
@@ -559,6 +631,7 @@ func Prepare(av Availability, spec Spec) (*Handle, error) {
 		args = append(args, "--seccomp", fmt.Sprint(fdNum))
 		fdNum++
 	}
+	args = append(args, "--remount-ro", "/")
 	args = append(args, insideTarget)
 	args = append(args, spec.Args...)
 	cmd.Args = append([]string{av.BwrapPath}, args...)

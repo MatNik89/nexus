@@ -571,8 +571,8 @@ func TestHandleRejectsStartAfterClose(t *testing.T) {
 // --- resolver semantics (r3 codex #3 / kilo #9-#11) ---
 
 func TestExpandRunpathsSemantics(t *testing.T) {
-	got := expandRunpaths("/opt/app/bin", []string{"$ORIGIN/../lib:${ORIGIN}/x::/abs", "$LIB/z"})
-	want := []string{"/opt/app/lib", "/opt/app/bin/x", "/abs"}
+	got := expandRunpaths("/opt/app/bin", []string{"$ORIGIN/../lib:${ORIGIN}/x::/abs", "$LIB/z", "lib:../rel"})
+	want := []string{"/opt/app/lib", "/opt/app/bin/x", "/abs"} // relative components dropped (never cwd)
 	if len(got) != len(want) {
 		t.Fatalf("want %v, got %v", want, got)
 	}
@@ -613,5 +613,79 @@ func TestOriginRunpathBinaryResolves(t *testing.T) {
 	out, err := run(t, av, Spec{Target: bin, WorkDir: wdir(t)})
 	if err != nil {
 		t.Fatalf("$ORIGIN RUNPATH binary must resolve and run: %v\n%s", err, out)
+	}
+}
+
+// --- rootfs is read-only: no library shadowing (r4 kilo #7) ---
+
+func TestRootfsReadOnlyPreventsLibShadowing(t *testing.T) {
+	av := mustDetect(t)
+	hp := helperPath(t)
+	out, err := run(t, av, Spec{Target: hp, Args: []string{"writefile", "/nexus-libs/libc.so.6", "evil"}, WorkDir: wdir(t)})
+	if err == nil {
+		t.Fatalf("write into the loader-searched /nexus-libs SUCCEEDED — shadowing possible:\n%s", out)
+	}
+	out, err = run(t, av, Spec{Target: hp, Args: []string{"writefile", "/lib/evil", "evil"}, WorkDir: wdir(t)})
+	if err == nil {
+		t.Fatalf("write into /lib on the rootfs SUCCEEDED — rootfs not read-only:\n%s", out)
+	}
+}
+
+// --- ambient env cannot widen the workdir allowlist (r4 codex #3) ---
+
+func TestHostileXDGRuntimeDirCannotWidenRoots(t *testing.T) {
+	av := mustDetect(t)
+	hp := helperPath(t)
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("no home")
+	}
+	t.Setenv("XDG_RUNTIME_DIR", home) // hostile: home is not a valid runtime root shape
+	sub := filepath.Join(home, ".nexus-probe-red")
+	if err := os.MkdirAll(sub, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(sub)
+	if _, err := Prepare(av, Spec{Target: hp, Args: []string{"sleep", "0"}, WorkDir: sub}); err == nil {
+		t.Fatal("hostile XDG_RUNTIME_DIR widened the workdir allowlist to $HOME")
+	}
+}
+
+// --- old-dtags transitive RPATH (r4 codex #1 fixture shape) ---
+
+func TestTransitiveRpathBinaryResolves(t *testing.T) {
+	av := mustDetect(t)
+	cc, err := exec.LookPath("cc")
+	if err != nil {
+		t.Skip("no C compiler")
+	}
+	root := t.TempDir()
+	dirA := filepath.Join(root, "a")
+	dirB := filepath.Join(root, "b")
+	binDir := filepath.Join(root, "bin")
+	for _, d := range []string{dirA, dirB, binDir} {
+		os.Mkdir(d, 0o755)
+	}
+	os.WriteFile(filepath.Join(root, "b.c"), []byte("int bee(void){return 7;}\n"), 0o644)
+	if out, err := exec.Command(cc, "-shared", "-fPIC", "-o", filepath.Join(dirB, "libnexusb.so"), filepath.Join(root, "b.c")).CombinedOutput(); err != nil {
+		t.Skipf("cc: %v\n%s", err, out)
+	}
+	os.WriteFile(filepath.Join(root, "a.c"), []byte("int bee(void); int aye(void){return bee();}\n"), 0o644)
+	// liba NEEDS libnexusb but carries NO runpath of its own.
+	if out, err := exec.Command(cc, "-shared", "-fPIC", "-o", filepath.Join(dirA, "libnexusa.so"), filepath.Join(root, "a.c"), "-L", dirB, "-lnexusb").CombinedOutput(); err != nil {
+		t.Skipf("cc: %v\n%s", err, out)
+	}
+	os.WriteFile(filepath.Join(root, "m.c"), []byte("int aye(void); int main(void){return aye()==7?0:1;}\n"), 0o644)
+	bin := filepath.Join(binDir, "app")
+	// main carries old-dtags RPATH covering BOTH dirs; loader semantics make
+	// it apply transitively to liba's own lookup of libnexusb.
+	if out, err := exec.Command(cc, "-o", bin, filepath.Join(root, "m.c"),
+		"-L", dirA, "-lnexusa",
+		"-Wl,--disable-new-dtags,-rpath,$ORIGIN/../a:$ORIGIN/../b").CombinedOutput(); err != nil {
+		t.Skipf("cc link: %v\n%s", err, out)
+	}
+	out, err := run(t, av, Spec{Target: bin, WorkDir: wdir(t)})
+	if err != nil {
+		t.Fatalf("transitive-RPATH binary must resolve and run: %v\n%s", err, out)
 	}
 }
