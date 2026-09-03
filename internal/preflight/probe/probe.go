@@ -7,10 +7,12 @@
 //
 // Closure model (B4 as refined by the Phase-0 review): the sandbox sees a
 // SYNTHETIC closure — only the promoted ELF target and its resolved
-// loader/library dependencies, each content-pinned via bwrap --ro-bind-data
-// file descriptors (the bytes are fixed at hash time, so a path swap after
-// validation cannot change what runs). No blanket /usr grant: an undeclared
-// child executable simply does not exist inside the mount namespace.
+// loader/library dependencies. Each file is copied into a SEALED memfd at
+// Prepare time and bound via bwrap --ro-bind-data: after Prepare, neither a
+// path swap, an inode truncation, nor a write through the descriptor can
+// change what runs. Dependencies are resolved by parsing ELF metadata
+// (PT_INTERP + DT_NEEDED + RUNPATH) — the untrusted target is NEVER
+// executed to discover them (no ldd; Phase-0 r2 codex #4).
 package probe
 
 import (
@@ -20,17 +22,19 @@ import (
 	"debug/elf"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
 
 // Availability reports whether the bwrap backend can be used at all.
-// Absent or non-functional backend => exec capability OFF (fail-closed);
-// there is no weaker fallback.
+// Absent or non-functional backend => exec capability OFF (fail-closed).
 type Availability struct {
 	BwrapPath    string
 	BwrapVersion string
@@ -57,75 +61,127 @@ func Detect() (Availability, error) {
 	return Availability{BwrapPath: path, BwrapVersion: ver}, nil
 }
 
-// FloorProbe proves the kernel actually permits an unprivileged sandbox
-// (user namespaces enabled and usable) by launching a trivial confined
-// process. bwrap --version succeeding is NOT sufficient (kilo Phase-0 #1).
-func FloorProbe(av Availability) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, av.BwrapPath,
-		"--unshare-user", "--unshare-pid", "--unshare-net",
-		"--dev", "/dev", "--proc", "/proc",
-		"--ro-bind", "/usr", "/usr",
-		"--symlink", "usr/bin", "/bin", "--symlink", "usr/lib", "/lib",
-		"--symlink", "usr/lib64", "/lib64",
-		"--clearenv", "/usr/bin/true")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("SANDBOX_CAPABILITY_UNAVAILABLE: kernel floor probe failed (user namespaces disabled?): %v: %s", err, bytes.TrimSpace(out))
+// FloorProbe proves the WHOLE production launch path works on this host —
+// closure resolution, sealed memfds, bwrap namespaces AND the seccomp
+// syscall floor — by running a harmless static ELF that attempts
+// PTRACE_TRACEME and must be DENIED (Phase-0 r2 codex #1: a weaker separate
+// bwrap invocation proved nothing about real launches).
+// probeTarget must be an ELF whose given args attempt ptrace and print
+// "denied" on the denial path (nexus: `__probe-ptrace`; tests: probehelper
+// `syscall-ptrace`).
+func FloorProbe(av Availability, probeTarget string, args []string) error {
+	out, err := Run(av, Spec{Target: probeTarget, Args: args, Timeout: 15 * time.Second})
+	if err == nil {
+		return fmt.Errorf("SANDBOX_CAPABILITY_UNAVAILABLE: syscall floor INACTIVE (ptrace succeeded inside sandbox)")
+	}
+	if !strings.Contains(out, "denied") {
+		return fmt.Errorf("SANDBOX_CAPABILITY_UNAVAILABLE: confined launch failed on this host: %v: %s", err, strings.TrimSpace(out))
 	}
 	return nil
 }
 
 // Spec describes one sandboxed launch of a promoted ELF target.
-// It cannot express a weakened boundary: the negative-control switches live
-// in an unexported loosen struct reachable only from this package's tests.
+// It cannot express a weakened boundary: negative-control switches live in
+// an unexported loosen struct reachable only from this package's tests.
 type Spec struct {
-	Target  string   // absolute HOST path of the promoted executable (ELF only)
+	Target  string // absolute HOST path of the promoted executable (ELF only)
 	Args    []string
-	WorkDir string   // host dir bound read-write at /work (canonicalized)
+	WorkDir string // host dir bound read-write at /work (guarded; see Prepare)
 	Timeout time.Duration
 
 	loosen loosen
 }
 
-// loosen holds hazard-safe negative-control switches (test-owned resources
-// only). Unexported: production callers cannot set them (codex Phase-0 #7).
 type loosen struct {
-	roBind  string // extra host dir bound read-only (canary dir)
-	net     bool   // do NOT unshare the network namespace
-	pidNS   bool   // do NOT unshare pid / die-with-parent
-	seccomp bool   // do NOT install the syscall-floor filter
+	roBind  string
+	net     bool
+	pidNS   bool
+	seccomp bool
 }
 
-// ErrNotELF: the launch target is not a plain ELF executable (shebang or
-// other script). Refused BEFORE any sandbox is set up.
-var ErrNotELF = fmt.Errorf("launch target is not an ELF executable (scripts/shebang rejected)")
+// ErrNotELF: the launch target is not a native ELF executable (shebang,
+// script, foreign architecture). Refused BEFORE any sandbox is set up.
+var ErrNotELF = fmt.Errorf("launch target is not a native ELF executable (scripts/shebang/foreign-arch rejected)")
 
-// closureFile is one content-pinned file the sandbox will see.
+const (
+	maxClosureFiles = 64
+	maxClosureBytes = 256 << 20
+)
+
 type closureFile struct {
 	f    *os.File
-	dest string // absolute path inside the sandbox
+	dest string
 	hash string
 }
 
-// resolveClosure opens the target and every transitively needed library plus
-// the ELF interpreter, hashing each. Files stay open; their bytes are what
-// the sandbox receives (--ro-bind-data), so post-hash swaps are inert.
+func nativeMachine() (elf.Machine, error) {
+	switch runtime.GOARCH {
+	case "arm64":
+		return elf.EM_AARCH64, nil
+	case "amd64":
+		return elf.EM_X86_64, nil
+	default:
+		return elf.EM_NONE, fmt.Errorf("unsupported GOARCH %s (fail closed)", runtime.GOARCH)
+	}
+}
+
+// openNativeELF parses hdr and enforces native class+machine (Phase-0 r2
+// codex #7: a compat-arch ELF must never run under a filter keyed to the
+// native audit arch).
+func openNativeELF(path string) (*elf.File, error) {
+	ef, err := elf.Open(path)
+	if err != nil {
+		return nil, ErrNotELF
+	}
+	native, err := nativeMachine()
+	if err != nil {
+		ef.Close()
+		return nil, err
+	}
+	if ef.Machine != native || ef.Class != elf.ELFCLASS64 {
+		ef.Close()
+		return nil, ErrNotELF
+	}
+	return ef, nil
+}
+
+// depSearchDirs returns the deterministic trusted library search order.
+func depSearchDirs(runpaths []string) []string {
+	dirs := append([]string{}, runpaths...)
+	for _, d := range []string{"/lib", "/lib64", "/usr/lib", "/usr/lib64"} {
+		dirs = append(dirs, d)
+		if matches, _ := filepath.Glob(d + "/*-linux-gnu*"); matches != nil {
+			dirs = append(dirs, matches...)
+		}
+	}
+	return dirs
+}
+
+// resolveClosure resolves target + interpreter + transitive DT_NEEDED
+// libraries by ELF metadata only, pinning each into a sealed memfd.
 func resolveClosure(target string) (files []closureFile, insideTarget string, err error) {
+	total := 0
 	closeAll := func() {
 		for _, cf := range files {
 			cf.f.Close()
 		}
 	}
-	// add copies the file's bytes into an anonymous memfd at Prepare time:
-	// after this, neither a rename NOR an in-place truncation of the host
-	// path can change what the sandbox receives (proven by
-	// TestTargetSwapAfterPrepareIsInert — an earlier fd-only design failed
-	// it, because O_TRUNC rewrites the pinned inode).
+	seen := map[string]bool{}
 	add := func(hostPath, dest string) error {
+		if seen[dest] {
+			return nil
+		}
+		seen[dest] = true
+		if len(files) >= maxClosureFiles {
+			return fmt.Errorf("closure exceeds %d files", maxClosureFiles)
+		}
 		buf, err := os.ReadFile(hostPath)
 		if err != nil {
 			return fmt.Errorf("closure file %s: %w", hostPath, err)
+		}
+		total += len(buf)
+		if total > maxClosureBytes {
+			return fmt.Errorf("closure exceeds %d bytes", maxClosureBytes)
 		}
 		sum := sha256.Sum256(buf)
 		mf, err := memfdWithContent(filepath.Base(dest), buf)
@@ -136,9 +192,9 @@ func resolveClosure(target string) (files []closureFile, insideTarget string, er
 		return nil
 	}
 
-	ef, err := elf.Open(target)
+	ef, err := openNativeELF(target)
 	if err != nil {
-		return nil, "", ErrNotELF
+		return nil, "", err
 	}
 	interp := ""
 	for _, p := range ef.Progs {
@@ -148,80 +204,173 @@ func resolveClosure(target string) (files []closureFile, insideTarget string, er
 			interp = strings.TrimRight(string(b), "\x00")
 		}
 	}
+	var runpaths []string
+	if rp, err := ef.DynString(elf.DT_RUNPATH); err == nil {
+		for _, r := range rp {
+			runpaths = append(runpaths, strings.Split(r, ":")...)
+		}
+	}
+	needed, _ := ef.ImportedLibraries()
 	ef.Close()
 
 	insideTarget = "/nexus-target"
 	if err := add(target, insideTarget); err != nil {
+		closeAll()
 		return nil, "", err
 	}
 	if interp != "" {
-		// Dynamic ELF: resolve the full library set with the host loader's
-		// own view (ldd on an already-promoted, hash-pinned target).
 		if err := add(interp, interp); err != nil {
 			closeAll()
 			return nil, "", err
 		}
-		out, err := exec.Command("ldd", target).Output()
-		if err != nil {
-			closeAll()
-			return nil, "", fmt.Errorf("resolving library closure: %w", err)
+	}
+	// BFS over DT_NEEDED across trusted system libraries.
+	dirs := depSearchDirs(runpaths)
+	queue := append([]string{}, needed...)
+	resolvedNames := map[string]bool{}
+	for len(queue) > 0 {
+		name := queue[0]
+		queue = queue[1:]
+		if resolvedNames[name] {
+			continue
 		}
-		for _, line := range strings.Split(string(out), "\n") {
-			// forms: "libc.so.6 => /usr/lib/... (0x..)" | "/lib/ld-... (0x..)"
-			var lib string
-			if i := strings.Index(line, "=>"); i >= 0 {
-				lib = strings.TrimSpace(line[i+2:])
-			} else {
-				lib = strings.TrimSpace(line)
+		resolvedNames[name] = true
+		found := ""
+		for _, d := range dirs {
+			cand := filepath.Join(d, name)
+			if st, err := os.Stat(cand); err == nil && st.Mode().IsRegular() {
+				found = cand
+				break
 			}
-			if j := strings.Index(lib, " ("); j >= 0 {
-				lib = lib[:j]
+		}
+		if found == "" {
+			closeAll()
+			return nil, "", fmt.Errorf("cannot resolve library %q for %s", name, target)
+		}
+		if err := add(found, found); err != nil {
+			closeAll()
+			return nil, "", err
+		}
+		if lef, err := elf.Open(found); err == nil { // system lib: trusted parse
+			if sub, err := lef.ImportedLibraries(); err == nil {
+				queue = append(queue, sub...)
 			}
-			lib = strings.TrimSpace(lib)
-			if lib == "" || !strings.HasPrefix(lib, "/") || lib == interp {
-				continue
-			}
-			if err := add(lib, lib); err != nil {
-				closeAll()
-				return nil, "", err
-			}
+			lef.Close()
 		}
 	}
 	return files, insideTarget, nil
 }
 
-// Handle is a running sandboxed process (the production launch path).
+// guardWorkDir canonicalizes and rejects hazardous RW grants: root, shallow
+// paths, foreign ownership, group/world-writable dirs.
+// topknot ceiling: bwrap still binds by PATH, so a same-user swap between
+// this check and namespace setup remains possible; the T25 backend closes it
+// with a policy-owned disposable-directory capability. Upgrade trigger: T25.
+func guardWorkDir(dir string) (string, error) {
+	wd, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return "", fmt.Errorf("workdir: %w", err)
+	}
+	if wd == "/" || len(strings.Split(strings.Trim(wd, "/"), "/")) < 2 {
+		return "", fmt.Errorf("workdir %q refused: too broad for a disposable RW grant", wd)
+	}
+	st, err := os.Stat(wd)
+	if err != nil || !st.IsDir() {
+		return "", fmt.Errorf("workdir %s is not a directory", dir)
+	}
+	sys, ok := st.Sys().(*syscall.Stat_t)
+	if !ok || int(sys.Uid) != os.Geteuid() {
+		return "", fmt.Errorf("workdir %s not owned by the current user", wd)
+	}
+	// World-writable is refused outright. Group-writable is tolerated because
+	// user-private-group distros (umask 002) create 0775 dirs by default;
+	// the T25 backend's policy-owned disposable dirs will be 0700 regardless.
+	if st.Mode().Perm()&0o002 != 0 {
+		return "", fmt.Errorf("workdir %s is world-writable", wd)
+	}
+	return wd, nil
+}
+
+// Handle is a running (or prepared) sandboxed process. The underlying
+// command is PRIVATE: no caller can alter argv, fds or environment after
+// Prepare (Phase-0 r2 codex #5).
 type Handle struct {
-	Cmd     *exec.Cmd
-	cancel  context.CancelFunc
-	closers []*os.File
-	// ClosureHashes records sha256 per inside-path (attestation seed).
-	ClosureHashes map[string]string
+	cmd       *exec.Cmd
+	cancel    context.CancelFunc
+	closers   []*os.File
+	closeOnce sync.Once
+	hashes    map[string]string
+	started   bool
 }
 
-// Kill terminates the sandbox leader; with PID isolation + --die-with-parent
-// everything inside dies with it.
-func (h *Handle) Kill() {
-	if h.Cmd.Process != nil {
-		h.Cmd.Process.Kill()
+// ClosureHashes returns a copy of the sha256-per-inside-path attestation.
+func (h *Handle) ClosureHashes() map[string]string {
+	out := make(map[string]string, len(h.hashes))
+	for k, v := range h.hashes {
+		out[k] = v
 	}
-	h.cancel()
+	return out
 }
 
-// Wait reaps the leader and releases closure file descriptors.
-func (h *Handle) Wait() error {
-	err := h.Cmd.Wait()
-	for _, f := range h.closers {
-		f.Close()
+// SetOutput wires stdout/stderr; only valid before Start.
+func (h *Handle) SetOutput(stdout, stderr io.Writer) error {
+	if h.started {
+		return fmt.Errorf("SetOutput after Start")
 	}
-	h.cancel()
+	h.cmd.Stdout, h.cmd.Stderr = stdout, stderr
+	return nil
+}
+
+// Pid returns the sandbox leader pid, or 0 before Start.
+func (h *Handle) Pid() int {
+	if h.cmd.Process == nil {
+		return 0
+	}
+	return h.cmd.Process.Pid
+}
+
+// Start begins execution.
+func (h *Handle) Start() error {
+	err := h.cmd.Start()
+	h.started = err == nil
+	if err != nil {
+		h.Close()
+	}
 	return err
 }
 
-// Prepare validates the target (ELF-only), resolves and content-pins its
-// closure, and builds the bwrap command WITHOUT starting it, so the caller
-// may wire stdout/stderr first. This is the ONLY launch path; tests use it
-// unmodified (codex Phase-0 #3).
+// Kill terminates the sandbox leader; PID isolation + --die-with-parent
+// take everything inside down with it.
+func (h *Handle) Kill() {
+	if h.cmd.Process != nil {
+		h.cmd.Process.Kill()
+	}
+	h.cancel()
+}
+
+// Wait reaps the leader and releases every owned descriptor exactly once.
+func (h *Handle) Wait() error {
+	var err error
+	if h.started {
+		err = h.cmd.Wait()
+	}
+	h.Close()
+	return err
+}
+
+// Close releases owned resources; safe to call on every failure path.
+func (h *Handle) Close() {
+	h.closeOnce.Do(func() {
+		for _, f := range h.closers {
+			f.Close()
+		}
+		h.cancel()
+	})
+}
+
+// Prepare validates the target (native-ELF-only), resolves and seals its
+// closure, and builds the bwrap command WITHOUT starting it. This is the
+// ONLY launch path; tests use it unmodified.
 func Prepare(av Availability, spec Spec) (*Handle, error) {
 	if spec.Timeout <= 0 {
 		spec.Timeout = 30 * time.Second
@@ -246,13 +395,9 @@ func Prepare(av Availability, spec Spec) (*Handle, error) {
 		"--new-session",
 	}
 	if spec.WorkDir != "" {
-		wd, err := filepath.EvalSymlinks(spec.WorkDir)
+		wd, err := guardWorkDir(spec.WorkDir)
 		if err != nil {
-			return fail(fmt.Errorf("workdir: %w", err))
-		}
-		st, err := os.Stat(wd)
-		if err != nil || !st.IsDir() {
-			return fail(fmt.Errorf("workdir %s is not a directory", spec.WorkDir))
+			return fail(err)
 		}
 		args = append(args, "--bind", wd, "/work")
 	}
@@ -267,12 +412,13 @@ func Prepare(av Availability, spec Spec) (*Handle, error) {
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), spec.Timeout)
-	cmd := exec.CommandContext(ctx, av.BwrapPath) // args attached below
+	cmd := exec.CommandContext(ctx, av.BwrapPath)
 	hashes := map[string]string{}
-	fdNum := 3 // first ExtraFiles fd
+	var closers []*os.File
+	fdNum := 3
 	for _, cf := range files {
 		cmd.ExtraFiles = append(cmd.ExtraFiles, cf.f)
-		// --perms 0555: ro-bind-data files default to non-executable.
+		closers = append(closers, cf.f)
 		args = append(args, "--perms", "0555", "--ro-bind-data", fmt.Sprint(fdNum), cf.dest)
 		hashes[cf.dest] = cf.hash
 		fdNum++
@@ -284,6 +430,7 @@ func Prepare(av Availability, spec Spec) (*Handle, error) {
 			return fail(fmt.Errorf("SANDBOX_CAPABILITY_UNAVAILABLE: syscall floor: %w", err))
 		}
 		cmd.ExtraFiles = append(cmd.ExtraFiles, filt)
+		closers = append(closers, filt)
 		args = append(args, "--seccomp", fmt.Sprint(fdNum))
 		fdNum++
 	}
@@ -292,16 +439,7 @@ func Prepare(av Availability, spec Spec) (*Handle, error) {
 	cmd.Args = append([]string{av.BwrapPath}, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	h := &Handle{Cmd: cmd, cancel: cancel, ClosureHashes: hashes}
-	for _, cf := range files {
-		h.closers = append(h.closers, cf.f)
-	}
-	return h, nil
-}
-
-// Start begins execution of a prepared handle.
-func (h *Handle) Start() error {
-	return h.Cmd.Start()
+	return &Handle{cmd: cmd, cancel: cancel, closers: closers, hashes: hashes}, nil
 }
 
 // Run prepares, starts and waits, returning combined output.
@@ -311,10 +449,8 @@ func Run(av Availability, spec Spec) (string, error) {
 		return "", err
 	}
 	var out bytes.Buffer
-	h.Cmd.Stdout = &out
-	h.Cmd.Stderr = &out
+	h.SetOutput(&out, &out)
 	if err := h.Start(); err != nil {
-		h.Wait()
 		return "", err
 	}
 	err = h.Wait()

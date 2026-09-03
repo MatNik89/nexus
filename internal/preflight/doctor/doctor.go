@@ -46,10 +46,15 @@ func DefaultEnv() (Env, error) {
 		return Env{}, fmt.Errorf("cannot resolve user config dir: %w", err)
 	}
 	return Env{
-		LookupEnv:  os.LookupEnv,
-		DataDir:    filepath.Join(base, "nexus"),
-		Detect:     probe.Detect,
-		FloorProbe: probe.FloorProbe,
+		LookupEnv: os.LookupEnv,
+		DataDir:   filepath.Join(base, "nexus"),
+		Detect:    probe.Detect,
+		// The floor probe runs the REAL production launch path against this
+		// very binary (static ELF): its hidden __probe-ptrace subcommand
+		// must be DENIED by the syscall floor inside the sandbox.
+		FloorProbe: func(av probe.Availability) error {
+			return probe.FloorProbe(av, "/proc/self/exe", []string{"__probe-ptrace"})
+		},
 	}, nil
 }
 

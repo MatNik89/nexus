@@ -63,8 +63,12 @@ func main() {
 			fail("ptrace denied: %v", err)
 		}
 		fmt.Println("ptrace ok")
-	case "hang": // never exits — timeout/cleanup fixture
-		select {}
+	case "hang": // never exits — timeout/cleanup fixture. NOT select{}: an
+		// empty select trips Go's deadlock detector and self-terminates,
+		// making the timeout test vacuous (Phase-0 r2 kilo #1).
+		for {
+			time.Sleep(time.Hour)
+		}
 	default:
 		fail("unknown subcommand %q", os.Args[1])
 	}

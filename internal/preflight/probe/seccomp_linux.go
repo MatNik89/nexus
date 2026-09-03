@@ -89,12 +89,13 @@ func seccompFilter() (*os.File, error) {
 		return nil, err
 	}
 	var prog []sockFilter
-	// [0-2] load arch; if not ours → allow (bwrap runs same-arch; a foreign
-	// table would misdeny).
+	// [0-1] load arch; an UNEXPECTED audit architecture is DENIED, not
+	// allowed (Phase-0 r2 codex #7: allow-on-foreign-arch let a compat
+	// 32-bit ELF bypass the whole table). JF jumps to the trailing deny.
 	prog = append(prog, sockFilter{Code: bpfLD | bpfW | bpfABS, K: offArch})
-	prog = append(prog, sockFilter{Code: bpfJMP | bpfJEQ | bpfK, JT: 1, JF: 0, K: arch})
-	prog = append(prog, sockFilter{Code: bpfRET | bpfK, K: seccompRetAllow})
-	// [3] load nr; then one JEQ per denied nr, all jumping to the trailing
+	archJmpIdx := len(prog)
+	prog = append(prog, sockFilter{Code: bpfJMP | bpfJEQ | bpfK, JT: 0, K: arch})
+	// [2] load nr; then one JEQ per denied nr, all jumping to the trailing
 	// deny instruction (targets fixed up below by recorded index).
 	prog = append(prog, sockFilter{Code: bpfLD | bpfW | bpfABS, K: offNR})
 	var jeqIdx []int
@@ -108,6 +109,7 @@ func seccompFilter() (*os.File, error) {
 	for _, i := range jeqIdx {
 		prog[i].JT = uint8(denyIdx - i - 1)
 	}
+	prog[archJmpIdx].JF = uint8(denyIdx - archJmpIdx - 1)
 
 	var buf bytes.Buffer
 	for _, ins := range prog {

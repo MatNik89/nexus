@@ -71,7 +71,8 @@ func TestDetectRejectsBelowFloorVersion(t *testing.T) {
 
 func TestFloorProbeFunctionalOnThisHost(t *testing.T) {
 	av := mustDetect(t)
-	if err := FloorProbe(av); err != nil {
+	hp := helperPath(t)
+	if err := FloorProbe(av, hp, []string{"syscall-ptrace"}); err != nil {
 		t.Fatalf("kernel floor probe failed on the deployment host: %v", err)
 	}
 }
@@ -341,7 +342,7 @@ func TestKillReapsWholeTree(t *testing.T) {
 		t.Fatal(err)
 	}
 	time.Sleep(1500 * time.Millisecond)
-	tree := descendants(t, h.Cmd.Process.Pid)
+	tree := descendants(t, h.Pid())
 	if len(tree) == 0 {
 		t.Fatal("oracle vacuous: no descendants observed before kill (spawn failed?)")
 	}
@@ -366,12 +367,13 @@ func TestNegativeControlChildSurvivesWhenPIDNSLoosened(t *testing.T) {
 		t.Fatal(err)
 	}
 	time.Sleep(1500 * time.Millisecond)
-	tree := descendants(t, h.Cmd.Process.Pid)
+	tree := descendants(t, h.Pid())
 	if len(tree) == 0 {
 		t.Fatal("no descendants observed before kill")
 	}
-	h.Cmd.Process.Kill() // kill ONLY the leader, not the group
-	h.Cmd.Wait()
+	h.cmd.Process.Kill() // kill ONLY the leader, not the group (in-package test access)
+	h.cmd.Wait()
+	h.Close()
 	time.Sleep(500 * time.Millisecond)
 	alive := stillAlive(tree)
 	// Clean up the test-owned survivors regardless of outcome.
@@ -402,7 +404,7 @@ func TestHangingTargetCleanedUpWithinTimeout(t *testing.T) {
 	if err := h.Start(); err != nil {
 		t.Fatal(err)
 	}
-	tree := descendants(t, h.Cmd.Process.Pid)
+	tree := descendants(t, h.Pid())
 	h.Wait() // must return via context timeout, not hang
 	if elapsed := time.Since(start); elapsed > 15*time.Second {
 		t.Fatalf("hanging target not cleaned up within bounds: %v", elapsed)
@@ -410,5 +412,69 @@ func TestHangingTargetCleanedUpWithinTimeout(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 	if alive := stillAlive(tree); len(alive) != 0 {
 		t.Fatalf("hanging target left survivors: %v", alive)
+	}
+}
+
+// --- sealed-memfd pin: post-Prepare writes must be impossible (r2 codex #6) ---
+
+func TestMemfdSealedAgainstPostPrepareWrite(t *testing.T) {
+	av := mustDetect(t)
+	hp := helperPath(t)
+	h, err := Prepare(av, Spec{Target: hp, Args: []string{"sleep", "0"}, WorkDir: t.TempDir(), Timeout: 15 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	if len(h.closers) == 0 {
+		t.Fatal("no pinned closure files")
+	}
+	if _, err := h.closers[0].WriteAt([]byte{0x00}, 0); err == nil {
+		t.Fatal("pinned memfd accepted a post-Prepare write — seals not effective")
+	}
+}
+
+// --- fd hygiene: repeated launches must not leak descriptors (r2 codex #8) ---
+
+func countFDs(t *testing.T) int {
+	t.Helper()
+	ents, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(ents)
+}
+
+func TestNoFDLeakAcrossRuns(t *testing.T) {
+	av := mustDetect(t)
+	hp := helperPath(t)
+	spec := Spec{Target: hp, Args: []string{"sleep", "0"}, WorkDir: t.TempDir()}
+	if _, err := run(t, av, spec); err != nil { // warm-up
+		t.Fatal(err)
+	}
+	before := countFDs(t)
+	for i := 0; i < 5; i++ {
+		if _, err := run(t, av, spec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if after := countFDs(t); after > before+2 {
+		t.Fatalf("descriptor leak across runs: %d -> %d", before, after)
+	}
+}
+
+// --- RW grant guard: hazardous workdirs refused (r2 codex #2) ---
+
+func TestWorkdirRootRefused(t *testing.T) {
+	av := mustDetect(t)
+	hp := helperPath(t)
+	if _, err := Prepare(av, Spec{Target: hp, Args: []string{"sleep", "0"}, WorkDir: "/"}); err == nil {
+		t.Fatal("WorkDir '/' accepted — the whole host would be RW under /work")
+	}
+	link := filepath.Join(t.TempDir(), "to-root")
+	if err := os.Symlink("/", link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Prepare(av, Spec{Target: hp, Args: []string{"sleep", "0"}, WorkDir: link}); err == nil {
+		t.Fatal("symlink-to-/ workdir accepted")
 	}
 }
