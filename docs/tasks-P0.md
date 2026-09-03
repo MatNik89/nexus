@@ -106,7 +106,7 @@ Acceptance: harness passes with fake rows; recipe API sealed for consumers.
 RED: `test_projection_cannot_bypass_journal`; projector crash → offset not advanced past
 durable row; append-then-read of a core projection in the same process → new state visible.
 
-**[ ] T08 — State machine as fold (S0.2).**
+**[x] T08 (this commit) — State machine as fold (S0.2).**
 Transition table default-reject; state reconstructed by folding journal events;
 checkpoint = offset; UNKNOWN only via reconciliation event.
 Trace: HARNESS-SPEC P0.1 states; E4.
