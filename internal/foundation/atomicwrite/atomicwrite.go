@@ -48,10 +48,19 @@ func Write(path string, data []byte, perm os.FileMode) error {
 		os.Remove(tmpName)
 		return fmt.Errorf("atomicwrite %s: rename: %w", path, err)
 	}
-	// Make the rename itself durable: fsync the directory.
-	if d, err := os.Open(dir); err == nil {
-		d.Sync()
+	// Make the rename itself durable: fsync the directory. Failures here
+	// mean the caller CANNOT assume durability — propagate (Phase-1A
+	// codex #14).
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("atomicwrite %s: open dir for fsync: %w", path, err)
+	}
+	if err := d.Sync(); err != nil {
 		d.Close()
+		return fmt.Errorf("atomicwrite %s: dir fsync: %w", path, err)
+	}
+	if err := d.Close(); err != nil {
+		return fmt.Errorf("atomicwrite %s: dir close: %w", path, err)
 	}
 	return nil
 }

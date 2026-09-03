@@ -6,6 +6,7 @@ package redact
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"sort"
 )
@@ -35,6 +36,17 @@ func NewKnownRefs(refs map[string]string) *KnownRefs {
 			continue
 		}
 		r.entries = append(r.entries, entry{name: name, value: []byte(val)})
+		// A secret embedded in marshaled JSON appears in its ESCAPED form
+		// (quotes, backslashes, control chars) — match that too (Phase-1A
+		// codex #11). topknot ceiling: a secret split across value
+		// boundaries is not matched; upgrade when a tokenizing redactor
+		// lands (P4 entropy/shape pass).
+		if esc, err := json.Marshal(val); err == nil {
+			escaped := esc[1 : len(esc)-1] // strip the surrounding quotes
+			if string(escaped) != val {
+				r.entries = append(r.entries, entry{name: name, value: append([]byte{}, escaped...)})
+			}
+		}
 	}
 	sort.Slice(r.entries, func(i, j int) bool {
 		if len(r.entries[i].value) != len(r.entries[j].value) {

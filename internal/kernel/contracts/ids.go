@@ -48,7 +48,9 @@ func (v ToolID) Valid() bool      { return validID(string(v)) }
 
 func requireID(name, v string) error {
 	if !validID(v) {
-		return fmt.Errorf("%s: invalid identifier %q", name, v)
+		// Never echo the value: it may contain a secret or control bytes
+		// and this error can reach diagnostic sinks (Phase-1A codex #10).
+		return fmt.Errorf("%s: invalid identifier (len=%d)", name, len(v))
 	}
 	return nil
 }

@@ -1,6 +1,9 @@
 package contracts
 
-import "fmt"
+import (
+	"encoding/json"
+	"fmt"
+)
 
 // Every enum follows the same fail-closed pattern (E3): the zero value is
 // Invalid, Valid() accepts only known members, and JSON decoding goes
@@ -180,11 +183,13 @@ const (
 	RunFailed
 	RunCancelled
 	RunUnknown
+	RunManualRecovery
 )
 
 var runStateNames = map[RunState]string{
 	RunCreated: "CREATED", RunAdmitted: "ADMITTED", RunRunning: "RUNNING",
 	RunSucceeded: "SUCCEEDED", RunFailed: "FAILED", RunCancelled: "CANCELLED", RunUnknown: "UNKNOWN",
+	RunManualRecovery: "MANUAL_RECOVERY",
 }
 
 type TurnState uint8
@@ -214,12 +219,13 @@ const (
 	AttemptFailed
 	AttemptCancelled
 	AttemptUnknown
+	AttemptManualRecovery
 )
 
 var attemptStateNames = map[AttemptState]string{
 	AttemptPlanned: "PLANNED", AttemptAuthorized: "AUTHORIZED", AttemptRunning: "RUNNING",
 	AttemptSucceeded: "SUCCEEDED", AttemptFailed: "FAILED", AttemptCancelled: "CANCELLED",
-	AttemptUnknown: "UNKNOWN",
+	AttemptUnknown: "UNKNOWN", AttemptManualRecovery: "MANUAL_RECOVERY",
 }
 
 // ResultStatus of a tool result (P0.1).
@@ -241,7 +247,7 @@ var resultStatusNames = map[ResultStatus]string{
 // ---- generated-by-hand shared plumbing (one generic implementation) ----
 
 type enumSpec[T comparable] struct {
-	names map[T]string
+	names  map[T]string
 	byName map[string]T
 }
 
@@ -268,6 +274,27 @@ func (s enumSpec[T]) parse(name, kind string) (T, error) {
 	}
 	var zero T
 	return zero, fmt.Errorf("unknown %s discriminator %q (fail closed)", kind, name)
+}
+
+// marshalJSON emits the canonical string; an invalid member cannot be
+// serialized (fail closed on the way OUT too).
+func (s enumSpec[T]) marshalJSON(v T, kind string) ([]byte, error) {
+	n, ok := s.names[v]
+	if !ok {
+		return nil, fmt.Errorf("cannot marshal invalid %s value", kind)
+	}
+	return json.Marshal(n)
+}
+
+// unmarshalJSON accepts ONLY a known canonical string — numbers and unknown
+// strings are rejected (closed wire discriminators, Annex P0.1).
+func (s enumSpec[T]) unmarshalJSON(b []byte, kind string) (T, error) {
+	var zero T
+	var name string
+	if err := json.Unmarshal(b, &name); err != nil {
+		return zero, fmt.Errorf("%s discriminator must be a canonical string, got %s", kind, string(b))
+	}
+	return s.parse(name, kind)
 }
 
 var (
@@ -342,3 +369,143 @@ func ParseAttemptState(s string) (AttemptState, error) { return attemptSpec.pars
 func (v ResultStatus) Valid() bool    { return resultSpec.valid(v) }
 func (v ResultStatus) String() string { return resultSpec.str(v, "RESULT_STATUS") }
 func ParseResultStatus(s string) (ResultStatus, error) { return resultSpec.parse(s, "result_status") }
+
+func (v Role) MarshalJSON() ([]byte, error) { return roleSpec.marshalJSON(v, "role") }
+func (v *Role) UnmarshalJSON(b []byte) error {
+	x, err := roleSpec.unmarshalJSON(b, "role")
+	if err != nil {
+		return err
+	}
+	*v = x
+	return nil
+}
+
+func (v EffectClass) MarshalJSON() ([]byte, error) { return effectSpec.marshalJSON(v, "effect_class") }
+func (v *EffectClass) UnmarshalJSON(b []byte) error {
+	x, err := effectSpec.unmarshalJSON(b, "effect_class")
+	if err != nil {
+		return err
+	}
+	*v = x
+	return nil
+}
+
+func (v TrustClass) MarshalJSON() ([]byte, error) { return trustSpec.marshalJSON(v, "trust_class") }
+func (v *TrustClass) UnmarshalJSON(b []byte) error {
+	x, err := trustSpec.unmarshalJSON(b, "trust_class")
+	if err != nil {
+		return err
+	}
+	*v = x
+	return nil
+}
+
+func (v Sensitivity) MarshalJSON() ([]byte, error) { return sensitivitySpec.marshalJSON(v, "sensitivity") }
+func (v *Sensitivity) UnmarshalJSON(b []byte) error {
+	x, err := sensitivitySpec.unmarshalJSON(b, "sensitivity")
+	if err != nil {
+		return err
+	}
+	*v = x
+	return nil
+}
+
+func (v ErrorCategory) MarshalJSON() ([]byte, error) { return errCatSpec.marshalJSON(v, "error_category") }
+func (v *ErrorCategory) UnmarshalJSON(b []byte) error {
+	x, err := errCatSpec.unmarshalJSON(b, "error_category")
+	if err != nil {
+		return err
+	}
+	*v = x
+	return nil
+}
+
+func (v Retryability) MarshalJSON() ([]byte, error) { return retrySpec.marshalJSON(v, "retryability") }
+func (v *Retryability) UnmarshalJSON(b []byte) error {
+	x, err := retrySpec.unmarshalJSON(b, "retryability")
+	if err != nil {
+		return err
+	}
+	*v = x
+	return nil
+}
+
+func (v ExecutionKind) MarshalJSON() ([]byte, error) { return execKindSpec.marshalJSON(v, "execution_kind") }
+func (v *ExecutionKind) UnmarshalJSON(b []byte) error {
+	x, err := execKindSpec.unmarshalJSON(b, "execution_kind")
+	if err != nil {
+		return err
+	}
+	*v = x
+	return nil
+}
+
+func (v EffectPhase) MarshalJSON() ([]byte, error) { return phaseSpec.marshalJSON(v, "effect_phase") }
+func (v *EffectPhase) UnmarshalJSON(b []byte) error {
+	x, err := phaseSpec.unmarshalJSON(b, "effect_phase")
+	if err != nil {
+		return err
+	}
+	*v = x
+	return nil
+}
+
+func (v Decision) MarshalJSON() ([]byte, error) { return decisionSpec.marshalJSON(v, "decision") }
+func (v *Decision) UnmarshalJSON(b []byte) error {
+	x, err := decisionSpec.unmarshalJSON(b, "decision")
+	if err != nil {
+		return err
+	}
+	*v = x
+	return nil
+}
+
+func (v PolicyMode) MarshalJSON() ([]byte, error) { return policyModeSpec.marshalJSON(v, "policy_mode") }
+func (v *PolicyMode) UnmarshalJSON(b []byte) error {
+	x, err := policyModeSpec.unmarshalJSON(b, "policy_mode")
+	if err != nil {
+		return err
+	}
+	*v = x
+	return nil
+}
+
+func (v RunState) MarshalJSON() ([]byte, error) { return runStateSpec.marshalJSON(v, "run_state") }
+func (v *RunState) UnmarshalJSON(b []byte) error {
+	x, err := runStateSpec.unmarshalJSON(b, "run_state")
+	if err != nil {
+		return err
+	}
+	*v = x
+	return nil
+}
+
+func (v TurnState) MarshalJSON() ([]byte, error) { return turnStateSpec.marshalJSON(v, "turn_state") }
+func (v *TurnState) UnmarshalJSON(b []byte) error {
+	x, err := turnStateSpec.unmarshalJSON(b, "turn_state")
+	if err != nil {
+		return err
+	}
+	*v = x
+	return nil
+}
+
+func (v AttemptState) MarshalJSON() ([]byte, error) { return attemptSpec.marshalJSON(v, "attempt_state") }
+func (v *AttemptState) UnmarshalJSON(b []byte) error {
+	x, err := attemptSpec.unmarshalJSON(b, "attempt_state")
+	if err != nil {
+		return err
+	}
+	*v = x
+	return nil
+}
+
+func (v ResultStatus) MarshalJSON() ([]byte, error) { return resultSpec.marshalJSON(v, "result_status") }
+func (v *ResultStatus) UnmarshalJSON(b []byte) error {
+	x, err := resultSpec.unmarshalJSON(b, "result_status")
+	if err != nil {
+		return err
+	}
+	*v = x
+	return nil
+}

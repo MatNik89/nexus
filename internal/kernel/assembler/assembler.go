@@ -8,6 +8,8 @@
 package assembler
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"sort"
 	"strings"
@@ -41,8 +43,14 @@ func Base(blocks []contracts.ContextBlock) (string, error) {
 			content = "[ref:" + *b.ContentRef + "]"
 		}
 		if b.Trust == contracts.TrustUntrustedExternal {
-			// Structural fence: untrusted content is DATA, never instruction.
-			fmt.Fprintf(&sb, "<untrusted-data block=%q>\n%s\n</untrusted-data>\n", b.BlockID, content)
+			// Structural fence whose tag embeds the CONTENT HASH: forging a
+			// valid closing tag requires content containing the hash of
+			// itself-including-that-tag (a fixed point) — a literal
+			// "</untrusted-data>" in the payload closes nothing (Phase-1A
+			// codex #15). Deterministic: same content, same tag.
+			sum := sha256.Sum256([]byte(content))
+			tag := "untrusted-" + hex.EncodeToString(sum[:8])
+			fmt.Fprintf(&sb, "<%s block=%q>\n%s\n</%s>\n", tag, b.BlockID, content, tag)
 			continue
 		}
 		fmt.Fprintf(&sb, "[%s %s]\n%s\n", b.Trust, b.BlockID, content)

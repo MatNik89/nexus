@@ -14,7 +14,8 @@ func block(t *testing.T, id, content string) contracts.ContextBlock {
 	t.Helper()
 	b, err := contracts.NewContextBlock(contracts.ContextBlockParams{
 		BlockID: contracts.BlockID(id), Kind: "text", Content: &content,
-		ContentHash: "h", Trust: contracts.TrustUser,
+		ContentHash: "h", SourceURI: "local:test", Producer: "test",
+		Trust: contracts.TrustUser,
 		Sensitivity: contracts.SensitivityInternal, Lineage: []string{},
 		ObservedAt: time.Unix(1000, 0),
 	})

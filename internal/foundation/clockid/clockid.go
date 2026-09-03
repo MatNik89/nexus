@@ -26,7 +26,7 @@ type IDGen interface {
 // System is the production clock.
 type System struct{}
 
-func (System) Now() time.Time                  { return time.Now() }
+func (System) Now() time.Time                  { return time.Now().UTC() } // Annex: every timestamp UTC
 func (System) Since(t time.Time) time.Duration { return time.Since(t) }
 
 // RandomIDs is the production generator: prefix-<16 hex bytes>.
@@ -54,7 +54,7 @@ func NewFake(start time.Time) *Fake {
 	return f
 }
 
-func (f *Fake) Now() time.Time                  { return time.Unix(0, f.now.Load()) }
+func (f *Fake) Now() time.Time                  { return time.Unix(0, f.now.Load()).UTC() }
 func (f *Fake) Since(t time.Time) time.Duration { return f.Now().Sub(t) }
 func (f *Fake) Advance(d time.Duration)         { f.now.Add(int64(d)) }
 

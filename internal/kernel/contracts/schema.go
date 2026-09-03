@@ -11,9 +11,17 @@ import (
 // migration layer adds the upcast chain + quarantine sink; never a lossy
 // downcast, never a silent drop).
 
-// KnownSchemas is the closed P0 registry. Additions are code changes.
-var KnownSchemas = map[SchemaID]map[int]bool{
+// knownSchemas is the closed P0 registry — private and immutable at
+// runtime; additions are code changes (Phase-1A codex #3).
+var knownSchemas = map[SchemaID]map[int]bool{
 	"nexus.event": {1: true},
+}
+
+// schemaKnown is the single admission check used by BOTH the wire parser
+// and the constructor.
+func schemaKnown(id SchemaID, version int) bool {
+	v, ok := knownSchemas[id]
+	return ok && v[version]
 }
 
 // UnknownSchemaError preserves the raw, unprocessed input (C7).
@@ -40,8 +48,7 @@ func ParseEnvelope(raw []byte) (Envelope, error) {
 	if err := json.Unmarshal(raw, &probe); err != nil {
 		return Envelope{}, fmt.Errorf("envelope is not valid JSON: %w", err)
 	}
-	versions, ok := KnownSchemas[probe.SchemaID]
-	if !ok || !versions[probe.SchemaVersion] {
+	if !schemaKnown(probe.SchemaID, probe.SchemaVersion) {
 		rawCopy := make([]byte, len(raw))
 		copy(rawCopy, raw)
 		return Envelope{}, &UnknownSchemaError{
@@ -53,8 +60,9 @@ func ParseEnvelope(raw []byte) (Envelope, error) {
 		return Envelope{}, fmt.Errorf("envelope decode: %w", err)
 	}
 	// Re-run the constructor so wire-decoded envelopes obey the same MUSTs
-	// as locally built ones (single validation owner).
-	return NewEnvelope(EnvelopeParams{
+	// as locally built ones (single validation owner). The exact admitted
+	// bytes are preserved on the result (unknown-field preservation).
+	env, err := NewEnvelope(EnvelopeParams{
 		SchemaID: wire.SchemaID, SchemaVersion: wire.SchemaVersion, EventID: wire.EventID,
 		EventType: wire.EventType, RunID: wire.RunID, TurnID: wire.TurnID,
 		ToolCallID: wire.ToolCallID, ParentEventID: wire.ParentEventID,
@@ -63,4 +71,11 @@ func ParseEnvelope(raw []byte) (Envelope, error) {
 		WorkspaceID: wire.WorkspaceID, ProfileID: wire.ProfileID, AttemptNo: wire.AttemptNo,
 		IdempotencyKey: wire.IdempotencyKey, Payload: wire.Payload, PayloadHash: wire.PayloadHash,
 	})
+	if err != nil {
+		return Envelope{}, err
+	}
+	rawCopy := make([]byte, len(raw))
+	copy(rawCopy, raw)
+	env.Wire = rawCopy
+	return env, nil
 }

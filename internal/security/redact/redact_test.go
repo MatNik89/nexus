@@ -36,3 +36,18 @@ func TestEmptyValueIgnored(t *testing.T) {
 		t.Fatalf("empty secret mangled input: %q", got)
 	}
 }
+
+
+func TestJSONEscapedSecretRedacted(t *testing.T) {
+	secret := `pa"ss\word`
+	r := NewKnownRefs(map[string]string{"weird": secret})
+	// As it appears inside marshaled JSON:
+	encoded := `{"v":"pa\"ss\\word"}`
+	out := string(r.Redact([]byte(encoded)))
+	if strings.Contains(out, `pa\"ss`) {
+		t.Fatalf("escaped form of the secret survived: %s", out)
+	}
+	if !strings.Contains(out, "[REDACTED:weird]") {
+		t.Fatalf("marker missing: %s", out)
+	}
+}

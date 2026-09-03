@@ -13,9 +13,16 @@ import (
 // map[string]any (E3). Constructors are the only sanctioned way to build
 // values: every P0.1 MUST is enforced there, fail-closed.
 
+// utc normalizes a timestamp to UTC (Annex convention: every persisted
+// timestamp is UTC; local offsets are canonicalized, zero is rejected by
+// the constructors).
+func utc(t time.Time) time.Time { return t.UTC() }
+
 // Envelope is the canonical event envelope (P0.1). ProfileID is the
 // mandatory admission-time stamp carried immutably through the causal chain
-// (HARDQ B3).
+// (HARDQ B3). Wire preserves the exact admitted bytes for known-schema
+// envelopes parsed off the wire (unknown FIELDS are preserved there while
+// unknown DISCRIMINATORS are rejected — Annex P0.1).
 type Envelope struct {
 	SchemaID      SchemaID        `json:"schema_id"`
 	SchemaVersion int             `json:"schema_version"`
@@ -37,6 +44,11 @@ type Envelope struct {
 	IdempotencyKey *string        `json:"idempotency_key,omitempty"`
 	Payload       json.RawMessage `json:"payload"`
 	PayloadHash   string          `json:"payload_hash"`
+
+	// Wire is the exact admitted raw input (nil for locally built
+	// envelopes). Never serialized; carried so replay/projection cannot
+	// lose unknown fields of a known schema.
+	Wire json.RawMessage `json:"-"`
 }
 
 // EnvelopeParams carries the constructor inputs; optional fields are
@@ -72,6 +84,11 @@ func NewEnvelope(p EnvelopeParams) (Envelope, error) {
 		}
 	}
 	check("schema_id", string(p.SchemaID))
+	if !schemaKnown(p.SchemaID, p.SchemaVersion) {
+		// The closed registry gates CONSTRUCTION too — the wire parser is
+		// not the only admission point (Phase-1A codex #3).
+		errs = append(errs, fmt.Errorf("unknown schema %s v%d (fail closed)", p.SchemaID, p.SchemaVersion))
+	}
 	check("event_id", string(p.EventID))
 	check("event_type", p.EventType)
 	check("run_id", string(p.RunID))
@@ -113,7 +130,7 @@ func NewEnvelope(p EnvelopeParams) (Envelope, error) {
 	return Envelope{
 		SchemaID: p.SchemaID, SchemaVersion: p.SchemaVersion, EventID: p.EventID,
 		EventType: p.EventType, RunID: p.RunID, TurnID: p.TurnID, ToolCallID: p.ToolCallID,
-		ParentEventID: p.ParentEventID, Sequence: p.Sequence, EmittedAt: p.EmittedAt,
+		ParentEventID: p.ParentEventID, Sequence: p.Sequence, EmittedAt: utc(p.EmittedAt),
 		ActorType: p.ActorType, ActorID: p.ActorID, PrincipalID: p.PrincipalID,
 		TenantID: p.TenantID, WorkspaceID: p.WorkspaceID, ProfileID: p.ProfileID,
 		AttemptNo: p.AttemptNo, IdempotencyKey: p.IdempotencyKey,
@@ -177,18 +194,42 @@ func NewContextBlock(p ContextBlockParams) (ContextBlock, error) {
 	if p.ObservedAt.IsZero() {
 		errs = append(errs, errors.New("observed_at is required"))
 	}
+	if p.SourceURI == "" {
+		errs = append(errs, errors.New("source_uri is required"))
+	}
+	if p.Producer == "" {
+		errs = append(errs, errors.New("producer is required"))
+	}
 	if p.Lineage == nil {
 		errs = append(errs, errors.New("lineage is required (may be empty, never absent)"))
 	}
 	if len(errs) > 0 {
 		return ContextBlock{}, fmt.Errorf("invalid context block: %w", errors.Join(errs...))
 	}
+	var exp *time.Time
+	if p.ExpiresAt != nil {
+		e := utc(*p.ExpiresAt)
+		exp = &e
+	}
 	return ContextBlock{
 		BlockID: p.BlockID, Kind: p.Kind, Content: p.Content, ContentRef: p.ContentRef,
 		ContentHash: p.ContentHash, SourceURI: p.SourceURI, Producer: p.Producer,
 		Trust: p.Trust, Sensitivity: p.Sensitivity, Lineage: p.Lineage,
-		ObservedAt: p.ObservedAt, ExpiresAt: p.ExpiresAt,
+		ObservedAt: utc(p.ObservedAt), ExpiresAt: exp,
 	}, nil
+}
+
+// Validate re-checks a ContextBlock that did not come through the
+// constructor (e.g. embedded in a wire message). Single validation owner:
+// it re-runs the constructor.
+func (b ContextBlock) Validate() error {
+	_, err := NewContextBlock(ContextBlockParams{
+		BlockID: b.BlockID, Kind: b.Kind, Content: b.Content, ContentRef: b.ContentRef,
+		ContentHash: b.ContentHash, SourceURI: b.SourceURI, Producer: b.Producer,
+		Trust: b.Trust, Sensitivity: b.Sensitivity, Lineage: b.Lineage,
+		ObservedAt: b.ObservedAt, ExpiresAt: b.ExpiresAt,
+	})
+	return err
 }
 
 // Message (P0.1): every content element is a validated ContextBlock.
@@ -213,10 +254,15 @@ func NewMessage(id MessageID, role Role, blocks []ContextBlock, createdAt time.T
 	if len(blocks) == 0 {
 		errs = append(errs, errors.New("content_blocks must not be empty"))
 	}
+	for i, b := range blocks {
+		if err := b.Validate(); err != nil {
+			errs = append(errs, fmt.Errorf("content_blocks[%d]: %w", i, err))
+		}
+	}
 	if len(errs) > 0 {
 		return Message{}, fmt.Errorf("invalid message: %w", errors.Join(errs...))
 	}
-	return Message{MessageID: id, Role: role, Blocks: blocks, CreatedAt: createdAt}, nil
+	return Message{MessageID: id, Role: role, Blocks: blocks, CreatedAt: utc(createdAt)}, nil
 }
 
 // ToolCall (P0.1): an idempotency key is MANDATORY for every state-changing
@@ -285,9 +331,20 @@ func NewToolCall(p ToolCallParams) (ToolCall, error) {
 	return ToolCall{
 		ToolCallID: p.ToolCallID, ToolID: p.ToolID, Arguments: p.Arguments,
 		ArgsSchemaHash: p.ArgsSchemaHash, Effect: p.Effect, ExecutionKind: p.ExecutionKind,
-		Deadline: p.Deadline, AttemptNo: p.AttemptNo, IdempotencyKey: p.IdempotencyKey,
+		Deadline: utc(p.Deadline), AttemptNo: p.AttemptNo, IdempotencyKey: p.IdempotencyKey,
 		ProfileID: p.ProfileID,
 	}, nil
+}
+
+// Validate re-runs the constructor on a ToolCall that arrived from outside.
+func (c ToolCall) Validate() error {
+	_, err := NewToolCall(ToolCallParams{
+		ToolCallID: c.ToolCallID, ToolID: c.ToolID, Arguments: c.Arguments,
+		ArgsSchemaHash: c.ArgsSchemaHash, Effect: c.Effect, ExecutionKind: c.ExecutionKind,
+		Deadline: c.Deadline, AttemptNo: c.AttemptNo, IdempotencyKey: c.IdempotencyKey,
+		ProfileID: c.ProfileID,
+	})
+	return err
 }
 
 // CommitReceipt attests when an effect committed (DESIGN-FIXES-r2); it is
@@ -322,6 +379,19 @@ type ToolResult struct {
 // NewToolResult validates correlation against the originating call.
 func NewToolResult(call ToolCall, status ResultStatus, output []ContextBlock, terr *TypedError, started, finished time.Time, commit *CommitReceipt) (ToolResult, error) {
 	var errs []error
+	if err := call.Validate(); err != nil {
+		errs = append(errs, fmt.Errorf("originating call invalid: %w", err))
+	}
+	for i, b := range output {
+		if err := b.Validate(); err != nil {
+			errs = append(errs, fmt.Errorf("output_blocks[%d]: %w", i, err))
+		}
+	}
+	if terr != nil {
+		if err := terr.Validate(); err != nil {
+			errs = append(errs, fmt.Errorf("error: %w", err))
+		}
+	}
 	if !status.Valid() {
 		errs = append(errs, fmt.Errorf("status %d invalid", status))
 	}
@@ -339,7 +409,7 @@ func NewToolResult(call ToolCall, status ResultStatus, output []ContextBlock, te
 	}
 	return ToolResult{
 		ToolCallID: call.ToolCallID, AttemptNo: call.AttemptNo, Status: status,
-		Output: output, Err: terr, StartedAt: started, FinishedAt: finished, Commit: commit,
+		Output: output, Err: terr, StartedAt: utc(started), FinishedAt: utc(finished), Commit: commit,
 	}, nil
 }
 
@@ -385,6 +455,12 @@ func NewTypedError(code string, cat ErrorCategory, retry Retryability, safeMsg, 
 		Code: code, Category: cat, Retryability: retry, SafeMessage: safeMsg,
 		RetryAfter: retryAfter, Origin: origin, CauseEventID: cause,
 	}, nil
+}
+
+// Validate re-runs the constructor on a TypedError from outside.
+func (e TypedError) Validate() error {
+	_, err := NewTypedError(e.Code, e.Category, e.Retryability, e.SafeMessage, e.Origin, e.RetryAfter, e.CauseEventID)
+	return err
 }
 
 func (e TypedError) Error() string {

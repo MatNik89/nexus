@@ -61,7 +61,8 @@ func TestEnvelopeConstructorRejectsEachMissingMust(t *testing.T) {
 
 func TestContextBlockXOR(t *testing.T) {
 	base := ContextBlockParams{
-		BlockID: "b1", Kind: "text", ContentHash: "h", Trust: TrustUser,
+		BlockID: "b1", Kind: "text", ContentHash: "h", SourceURI: "local:test",
+		Producer: "test", Trust: TrustUser,
 		Sensitivity: SensitivityInternal, Lineage: []string{}, ObservedAt: time.Unix(1000, 0),
 	}
 	both := base
@@ -83,6 +84,7 @@ func TestContextBlockXOR(t *testing.T) {
 func TestContextBlockRejectsInvalidProvenance(t *testing.T) {
 	p := ContextBlockParams{
 		BlockID: "b1", Kind: "text", Content: str("x"), ContentHash: "h",
+		SourceURI: "local:test", Producer: "test",
 		Trust: TrustClass(99), Sensitivity: SensitivityInternal,
 		Lineage: []string{}, ObservedAt: time.Unix(1000, 0),
 	}
@@ -90,9 +92,24 @@ func TestContextBlockRejectsInvalidProvenance(t *testing.T) {
 		t.Fatal("unknown trust_class accepted")
 	}
 	p.Trust = TrustUser
+	p.Sensitivity = Sensitivity(99)
+	if _, err := NewContextBlock(p); err == nil {
+		t.Fatal("unknown sensitivity accepted")
+	}
+	p.Sensitivity = SensitivityInternal
 	p.Lineage = nil
 	if _, err := NewContextBlock(p); err == nil {
 		t.Fatal("absent lineage accepted (must be present, possibly empty)")
+	}
+	p.Lineage = []string{}
+	p.SourceURI = ""
+	if _, err := NewContextBlock(p); err == nil {
+		t.Fatal("empty source_uri accepted")
+	}
+	p.SourceURI = "local:test"
+	p.Producer = ""
+	if _, err := NewContextBlock(p); err == nil {
+		t.Fatal("empty producer accepted")
 	}
 }
 
@@ -254,5 +271,122 @@ func TestParseEnvelopeWireObeysSameMusts(t *testing.T) {
 		`"payload":{"k":1},"payload_hash":"h"}`)
 	if _, err := ParseEnvelope(raw); err == nil || !strings.Contains(err.Error(), "profile_id") {
 		t.Fatalf("wire envelope without profile_id must fail on profile_id, got: %v", err)
+	}
+}
+
+
+func validBlock(t *testing.T) ContextBlock {
+	t.Helper()
+	c := "content"
+	b, err := NewContextBlock(ContextBlockParams{
+		BlockID: "b1", Kind: "text", Content: &c, ContentHash: "h",
+		SourceURI: "local:test", Producer: "test", Trust: TrustUser,
+		Sensitivity: SensitivityInternal, Lineage: []string{}, ObservedAt: time.Unix(1000, 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// Enums on the JSON wire are CLOSED STRINGS (Phase-1A codex #4 / kilo #1).
+func TestEnumJSONWireIsClosedStrings(t *testing.T) {
+	b := validBlock(t)
+	msg, err := NewMessage("m1", RoleUser, []ContextBlock{b}, time.Unix(1000, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"role":"USER"`) || !strings.Contains(string(raw), `"trust_class":"USER"`) {
+		t.Fatalf("enums must marshal as canonical strings: %s", raw)
+	}
+	var back Message
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatalf("canonical round trip failed: %v", err)
+	}
+	// Unknown string discriminator rejected.
+	if err := json.Unmarshal([]byte(strings.Replace(string(raw), `"role":"USER"`, `"role":"SUPERUSER"`, 1)), &back); err == nil {
+		t.Fatal("unknown role string accepted from the wire")
+	}
+	// NUMERIC discriminator rejected (numbers could smuggle out-of-range
+	// values past Valid()).
+	if err := json.Unmarshal([]byte(strings.Replace(string(raw), `"role":"USER"`, `"role":2`, 1)), &back); err == nil {
+		t.Fatal("numeric role accepted from the wire")
+	}
+	// Invalid member cannot even be marshaled.
+	if _, err := json.Marshal(Role(99)); err == nil {
+		t.Fatal("out-of-range enum marshaled")
+	}
+}
+
+// Recursive validation: a forged zero block inside a Message is rejected
+// (Phase-1A codex #6).
+func TestMessageRejectsForgedBlock(t *testing.T) {
+	if _, err := NewMessage("m1", RoleUser, []ContextBlock{{}}, time.Unix(1000, 0)); err == nil {
+		t.Fatal("zero-value ContextBlock accepted inside a Message")
+	}
+}
+
+func TestToolResultRejectsForgedCall(t *testing.T) {
+	if _, err := NewToolResult(ToolCall{}, ResultSucceeded, nil, nil, time.Unix(1,0), time.Unix(2,0), nil); err == nil {
+		t.Fatal("zero-value ToolCall accepted as the originating call")
+	}
+}
+
+// Constructor-level schema admission (Phase-1A codex #3): the wire parser
+// is not the only gate.
+func TestConstructorRejectsUnknownSchema(t *testing.T) {
+	p := validEnvelopeParams()
+	p.SchemaID = "evil.schema"
+	if _, err := NewEnvelope(p); err == nil {
+		t.Fatal("unknown schema accepted by the constructor")
+	}
+	p = validEnvelopeParams()
+	p.SchemaVersion = 99
+	if _, err := NewEnvelope(p); err == nil {
+		t.Fatal("unknown schema version accepted by the constructor")
+	}
+}
+
+// Known-schema unknown FIELDS are preserved via Wire (Phase-1A codex #5).
+func TestParseEnvelopePreservesUnknownFields(t *testing.T) {
+	env, err := NewEnvelope(validEnvelopeParams())
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(env)
+	extended := strings.Replace(string(raw), `{`, `{"future_ext_field":"keep-me",`, 1)
+	back, err := ParseEnvelope([]byte(extended))
+	if err != nil {
+		t.Fatalf("known schema with extra field must be admitted: %v", err)
+	}
+	if !strings.Contains(string(back.Wire), "keep-me") {
+		t.Fatal("unknown field lost — Wire must preserve the admitted bytes")
+	}
+}
+
+// Every persisted timestamp is UTC (Phase-1A codex #8).
+func TestTimestampsNormalizedToUTC(t *testing.T) {
+	loc := time.FixedZone("CET", 3600)
+	p := validEnvelopeParams()
+	p.EmittedAt = time.Date(2026, 1, 1, 12, 0, 0, 0, loc)
+	env, err := NewEnvelope(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env.EmittedAt.Location() != time.UTC {
+		t.Fatalf("emitted_at not UTC: %v", env.EmittedAt.Location())
+	}
+}
+
+func TestManualRecoveryStatesExist(t *testing.T) {
+	if !RunManualRecovery.Valid() || RunManualRecovery.String() != "MANUAL_RECOVERY" {
+		t.Fatal("RunManualRecovery missing/mislabeled (P0.1 UNKNOWN exit vocabulary)")
+	}
+	if !AttemptManualRecovery.Valid() {
+		t.Fatal("AttemptManualRecovery missing")
 	}
 }
