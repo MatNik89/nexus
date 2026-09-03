@@ -38,6 +38,16 @@ func TestEmptyValueIgnored(t *testing.T) {
 }
 
 
+func TestUnicodeEscapeVariantRedacted(t *testing.T) {
+	r := NewKnownRefs(map[string]string{"key": "secret"})
+	// Semantically identical JSON spelled with a \u escape (r2 codex #5).
+	encoded := `{"v":"s\u0065cret"}`
+	out := string(r.Redact([]byte(encoded)))
+	if strings.Contains(out, "ecret") && !strings.Contains(out, "[REDACTED:key]") {
+		t.Fatalf("unicode-escaped spelling bypassed redaction: %s", out)
+	}
+}
+
 func TestJSONEscapedSecretRedacted(t *testing.T) {
 	secret := `pa"ss\word`
 	r := NewKnownRefs(map[string]string{"weird": secret})

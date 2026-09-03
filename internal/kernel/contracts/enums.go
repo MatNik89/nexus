@@ -228,6 +228,24 @@ var attemptStateNames = map[AttemptState]string{
 	AttemptUnknown: "UNKNOWN", AttemptManualRecovery: "MANUAL_RECOVERY",
 }
 
+// ActorType is the closed set of event emitters (Phase-1A r2 codex #7:
+// an open string here let unknown discriminators reach the journal).
+type ActorType uint8
+
+const (
+	ActorInvalid ActorType = iota
+	ActorUser
+	ActorSystem
+	ActorScheduler
+	ActorChannel
+	ActorTool
+)
+
+var actorTypeNames = map[ActorType]string{
+	ActorUser: "USER", ActorSystem: "SYSTEM", ActorScheduler: "SCHEDULER",
+	ActorChannel: "CHANNEL", ActorTool: "TOOL",
+}
+
 // ResultStatus of a tool result (P0.1).
 type ResultStatus uint8
 
@@ -311,6 +329,7 @@ var (
 	runStateSpec    = newEnumSpec(runStateNames)
 	turnStateSpec   = newEnumSpec(turnStateNames)
 	attemptSpec     = newEnumSpec(attemptStateNames)
+	actorTypeSpec   = newEnumSpec(actorTypeNames)
 	resultSpec      = newEnumSpec(resultStatusNames)
 )
 
@@ -503,6 +522,19 @@ func (v *AttemptState) UnmarshalJSON(b []byte) error {
 func (v ResultStatus) MarshalJSON() ([]byte, error) { return resultSpec.marshalJSON(v, "result_status") }
 func (v *ResultStatus) UnmarshalJSON(b []byte) error {
 	x, err := resultSpec.unmarshalJSON(b, "result_status")
+	if err != nil {
+		return err
+	}
+	*v = x
+	return nil
+}
+
+func (v ActorType) Valid() bool    { return actorTypeSpec.valid(v) }
+func (v ActorType) String() string { return actorTypeSpec.str(v, "ACTOR_TYPE") }
+func ParseActorType(s string) (ActorType, error) { return actorTypeSpec.parse(s, "actor_type") }
+func (v ActorType) MarshalJSON() ([]byte, error) { return actorTypeSpec.marshalJSON(v, "actor_type") }
+func (v *ActorType) UnmarshalJSON(b []byte) error {
+	x, err := actorTypeSpec.unmarshalJSON(b, "actor_type")
 	if err != nil {
 		return err
 	}

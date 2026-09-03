@@ -1,9 +1,11 @@
 package contracts
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 )
 
@@ -34,7 +36,7 @@ type Envelope struct {
 	ParentEventID *EventID        `json:"parent_event_id,omitempty"`
 	Sequence      uint64          `json:"sequence"`
 	EmittedAt     time.Time       `json:"emitted_at"`
-	ActorType     string          `json:"actor_type"`
+	ActorType     ActorType       `json:"actor_type"`
 	ActorID       ActorID         `json:"actor_id"`
 	PrincipalID   PrincipalID     `json:"principal_id"`
 	TenantID      *TenantID       `json:"tenant_id,omitempty"`
@@ -51,6 +53,53 @@ type Envelope struct {
 	Wire json.RawMessage `json:"-"`
 }
 
+// envelopeWire is the plain-struct shadow used to marshal known fields
+// without recursing into Envelope.MarshalJSON.
+type envelopeWire Envelope
+
+// MarshalJSON emits a LOSSLESS wire form: when the envelope was admitted
+// from the wire (Wire != nil), unknown fields from the admitted bytes are
+// preserved and known fields overwrite them (Phase-1A r2 codex #4). Values
+// stay opaque json.RawMessage — never map[string]any.
+func (e Envelope) MarshalJSON() ([]byte, error) {
+	known, err := json.Marshal(envelopeWire(e))
+	if err != nil {
+		return nil, err
+	}
+	if len(e.Wire) == 0 {
+		return known, nil
+	}
+	var orig map[string]json.RawMessage
+	if err := json.Unmarshal(e.Wire, &orig); err != nil {
+		return known, nil // unreadable sidecar: fall back to known fields
+	}
+	var kn map[string]json.RawMessage
+	if err := json.Unmarshal(known, &kn); err != nil {
+		return nil, err
+	}
+	for k, v := range kn {
+		orig[k] = v
+	}
+	keys := make([]string, 0, len(orig))
+	for k := range orig {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var sb bytes.Buffer
+	sb.WriteByte('{')
+	for i, k := range keys {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		kb, _ := json.Marshal(k)
+		sb.Write(kb)
+		sb.WriteByte(':')
+		sb.Write(orig[k])
+	}
+	sb.WriteByte('}')
+	return sb.Bytes(), nil
+}
+
 // EnvelopeParams carries the constructor inputs; optional fields are
 // pointers so absence is explicit, never a zero-value guess.
 type EnvelopeParams struct {
@@ -64,7 +113,7 @@ type EnvelopeParams struct {
 	ParentEventID *EventID
 	Sequence      uint64
 	EmittedAt     time.Time
-	ActorType     string
+	ActorType     ActorType
 	ActorID       ActorID
 	PrincipalID   PrincipalID
 	TenantID      *TenantID
@@ -85,14 +134,16 @@ func NewEnvelope(p EnvelopeParams) (Envelope, error) {
 	}
 	check("schema_id", string(p.SchemaID))
 	if !schemaKnown(p.SchemaID, p.SchemaVersion) {
-		// The closed registry gates CONSTRUCTION too — the wire parser is
-		// not the only admission point (Phase-1A codex #3).
-		errs = append(errs, fmt.Errorf("unknown schema %s v%d (fail closed)", p.SchemaID, p.SchemaVersion))
+		// The closed registry gates CONSTRUCTION too. Never echo the id —
+		// it is caller-controlled and errors reach sinks (r2 codex #5).
+		errs = append(errs, fmt.Errorf("unknown schema (version %d) rejected fail-closed", p.SchemaVersion))
 	}
 	check("event_id", string(p.EventID))
 	check("event_type", p.EventType)
 	check("run_id", string(p.RunID))
-	check("actor_type", p.ActorType)
+	if !p.ActorType.Valid() {
+		errs = append(errs, errors.New("actor_type invalid (closed set)"))
+	}
 	check("actor_id", string(p.ActorID))
 	check("principal_id", string(p.PrincipalID))
 	check("workspace_id", string(p.WorkspaceID))
@@ -219,16 +270,35 @@ func NewContextBlock(p ContextBlockParams) (ContextBlock, error) {
 	}, nil
 }
 
-// Validate re-checks a ContextBlock that did not come through the
-// constructor (e.g. embedded in a wire message). Single validation owner:
-// it re-runs the constructor.
-func (b ContextBlock) Validate() error {
-	_, err := NewContextBlock(ContextBlockParams{
-		BlockID: b.BlockID, Kind: b.Kind, Content: b.Content, ContentRef: b.ContentRef,
+// Normalized re-runs the constructor on a ContextBlock from outside and
+// returns the CANONICAL copy (UTC times, owned slices/pointers) — callers
+// must use the returned value, or non-canonical/aliased data survives
+// (Phase-1A r2 codex #6).
+func (b ContextBlock) Normalized() (ContextBlock, error) {
+	var content, ref *string
+	if b.Content != nil {
+		c := *b.Content
+		content = &c
+	}
+	if b.ContentRef != nil {
+		r := *b.ContentRef
+		ref = &r
+	}
+	var lineage []string
+	if b.Lineage != nil {
+		lineage = append([]string{}, b.Lineage...)
+	}
+	return NewContextBlock(ContextBlockParams{
+		BlockID: b.BlockID, Kind: b.Kind, Content: content, ContentRef: ref,
 		ContentHash: b.ContentHash, SourceURI: b.SourceURI, Producer: b.Producer,
-		Trust: b.Trust, Sensitivity: b.Sensitivity, Lineage: b.Lineage,
+		Trust: b.Trust, Sensitivity: b.Sensitivity, Lineage: lineage,
 		ObservedAt: b.ObservedAt, ExpiresAt: b.ExpiresAt,
 	})
+}
+
+// Validate reports whether the block is admissible (see Normalized).
+func (b ContextBlock) Validate() error {
+	_, err := b.Normalized()
 	return err
 }
 
@@ -254,15 +324,19 @@ func NewMessage(id MessageID, role Role, blocks []ContextBlock, createdAt time.T
 	if len(blocks) == 0 {
 		errs = append(errs, errors.New("content_blocks must not be empty"))
 	}
+	normalized := make([]ContextBlock, 0, len(blocks))
 	for i, b := range blocks {
-		if err := b.Validate(); err != nil {
-			errs = append(errs, fmt.Errorf("content_blocks[%d]: %w", i, err))
+		nb, nerr := b.Normalized()
+		if nerr != nil {
+			errs = append(errs, fmt.Errorf("content_blocks[%d]: %w", i, nerr))
+			continue
 		}
+		normalized = append(normalized, nb)
 	}
 	if len(errs) > 0 {
 		return Message{}, fmt.Errorf("invalid message: %w", errors.Join(errs...))
 	}
-	return Message{MessageID: id, Role: role, Blocks: blocks, CreatedAt: utc(createdAt)}, nil
+	return Message{MessageID: id, Role: role, Blocks: normalized, CreatedAt: utc(createdAt)}, nil
 }
 
 // ToolCall (P0.1): an idempotency key is MANDATORY for every state-changing
@@ -382,10 +456,14 @@ func NewToolResult(call ToolCall, status ResultStatus, output []ContextBlock, te
 	if err := call.Validate(); err != nil {
 		errs = append(errs, fmt.Errorf("originating call invalid: %w", err))
 	}
+	normalizedOut := make([]ContextBlock, 0, len(output))
 	for i, b := range output {
-		if err := b.Validate(); err != nil {
-			errs = append(errs, fmt.Errorf("output_blocks[%d]: %w", i, err))
+		nb, nerr := b.Normalized()
+		if nerr != nil {
+			errs = append(errs, fmt.Errorf("output_blocks[%d]: %w", i, nerr))
+			continue
 		}
+		normalizedOut = append(normalizedOut, nb)
 	}
 	if terr != nil {
 		if err := terr.Validate(); err != nil {
@@ -409,7 +487,7 @@ func NewToolResult(call ToolCall, status ResultStatus, output []ContextBlock, te
 	}
 	return ToolResult{
 		ToolCallID: call.ToolCallID, AttemptNo: call.AttemptNo, Status: status,
-		Output: output, Err: terr, StartedAt: utc(started), FinishedAt: utc(finished), Commit: commit,
+		Output: normalizedOut, Err: terr, StartedAt: utc(started), FinishedAt: utc(finished), Commit: commit,
 	}, nil
 }
 

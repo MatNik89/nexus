@@ -1,9 +1,12 @@
+//go:build linux
+
 // Package journal owns the EventJournal (Annex P0.3): the ONLY writer of
 // canonical domain events. Interface (the seam): Open / Append / Replay /
-// Close — everything else (the single serialized append actor, per-run
-// sequence + global journal offset allocation, the integrity hash chain,
-// SQLite-WAL durability, pre-persist redaction) is implementation behind it
-// (HARDQ B7; Essentials E4; Phase-1A review fold).
+// Close (+ VerifyChain) — everything else (the single serialized append
+// actor, per-run sequence + global journal offset allocation, the
+// full-record integrity hash chain, SQLite-WAL durability, pre-persist
+// redaction, DB-persisted profile binding, single-writer detection) is
+// implementation behind it (HARDQ B3/B7; Essentials E4; Phase-1A r2 fold).
 package journal
 
 import (
@@ -13,6 +16,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
@@ -25,9 +31,11 @@ import (
 // each stored event (P0.3 MUST field). Bump on any redactor semantics change.
 const redactionPolicyVersion = 1
 
-// Event is the durable P0.3 journal record: the envelope plus journal-level
-// MUST fields. JournalOffset is the GLOBAL total order; Envelope.Sequence
-// is the PER-RUN causal order — deliberately distinct (Annex P0.3).
+// PayloadValidator checks a payload for one closed event type.
+type PayloadValidator func(json.RawMessage) error
+
+// Event is the durable P0.3 journal record. JournalOffset is the GLOBAL
+// total order; Envelope.Sequence is the PER-RUN causal order.
 type Event struct {
 	JournalOffset          uint64
 	Envelope               contracts.Envelope
@@ -37,12 +45,30 @@ type Event struct {
 	SealedPayloadRef       *string
 }
 
-// Journal is the single-write-owner event log, BOUND to one profile at Open
-// (HARDQ B3: a private event physically cannot land in the work journal).
+// chainInput is the canonical encoding the integrity chain authenticates:
+// EVERY journal field except integrity_hash itself (r2 codex #1 — hashing
+// only the envelope left the metadata columns forgeable).
+func chainInput(offset uint64, eventID, runID string, seq uint64, rpv int, prevHash string, sealedRef *string, envelope []byte) []byte {
+	sr := ""
+	if sealedRef != nil {
+		sr = *sealedRef
+	}
+	head := fmt.Sprintf("%d|%s|%s|%d|%d|%s|%s|", offset, eventID, runID, seq, rpv, prevHash, sr)
+	return append([]byte(head), envelope...)
+}
+
+func chainHash(input []byte) string {
+	sum := sha256.Sum256(input)
+	return hex.EncodeToString(sum[:])
+}
+
+// Journal is the single-write-owner event log, BOUND to one profile — in
+// the DATABASE, not just process memory (r2 codex #3).
 type Journal struct {
 	db        *sql.DB
 	profile   contracts.ProfileID
 	redact    redact.Redactor
+	events    map[string]PayloadValidator
 	reqs      chan appendReq
 	done      chan struct{}
 	actorDone chan struct{}
@@ -60,27 +86,55 @@ type appendReply struct {
 	err error
 }
 
-// testPauseAfterCommit, when non-nil, runs after the durable commit but
-// before the reply — the post-commit crash window the SIGKILL RED targets.
-// Test-only seam; production never sets it.
-var testPauseAfterCommit func()
+// test-only fault seams (production never sets them).
+var (
+	testPauseAfterCommit func()
+	testFailCommit       func() error
+)
 
-// Open opens (or creates) the journal at path, bound to profile. The
-// redactor is an accepted dependency and mandatory (fail closed).
-func Open(path string, profile contracts.ProfileID, r redact.Redactor) (*Journal, error) {
+func selfStartToken() (int, string, error) {
+	pid := os.Getpid()
+	st, err := procStartTime(pid)
+	return pid, st, err
+}
+
+func procStartTime(pid int) (string, error) {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return "", err
+	}
+	s := string(b)
+	close := strings.LastIndex(s, ")")
+	if close < 0 {
+		return "", fmt.Errorf("malformed stat")
+	}
+	fields := strings.Fields(s[close+1:])
+	if len(fields) < 20 {
+		return "", fmt.Errorf("malformed stat")
+	}
+	return fields[19], nil
+}
+
+// Open opens (or creates) the journal at path, bound to profile, accepting
+// only the given closed event-type set (r2 codex #7). It fails closed on:
+// nil/empty dependencies, a profile mismatch with the database's own
+// binding, a live concurrent writer, or an invalid integrity chain.
+func Open(path string, profile contracts.ProfileID, r redact.Redactor, events map[string]PayloadValidator) (*Journal, error) {
 	if r == nil {
 		return nil, fmt.Errorf("journal open: redactor is required (fail closed)")
 	}
 	if !profile.Valid() {
 		return nil, fmt.Errorf("journal open: a valid profile binding is required")
 	}
-	// synchronous=FULL: P0.3 requires durable flush before an append is
-	// acknowledged (NORMAL can lose acknowledged commits on power failure).
+	if len(events) == 0 {
+		return nil, fmt.Errorf("journal open: a closed event-type set is required (fail closed)")
+	}
 	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(FULL)", path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("journal open: %w", err)
 	}
+	fail := func(e error) (*Journal, error) { db.Close(); return nil, e }
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS events (
 		journal_offset INTEGER PRIMARY KEY,
 		event_id TEXT NOT NULL UNIQUE,
@@ -92,37 +146,82 @@ func Open(path string, profile contracts.ProfileID, r redact.Redactor) (*Journal
 		integrity_hash TEXT NOT NULL,
 		sealed_payload_ref TEXT,
 		UNIQUE(run_id, sequence)
+	); CREATE TABLE IF NOT EXISTS journal_meta (
+		key TEXT PRIMARY KEY,
+		value TEXT NOT NULL
 	)`); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("journal schema: %w", err)
+		return fail(fmt.Errorf("journal schema: %w", err))
 	}
-	// Fail closed at Open: the recovery reads must succeed BEFORE the actor
-	// starts (a swallowed MAX() error must not silently restart history).
-	var lastOffset uint64
-	var lastHash string
-	row := db.QueryRow(`SELECT COALESCE(MAX(journal_offset),0) FROM events`)
-	if err := row.Scan(&lastOffset); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("journal recovery (offset): %w", err)
+
+	// Profile binding lives IN the database: a reopen under another profile
+	// is refused regardless of process memory (r2 codex #3).
+	tx, err := db.Begin()
+	if err != nil {
+		return fail(fmt.Errorf("journal open tx: %w", err))
 	}
-	if lastOffset > 0 {
-		row = db.QueryRow(`SELECT integrity_hash FROM events WHERE journal_offset = ?`, int64(lastOffset))
-		if err := row.Scan(&lastHash); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("journal recovery (hash chain): %w", err)
+	var stored string
+	err = tx.QueryRow(`SELECT value FROM journal_meta WHERE key='profile'`).Scan(&stored)
+	switch {
+	case err == sql.ErrNoRows:
+		if _, err := tx.Exec(`INSERT INTO journal_meta(key,value) VALUES('profile',?)`, string(profile)); err != nil {
+			tx.Rollback()
+			return fail(fmt.Errorf("journal open: recording profile binding: %w", err))
 		}
+	case err != nil:
+		tx.Rollback()
+		return fail(fmt.Errorf("journal open: reading profile binding: %w", err))
+	case stored != string(profile):
+		tx.Rollback()
+		return fail(fmt.Errorf("journal open: database is bound to another profile (fail closed, B3)"))
 	}
+
+	// Single-writer detection (B7): a LIVE writer blocks a second opener;
+	// a dead one (crash) is taken over via pid+starttime liveness.
+	pid, start, err := selfStartToken()
+	if err != nil {
+		tx.Rollback()
+		return fail(fmt.Errorf("journal open: self identity: %w", err))
+	}
+	var writerVal string
+	err = tx.QueryRow(`SELECT value FROM journal_meta WHERE key='writer'`).Scan(&writerVal)
+	if err == nil {
+		parts := strings.SplitN(writerVal, ":", 2)
+		if len(parts) == 2 {
+			if oldPid, perr := strconv.Atoi(parts[0]); perr == nil {
+				if st, serr := procStartTime(oldPid); serr == nil && st == parts[1] && oldPid != pid {
+					tx.Rollback()
+					return fail(fmt.Errorf("journal open: another live writer holds this journal (fail closed, B7)"))
+				}
+			}
+		}
+	} else if err != sql.ErrNoRows {
+		tx.Rollback()
+		return fail(fmt.Errorf("journal open: reading writer lease: %w", err))
+	}
+	if _, err := tx.Exec(`INSERT INTO journal_meta(key,value) VALUES('writer',?)
+		ON CONFLICT(key) DO UPDATE SET value=excluded.value`, fmt.Sprintf("%d:%s", pid, start)); err != nil {
+		tx.Rollback()
+		return fail(fmt.Errorf("journal open: writer lease: %w", err))
+	}
+	if err := tx.Commit(); err != nil {
+		return fail(fmt.Errorf("journal open commit: %w", err))
+	}
+
 	j := &Journal{
-		db: db, profile: profile, redact: r,
+		db: db, profile: profile, redact: r, events: events,
 		reqs: make(chan appendReq), done: make(chan struct{}), actorDone: make(chan struct{}),
+	}
+	// The chain is verified ON OPEN (r2 codex #1): a tampered journal never
+	// starts serving.
+	lastOffset, lastHash, err := j.verifyChainFull()
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("journal open: %w", err)
 	}
 	go j.actor(lastOffset, lastHash)
 	return j, nil
 }
 
-// actor is the ONE goroutine that allocates offsets/sequences and writes.
-// Allocation advances ONLY after a successful durable commit (a rejected or
-// failed append burns nothing — Phase-1A codex #2).
 func (j *Journal) actor(lastOffset uint64, lastHash string) {
 	defer close(j.actorDone)
 	for {
@@ -143,18 +242,59 @@ func (j *Journal) actor(lastOffset uint64, lastHash string) {
 	}
 }
 
+// structuralFields lists every non-payload field a known secret must never
+// occupy: rather than mutating them (which would fork stored vs returned
+// identity — r2 codex #2), the append is REJECTED.
+func structuralFields(p contracts.EnvelopeParams) []string {
+	out := []string{
+		string(p.EventID), string(p.RunID), p.EventType,
+		string(p.ActorID), string(p.PrincipalID), string(p.WorkspaceID), string(p.ProfileID),
+	}
+	if p.TurnID != nil {
+		out = append(out, string(*p.TurnID))
+	}
+	if p.ToolCallID != nil {
+		out = append(out, string(*p.ToolCallID))
+	}
+	if p.TenantID != nil {
+		out = append(out, string(*p.TenantID))
+	}
+	if p.IdempotencyKey != nil {
+		out = append(out, *p.IdempotencyKey)
+	}
+	return out
+}
+
 func (j *Journal) appendOne(p contracts.EnvelopeParams, offset uint64, prevHash string) appendReply {
 	fail := func(err error) appendReply { return appendReply{err: err} }
 	if p.ProfileID != j.profile {
 		return fail(fmt.Errorf("journal append: envelope profile does not match the journal's bound profile (fail closed, B3)"))
 	}
-	// Redact BEFORE anything else touches the bytes, then recompute the
-	// payload hash so integrity describes the STORED payload (Phase-1A
-	// kilo #2 — a stale hash breaks the chain on exactly the secret-bearing
-	// events).
+	// Closed event-type admission + typed payload validation BEFORE
+	// persistence (r2 codex #7).
+	validator, ok := j.events[p.EventType]
+	if !ok {
+		return fail(fmt.Errorf("journal append: unknown event type (fail closed; closed set has %d entries)", len(j.events)))
+	}
+	// Known secrets in STRUCTURAL fields are rejected, not mutated
+	// (r2 codex #2): stored and returned identity stay one and the same.
+	if t, ok := j.redact.(redact.Toucher); ok {
+		for _, f := range structuralFields(p) {
+			if t.Touches(f) {
+				return fail(fmt.Errorf("journal append: a known secret occurs in a structural field (rejected fail-closed)"))
+			}
+		}
+	}
+	// Redact the payload SEMANTICALLY, then recompute its hash so integrity
+	// describes the stored bytes (r1 kilo #2).
 	p.Payload = json.RawMessage(j.redact.Redact([]byte(p.Payload)))
 	sum := sha256.Sum256(p.Payload)
 	p.PayloadHash = hex.EncodeToString(sum[:])
+	if validator != nil {
+		if err := validator(p.Payload); err != nil {
+			return fail(fmt.Errorf("journal append: payload invalid for event type: %w", err))
+		}
+	}
 
 	tx, err := j.db.Begin()
 	if err != nil {
@@ -162,7 +302,6 @@ func (j *Journal) appendOne(p contracts.EnvelopeParams, offset uint64, prevHash 
 	}
 	defer tx.Rollback()
 
-	// Per-run causal sequence, allocated inside the transaction.
 	var runSeq uint64
 	row := tx.QueryRow(`SELECT COALESCE(MAX(sequence),0) FROM events WHERE run_id = ?`, string(p.RunID))
 	if err := row.Scan(&runSeq); err != nil {
@@ -178,15 +317,8 @@ func (j *Journal) appendOne(p contracts.EnvelopeParams, offset uint64, prevHash 
 	if err != nil {
 		return fail(fmt.Errorf("journal encode: %w", err))
 	}
-	// Defense in depth: redact the fully marshaled record too — a known
-	// secret placed in a NON-payload field (actor, event type…) must also
-	// never reach the sink (Phase-1A codex #10).
-	raw = j.redact.Redact(raw)
-
-	h := sha256.New()
-	h.Write([]byte(prevHash))
-	h.Write(raw)
-	integrity := hex.EncodeToString(h.Sum(nil))
+	integrity := chainHash(chainInput(offset, string(env.EventID), string(env.RunID),
+		env.Sequence, redactionPolicyVersion, prevHash, nil, raw))
 
 	if _, err := tx.Exec(
 		`INSERT INTO events(journal_offset, event_id, run_id, sequence, envelope,
@@ -196,6 +328,11 @@ func (j *Journal) appendOne(p contracts.EnvelopeParams, offset uint64, prevHash 
 		string(raw), redactionPolicyVersion, prevHash, integrity,
 	); err != nil {
 		return fail(fmt.Errorf("journal append: %w", err))
+	}
+	if testFailCommit != nil {
+		if err := testFailCommit(); err != nil {
+			return fail(fmt.Errorf("journal commit: %w", err))
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fail(fmt.Errorf("journal commit: %w", err))
@@ -207,11 +344,8 @@ func (j *Journal) appendOne(p contracts.EnvelopeParams, offset uint64, prevHash 
 	}}
 }
 
-// Append validates, redacts, sequences and durably persists one event,
-// returning the full journal Event. ctx gates ADMISSION only: once the
-// actor has accepted the request, Append waits for the definitive outcome —
-// a caller can never see "cancelled" for an event that actually committed
-// (Phase-1A codex #12 / kilo #3).
+// Append validates, redacts, sequences and durably persists one event. ctx
+// gates ADMISSION only: after the actor accepts, the outcome is definitive.
 func (j *Journal) Append(ctx context.Context, p contracts.EnvelopeParams) (Event, error) {
 	req := appendReq{params: p, reply: make(chan appendReply, 1)}
 	select {
@@ -221,36 +355,53 @@ func (j *Journal) Append(ctx context.Context, p contracts.EnvelopeParams) (Event
 	case <-ctx.Done():
 		return Event{}, ctx.Err()
 	}
-	rep := <-req.reply // admission accepted: outcome is definitive
+	rep := <-req.reply
 	return rep.ev, rep.err
 }
 
-// Replay folds every event with journal_offset > from, in order. Errors
-// carry the failing offset (causal context, constitution rule).
+// Replay folds every event with journal_offset > from, in order, VERIFYING
+// the integrity chain as it streams (r2 codex #1: replay must not serve
+// tampered history). Verification always starts from offset 0 internally.
 func (j *Journal) Replay(from uint64, fn func(Event) error) error {
 	if fn == nil {
 		return fmt.Errorf("journal replay: nil callback")
 	}
+	prev := ""
 	rows, err := j.db.Query(
-		`SELECT journal_offset, envelope, redaction_policy_version,
-		        integrity_prev_hash, integrity_hash, sealed_payload_ref
-		 FROM events WHERE journal_offset > ? ORDER BY journal_offset`, int64(from))
+		`SELECT journal_offset, event_id, run_id, sequence, envelope,
+		        redaction_policy_version, integrity_prev_hash, integrity_hash, sealed_payload_ref
+		 FROM events ORDER BY journal_offset`)
 	if err != nil {
 		return fmt.Errorf("journal replay: %w", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var ev Event
-		var raw string
-		if err := rows.Scan(&ev.JournalOffset, &raw, &ev.RedactionPolicyVersion,
-			&ev.IntegrityPrevHash, &ev.IntegrityHash, &ev.SealedPayloadRef); err != nil {
+		var raw, eventID, runID string
+		var seq uint64
+		if err := rows.Scan(&ev.JournalOffset, &eventID, &runID, &seq, &raw,
+			&ev.RedactionPolicyVersion, &ev.IntegrityPrevHash, &ev.IntegrityHash, &ev.SealedPayloadRef); err != nil {
 			return fmt.Errorf("journal replay scan: %w", err)
 		}
+		if ev.IntegrityPrevHash != prev {
+			return fmt.Errorf("journal replay: chain broken at offset %d (prev-hash mismatch)", ev.JournalOffset)
+		}
+		if chainHash(chainInput(ev.JournalOffset, eventID, runID, seq,
+			ev.RedactionPolicyVersion, ev.IntegrityPrevHash, ev.SealedPayloadRef, []byte(raw))) != ev.IntegrityHash {
+			return fmt.Errorf("journal replay: chain broken at offset %d (hash mismatch)", ev.JournalOffset)
+		}
+		prev = ev.IntegrityHash
 		env, err := contracts.ParseEnvelope([]byte(raw))
 		if err != nil {
 			return fmt.Errorf("journal replay decode at offset %d: %w", ev.JournalOffset, err)
 		}
+		if string(env.EventID) != eventID || string(env.RunID) != runID || env.Sequence != seq {
+			return fmt.Errorf("journal replay: denormalized columns diverge from envelope at offset %d", ev.JournalOffset)
+		}
 		ev.Envelope = env
+		if ev.JournalOffset <= from {
+			continue
+		}
 		if err := fn(ev); err != nil {
 			return fmt.Errorf("journal replay callback at offset %d: %w", ev.JournalOffset, err)
 		}
@@ -261,33 +412,44 @@ func (j *Journal) Replay(from uint64, fn func(Event) error) error {
 	return nil
 }
 
-// VerifyChain re-computes the integrity hash chain over the whole journal.
-func (j *Journal) VerifyChain() error {
+// verifyChainFull walks the whole journal, returning the last offset+hash.
+func (j *Journal) verifyChainFull() (uint64, string, error) {
 	prev := ""
-	rows, err := j.db.Query(`SELECT journal_offset, envelope, integrity_prev_hash, integrity_hash
+	var lastOffset uint64
+	rows, err := j.db.Query(`SELECT journal_offset, event_id, run_id, sequence, envelope,
+		redaction_policy_version, integrity_prev_hash, integrity_hash, sealed_payload_ref
 		FROM events ORDER BY journal_offset`)
 	if err != nil {
-		return fmt.Errorf("journal verify: %w", err)
+		return 0, "", fmt.Errorf("chain verify: %w", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var off uint64
-		var raw, prevStored, stored string
-		if err := rows.Scan(&off, &raw, &prevStored, &stored); err != nil {
-			return fmt.Errorf("journal verify scan: %w", err)
+		var off, seq uint64
+		var eventID, runID, raw, prevStored, stored string
+		var rpv int
+		var sealed *string
+		if err := rows.Scan(&off, &eventID, &runID, &seq, &raw, &rpv, &prevStored, &stored, &sealed); err != nil {
+			return 0, "", fmt.Errorf("chain verify scan: %w", err)
 		}
 		if prevStored != prev {
-			return fmt.Errorf("journal chain broken at offset %d: prev-hash mismatch", off)
+			return 0, "", fmt.Errorf("journal chain broken at offset %d: prev-hash mismatch", off)
 		}
-		h := sha256.New()
-		h.Write([]byte(prev))
-		h.Write([]byte(raw))
-		if hex.EncodeToString(h.Sum(nil)) != stored {
-			return fmt.Errorf("journal chain broken at offset %d: hash mismatch", off)
+		if chainHash(chainInput(off, eventID, runID, seq, rpv, prevStored, sealed, []byte(raw))) != stored {
+			return 0, "", fmt.Errorf("journal chain broken at offset %d: hash mismatch", off)
 		}
 		prev = stored
+		lastOffset = off
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return 0, "", err
+	}
+	return lastOffset, prev, nil
+}
+
+// VerifyChain re-computes the full-record integrity chain.
+func (j *Journal) VerifyChain() error {
+	_, _, err := j.verifyChainFull()
+	return err
 }
 
 // Close stops the actor and releases the database. Concurrency-idempotent.

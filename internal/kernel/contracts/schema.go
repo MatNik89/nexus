@@ -32,8 +32,10 @@ type UnknownSchemaError struct {
 }
 
 func (e *UnknownSchemaError) Error() string {
-	return fmt.Sprintf("unknown schema %s v%d rejected unprocessed (raw preserved, %d bytes)",
-		e.SchemaID, e.SchemaVersion, len(e.Raw))
+	// Never echo the schema id (caller-controlled; may carry a secret —
+	// r2 codex #5). The typed fields remain available to programmatic callers.
+	return fmt.Sprintf("unknown schema (id len=%d, version %d) rejected unprocessed (raw preserved, %d bytes)",
+		len(e.SchemaID), e.SchemaVersion, len(e.Raw))
 }
 
 // ParseEnvelope decodes raw into a validated Envelope. Unknown schema

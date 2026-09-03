@@ -18,7 +18,7 @@ func validEnvelopeParams() EnvelopeParams {
 	return EnvelopeParams{
 		SchemaID: "nexus.event", SchemaVersion: 1, EventID: "ev-1",
 		EventType: "run.created", RunID: "run-1", Sequence: 1,
-		EmittedAt: time.Unix(1000, 0), ActorType: "user", ActorID: "actor-1",
+		EmittedAt: time.Unix(1000, 0), ActorType: ActorUser, ActorID: "actor-1",
 		PrincipalID: "matej", WorkspaceID: "ws-1", ProfileID: "work",
 		AttemptNo: 1, Payload: json.RawMessage(`{"k":"v"}`), PayloadHash: "h",
 	}
@@ -37,7 +37,8 @@ func TestEnvelopeConstructorRejectsEachMissingMust(t *testing.T) {
 		"event_type":    func(p *EnvelopeParams) { p.EventType = "" },
 		"run_id":        func(p *EnvelopeParams) { p.RunID = "" },
 		"emitted_at":    func(p *EnvelopeParams) { p.EmittedAt = time.Time{} },
-		"actor_type":    func(p *EnvelopeParams) { p.ActorType = "" },
+		"actor_type":    func(p *EnvelopeParams) { p.ActorType = ActorInvalid },
+		"actor_type_oob": func(p *EnvelopeParams) { p.ActorType = ActorType(99) },
 		"actor_id":      func(p *EnvelopeParams) { p.ActorID = "" },
 		"principal_id":  func(p *EnvelopeParams) { p.PrincipalID = "" },
 		"workspace_id":  func(p *EnvelopeParams) { p.WorkspaceID = "" },
@@ -266,7 +267,7 @@ func TestParseEnvelopeWireObeysSameMusts(t *testing.T) {
 	// A wire envelope with a missing profile_id must be rejected by the SAME
 	// validation as local construction (single owner).
 	raw := []byte(`{"schema_id":"nexus.event","schema_version":1,"event_id":"e","event_type":"t",` +
-		`"run_id":"r","sequence":1,"emitted_at":"2026-01-01T00:00:00Z","actor_type":"user",` +
+		`"run_id":"r","sequence":1,"emitted_at":"2026-01-01T00:00:00Z","actor_type":"USER",` +
 		`"actor_id":"a","principal_id":"p","workspace_id":"w","attempt_no":1,` +
 		`"payload":{"k":1},"payload_hash":"h"}`)
 	if _, err := ParseEnvelope(raw); err == nil || !strings.Contains(err.Error(), "profile_id") {
@@ -365,6 +366,49 @@ func TestParseEnvelopePreservesUnknownFields(t *testing.T) {
 	}
 	if !strings.Contains(string(back.Wire), "keep-me") {
 		t.Fatal("unknown field lost — Wire must preserve the admitted bytes")
+	}
+	// LOSSLESS wire round trip (r2 codex #4): parse → marshal → parse keeps
+	// the unknown field in the actual serialized output, not just a sidecar.
+	re, err := json.Marshal(back)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(re), "keep-me") {
+		t.Fatalf("re-marshal dropped the unknown field: %s", re)
+	}
+	back2, err := ParseEnvelope(re)
+	if err != nil {
+		t.Fatalf("second parse failed: %v", err)
+	}
+	if back2.EventID != back.EventID {
+		t.Fatal("second round trip lost known fields")
+	}
+}
+
+// Nested normalization (r2 codex #6): a non-UTC block inside a Message
+// comes out canonical, and post-construction mutation of the caller's
+// slice does not reach the constructed Message.
+func TestMessageNormalizesAndCopiesBlocks(t *testing.T) {
+	loc := time.FixedZone("CET", 3600)
+	c := "content"
+	blk := ContextBlock{
+		BlockID: "b1", Kind: "text", Content: &c, ContentHash: "h",
+		SourceURI: "local:test", Producer: "test", Trust: TrustUser,
+		Sensitivity: SensitivityInternal, Lineage: []string{"a"},
+		ObservedAt: time.Date(2026, 1, 1, 12, 0, 0, 0, loc),
+	}
+	in := []ContextBlock{blk}
+	msg, err := NewMessage("m1", RoleUser, in, time.Unix(1000, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.Blocks[0].ObservedAt.Location() != time.UTC {
+		t.Fatal("nested block not normalized to UTC")
+	}
+	in[0].Lineage[0] = "mutated"
+	*in[0].Content = "mutated"
+	if msg.Blocks[0].Lineage[0] == "mutated" || *msg.Blocks[0].Content == "mutated" {
+		t.Fatal("constructed Message aliases caller-owned memory")
 	}
 }
 
