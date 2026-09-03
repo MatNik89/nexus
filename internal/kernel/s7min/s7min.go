@@ -63,6 +63,11 @@ type operation struct {
 	nonce    string
 	expires  time.Time
 	consumed bool
+	// execCancel is the LIVE execution context's cancel — stored under the
+	// authority mutex so Cancel() propagates into a running attempt
+	// race-free (SPEC P0.2: cancel propagates to child tasks; Phase-2-r4
+	// codex #4: a cancelled authority left the executor context open).
+	execCancel context.CancelFunc
 }
 
 // Authority is the sole grant issuer. Safe for concurrent use.
@@ -200,6 +205,10 @@ func (a *Authority) Cancel(op contracts.OperationID) error {
 		return fmt.Errorf("s7min cancel: %w", err)
 	}
 	rec.state = state
+	if rec.execCancel != nil {
+		rec.execCancel() // the running execution context dies WITH the attempt
+		rec.execCancel = nil
+	}
 	return nil
 }
 
@@ -211,22 +220,20 @@ func (a *Authority) Cancel(op contracts.OperationID) error {
 // the P2/P3 engine's.
 func (a *Authority) AttemptContext(ctx context.Context, op contracts.OperationID, callDeadline time.Time) (context.Context, context.CancelFunc, error) {
 	a.mu.Lock()
+	defer a.mu.Unlock()
 	rec, ok := a.ops[op]
-	state := contracts.AttemptInvalid
-	var expires time.Time
-	if ok {
-		state = rec.state
-		expires = rec.expires
-	}
-	a.mu.Unlock()
-	if !ok || state != contracts.AttemptRunning {
+	if !ok || rec.state != contracts.AttemptRunning {
 		return nil, nil, fmt.Errorf("s7min attempt-context: operation is not RUNNING: %w", ErrAttemptNotAuthorized)
 	}
 	deadline := callDeadline
-	if callDeadline.IsZero() || (!expires.IsZero() && expires.Before(callDeadline)) {
-		deadline = expires
+	if callDeadline.IsZero() || (!rec.expires.IsZero() && rec.expires.Before(callDeadline)) {
+		deadline = rec.expires
 	}
 	dctx, cancel := context.WithDeadline(ctx, deadline)
+	// Registered under the SAME lock as the state check: a Cancel racing
+	// this call either sees non-RUNNING (context refused) or finds the
+	// stored cancel and kills the live context.
+	rec.execCancel = cancel
 	return dctx, cancel, nil
 }
 

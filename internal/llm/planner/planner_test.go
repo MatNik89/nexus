@@ -151,36 +151,72 @@ func TestPlanGovernedAndStreaming(t *testing.T) {
 }
 
 // A failed provider call lands the honest S7 terminal (Phase-2-r3 codex
-// #2): an adapter that refuses LOCALLY (grant never consumed) leaves the
-// operation CANCELLED — never a permanent AUTHORIZED leak; a consumed
-// failure lands FAILED.
-type refusingChat struct{ auth *s7min.Authority }
-
-func (f *refusingChat) Chat(ctx context.Context, msgs []provider.ChatMessage, g s7min.Grant) (provider.ChatOutput, error) {
-	return provider.ChatOutput{}, fmt.Errorf("local refusal before the wire")
+// #2 / r4 codex #3): every leg observes the CAPTURED operation id — the
+// fakes record g.OperationID so the authority state is asserted directly.
+type failingChat struct {
+	auth       *s7min.Authority
+	consume    bool
+	preReport  bool // adversarial: consume AND self-report before failing
+	capturedOp contracts.OperationID
 }
 
-func TestFailedPlanLandsHonestS7State(t *testing.T) {
-	auth := s7min.NewAuthority(func() time.Time { return time.Unix(1000, 0) }, time.Minute)
-	p, err := New(&refusingChat{auth: auth}, auth, "provider:test")
-	if err != nil {
-		t.Fatal(err)
+func (f *failingChat) Chat(ctx context.Context, msgs []provider.ChatMessage, g s7min.Grant) (provider.ChatOutput, error) {
+	f.capturedOp = g.OperationID
+	if f.consume {
+		if err := f.auth.Consume(g); err != nil {
+			return provider.ChatOutput{}, err
+		}
 	}
-	b, _ := contracts.NewContextBlock(contracts.ContextBlockParams{
+	if f.preReport {
+		f.auth.Report(g.OperationID, s7min.OutcomeSucceeded)
+	}
+	return provider.ChatOutput{}, fmt.Errorf("provider failure")
+}
+
+func userBlockForPlan(t *testing.T) contracts.ContextBlock {
+	t.Helper()
+	b, err := contracts.NewContextBlock(contracts.ContextBlockParams{
 		BlockID: "u1", Kind: "text", Content: strp("hi"), ContentHash: "h",
 		SourceURI: "test://u1", Producer: "t", Trust: contracts.TrustUser,
 		Sensitivity: contracts.Sensitivity(1), Lineage: []string{}, ObservedAt: time.Unix(1, 0),
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func TestFailedPlanLandsHonestS7State(t *testing.T) {
+	b := userBlockForPlan(t)
+	// (a) LOCAL refusal — grant never consumed → CANCELLED, no leak.
+	auth := s7min.NewAuthority(nil, time.Minute)
+	fc := &failingChat{auth: auth}
+	p, err := New(fc, auth, "provider:test")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := p.Plan(context.Background(), []contracts.ContextBlock{b}); err == nil {
 		t.Fatal("refusing provider returned a plan")
 	}
-	// Exactly one operation exists and it is CANCELLED (unconsumed).
-	// The op id is random; prove no AUTHORIZED leak by issuing... instead
-	// scan is not exposed — assert via a SECOND plan working (a leaked
-	// AUTHORIZED op would not block it) plus the consumed-failure leg:
-	fc := &fakeChat{auth: auth, reply: "ok"}
-	p2, _ := New(fc, auth, "provider:test")
-	if _, err := p2.Plan(context.Background(), []contracts.ContextBlock{b}); err != nil {
-		t.Fatalf("second plan failed: %v", err)
+	if st, _ := auth.State(fc.capturedOp); st != contracts.AttemptCancelled {
+		t.Fatalf("unconsumed failed plan left op in %v (want CANCELLED)", st)
+	}
+	// (b) CONSUMED failure → FAILED_TERMINAL.
+	fc2 := &failingChat{auth: auth, consume: true}
+	p2, _ := New(fc2, auth, "provider:test")
+	if _, err := p2.Plan(context.Background(), []contracts.ContextBlock{b}); err == nil {
+		t.Fatal("consumed-failure provider returned a plan")
+	}
+	if st, _ := auth.State(fc2.capturedOp); st != contracts.AttemptFailed {
+		t.Fatalf("consumed failed plan left op in %v (want FAILED)", st)
+	}
+	// (c) landing failure is SURFACED: an adversarial adapter that
+	// self-reports SUCCEEDED then errors forces an illegal FAILED
+	// transition — the landing rejection must reach the caller.
+	fc3 := &failingChat{auth: auth, consume: true, preReport: true}
+	p3, _ := New(fc3, auth, "provider:test")
+	_, perr := p3.Plan(context.Background(), []contracts.ContextBlock{b})
+	if perr == nil || !strings.Contains(perr.Error(), "S7 landing") {
+		t.Fatalf("landing failure not surfaced: %v", perr)
 	}
 }

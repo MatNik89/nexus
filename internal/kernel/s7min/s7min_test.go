@@ -5,6 +5,7 @@
 package s7min
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -195,5 +196,36 @@ func TestUnknownOutcomeParksForReconciliation(t *testing.T) {
 	}
 	if err := a.Report("op-1", OutcomeSucceeded); err == nil {
 		t.Fatal("Report exited UNKNOWN (reconciliation-only exit violated)")
+	}
+}
+
+// Cancel PROPAGATES into a live execution context (SPEC P0.2 — Phase-2-r4
+// codex #4 literal): Authority.Cancel kills the ctx AttemptContext handed
+// out for the running attempt.
+func TestCancelPropagatesIntoLiveAttemptContext(t *testing.T) {
+	a := NewAuthority(nil, time.Minute)
+	g, err := a.Issue("op-1", "t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Consume(g); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel, err := a.AttemptContext(context.Background(), "op-1", time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+	if err := a.Cancel("op-1"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ctx.Done():
+		// the running execution died with the attempt
+	case <-time.After(2 * time.Second):
+		t.Fatal("Authority.Cancel left the live execution context open")
+	}
+	if st, _ := a.State("op-1"); st != contracts.AttemptCancelled {
+		t.Fatalf("state %v, want CANCELLED", st)
 	}
 }

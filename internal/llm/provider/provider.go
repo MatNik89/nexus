@@ -60,10 +60,11 @@ type DataDescriptor struct {
 // configured env var; it never appears in errors or descriptors.
 //
 // topknot ceiling (Phase-2 kilo #3): the egress boundary here is a
-// host-string allowlist enforced at construction AND on every redirect —
-// resolved-IP pinning / DNS-rebinding defense (E11) is owned by the S6.3
-// dialer when it lands; until then this provider talks only to allowlisted
-// hosts over TLS (or explicit loopback for tests). Upgrade trigger: S6.3.
+// host-string allowlist enforced at construction, with EVERY redirect
+// categorically refused (one grant = one physical request) — resolved-IP
+// pinning / DNS-rebinding defense (E11) is owned by the S6.3 dialer when
+// it lands; until then this provider talks only to allowlisted hosts over
+// TLS (or explicit loopback for tests). Upgrade trigger: S6.3.
 type APIKey struct {
 	baseURL string
 	host    string
