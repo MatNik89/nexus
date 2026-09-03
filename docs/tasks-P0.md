@@ -127,7 +127,7 @@ Trace: HARNESS-PLAN 1.2; E5.
 Acceptance: spawned tree fully terminates; identity survives PID-reuse check.
 RED: group terminate leaves orphan grandchild alive → fail.
 
-**[ ] T11 — Sealed capability snapshot (S0.5-min, sandbox-probe only at this phase).**
+**[x] T11 (this commit) — Sealed capability snapshot (S0.5-min, sandbox-probe only at this phase).**
 `Resolver.Resolve` fail-closed validation (unknown/cycle/conflict → REJECTED); sealed
 startup snapshot from config + the T02 sandbox probe + **contract-valid probe fakes** for
 provider/channel (live probes register in T15/T23; T27 verifies the final snapshot). NO
