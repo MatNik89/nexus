@@ -120,7 +120,7 @@ Trace: HARNESS-PLAN 1.1; E11; HARDQ B9.
 Acceptance: precedence table-driven test; invalid config → startup refuses.
 RED: config attempts egress `*` / sandbox below floor → reject.
 
-**[ ] T10 — Paths + process identity (S1.2-min).**
+**[x] T10 (this commit) — Paths + process identity (S1.2-min).**
 `os.UserConfigDir` layout; `proc_linux.go` Setpgid + killpg TERM→grace→KILL→Wait;
 PID + start-token identity.
 Trace: HARNESS-PLAN 1.2; E5.
