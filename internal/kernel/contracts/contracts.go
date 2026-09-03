@@ -26,26 +26,26 @@ func utc(t time.Time) time.Time { return t.UTC() }
 // envelopes parsed off the wire (unknown FIELDS are preserved there while
 // unknown DISCRIMINATORS are rejected — Annex P0.1).
 type Envelope struct {
-	SchemaID      SchemaID        `json:"schema_id"`
-	SchemaVersion int             `json:"schema_version"`
-	EventID       EventID         `json:"event_id"`
-	EventType     string          `json:"event_type"`
-	RunID         RunID           `json:"run_id"`
-	TurnID        *TurnID         `json:"turn_id,omitempty"`
-	ToolCallID    *ToolCallID     `json:"tool_call_id,omitempty"`
-	ParentEventID *EventID        `json:"parent_event_id,omitempty"`
-	Sequence      uint64          `json:"sequence"`
-	EmittedAt     time.Time       `json:"emitted_at"`
-	ActorType     ActorType       `json:"actor_type"`
-	ActorID       ActorID         `json:"actor_id"`
-	PrincipalID   PrincipalID     `json:"principal_id"`
-	TenantID      *TenantID       `json:"tenant_id,omitempty"`
-	WorkspaceID   WorkspaceID     `json:"workspace_id"`
-	ProfileID     ProfileID       `json:"profile_id"`
-	AttemptNo     int             `json:"attempt_no"`
-	IdempotencyKey *string        `json:"idempotency_key,omitempty"`
-	Payload       json.RawMessage `json:"payload"`
-	PayloadHash   string          `json:"payload_hash"`
+	SchemaID       SchemaID        `json:"schema_id"`
+	SchemaVersion  int             `json:"schema_version"`
+	EventID        EventID         `json:"event_id"`
+	EventType      string          `json:"event_type"`
+	RunID          RunID           `json:"run_id"`
+	TurnID         *TurnID         `json:"turn_id,omitempty"`
+	ToolCallID     *ToolCallID     `json:"tool_call_id,omitempty"`
+	ParentEventID  *EventID        `json:"parent_event_id,omitempty"`
+	Sequence       uint64          `json:"sequence"`
+	EmittedAt      time.Time       `json:"emitted_at"`
+	ActorType      ActorType       `json:"actor_type"`
+	ActorID        ActorID         `json:"actor_id"`
+	PrincipalID    PrincipalID     `json:"principal_id"`
+	TenantID       *TenantID       `json:"tenant_id,omitempty"`
+	WorkspaceID    WorkspaceID     `json:"workspace_id"`
+	ProfileID      ProfileID       `json:"profile_id"`
+	AttemptNo      int             `json:"attempt_no"`
+	IdempotencyKey *string         `json:"idempotency_key,omitempty"`
+	Payload        json.RawMessage `json:"payload"`
+	PayloadHash    string          `json:"payload_hash"`
 
 	// Wire is the exact admitted raw input (nil for locally built
 	// envelopes). Never serialized; carried so replay/projection cannot
@@ -56,6 +56,16 @@ type Envelope struct {
 // envelopeWire is the plain-struct shadow used to marshal known fields
 // without recursing into Envelope.MarshalJSON.
 type envelopeWire Envelope
+
+// envelopeKnownKeys lists every JSON key the Envelope struct owns —
+// including omitempty optionals (kept in sync with the struct tags; the
+// wire-merge RED breaks if one is missed).
+var envelopeKnownKeys = []string{
+	"schema_id", "schema_version", "event_id", "event_type", "run_id",
+	"turn_id", "tool_call_id", "parent_event_id", "sequence", "emitted_at",
+	"actor_type", "actor_id", "principal_id", "tenant_id", "workspace_id",
+	"profile_id", "attempt_no", "idempotency_key", "payload", "payload_hash",
+}
 
 // MarshalJSON emits a LOSSLESS wire form: when the envelope was admitted
 // from the wire (Wire != nil), unknown fields from the admitted bytes are
@@ -76,6 +86,12 @@ func (e Envelope) MarshalJSON() ([]byte, error) {
 	var kn map[string]json.RawMessage
 	if err := json.Unmarshal(known, &kn); err != nil {
 		return nil, err
+	}
+	// Remove EVERY known key from the preserved copy first — otherwise a
+	// cleared omitempty optional (turn_id…) would be resurrected from Wire
+	// (r3 codex #5). Only truly UNKNOWN fields survive from Wire.
+	for _, k := range envelopeKnownKeys {
+		delete(orig, k)
 	}
 	for k, v := range kn {
 		orig[k] = v
@@ -103,26 +119,26 @@ func (e Envelope) MarshalJSON() ([]byte, error) {
 // EnvelopeParams carries the constructor inputs; optional fields are
 // pointers so absence is explicit, never a zero-value guess.
 type EnvelopeParams struct {
-	SchemaID      SchemaID
-	SchemaVersion int
-	EventID       EventID
-	EventType     string
-	RunID         RunID
-	TurnID        *TurnID
-	ToolCallID    *ToolCallID
-	ParentEventID *EventID
-	Sequence      uint64
-	EmittedAt     time.Time
-	ActorType     ActorType
-	ActorID       ActorID
-	PrincipalID   PrincipalID
-	TenantID      *TenantID
-	WorkspaceID   WorkspaceID
-	ProfileID     ProfileID
-	AttemptNo     int
+	SchemaID       SchemaID
+	SchemaVersion  int
+	EventID        EventID
+	EventType      string
+	RunID          RunID
+	TurnID         *TurnID
+	ToolCallID     *ToolCallID
+	ParentEventID  *EventID
+	Sequence       uint64
+	EmittedAt      time.Time
+	ActorType      ActorType
+	ActorID        ActorID
+	PrincipalID    PrincipalID
+	TenantID       *TenantID
+	WorkspaceID    WorkspaceID
+	ProfileID      ProfileID
+	AttemptNo      int
 	IdempotencyKey *string
-	Payload       json.RawMessage
-	PayloadHash   string
+	Payload        json.RawMessage
+	PayloadHash    string
 }
 
 func NewEnvelope(p EnvelopeParams) (Envelope, error) {
@@ -494,13 +510,13 @@ func NewToolResult(call ToolCall, status ResultStatus, output []ContextBlock, te
 // TypedError (P0.1): the closed category/retryability pair drives handling;
 // an arbitrary string never does.
 type TypedError struct {
-	Code         string        `json:"code"`
-	Category     ErrorCategory `json:"category"`
-	Retryability Retryability  `json:"retryability"`
-	SafeMessage  string        `json:"safe_message"`
+	Code         string         `json:"code"`
+	Category     ErrorCategory  `json:"category"`
+	Retryability Retryability   `json:"retryability"`
+	SafeMessage  string         `json:"safe_message"`
 	RetryAfter   *time.Duration `json:"retry_after,omitempty"`
-	Origin       string        `json:"origin"`
-	CauseEventID *EventID      `json:"cause_event_id,omitempty"`
+	Origin       string         `json:"origin"`
+	CauseEventID *EventID       `json:"cause_event_id,omitempty"`
 }
 
 func NewTypedError(code string, cat ErrorCategory, retry Retryability, safeMsg, origin string, retryAfter *time.Duration, cause *EventID) (TypedError, error) {

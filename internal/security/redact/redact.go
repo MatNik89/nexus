@@ -14,9 +14,12 @@ import (
 	"strings"
 )
 
-// Redactor replaces known secret values in a byte stream.
+// Redactor replaces known secret values in a byte stream AND can preflight
+// a string without mutating it (r3 codex #2: structural-field rejection is
+// part of the required contract, not an optional extra interface).
 type Redactor interface {
 	Redact([]byte) []byte
+	Touches(string) bool
 }
 
 // KnownRefs redacts an explicit name→value set.
@@ -58,82 +61,95 @@ func (r *KnownRefs) redactString(s string) string {
 	return s
 }
 
-// redactJSONValue walks a decoded JSON tree, redacting every string value.
-// Values are kept as json.RawMessage except strings (never map[string]any
-// in any API — this is a private traversal).
-func (r *KnownRefs) redactJSONValue(raw json.RawMessage) (json.RawMessage, error) {
-	trimmed := bytes.TrimSpace(raw)
-	if len(trimmed) == 0 {
-		return raw, nil
+// Budgets (r3 codex #7: the previous recursive walk re-unmarshaled every
+// subtree per depth level — superlinear). The tree walk below parses the
+// input ONCE (O(n)) and bounds depth; over-budget input falls back to plain
+// byte replacement — still redacted, never unbounded work.
+const (
+	maxJSONBytes = 1 << 20 // 1 MiB
+	maxJSONDepth = 64
+)
+
+// redactValue rebuilds a decoded JSON value with every string redacted.
+// The decoded tree is a PRIVATE traversal buffer — no kernel API carries
+// map[string]any; the public surface stays []byte in, []byte out (E3 is a
+// rule about contracts, not about a local decode inside the redactor).
+func (r *KnownRefs) redactValue(v interface{}, depth int, out *bytes.Buffer) error {
+	if depth > maxJSONDepth {
+		return fmt.Errorf("json depth budget exceeded")
 	}
-	switch trimmed[0] {
-	case '"':
-		var s string
-		if err := json.Unmarshal(trimmed, &s); err != nil {
-			return nil, err
+	switch t := v.(type) {
+	case string:
+		enc, err := json.Marshal(r.redactString(t))
+		if err != nil {
+			return err
 		}
-		out, err := json.Marshal(r.redactString(s))
-		return out, err
-	case '{':
-		var obj map[string]json.RawMessage
-		if err := json.Unmarshal(trimmed, &obj); err != nil {
-			return nil, err
-		}
-		keys := make([]string, 0, len(obj))
-		for k := range obj {
+		out.Write(enc)
+	case map[string]interface{}:
+		keys := make([]string, 0, len(t))
+		for k := range t {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
-		var sb bytes.Buffer
-		sb.WriteByte('{')
+		out.WriteByte('{')
 		for i, k := range keys {
 			if i > 0 {
-				sb.WriteByte(',')
+				out.WriteByte(',')
 			}
-			kb, _ := json.Marshal(r.redactString(k)) // keys can carry secrets too
-			sb.Write(kb)
-			sb.WriteByte(':')
-			v, err := r.redactJSONValue(obj[k])
+			kb, err := json.Marshal(r.redactString(k)) // keys can carry secrets too
 			if err != nil {
-				return nil, err
+				return err
 			}
-			sb.Write(v)
+			out.Write(kb)
+			out.WriteByte(':')
+			if err := r.redactValue(t[k], depth+1, out); err != nil {
+				return err
+			}
 		}
-		sb.WriteByte('}')
-		return sb.Bytes(), nil
-	case '[':
-		var arr []json.RawMessage
-		if err := json.Unmarshal(trimmed, &arr); err != nil {
-			return nil, err
-		}
-		var sb bytes.Buffer
-		sb.WriteByte('[')
-		for i, item := range arr {
+		out.WriteByte('}')
+	case []interface{}:
+		out.WriteByte('[')
+		for i, item := range t {
 			if i > 0 {
-				sb.WriteByte(',')
+				out.WriteByte(',')
 			}
-			v, err := r.redactJSONValue(item)
-			if err != nil {
-				return nil, err
+			if err := r.redactValue(item, depth+1, out); err != nil {
+				return err
 			}
-			sb.Write(v)
 		}
-		sb.WriteByte(']')
-		return sb.Bytes(), nil
-	default: // number/bool/null: cannot carry a string secret
-		return trimmed, nil
+		out.WriteByte(']')
+	case json.Number:
+		out.WriteString(t.String())
+	case bool:
+		if t {
+			out.WriteString("true")
+		} else {
+			out.WriteString("false")
+		}
+	case nil:
+		out.WriteString("null")
+	default:
+		return fmt.Errorf("unexpected json node type %T", v)
 	}
+	return nil
 }
 
-// Redact processes b: valid JSON is redacted on decoded string values
-// (escape-proof); anything else falls back to raw byte replacement.
+// Redact processes b: valid JSON within budget is parsed ONCE and redacted
+// on decoded string values; anything else (invalid, over-budget, transform
+// failure) falls back to raw byte replacement — fail SAFE, never fail open.
 func (r *KnownRefs) Redact(b []byte) []byte {
 	if len(r.entries) == 0 {
 		return b
 	}
-	if json.Valid(b) {
-		if out, err := r.redactJSONValue(b); err == nil {
-			return out
+	if len(b) <= maxJSONBytes && json.Valid(b) {
+		dec := json.NewDecoder(bytes.NewReader(b))
+		dec.UseNumber()
+		var v interface{}
+		if err := dec.Decode(&v); err == nil {
+			var out bytes.Buffer
+			if err := r.redactValue(v, 0, &out); err == nil && json.Valid(out.Bytes()) {
+				return out.Bytes()
+			}
 		}
 	}
 	out := b
@@ -158,11 +174,9 @@ func (r *KnownRefs) Touches(s string) bool {
 }
 
 // None is a no-op redactor for contexts with no known secrets (tests).
+// It explicitly reports NO matches — the structural preflight always runs;
+// there is simply nothing to match.
 type None struct{}
 
 func (None) Redact(b []byte) []byte { return b }
-
-// Toucher is implemented by redactors that can CHECK without mutating.
-type Toucher interface {
-	Touches(string) bool
-}
+func (None) Touches(string) bool    { return false }

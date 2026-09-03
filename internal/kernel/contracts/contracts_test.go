@@ -434,3 +434,29 @@ func TestManualRecoveryStatesExist(t *testing.T) {
 		t.Fatal("AttemptManualRecovery missing")
 	}
 }
+
+
+// A cleared known optional must not be resurrected from Wire on marshal
+// (r3 codex #5).
+func TestClearedOptionalNotResurrectedFromWire(t *testing.T) {
+	p := validEnvelopeParams()
+	tid := TurnID("turn-9")
+	p.TurnID = &tid
+	env, err := NewEnvelope(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(env)
+	back, err := ParseEnvelope(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	back.TurnID = nil // clear the optional AFTER wire admission
+	re, err := json.Marshal(back)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(re), "turn-9") {
+		t.Fatalf("cleared turn_id resurrected from Wire: %s", re)
+	}
+}

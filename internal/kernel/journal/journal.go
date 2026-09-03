@@ -11,8 +11,10 @@ package journal
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -46,15 +48,33 @@ type Event struct {
 }
 
 // chainInput is the canonical encoding the integrity chain authenticates:
-// EVERY journal field except integrity_hash itself (r2 codex #1 — hashing
-// only the envelope left the metadata columns forgeable).
+// EVERY journal field except integrity_hash itself. LENGTH-PREFIXED fields
+// with an explicit nullability byte — delimiter characters inside IDs and
+// NULL-vs-empty sealed refs cannot produce colliding encodings
+// (r3 codex #1: "a|b","c" vs "a","b|c" collided under bare pipes).
 func chainInput(offset uint64, eventID, runID string, seq uint64, rpv int, prevHash string, sealedRef *string, envelope []byte) []byte {
-	sr := ""
-	if sealedRef != nil {
-		sr = *sealedRef
+	var buf []byte
+	putUint := func(v uint64) {
+		buf = binary.AppendUvarint(buf, v)
 	}
-	head := fmt.Sprintf("%d|%s|%s|%d|%d|%s|%s|", offset, eventID, runID, seq, rpv, prevHash, sr)
-	return append([]byte(head), envelope...)
+	putStr := func(v string) {
+		buf = binary.AppendUvarint(buf, uint64(len(v)))
+		buf = append(buf, v...)
+	}
+	putUint(offset)
+	putStr(eventID)
+	putStr(runID)
+	putUint(seq)
+	putUint(uint64(rpv))
+	putStr(prevHash)
+	if sealedRef == nil {
+		buf = append(buf, 0)
+	} else {
+		buf = append(buf, 1)
+		putStr(*sealedRef)
+	}
+	buf = binary.AppendUvarint(buf, uint64(len(envelope)))
+	return append(buf, envelope...)
 }
 
 func chainHash(input []byte) string {
@@ -65,15 +85,16 @@ func chainHash(input []byte) string {
 // Journal is the single-write-owner event log, BOUND to one profile — in
 // the DATABASE, not just process memory (r2 codex #3).
 type Journal struct {
-	db        *sql.DB
-	profile   contracts.ProfileID
-	redact    redact.Redactor
-	events    map[string]PayloadValidator
-	reqs      chan appendReq
-	done      chan struct{}
-	actorDone chan struct{}
-	closeOnce sync.Once
-	closeErr  error
+	db         *sql.DB
+	profile    contracts.ProfileID
+	redact     redact.Redactor
+	events     map[string]PayloadValidator
+	leaseToken string
+	reqs       chan appendReq
+	done       chan struct{}
+	actorDone  chan struct{}
+	closeOnce  sync.Once
+	closeErr   error
 }
 
 type appendReq struct {
@@ -89,6 +110,7 @@ type appendReply struct {
 // test-only fault seams (production never sets them).
 var (
 	testPauseAfterCommit func()
+	testPauseBeforeReply func()
 	testFailCommit       func() error
 )
 
@@ -175,49 +197,82 @@ func Open(path string, profile contracts.ProfileID, r redact.Redactor, events ma
 		return fail(fmt.Errorf("journal open: database is bound to another profile (fail closed, B3)"))
 	}
 
-	// Single-writer detection (B7): a LIVE writer blocks a second opener;
-	// a dead one (crash) is taken over via pid+starttime liveness.
-	pid, start, err := selfStartToken()
-	if err != nil {
-		tx.Rollback()
-		return fail(fmt.Errorf("journal open: self identity: %w", err))
-	}
-	var writerVal string
-	err = tx.QueryRow(`SELECT value FROM journal_meta WHERE key='writer'`).Scan(&writerVal)
-	if err == nil {
-		parts := strings.SplitN(writerVal, ":", 2)
-		if len(parts) == 2 {
-			if oldPid, perr := strconv.Atoi(parts[0]); perr == nil {
-				if st, serr := procStartTime(oldPid); serr == nil && st == parts[1] && oldPid != pid {
-					tx.Rollback()
-					return fail(fmt.Errorf("journal open: another live writer holds this journal (fail closed, B7)"))
-				}
-			}
-		}
-	} else if err != sql.ErrNoRows {
-		tx.Rollback()
-		return fail(fmt.Errorf("journal open: reading writer lease: %w", err))
-	}
-	if _, err := tx.Exec(`INSERT INTO journal_meta(key,value) VALUES('writer',?)
-		ON CONFLICT(key) DO UPDATE SET value=excluded.value`, fmt.Sprintf("%d:%s", pid, start)); err != nil {
-		tx.Rollback()
-		return fail(fmt.Errorf("journal open: writer lease: %w", err))
-	}
 	if err := tx.Commit(); err != nil {
 		return fail(fmt.Errorf("journal open commit: %w", err))
 	}
 
+	// The chain is verified BEFORE ownership is published (r3 codex #3:
+	// a failed open must not leave a live lease behind) — a tampered
+	// journal never starts serving nor claims the lease.
 	j := &Journal{
-		db: db, profile: profile, redact: r, events: events,
+		db: db, profile: profile, redact: r,
 		reqs: make(chan appendReq), done: make(chan struct{}), actorDone: make(chan struct{}),
 	}
-	// The chain is verified ON OPEN (r2 codex #1): a tampered journal never
-	// starts serving.
+	// Defensive copy: the closed event set must stay closed after Open
+	// (r3 codex #4 — a caller-held map is mutable and racy).
+	j.events = make(map[string]PayloadValidator, len(events))
+	for name, v := range events {
+		if name == "" {
+			db.Close()
+			return nil, fmt.Errorf("journal open: empty event-type name in the closed set")
+		}
+		j.events[name] = v
+	}
 	lastOffset, lastHash, err := j.verifyChainFull()
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("journal open: %w", err)
 	}
+
+	// Single-writer lease (B7): value = pid:starttime:nonce. A LIVE holder
+	// (any pid, incl. our own other handle — the NONCE distinguishes
+	// handles, r3 codex #3) blocks this open; a dead one is taken over.
+	pid, start, err := selfStartToken()
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("journal open: self identity: %w", err)
+	}
+	nonceB := make([]byte, 8)
+	if _, err := rand.Read(nonceB); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("journal open: nonce: %w", err)
+	}
+	token := fmt.Sprintf("%d:%s:%s", pid, start, hex.EncodeToString(nonceB))
+	ltx, err := db.Begin()
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("journal open lease tx: %w", err)
+	}
+	var writerVal string
+	err = ltx.QueryRow(`SELECT value FROM journal_meta WHERE key='writer'`).Scan(&writerVal)
+	switch {
+	case err == nil:
+		parts := strings.SplitN(writerVal, ":", 3)
+		if len(parts) == 3 {
+			if oldPid, perr := strconv.Atoi(parts[0]); perr == nil {
+				if st, serr := procStartTime(oldPid); serr == nil && st == parts[1] {
+					ltx.Rollback()
+					db.Close()
+					return nil, fmt.Errorf("journal open: another live writer holds this journal (fail closed, B7)")
+				}
+			}
+		}
+	case err != sql.ErrNoRows:
+		ltx.Rollback()
+		db.Close()
+		return nil, fmt.Errorf("journal open: reading writer lease: %w", err)
+	}
+	if _, err := ltx.Exec(`INSERT INTO journal_meta(key,value) VALUES('writer',?)
+		ON CONFLICT(key) DO UPDATE SET value=excluded.value`, token); err != nil {
+		ltx.Rollback()
+		db.Close()
+		return nil, fmt.Errorf("journal open: writer lease: %w", err)
+	}
+	if err := ltx.Commit(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("journal open lease commit: %w", err)
+	}
+	j.leaseToken = token
 	go j.actor(lastOffset, lastHash)
 	return j, nil
 }
@@ -237,6 +292,9 @@ func (j *Journal) actor(lastOffset uint64, lastHash string) {
 			if testPauseAfterCommit != nil && rep.err == nil {
 				testPauseAfterCommit()
 			}
+			if testPauseBeforeReply != nil {
+				testPauseBeforeReply()
+			}
 			req.reply <- rep
 		}
 	}
@@ -249,6 +307,9 @@ func structuralFields(p contracts.EnvelopeParams) []string {
 	out := []string{
 		string(p.EventID), string(p.RunID), p.EventType,
 		string(p.ActorID), string(p.PrincipalID), string(p.WorkspaceID), string(p.ProfileID),
+	}
+	if p.ParentEventID != nil {
+		out = append(out, string(*p.ParentEventID))
 	}
 	if p.TurnID != nil {
 		out = append(out, string(*p.TurnID))
@@ -278,11 +339,10 @@ func (j *Journal) appendOne(p contracts.EnvelopeParams, offset uint64, prevHash 
 	}
 	// Known secrets in STRUCTURAL fields are rejected, not mutated
 	// (r2 codex #2): stored and returned identity stay one and the same.
-	if t, ok := j.redact.(redact.Toucher); ok {
-		for _, f := range structuralFields(p) {
-			if t.Touches(f) {
-				return fail(fmt.Errorf("journal append: a known secret occurs in a structural field (rejected fail-closed)"))
-			}
+	// Touches is part of the required Redactor contract (r3 codex #2).
+	for _, f := range structuralFields(p) {
+		if j.redact.Touches(f) {
+			return fail(fmt.Errorf("journal append: a known secret occurs in a structural field (rejected fail-closed)"))
 		}
 	}
 	// Redact the payload SEMANTICALLY, then recompute its hash so integrity
@@ -437,6 +497,13 @@ func (j *Journal) verifyChainFull() (uint64, string, error) {
 		if chainHash(chainInput(off, eventID, runID, seq, rpv, prevStored, sealed, []byte(raw))) != stored {
 			return 0, "", fmt.Errorf("journal chain broken at offset %d: hash mismatch", off)
 		}
+		env, perr := contracts.ParseEnvelope([]byte(raw))
+		if perr != nil {
+			return 0, "", fmt.Errorf("chain verify: envelope undecodable at offset %d: %w", off, perr)
+		}
+		if string(env.EventID) != eventID || string(env.RunID) != runID || env.Sequence != seq {
+			return 0, "", fmt.Errorf("chain verify: denormalized columns diverge from envelope at offset %d", off)
+		}
 		prev = stored
 		lastOffset = off
 	}
@@ -452,11 +519,15 @@ func (j *Journal) VerifyChain() error {
 	return err
 }
 
-// Close stops the actor and releases the database. Concurrency-idempotent.
+// Close stops the actor, RELEASES the writer lease (exactly our own token,
+// r3 codex #3) and closes the database. Concurrency-idempotent.
 func (j *Journal) Close() error {
 	j.closeOnce.Do(func() {
 		close(j.done)
 		<-j.actorDone
+		if j.leaseToken != "" {
+			j.db.Exec(`DELETE FROM journal_meta WHERE key='writer' AND value=?`, j.leaseToken)
+		}
 		j.closeErr = j.db.Close()
 	})
 	return j.closeErr

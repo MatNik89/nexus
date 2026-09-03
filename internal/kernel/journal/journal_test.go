@@ -7,6 +7,7 @@ package journal
 
 import (
 	"context"
+	"database/sql"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -169,19 +170,35 @@ func TestPayloadHashMatchesStoredPayload(t *testing.T) {
 // stored copy diverging from the returned one (r2 codex #2), and nothing
 // reaches the sink.
 func TestSecretInStructuralFieldRejected(t *testing.T) {
-	dir := t.TempDir()
 	secret := "tok-9988776655"
-	j := open(t, dir, redact.NewKnownRefs(map[string]string{"tg": secret}))
-	p := params("run-a", "x")
-	p.ActorID = contracts.ActorID("actor-" + secret)
-	if _, err := j.Append(context.Background(), p); err == nil {
-		t.Fatal("append with a known secret in a structural field accepted")
+	fields := map[string]func(*contracts.EnvelopeParams){
+		"actor_id":       func(p *contracts.EnvelopeParams) { p.ActorID = contracts.ActorID("a-" + secret) },
+		"event_id":       func(p *contracts.EnvelopeParams) { p.EventID = contracts.EventID("e-" + secret) },
+		"run_id":         func(p *contracts.EnvelopeParams) { p.RunID = contracts.RunID("r-" + secret) },
+		"event_type":     func(p *contracts.EnvelopeParams) { p.EventType = "x-" + secret },
+		"principal_id":   func(p *contracts.EnvelopeParams) { p.PrincipalID = contracts.PrincipalID("p-" + secret) },
+		"workspace_id":   func(p *contracts.EnvelopeParams) { p.WorkspaceID = contracts.WorkspaceID("w-" + secret) },
+		"parent_event_id": func(p *contracts.EnvelopeParams) { id := contracts.EventID("pe-" + secret); p.ParentEventID = &id },
+		"turn_id":        func(p *contracts.EnvelopeParams) { id := contracts.TurnID("t-" + secret); p.TurnID = &id },
+		"tool_call_id":   func(p *contracts.EnvelopeParams) { id := contracts.ToolCallID("tc-" + secret); p.ToolCallID = &id },
+		"idempotency_key": func(p *contracts.EnvelopeParams) { k := "k-" + secret; p.IdempotencyKey = &k },
 	}
-	j.Close()
-	for _, f := range []string{"journal.db", "journal.db-wal"} {
-		if b, err := os.ReadFile(filepath.Join(dir, f)); err == nil && strings.Contains(string(b), secret) {
-			t.Fatalf("secret present in sink file %s", f)
-		}
+	for name, mutate := range fields {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			j := open(t, dir, redact.NewKnownRefs(map[string]string{"tg": secret}))
+			p := params("run-a", "x")
+			mutate(&p)
+			if _, err := j.Append(context.Background(), p); err == nil {
+				t.Fatalf("append with a known secret in %s accepted", name)
+			}
+			j.Close()
+			for _, f := range []string{"journal.db", "journal.db-wal"} {
+				if b, err := os.ReadFile(filepath.Join(dir, f)); err == nil && strings.Contains(string(b), secret) {
+					t.Fatalf("secret present in sink file %s", f)
+				}
+			}
+		})
 	}
 }
 
@@ -260,28 +277,100 @@ func TestReopenUnderDifferentProfileRefused(t *testing.T) {
 	}
 }
 
-// A second LIVE opener is refused (single writer, B7); after Close the
-// same process may reopen (its lease is its own).
-func TestSecondLiveOpenerRefused(t *testing.T) {
+// The REAL two-handle case (r3 codex #3): while one handle is open, a
+// second Open on the same database is refused — nonce distinguishes
+// handles within one process. After Close (lease released) reopen works.
+func TestSecondLiveHandleRefused(t *testing.T) {
 	dir := t.TempDir()
-	j := open(t, dir, redact.None{})
-	_ = j
-	// Same process holds the lease; simulate a FOREIGN live writer by
-	// planting another live pid (our parent) in the lease.
-	j.Close()
+	j1 := open(t, dir, redact.None{})
+	if _, err := Open(filepath.Join(dir, "journal.db"), "work", redact.None{}, manyEvents()); err == nil {
+		t.Fatal("second live handle on the same journal accepted")
+	}
+	j1.Close()
 	j2, err := Open(filepath.Join(dir, "journal.db"), "work", redact.None{}, manyEvents())
 	if err != nil {
-		t.Fatalf("reopen after close must succeed: %v", err)
+		t.Fatalf("reopen after Close (lease released) must succeed: %v", err)
 	}
-	ppid := os.Getppid()
-	st, err := procStartTime(ppid)
-	if err != nil {
-		t.Skip("no parent stat")
-	}
-	j2.db.Exec(`UPDATE journal_meta SET value=? WHERE key='writer'`, fmt.Sprintf("%d:%s", ppid, st))
 	j2.Close()
+}
+
+// A FAILED open must not leave a live lease behind (r3 codex #3).
+func TestFailedOpenLeavesNoLease(t *testing.T) {
+	dir := t.TempDir()
+	j := open(t, dir, redact.None{})
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		if _, err := j.Append(ctx, params("run-a", fmt.Sprintf("e%d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := j.db.Exec(`UPDATE events SET envelope = replace(envelope, 'e1', 'eX') WHERE journal_offset = 2`); err != nil {
+		t.Fatal(err)
+	}
+	j.Close()
 	if _, err := Open(filepath.Join(dir, "journal.db"), "work", redact.None{}, manyEvents()); err == nil {
-		t.Fatal("journal with a LIVE foreign writer lease reopened")
+		t.Fatal("tampered journal opened")
+	}
+	// The failed open must not have written a writer lease.
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(dir, "journal.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var v string
+	err = db.QueryRow(`SELECT value FROM journal_meta WHERE key='writer'`).Scan(&v)
+	if err == nil {
+		t.Fatalf("failed open left a writer lease behind: %s", v)
+	}
+}
+
+// The closed event set stays closed after Open (r3 codex #4).
+func TestEventSetImmutableAfterOpen(t *testing.T) {
+	dir := t.TempDir()
+	callerMap := testEvents("only.event")
+	j, err := Open(filepath.Join(dir, "journal.db"), "work", redact.None{}, callerMap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.Close()
+	callerMap["smuggled.event"] = nil // post-open mutation of the CALLER map
+	p := params("run-a", "smuggled.event")
+	if _, err := j.Append(context.Background(), p); err == nil {
+		t.Fatal("post-open mutation of the caller map widened the closed set")
+	}
+}
+
+// Admission-definitive with a REAL barrier (r3 codex #10): cancel the ctx
+// while the actor is BETWEEN commit and reply — Append must still return
+// the committed result, never ctx.Err().
+func TestCancelBetweenCommitAndReplyStillDefinitive(t *testing.T) {
+	j := open(t, t.TempDir(), redact.None{})
+	inWindow := make(chan struct{})
+	release := make(chan struct{})
+	testPauseBeforeReply = func() {
+		close(inWindow)
+		<-release
+	}
+	defer func() { testPauseBeforeReply = nil }()
+	ctx, cancel := context.WithCancel(context.Background())
+	type result struct {
+		ev  Event
+		err error
+	}
+	res := make(chan result, 1)
+	go func() {
+		ev, err := j.Append(ctx, params("run-a", "e1"))
+		res <- result{ev, err}
+	}()
+	<-inWindow // actor has committed, reply not yet delivered
+	cancel()   // cancellation lands exactly in the forbidden window
+	close(release)
+	r := <-res
+	if r.err != nil {
+		t.Fatalf("caller saw %v for an event that committed (admission-definitive violated)", r.err)
+	}
+	if r.ev.JournalOffset != 1 {
+		t.Fatalf("unexpected offset %d", r.ev.JournalOffset)
 	}
 }
 
