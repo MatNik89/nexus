@@ -64,7 +64,7 @@ outcome + nonzero `--strict` exit; all five green → `prerequisites-ready`.
 
 ## Phase 1 — K0 primitives
 
-**[x] T04 (this commit) — Typed contracts (S0.1).**
+**[x] T04 (1bdae45..6cbc2c1) — Typed contracts (S0.1).**
 `Envelope/Message/ContextBlock/ToolCall/ToolResult/TypedError` per Annex P0.1 + `ProfileID`
 (B3) + `ExecutionKind`/`EffectPhase`/`CommitReceipt` (DESIGN-FIXES). Enums default-reject;
 `Content` XOR `ContentRef`; no `map[string]any`; unknown schema ID/version → reject
@@ -73,7 +73,7 @@ Trace: HARNESS-SPEC P0.1; E3; DESIGN-FIXES-r2.
 Acceptance: constructors reject every malformed case in the P0.1 MUST lists.
 RED: unknown discriminator accepted → fail; XOR violation accepted → fail.
 
-**[x] T05 (this commit) — K0 seams: clock/ID injection · AtomicWriter (s5-min) · ContextBudget-min · Assembler-min.**
+**[x] T05 (d6dd454+r-folds) — K0 seams: clock/ID injection · AtomicWriter (s5-min) · ContextBudget-min · Assembler-min.**
 Injectable wall+monotonic clock and ID-generator seams (deterministic tests everywhere
 downstream); `AtomicWriter` tmp→fsync→rename, never in-place (the s5-min cut);
 `ContextBudget.Measure+HardLimit` (S8.1-min); `Assembler.Base` (S11.1-min) skeleton.
@@ -86,7 +86,7 @@ budget hard-limit breach → refuse, not truncate-silently; injected clock/ID �
 the same scenario produce identical event timelines (determinism conformance);
 `Assembler.Base` composes a fixed block set deterministically (golden output).
 
-**[x] T06 (this commit) — EventJournal core (P0.3): durability + serialization.**
+**[x] T06 (df64a23..6cbc2c1) — EventJournal core (P0.3): durability + serialization.**
 SQLite-WAL (`modernc.org/sqlite`), bounded `busy_timeout`; ONE serialized append actor owns
 Append + sequence; known-ref secret redaction BEFORE append (C1).
 Trace: HARNESS-SPEC P0.3; E4; HARDQ B7/C1.
