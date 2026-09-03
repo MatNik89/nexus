@@ -183,7 +183,7 @@ Acceptance: live chat call OK; malformed-JSON paths exercised; probe registered.
 RED: `test_structured_output_never_silent_accept`; malformed/unknown EFFECT or POLICY
 discriminator → reaches no sink (strict reject, no repair).
 
-**[ ] T16 — One-turn loop (S3.1-min) + trust fencing + interactive stuck-breaker.**
+**[x] T16 — One-turn loop (S3.1-min) + trust fencing + interactive stuck-breaker.**
 plan→act→observe single turn; tool errors packed into observation; assembler enforces
 lineage/trust monotonicity. Identical-call stuck-breaker WITHIN one interactive turn
 (same tool+args N× → break); scheduled/polling iterations exempt via continuous-loop
