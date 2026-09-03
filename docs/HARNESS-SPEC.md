@@ -1543,6 +1543,15 @@ Ovih 7 ugovora plan je citirao kao gate a nisu bili u Annexu (agy GATE-01). Sad 
 - **MUST:** measurement nosi target/version/config + measured-vector + probe-id/rev + evidence + expiry + hash; promjena bilo čega invalidira grant.
 - **RED — `test_capability_unknown_fails_closed`:** provider bez izmjerene sposobnosti → route/dispatch odbijen, nula pretpostavljenih sposobnosti.
 
+  **AMENDMENT (Phase-1B r2 review, 2026-09-03) — P0-min attestation vector:** u P0
+  (T11 sealed startup snapshot, HARDQ B9: bez runtime aktivacije) measurement nosi
+  {probe name, passed, detail, config-hash}; config-hash MORA biti sha256 digest
+  RESOLVED konfiguracije (shape-validiran, ne proizvoljan string) i snapshot ga
+  TRAJNO nosi. Probe-id/rev, expiry i measured-vector stižu s pravim S0.3
+  negotiation vlasnikom (P1) — freshness je u P0 strukturalan: probe se mjeri
+  jednom pri startu, snapshot umire s procesom, promjena configa = restart =
+  novo mjerenje. Mismatch hash → capability OFF (stale, fail closed).
+
 ## P0.6 — Config-bounds + process-identity
 - **Vlasnik:** S1.1 config, S1.2 proc.
 - **MUST:** config NE smije proširiti kernel floor (egress/sandbox/budget); reload nevaljan → stara generacija ostaje. Proces se identificira PID+start-token (PID sam nije dokaz vlasništva).

@@ -49,6 +49,16 @@ func Resolve(manifests []Manifest, requested []string) ([]string, error) {
 		}
 		byName[m.Name] = m
 	}
+	// Every DECLARED conflict target must name a known capability — a typo
+	// would otherwise silently disarm the conflict (Phase-1B-r2 codex #14 /
+	// kilo #11: contract says unknown conflicts are rejected).
+	for _, m := range manifests {
+		for _, c := range m.Conflicts {
+			if _, ok := byName[c]; !ok {
+				return nil, fmt.Errorf("closure: %q declares a conflict with unknown capability %q (fail closed)", m.Name, c)
+			}
+		}
+	}
 	// Transitive closure with cycle detection (DFS, three-color).
 	const (
 		white = 0
@@ -125,10 +135,30 @@ type CapabilityStatus struct {
 }
 
 // Snapshot is the SEALED startup capability state: immutable after Seal;
-// changing configuration means restarting the process (B9).
+// changing configuration means restarting the process (B9). It RETAINS the
+// config-hash binding it was sealed under, so a consumer can prove which
+// configuration the snapshot attests (Phase-1B-r2 codex #13).
 type Snapshot struct {
-	statuses map[string]CapabilityStatus
-	order    []string
+	statuses   map[string]CapabilityStatus
+	order      []string
+	configHash string
+}
+
+// ConfigHash returns the resolved-config digest the snapshot is bound to.
+func (s *Snapshot) ConfigHash() string { return s.configHash }
+
+// sha256Hex validates the config-hash SHAPE: 64 lowercase hex chars —
+// arbitrary caller-invented strings are not a config binding (codex #13).
+func sha256Hex(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for _, r := range s {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // Seal resolves the requested set and switches each capability ON only if
@@ -137,9 +167,14 @@ type Snapshot struct {
 // REJECTED (Phase-1B codex #19: last-write-wins let input order decide
 // capability state); a probe measured under a different config hash =
 // FAILED (codex #18).
+// topknot ceiling (recorded in the owner — SPEC P0.5 P0-min amendment):
+// the P0 attestation vector is {probe name, passed, detail, config hash};
+// probe id/revision, expiry, and a measured-capability vector arrive with
+// the S0.3 negotiation owner (P1). Freshness in P0 is structural: probes
+// run once at startup and the snapshot dies with the process (B9).
 func Seal(manifests []Manifest, requested []string, probes []ProbeResult, configHash string) (*Snapshot, error) {
-	if configHash == "" {
-		return nil, fmt.Errorf("closure: a config hash binding is required (fail closed)")
+	if !sha256Hex(configHash) {
+		return nil, fmt.Errorf("closure: the config binding must be a sha256 hex digest of the resolved config (fail closed)")
 	}
 	order, err := Resolve(manifests, requested)
 	if err != nil {
@@ -156,7 +191,7 @@ func Seal(manifests []Manifest, requested []string, probes []ProbeResult, config
 		}
 		probeOK[p.Name] = p
 	}
-	snap := &Snapshot{statuses: map[string]CapabilityStatus{}, order: order}
+	snap := &Snapshot{statuses: map[string]CapabilityStatus{}, order: order, configHash: configHash}
 	for _, name := range order { // topological: dependencies decided first
 		m := byName[name]
 		status := CapabilityStatus{Name: name, On: true}

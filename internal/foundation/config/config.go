@@ -93,21 +93,25 @@ func defaults() Config {
 
 // parseList validates a host list: trimmed, non-empty entries only
 // (kilo #3: an untrimmed " host" would silently break exact matching).
+// Diagnostics carry the entry POSITION, never the raw value — a mistyped
+// secret must not be echoed into startup errors (Phase-1B-r2 codex #10).
 func parseList(origin Origin, key string, raw []string) ([]string, error) {
 	out := make([]string, 0, len(raw))
-	for _, h := range raw {
+	for i, h := range raw {
 		trimmed := strings.TrimSpace(h)
 		if trimmed == "" {
-			return nil, fmt.Errorf("config %s: %s: empty host entry (rejected)", origin, key)
+			return nil, fmt.Errorf("config %s: %s: entry %d is empty (rejected)", origin, key, i)
 		}
 		if trimmed != h {
-			return nil, fmt.Errorf("config %s: %s: host %q has surrounding whitespace (rejected)", origin, key, h)
+			return nil, fmt.Errorf("config %s: %s: entry %d has surrounding whitespace (rejected)", origin, key, i)
 		}
 		out = append(out, trimmed)
 	}
 	return out, nil
 }
 
+// parseBoolStrict never echoes the raw value (codex #10: a secret mistyped
+// into a boolean key would land verbatim in the startup error).
 func parseBoolStrict(origin Origin, key, raw string) (bool, error) {
 	switch raw {
 	case "true":
@@ -115,7 +119,7 @@ func parseBoolStrict(origin Origin, key, raw string) (bool, error) {
 	case "false":
 		return false, nil
 	}
-	return false, fmt.Errorf("config %s: %s must be exactly true or false, got %q (rejected)", origin, key, raw)
+	return false, fmt.Errorf("config %s: %s must be exactly true or false (value withheld; rejected)", origin, key)
 }
 
 // parseFileLayer reads a JSON config file with STRICT per-key types.
@@ -169,6 +173,9 @@ const envPrefix = "NEXUS_CFG_"
 
 // envLayer ENUMERATES environ: every NEXUS_CFG_* name must be a known key
 // (codex #12: probing known names let unknown prefixed vars fail open).
+// The suffix must be CANONICAL UPPERCASE and each normalized key may appear
+// once — Linux env names are case-sensitive, so silent case folding was an
+// order-dependent duplicate/overwrite channel (Phase-1B-r2 codex #9).
 func envLayer(environ []string) (layer, error) {
 	l := layer{origin: OriginEnv, values: map[string]value{}}
 	for _, kv := range environ {
@@ -177,10 +184,17 @@ func envLayer(environ []string) (layer, error) {
 			continue
 		}
 		name, raw := kv[:eq], kv[eq+1:]
-		key := strings.ToLower(strings.TrimPrefix(name, envPrefix))
+		suffix := strings.TrimPrefix(name, envPrefix)
+		if suffix != strings.ToUpper(suffix) {
+			return l, fmt.Errorf("config env: %s is not canonical uppercase (fail closed)", name)
+		}
+		key := strings.ToLower(suffix)
 		kind, known := keySchema[key]
 		if !known {
 			return l, fmt.Errorf("config env: unknown variable %s (fail closed)", name)
+		}
+		if _, dup := l.values[key]; dup {
+			return l, fmt.Errorf("config env: %s set more than once (fail closed)", name)
 		}
 		val, err := parseRawLayerValue(OriginEnv, key, kind, raw)
 		if err != nil {

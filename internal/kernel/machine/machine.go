@@ -72,10 +72,19 @@ type FoldEvent struct {
 // CHECKPOINT (offset of the last applied event). observe receives every
 // intermediate state (nil to skip). An illegal step reports the exact
 // offset and returns the last legal state with the checkpoint BEFORE it.
+// Offsets are JOURNAL offsets and must be STRICTLY INCREASING (gaps are
+// legal after entity filtering; zero, duplicate, or decreasing offsets are
+// rejected — Phase-1B-r2 codex #6: a regressing checkpoint would make
+// resume replay already-applied events). A RESUMED fold passes the state
+// folded so far as initial and only events PAST its prior checkpoint.
 func (t *Table[S]) Fold(initial S, events []FoldEvent, observe func(state S, offset uint64)) (S, uint64, error) {
 	state := initial
 	var checkpoint uint64
 	for _, ev := range events {
+		if ev.Offset <= checkpoint {
+			return state, checkpoint, fmt.Errorf(
+				"fold: offset %d is not strictly increasing after checkpoint %d (fail closed)", ev.Offset, checkpoint)
+		}
 		next, err := t.Step(state, ev.Type)
 		if err != nil {
 			return state, checkpoint, fmt.Errorf("fold at offset %d: %w", ev.Offset, err)

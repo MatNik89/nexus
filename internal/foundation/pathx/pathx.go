@@ -74,14 +74,33 @@ func (l Layout) ProfileJournal(p contracts.ProfileID) (string, error) {
 // SystemDir holds non-profile state (zero profile payloads — B3).
 func (l Layout) SystemDir() string { return filepath.Join(l.Base, "system") }
 
-// EnsureDir creates a directory and VERIFIES the result is a private,
-// caller-owned real directory (Phase-1B codex #15: MkdirAll leaves a
-// pre-existing 0777 dir untouched and follows symlinked components — that
-// must refuse, not report success).
-func EnsureDir(path string) error {
-	if err := os.MkdirAll(path, 0o700); err != nil {
-		return fmt.Errorf("pathx: %w", err)
+// EnsureDir creates path under trustedRoot and VERIFIES every component
+// BELOW the root is a private, caller-owned REAL directory — a no-follow
+// walk, so a symlinked PARENT component cannot silently redirect storage
+// (Phase-1B codex #15; r2 codex #11: final-component Lstat missed
+// symlinked parents). Symlinks at or above trustedRoot are the caller's
+// trust decision (e.g. os.UserConfigDir under a symlinked $HOME).
+func EnsureDir(trustedRoot, path string) error {
+	rel, err := filepath.Rel(trustedRoot, path)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("pathx: %s is not strictly below the trusted root (fail closed)", path)
 	}
+	cur := trustedRoot
+	for _, component := range strings.Split(rel, string(filepath.Separator)) {
+		cur = filepath.Join(cur, component)
+		if err := os.Mkdir(cur, 0o700); err != nil && !os.IsExist(err) {
+			return fmt.Errorf("pathx: %w", err)
+		}
+		if err := verifyPrivateDir(cur); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// verifyPrivateDir proves ONE component is a caller-owned, private, real
+// directory (Lstat: never follows a symlink).
+func verifyPrivateDir(path string) error {
 	info, err := os.Lstat(path)
 	if err != nil {
 		return fmt.Errorf("pathx: %w", err)

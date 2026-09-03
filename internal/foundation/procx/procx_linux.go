@@ -104,9 +104,20 @@ func (t *Tracked) Wait() error { return t.wait() }
 // errors, and verifies the group is actually gone before reporting success.
 func (t *Tracked) Terminate(grace time.Duration) error {
 	pgid := t.Token.PID // Setpgid: pgid == leader pid
+	// pgidRecycled: a pgid is never reallocated while ANY member survives
+	// (the kernel pins a pid in use as a pgid). So if a process with the
+	// leader's PID exists with a DIFFERENT start time, the pid was recycled
+	// — which proves our whole group already exited. A dead-but-unrecycled
+	// leader (StartTime error) keeps the pgid valid for its survivors, and
+	// they MUST still be signalled (Phase-1B-r2 codex #12: gating on the
+	// leader token leaked TERM-resistant members after a prompt leader exit).
+	pgidRecycled := func() bool {
+		st, err := StartTime(pgid)
+		return err == nil && st != t.Token.Start
+	}
 	signalGroup := func(sig syscall.Signal) error {
-		if !t.Token.Alive() {
-			return nil // leader already gone: never signal a reused pgid
+		if pgidRecycled() {
+			return nil // group fully gone; never signal a reused pgid
 		}
 		if err := syscall.Kill(-pgid, sig); err != nil && err != syscall.ESRCH {
 			return fmt.Errorf("procx terminate: signal %v: %w", sig, err)
@@ -130,8 +141,10 @@ func (t *Tracked) Terminate(grace time.Duration) error {
 		return err
 	}
 	// Prove the GROUP is gone (not just the leader): any surviving member
-	// with a live start token is a failure, not a silent success.
-	if survivors := groupSurvivors(pgid); len(survivors) > 0 {
+	// with a live start token is a failure, not a silent success. A
+	// recycled pgid means the group is empty — a pid-coincident unrelated
+	// group is never misreported as survivors.
+	if survivors := groupSurvivors(pgid); !pgidRecycled() && len(survivors) > 0 {
 		return fmt.Errorf("procx terminate: %d group member(s) survived (group scope; tree containment is the sandbox owner's)", len(survivors))
 	}
 	return nil

@@ -218,3 +218,98 @@ func TestEventTypesCoverAllTables(t *testing.T) {
 		t.Fatalf("want 25 distinct event types, got %d", len(names))
 	}
 }
+
+// Fold offsets are checkpoint currency: zero, duplicate, and decreasing
+// offsets are rejected — a regressing checkpoint would replay applied
+// events on resume (Phase-1B-r2 codex #6 literals).
+func TestFoldRejectsNonMonotoneOffsets(t *testing.T) {
+	tbl := RunTable()
+	cases := map[string][]FoldEvent{
+		"zero":       {{Type: EvRunCreated, Offset: 0}},
+		"duplicate":  {{Type: EvRunCreated, Offset: 3}, {Type: EvRunAdmitted, Offset: 3}},
+		"decreasing": {{Type: EvRunCreated, Offset: 10}, {Type: EvRunAdmitted, Offset: 9}},
+	}
+	for name, events := range cases {
+		t.Run(name, func(t *testing.T) {
+			state, checkpoint, err := tbl.Fold(contracts.RunInvalid, events, nil)
+			if err == nil {
+				t.Fatalf("non-monotone offsets accepted: state=%v checkpoint=%d", state, checkpoint)
+			}
+			if !strings.Contains(err.Error(), "strictly increasing") {
+				t.Fatalf("wrong rejection: %v", err)
+			}
+		})
+	}
+	// The checkpoint never regresses: legal prefix is kept.
+	_, checkpoint, err := tbl.Fold(contracts.RunInvalid,
+		[]FoldEvent{{Type: EvRunCreated, Offset: 10}, {Type: EvRunAdmitted, Offset: 2}}, nil)
+	if err == nil || checkpoint != 10 {
+		t.Fatalf("checkpoint regressed past the legal prefix: %d (%v)", checkpoint, err)
+	}
+}
+
+// Exhaustive TURN edge matrix (Phase-1B-r2 codex #7: run-only coverage let
+// an invented turn/attempt edge stay green). Owner: Annex P0.1 turn list.
+func TestExhaustiveTurnEdgeMatrix(t *testing.T) {
+	tbl := TurnTable()
+	legal := map[string]map[contracts.TurnState]contracts.TurnState{
+		EvTurnCreated:   {contracts.TurnInvalid: contracts.TurnCreated},
+		EvTurnStarted:   {contracts.TurnCreated: contracts.TurnRunning},
+		EvTurnSucceeded: {contracts.TurnRunning: contracts.TurnSucceeded},
+		EvTurnFailed:    {contracts.TurnRunning: contracts.TurnFailed},
+		EvTurnCancelled: {contracts.TurnCreated: contracts.TurnCancelled, contracts.TurnRunning: contracts.TurnCancelled},
+	}
+	states := []contracts.TurnState{
+		contracts.TurnInvalid, contracts.TurnCreated, contracts.TurnRunning,
+		contracts.TurnSucceeded, contracts.TurnFailed, contracts.TurnCancelled,
+	}
+	for ev, froms := range legal {
+		for _, st := range states {
+			want, isLegal := froms[st]
+			got, err := tbl.Step(st, ev)
+			if isLegal {
+				if err != nil || got != want {
+					t.Fatalf("legal edge (%v,%s) failed: %v %v", st, ev, got, err)
+				}
+			} else if err == nil {
+				t.Fatalf("undeclared edge (%v,%s) accepted -> %v", st, ev, got)
+			}
+		}
+	}
+}
+
+// Exhaustive ATTEMPT edge matrix, including canonical cancel from every
+// pre-terminal state and cancel rejection from UNKNOWN/terminals.
+func TestExhaustiveAttemptEdgeMatrix(t *testing.T) {
+	tbl := AttemptTable()
+	legal := map[string]map[contracts.AttemptState]contracts.AttemptState{
+		EvAttemptPlanned:          {contracts.AttemptInvalid: contracts.AttemptPlanned},
+		EvAttemptAuthorized:       {contracts.AttemptPlanned: contracts.AttemptAuthorized},
+		EvAttemptStarted:          {contracts.AttemptAuthorized: contracts.AttemptRunning},
+		EvAttemptSucceeded:        {contracts.AttemptRunning: contracts.AttemptSucceeded},
+		EvAttemptFailed:           {contracts.AttemptRunning: contracts.AttemptFailed},
+		EvAttemptCancelled:        {contracts.AttemptPlanned: contracts.AttemptCancelled, contracts.AttemptAuthorized: contracts.AttemptCancelled, contracts.AttemptRunning: contracts.AttemptCancelled},
+		EvAttemptLost:             {contracts.AttemptRunning: contracts.AttemptUnknown},
+		EvAttemptReconciledOK:     {contracts.AttemptUnknown: contracts.AttemptSucceeded},
+		EvAttemptReconciledFailed: {contracts.AttemptUnknown: contracts.AttemptFailed},
+		EvAttemptManual:           {contracts.AttemptUnknown: contracts.AttemptManualRecovery},
+	}
+	states := []contracts.AttemptState{
+		contracts.AttemptInvalid, contracts.AttemptPlanned, contracts.AttemptAuthorized,
+		contracts.AttemptRunning, contracts.AttemptSucceeded, contracts.AttemptFailed,
+		contracts.AttemptCancelled, contracts.AttemptUnknown, contracts.AttemptManualRecovery,
+	}
+	for ev, froms := range legal {
+		for _, st := range states {
+			want, isLegal := froms[st]
+			got, err := tbl.Step(st, ev)
+			if isLegal {
+				if err != nil || got != want {
+					t.Fatalf("legal edge (%v,%s) failed: %v %v", st, ev, got, err)
+				}
+			} else if err == nil {
+				t.Fatalf("undeclared edge (%v,%s) accepted -> %v", st, ev, got)
+			}
+		}
+	}
+}

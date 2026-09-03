@@ -185,3 +185,56 @@ func TestBoundsEnforcedFromEveryLayer(t *testing.T) {
 		t.Fatal("sandbox_disabled accepted from env")
 	}
 }
+
+// Env names are canonical uppercase, once each: case-folded aliases and
+// duplicates are refused in BOTH orders — no order-dependent overwrite
+// channel (Phase-1B-r2 codex #9).
+func TestEnvNamesCanonicalAndUnique(t *testing.T) {
+	if _, err := Resolve("/nonexistent", "/nonexistent",
+		[]string{"NEXUS_CFG_provider_model=b"}, nil); err == nil {
+		t.Fatal("non-uppercase NEXUS_CFG_ name accepted")
+	}
+	for _, environ := range [][]string{
+		{"NEXUS_CFG_PROVIDER_MODEL=a", "NEXUS_CFG_PROVIDER_MODEL=b"},
+		{"NEXUS_CFG_PROVIDER_MODEL=b", "NEXUS_CFG_PROVIDER_MODEL=a"},
+	} {
+		if _, err := Resolve("/nonexistent", "/nonexistent", environ, nil); err == nil {
+			t.Fatal("duplicate env variable accepted (last-write-wins)")
+		}
+	}
+}
+
+// Rejected raw values are NEVER echoed into diagnostics (Phase-1B-r2
+// codex #10): a secret mistyped into a config key must not appear in the
+// startup error.
+func TestRejectedValueNotEchoed(t *testing.T) {
+	const canary = "sk-SECRET-CANARY-VALUE"
+	cases := map[string]func() error{
+		"env-bool": func() error {
+			_, err := Resolve("/nonexistent", "/nonexistent",
+				[]string{"NEXUS_CFG_SANDBOX_DISABLED=" + canary}, nil)
+			return err
+		},
+		"cli-bool": func() error {
+			_, err := Resolve("/nonexistent", "/nonexistent", noEnv,
+				map[string]string{"sandbox_disabled": canary})
+			return err
+		},
+		"env-list-padded": func() error {
+			_, err := Resolve("/nonexistent", "/nonexistent",
+				[]string{"NEXUS_CFG_EGRESS_ALLOW=ok.example, " + canary}, nil)
+			return err
+		},
+	}
+	for name, do := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := do()
+			if err == nil {
+				t.Fatal("invalid value accepted")
+			}
+			if strings.Contains(err.Error(), canary) {
+				t.Fatalf("rejected raw value echoed into diagnostics: %v", err)
+			}
+		})
+	}
+}

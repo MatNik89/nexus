@@ -141,3 +141,30 @@ func TestStaleTokenNeverSignals(t *testing.T) {
 		t.Fatalf("terminate of a dead instance must succeed as a no-op: %v", err)
 	}
 }
+
+// The codex r2 #12 literal: the leader exits PROMPTLY on TERM while a
+// TERM-resistant grandchild stays in the group — the KILL phase must still
+// reach the grandchild (gating group signals on the leader token leaked it).
+func TestTerminateReapsStragglerAfterPromptLeaderExit(t *testing.T) {
+	// Background grandchild ignores TERM; the leader exits immediately.
+	tr, err := Start(exec.Command("/bin/sh", "-c", `trap '' TERM; sleep 300 & exit 0`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond) // leader already exited; grandchild lives
+	survivorsBefore := groupMembers(t, tr.Token.PID)
+	if len(survivorsBefore) < 1 {
+		t.Fatal("oracle vacuous: the TERM-resistant grandchild is not in the group")
+	}
+	if err := tr.Terminate(200 * time.Millisecond); err != nil {
+		t.Fatalf("Terminate leaked a straggler: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	for member := range survivorsBefore {
+		parts := strings.SplitN(member, ":", 2)
+		pid, _ := strconv.Atoi(parts[0])
+		if st, err := StartTime(pid); err == nil && st == parts[1] {
+			t.Fatalf("TERM-resistant group member %s survived (leader-token gate leak)", member)
+		}
+	}
+}

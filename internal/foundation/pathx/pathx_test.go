@@ -50,18 +50,42 @@ func TestEnsureDirRefusesUnsafeExisting(t *testing.T) {
 		t.Fatal(err)
 	}
 	os.Chmod(open, 0o777)
-	if err := EnsureDir(open); err == nil {
+	if err := EnsureDir(base, open); err == nil {
 		t.Fatal("pre-existing 0777 directory accepted")
 	}
 	link := filepath.Join(base, "link")
 	if err := os.Symlink(base, link); err != nil {
 		t.Fatal(err)
 	}
-	if err := EnsureDir(link); err == nil {
+	if err := EnsureDir(base, link); err == nil {
 		t.Fatal("symlinked path accepted")
 	}
 	good := filepath.Join(base, "good")
-	if err := EnsureDir(good); err != nil {
+	if err := EnsureDir(base, good); err != nil {
 		t.Fatalf("fresh private dir refused: %v", err)
+	}
+}
+
+// A symlinked PARENT component cannot redirect storage: the no-follow walk
+// refuses it even when the FINAL directory is real, private, and owned
+// (Phase-1B-r2 codex #11 literal).
+func TestEnsureDirRefusesSymlinkedParent(t *testing.T) {
+	base := t.TempDir()
+	elsewhere := t.TempDir()
+	link := filepath.Join(base, "redirect")
+	if err := os.Symlink(elsewhere, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureDir(base, filepath.Join(link, "child")); err == nil {
+		t.Fatal("directory under a symlinked parent accepted")
+	}
+	// Escape via Rel: a target outside the root is refused outright.
+	if err := EnsureDir(base, elsewhere); err == nil {
+		t.Fatal("target outside the trusted root accepted")
+	}
+	// Nested creation below the root still works (every component verified).
+	deep := filepath.Join(base, "a", "b", "c")
+	if err := EnsureDir(base, deep); err != nil {
+		t.Fatalf("legitimate nested dir refused: %v", err)
 	}
 }

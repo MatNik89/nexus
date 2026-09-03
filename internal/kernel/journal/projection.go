@@ -45,13 +45,32 @@ func (p *ProjTx) Query(query string, args ...any) (*sql.Rows, error) {
 	return p.tx.Query(query, args...)
 }
 
-// QueryRow reads projection-owned tables only. A guarded query returns a
-// row that errors on Scan.
-func (p *ProjTx) QueryRow(query string, args ...any) *sql.Row {
+// There is deliberately NO QueryRow: sql.Row cannot carry the guard error,
+// so a NON_CANONICAL_WRITE rejection would masquerade as absent data
+// (Phase-1B-r2 codex #4). Use Query, where guard failure surfaces.
+
+// ProjDB is the RESTRICTED schema handle passed to SyncProjection.Init:
+// the same lexical guard as ProjTx, so Init can neither write canonical
+// rows directly nor install a trigger/view that mentions a canonical table
+// (Phase-1B-r2 codex #2 — a raw *sql.DB in Init bypassed the Apply guard).
+type ProjDB struct {
+	db *sql.DB
+}
+
+// Exec runs a schema/DDL statement against projection-owned objects only.
+func (p *ProjDB) Exec(query string, args ...any) (sql.Result, error) {
 	if err := guardStatement(query); err != nil {
-		return p.tx.QueryRow("SELECT 1 WHERE 1=0") // scan yields ErrNoRows
+		return nil, err
 	}
-	return p.tx.QueryRow(query, args...)
+	return p.db.Exec(query, args...)
+}
+
+// Query reads projection-owned tables only.
+func (p *ProjDB) Query(query string, args ...any) (*sql.Rows, error) {
+	if err := guardStatement(query); err != nil {
+		return nil, err
+	}
+	return p.db.Query(query, args...)
 }
 
 // T07 (HARDQ B7 core): synchronous projection harness + generic
@@ -65,12 +84,12 @@ func (p *ProjTx) QueryRow(query string, args ...any) *sql.Row {
 // on top of this sealed API.
 
 // SyncProjection is core state folded atomically with each append.
-// Init runs once at Open (schema); Apply runs INSIDE the append
-// transaction — returning an error aborts the whole append (state and
-// event commit together or not at all).
+// Init runs once at Open (schema) with a RESTRICTED handle; Apply runs
+// INSIDE the append transaction — returning an error aborts the whole
+// append (state and event commit together or not at all).
 type SyncProjection interface {
 	Name() string
-	Init(db *sql.DB) error
+	Init(db *ProjDB) error
 	Apply(tx *ProjTx, ev Event) error
 }
 

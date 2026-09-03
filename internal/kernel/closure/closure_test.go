@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-const cfgHash = "cfg-hash-1"
+const cfgHash = "1111111111111111111111111111111111111111111111111111111111111111"
 
 func allProbesPass() []ProbeResult {
 	return []ProbeResult{
@@ -166,7 +166,26 @@ func TestStaleProbeFromOtherConfigTurnsCapabilityOff(t *testing.T) {
 	if snap.On("exec") {
 		t.Fatal("exec ON from a stale probe measured under another config")
 	}
-	if _, err := Seal(P0Capabilities(), allP0(), allProbesPass(), ""); err == nil {
-		t.Fatal("empty config hash accepted")
+	for _, bad := range []string{"", "cfg-hash-1", "not-a-digest"} {
+		if _, err := Seal(P0Capabilities(), allP0(), allProbesPass(), bad); err == nil {
+			t.Fatalf("non-digest config binding accepted: %q", bad)
+		}
+	}
+	if snap.ConfigHash() != cfgHash {
+		t.Fatal("snapshot does not retain its config binding")
+	}
+}
+
+// A conflict declaration naming an UNKNOWN capability is a manifest defect,
+// rejected at Resolve (Phase-1B-r2 codex #14 / kilo #11 literal).
+func TestUnknownConflictTargetRejected(t *testing.T) {
+	manifests := append(P0Capabilities(), Manifest{Name: "extra", Conflicts: []string{"telegarm"}})
+	if _, err := Resolve(manifests, []string{"extra"}); err == nil {
+		t.Fatal("conflict with unknown capability accepted (typo silently disarmed)")
+	}
+	// Even when the conflicting manifest is not requested: the manifest SET
+	// is invalid.
+	if _, err := Resolve(manifests, []string{"conversation"}); err == nil {
+		t.Fatal("manifest set with a dangling conflict accepted")
 	}
 }

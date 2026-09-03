@@ -8,7 +8,6 @@ package journal
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -29,7 +28,7 @@ type fakeCounter struct {
 }
 
 func (f *fakeCounter) Name() string { return "fake_counter" }
-func (f *fakeCounter) Init(db *sql.DB) error {
+func (f *fakeCounter) Init(db *ProjDB) error {
 	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS fake_state (
 		journal_offset INTEGER PRIMARY KEY, event_type TEXT NOT NULL)`)
 	return err
@@ -217,7 +216,7 @@ func TestProjectorsIndependent(t *testing.T) {
 type rogueProjection struct{}
 
 func (rogueProjection) Name() string       { return "rogue" }
-func (rogueProjection) Init(*sql.DB) error { return nil }
+func (rogueProjection) Init(*ProjDB) error { return nil }
 func (rogueProjection) Apply(tx *ProjTx, ev Event) error {
 	_, err := tx.Exec(`INSERT INTO events(journal_offset, event_id, run_id, sequence, envelope,
 		redaction_policy_version, integrity_prev_hash, integrity_hash)
@@ -246,7 +245,7 @@ func TestProjectionCanaryWriteRejectedNonCanonical(t *testing.T) {
 type canaryInit struct{ ran *bool }
 
 func (c canaryInit) Name() string { return "canary_init" }
-func (c canaryInit) Init(db *sql.DB) error {
+func (c canaryInit) Init(db *ProjDB) error {
 	*c.ran = true
 	return nil
 }
@@ -262,7 +261,47 @@ func TestSecondOpenerInitNeverRuns(t *testing.T) {
 		t.Fatal("second live opener accepted")
 	}
 	if ran {
-		t.Fatal("rejected opener's projection Init mutDated/ran against the DB")
+		t.Fatal("rejected opener's projection Init mutated/ran against the DB")
+	}
+}
+
+// Init is restricted exactly like Apply (Phase-1B-r2 codex #2): a
+// projection whose Init writes a canonical table — directly or via a
+// trigger that MENTIONS one — fails Open with NON_CANONICAL_WRITE and no
+// forged event exists.
+type rogueInit struct{ stmt string }
+
+func (r rogueInit) Name() string { return "rogue_init" }
+func (r rogueInit) Init(db *ProjDB) error {
+	_, err := db.Exec(r.stmt)
+	return err
+}
+func (rogueInit) Apply(*ProjTx, Event) error { return nil }
+
+func TestProjectionInitCannotTouchCanonicalTables(t *testing.T) {
+	for name, stmt := range map[string]string{
+		"direct-insert": `INSERT INTO events(journal_offset, event_id, run_id, sequence, envelope,
+			redaction_policy_version, integrity_prev_hash, integrity_hash)
+			VALUES(999,'forged','run-x',1,'{}',1,'','')`,
+		"trigger": `CREATE TRIGGER sneak AFTER INSERT ON innocuous BEGIN
+			DELETE FROM events; END`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			_, err := Open(filepath.Join(dir, "journal.db"), "work", redact.None{}, manyEvents(), rogueInit{stmt: stmt})
+			if err == nil {
+				t.Fatal("Open with a canonical-table-touching Init succeeded")
+			}
+			if !strings.Contains(err.Error(), "NON_CANONICAL_WRITE") {
+				t.Fatalf("want NON_CANONICAL_WRITE, got: %v", err)
+			}
+			// The failed Open left no journal writer behind; a clean opener works.
+			j, err := Open(filepath.Join(dir, "journal.db"), "work", redact.None{}, manyEvents())
+			if err != nil {
+				t.Fatalf("journal unusable after rejected Init: %v", err)
+			}
+			j.Close()
+		})
 	}
 }
 

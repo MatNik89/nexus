@@ -296,9 +296,10 @@ func Open(path string, profile contracts.ProfileID, r redact.Redactor, events ma
 	}
 	// Projection Init runs ONLY under our verified ownership (Phase-1B
 	// codex #5: a rejected second opener must never get a DB handle to
-	// mutate through Init).
+	// mutate through Init) and only through the RESTRICTED handle
+	// (Phase-1B-r2 codex #2: a raw *sql.DB let Init forge canonical rows).
 	for _, sp := range syncProjections {
-		if err := sp.Init(db); err != nil {
+		if err := sp.Init(&ProjDB{db: db}); err != nil {
 			relErr := releaseLease()
 			closeErr := db.Close()
 			return nil, fmt.Errorf("journal open: sync projection %s init: %w", sp.Name(), errors.Join(err, relErr, closeErr))
