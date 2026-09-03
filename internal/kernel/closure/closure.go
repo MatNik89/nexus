@@ -134,6 +134,17 @@ type CapabilityStatus struct {
 	Reason string // OFF reason (probe/dependency), empty when On
 }
 
+// ConfigBinding is the resolved-configuration digest seam. The config
+// OWNER implements it (config.Resolved computes sha256 over the canonical
+// resolved configuration) — Seal consumes the typed seam, never a
+// free-floating string (Phase-1B-r3 codex #10). topknot ceiling: Go cannot
+// stop a hostile local caller from implementing the interface with an
+// invented digest; the composing root passes the REAL config.Resolved and
+// T27 verifies the all-live snapshot. Upgrade trigger: T27.
+type ConfigBinding interface {
+	ConfigHash() string
+}
+
 // Snapshot is the SEALED startup capability state: immutable after Seal;
 // changing configuration means restarting the process (B9). It RETAINS the
 // config-hash binding it was sealed under, so a consumer can prove which
@@ -172,7 +183,11 @@ func sha256Hex(s string) bool {
 // probe id/revision, expiry, and a measured-capability vector arrive with
 // the S0.3 negotiation owner (P1). Freshness in P0 is structural: probes
 // run once at startup and the snapshot dies with the process (B9).
-func Seal(manifests []Manifest, requested []string, probes []ProbeResult, configHash string) (*Snapshot, error) {
+func Seal(manifests []Manifest, requested []string, probes []ProbeResult, binding ConfigBinding) (*Snapshot, error) {
+	if binding == nil {
+		return nil, fmt.Errorf("closure: a resolved-config binding is required (fail closed)")
+	}
+	configHash := binding.ConfigHash()
 	if !sha256Hex(configHash) {
 		return nil, fmt.Errorf("closure: the config binding must be a sha256 hex digest of the resolved config (fail closed)")
 	}

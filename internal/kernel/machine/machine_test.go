@@ -313,3 +313,32 @@ func TestExhaustiveAttemptEdgeMatrix(t *testing.T) {
 		}
 	}
 }
+
+// Resumed folds carry their prior checkpoint explicitly (r3 codex #3
+// literals): a replayed already-applied offset is rejected even when the
+// transition itself would be legal, and an empty resumed batch returns the
+// prior checkpoint — never a regressed zero.
+func TestFoldFromEnforcesPriorCheckpoint(t *testing.T) {
+	tbl := RunTable()
+	// State folded through offset 10 (RUNNING); a legal-looking next event
+	// replayed at offset 9 must be rejected.
+	state, checkpoint, err := tbl.FoldFrom(contracts.RunRunning, 10,
+		[]FoldEvent{{Type: EvRunSucceeded, Offset: 9}}, nil)
+	if err == nil {
+		t.Fatalf("replayed offset behind the prior checkpoint accepted: %v@%d", state, checkpoint)
+	}
+	if checkpoint != 10 {
+		t.Fatalf("rejection regressed the checkpoint: %d", checkpoint)
+	}
+	// Empty resumed batch: prior checkpoint survives.
+	state, checkpoint, err = tbl.FoldFrom(contracts.RunRunning, 10, nil, nil)
+	if err != nil || state != contracts.RunRunning || checkpoint != 10 {
+		t.Fatalf("empty resume must keep state+checkpoint: %v@%d (%v)", state, checkpoint, err)
+	}
+	// Legal continuation past the checkpoint works.
+	state, checkpoint, err = tbl.FoldFrom(contracts.RunRunning, 10,
+		[]FoldEvent{{Type: EvRunSucceeded, Offset: 11}}, nil)
+	if err != nil || state != contracts.RunSucceeded || checkpoint != 11 {
+		t.Fatalf("legal resume failed: %v@%d (%v)", state, checkpoint, err)
+	}
+}

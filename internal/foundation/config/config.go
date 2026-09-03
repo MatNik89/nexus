@@ -12,6 +12,8 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -49,6 +51,19 @@ const (
 type Resolved struct {
 	Config  Config
 	Origins map[string]Origin
+}
+
+// ConfigHash returns the sha256 digest of the CANONICAL resolved
+// configuration — the config OWNER is the only principal that computes
+// capability-attestation bindings (SPEC P0.5 amendment; Phase-1B-r3 codex
+// #10: a free-floating caller string was assertion, not binding). It
+// satisfies the closure package's ConfigBinding seam.
+func (r Resolved) ConfigHash() string {
+	// A typed struct of strings/bools/string-slices marshals
+	// deterministically (fixed field order) and cannot fail.
+	b, _ := json.Marshal(r.Config)
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }
 
 // keyKind is the per-key schema (codex #11: every layer parses strictly).

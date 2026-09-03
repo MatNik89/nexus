@@ -7,9 +7,27 @@ package closure
 import (
 	"strings"
 	"testing"
+
+	"github.com/MatNik89/nexus/internal/foundation/config"
 )
 
-const cfgHash = "1111111111111111111111111111111111111111111111111111111111111111"
+// The REAL config owner computes the binding (r3 codex #10): tests seal
+// against an actually-resolved configuration, not an invented token.
+func mustResolve(cli map[string]string) config.Resolved {
+	r, err := config.Resolve("/nonexistent", "/nonexistent", nil, cli)
+	if err != nil {
+		panic(err)
+	}
+	return r
+}
+
+var cfgBinding = mustResolve(nil)
+var cfgHash = cfgBinding.ConfigHash()
+
+// fakeBinding exists ONLY to exercise the shape rejections.
+type fakeBinding string
+
+func (f fakeBinding) ConfigHash() string { return string(f) }
 
 func allProbesPass() []ProbeResult {
 	return []ProbeResult{
@@ -81,7 +99,7 @@ func TestAblatedSandboxProbeTurnsOnlyExecOff(t *testing.T) {
 			probes[i] = ProbeResult{Name: "sandbox", Passed: false, Detail: "bwrap missing", ConfigHash: cfgHash}
 		}
 	}
-	snap, err := Seal(P0Capabilities(), allP0(), probes, cfgHash)
+	snap, err := Seal(P0Capabilities(), allP0(), probes, cfgBinding)
 	if err != nil {
 		t.Fatalf("an ablated probe must not abort startup: %v", err)
 	}
@@ -107,7 +125,7 @@ func TestMissingProbeFailsClosedAndPropagates(t *testing.T) {
 		{Name: "sandbox", Passed: true, ConfigHash: cfgHash},
 		// provider probe MISSING entirely
 	}
-	snap, err := Seal(P0Capabilities(), allP0(), probes, cfgHash)
+	snap, err := Seal(P0Capabilities(), allP0(), probes, cfgBinding)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +146,7 @@ func TestMissingProbeFailsClosedAndPropagates(t *testing.T) {
 // Unknown capability names queried against the sealed snapshot are OFF —
 // never a skippable error.
 func TestUnknownCapabilityQueriesOff(t *testing.T) {
-	snap, err := Seal(P0Capabilities(), allP0(), allProbesPass(), cfgHash)
+	snap, err := Seal(P0Capabilities(), allP0(), allProbesPass(), cfgBinding)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,11 +159,11 @@ func TestUnknownCapabilityQueriesOff(t *testing.T) {
 // decide capability state (codex #19 literal).
 func TestDuplicateProbeNamesRejectedBothOrders(t *testing.T) {
 	dup1 := append(allProbesPass(), ProbeResult{Name: "sandbox", Passed: false, ConfigHash: cfgHash})
-	if _, err := Seal(P0Capabilities(), allP0(), dup1, cfgHash); err == nil {
+	if _, err := Seal(P0Capabilities(), allP0(), dup1, cfgBinding); err == nil {
 		t.Fatal("duplicate probe (pass-then-fail) accepted")
 	}
 	dup2 := append([]ProbeResult{{Name: "sandbox", Passed: false, ConfigHash: cfgHash}}, allProbesPass()...)
-	if _, err := Seal(P0Capabilities(), allP0(), dup2, cfgHash); err == nil {
+	if _, err := Seal(P0Capabilities(), allP0(), dup2, cfgBinding); err == nil {
 		t.Fatal("duplicate probe (fail-then-pass) accepted")
 	}
 }
@@ -159,7 +177,7 @@ func TestStaleProbeFromOtherConfigTurnsCapabilityOff(t *testing.T) {
 			probes[i].ConfigHash = "OLD-config"
 		}
 	}
-	snap, err := Seal(P0Capabilities(), allP0(), probes, cfgHash)
+	snap, err := Seal(P0Capabilities(), allP0(), probes, cfgBinding)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,9 +185,12 @@ func TestStaleProbeFromOtherConfigTurnsCapabilityOff(t *testing.T) {
 		t.Fatal("exec ON from a stale probe measured under another config")
 	}
 	for _, bad := range []string{"", "cfg-hash-1", "not-a-digest"} {
-		if _, err := Seal(P0Capabilities(), allP0(), allProbesPass(), bad); err == nil {
+		if _, err := Seal(P0Capabilities(), allP0(), allProbesPass(), fakeBinding(bad)); err == nil {
 			t.Fatalf("non-digest config binding accepted: %q", bad)
 		}
+	}
+	if _, err := Seal(P0Capabilities(), allP0(), allProbesPass(), nil); err == nil {
+		t.Fatal("nil config binding accepted")
 	}
 	if snap.ConfigHash() != cfgHash {
 		t.Fatal("snapshot does not retain its config binding")
@@ -187,5 +208,38 @@ func TestUnknownConflictTargetRejected(t *testing.T) {
 	// is invalid.
 	if _, err := Resolve(manifests, []string{"conversation"}); err == nil {
 		t.Fatal("manifest set with a dangling conflict accepted")
+	}
+}
+
+// A shape-valid but INVENTED digest cannot attest a differently-resolved
+// config (r3 codex #10 literal): probes measured under another real config
+// — or under a fabricated 64-hex token — never turn a capability ON when
+// sealing under the actual resolved config.
+func TestInventedOrForeignDigestCannotAttest(t *testing.T) {
+	other := mustResolve(map[string]string{"provider_model": "other-model"})
+	if other.ConfigHash() == cfgHash {
+		t.Fatal("oracle vacuous: different resolved configs share a digest")
+	}
+	for name, probeHash := range map[string]string{
+		"foreign-config":  other.ConfigHash(),
+		"invented-64-hex": "1111111111111111111111111111111111111111111111111111111111111111",
+	} {
+		probes := allProbesPass()
+		for i := range probes {
+			probes[i].ConfigHash = probeHash
+		}
+		snap, err := Seal(P0Capabilities(), allP0(), probes, cfgBinding)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, cap := range allP0() {
+			if snap.On(cap) {
+				t.Fatalf("%s: capability %q ON from a probe not measured under the sealed config", name, cap)
+			}
+		}
+	}
+	// Determinism: the same resolution yields the same digest.
+	if mustResolve(nil).ConfigHash() != cfgHash {
+		t.Fatal("config digest is not deterministic")
 	}
 }

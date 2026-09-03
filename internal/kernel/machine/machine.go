@@ -75,11 +75,19 @@ type FoldEvent struct {
 // Offsets are JOURNAL offsets and must be STRICTLY INCREASING (gaps are
 // legal after entity filtering; zero, duplicate, or decreasing offsets are
 // rejected — Phase-1B-r2 codex #6: a regressing checkpoint would make
-// resume replay already-applied events). A RESUMED fold passes the state
-// folded so far as initial and only events PAST its prior checkpoint.
+// resume replay already-applied events). Fold starts from genesis
+// (prior checkpoint 0); a RESUMED fold uses FoldFrom.
 func (t *Table[S]) Fold(initial S, events []FoldEvent, observe func(state S, offset uint64)) (S, uint64, error) {
+	return t.FoldFrom(initial, 0, events, observe)
+}
+
+// FoldFrom resumes a fold: initial is the state already folded through
+// priorCheckpoint, and every event must lie STRICTLY PAST that checkpoint —
+// a replayed already-applied offset is rejected, and an EMPTY batch returns
+// priorCheckpoint unchanged, never a regressed zero (Phase-1B-r3 codex #3).
+func (t *Table[S]) FoldFrom(initial S, priorCheckpoint uint64, events []FoldEvent, observe func(state S, offset uint64)) (S, uint64, error) {
 	state := initial
-	var checkpoint uint64
+	checkpoint := priorCheckpoint
 	for _, ev := range events {
 		if ev.Offset <= checkpoint {
 			return state, checkpoint, fmt.Errorf(
