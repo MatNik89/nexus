@@ -280,10 +280,11 @@ RED: approve-after-daemon-restart → completes exactly once; replay → `APPROV
 modified args under old approval → rejected (`test_approval_cannot_authorize_modified_
 effect`); **cross-profile (B3 chain):** occurrence/delivery/approval created in `work` can
 NEVER be seen, delivered, or approved via a `private`-bound chat (and vice versa),
-including across restart/replay; **yolo (F2):** in yolo the HITL path does not park (ASK
-auto-allows, journaled), but the sandbox/egress hostile checks still pass unchanged and a
-Telegram message can neither enable yolo nor piggyback on it to authorize a
-DENY-classified effect.
+including across restart/replay; **yolo (F2, policy half):** in yolo the HITL path does
+not park (ASK auto-allows, journaled) and a Telegram message can neither enable yolo nor
+piggyback on it to authorize a DENY-classified effect. (The yolo-with-REAL-sandbox
+integration RED — hostile suite unchanged under yolo — lives in T27, where the real
+backend exists; r4 codex #5.)
 
 ## Phase 6 — sandboxed exec (gated by T02)
 
@@ -319,7 +320,9 @@ adversarial review of the whole P0 before declaring done.
 RED: per-criterion sensitivity — for EACH of the six criteria, a controlled feature-off
 switch or targeted mutation (never reverting the check itself) turns exactly that
 criterion's check RED; tampered binary → signature verification fails; each live probe
-removed or stale-hashed → its capability OFF in the snapshot and no dispatch to it.
+removed or stale-hashed → its capability OFF in the snapshot and no dispatch to it;
+**yolo integration (F2):** with the REAL backend, the hostile sandbox/egress suite passes
+unchanged under `--yolo` (yolo never weakens containment).
 
 ---
 
