@@ -39,7 +39,7 @@ func openProfile(t *testing.T, layout pathx.Layout, p contracts.ProfileID) (*Sto
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { j.Close() })
-	s, err := NewStore(j)
+	s, err := NewStore(j, redact.None{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +139,7 @@ func TestProfileStampSurvivesRestartAndReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer j2.Close()
-	s2, err := NewStore(j2)
+	s2, err := NewStore(j2, redact.None{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,11 +152,30 @@ func TestProfileStampSurvivesRestartAndReplay(t *testing.T) {
 			t.Fatalf("row %s lost its profile stamp: %q", r.ID, r.Profile)
 		}
 	}
-	// REPLAY REPRODUCTION: fold the journal events through a fresh Apply
-	// into a scratch DB — the canonical stream alone rebuilds the facts.
-	replayed := replayFacts(t, j2)
-	if len(replayed) != 2 {
-		t.Fatalf("replay reproduced %d facts, want 2", len(replayed))
+	// REPLAY REPRODUCTION (Phase-3-r2 codex #1): DROP the projection
+	// tables and the checkpoint (the rebuild path), reopen — the
+	// canonical stream alone reconstructs the FULL projection state.
+	j2.Close()
+	dropProjection(t, workPath)
+	j3, err := journal.Open(workPath, "work", redact.None{}, Events(), NewProjection())
+	if err != nil {
+		t.Fatalf("reopen after projection drop: %v", err)
+	}
+	s3, err := NewStore(j3, redact.None{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err = s3.All(ctxT())
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("catch-up did not reconstruct the projection: %v %v", rows, err)
+	}
+	if hits, _ := s3.Search(ctxT(), "ZEBRAPROJECT"); len(hits) != 1 {
+		t.Fatalf("rebuilt FTS broken: %v", hits)
+	}
+	j3.Close()
+	j2, err = journal.Open(workPath, "work", redact.None{}, Events(), NewProjection())
+	if err != nil {
+		t.Fatal(err)
 	}
 	// A different profile can NEVER open this file (journal binding).
 	j2.Close()
@@ -217,5 +236,25 @@ func TestCallerCannotForgeProfileOnRow(t *testing.T) {
 	}
 	if err := work.SaveFact(ctxT(), "f-y", ""); err == nil {
 		t.Fatal("empty content accepted")
+	}
+}
+
+// dropProjection removes the derived tables AND the checkpoint — the
+// declared rebuild path.
+func dropProjection(t *testing.T, path string) {
+	t.Helper()
+	db, err := sqlOpen(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, stmt := range []string{
+		`DROP TABLE IF EXISTS mem_facts`,
+		`DROP TABLE IF EXISTS mem_facts_fts`,
+		`DELETE FROM proj_sync_offsets WHERE name='memory_facts'`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
 	}
 }

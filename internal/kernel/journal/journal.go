@@ -305,9 +305,65 @@ func Open(path string, profile contracts.ProfileID, r redact.Redactor, events ma
 			return nil, fmt.Errorf("journal open: sync projection %s init: %w", sp.Name(), errors.Join(err, relErr, closeErr))
 		}
 	}
+	// CATCH-UP (Phase-3-r2 codex #1): a projection behind the canonical
+	// stream — fresh tables, or a checkpoint reset for rebuild — replays
+	// every missing event through Apply before the journal serves anyone.
+	// The canonical stream alone reconstructs derived state.
+	if err := j.catchupProjections(lastOffset); err != nil {
+		relErr := releaseLease()
+		closeErr := db.Close()
+		return nil, fmt.Errorf("journal open: projection catch-up: %w", errors.Join(err, relErr, closeErr))
+	}
 
 	go j.actor(lastOffset, lastHash)
 	return j, nil
+}
+
+// catchupProjections replays canonical events into every sync projection
+// whose durable checkpoint is behind head. Deleting a projection's
+// checkpoint row (and its tables) is the REBUILD path: the next Open
+// refolds from offset zero.
+func (j *Journal) catchupProjections(head uint64) error {
+	if len(j.syncProjections) == 0 {
+		return nil
+	}
+	if _, err := j.db.Exec(`CREATE TABLE IF NOT EXISTS proj_sync_offsets (
+		name TEXT PRIMARY KEY, applied_offset INTEGER NOT NULL)`); err != nil {
+		return err
+	}
+	for _, sp := range j.syncProjections {
+		var cp uint64
+		err := j.db.QueryRow(`SELECT applied_offset FROM proj_sync_offsets WHERE name=?`, sp.Name()).Scan(&cp)
+		if err == sql.ErrNoRows {
+			cp = 0
+			if _, err := j.db.Exec(`INSERT INTO proj_sync_offsets(name, applied_offset) VALUES(?,0)`, sp.Name()); err != nil {
+				return err
+			}
+		} else if err != nil {
+			return err
+		}
+		if cp >= head {
+			continue
+		}
+		if err := j.Replay(cp, func(ev Event) error {
+			tx, err := j.db.Begin()
+			if err != nil {
+				return err
+			}
+			defer tx.Rollback()
+			if err := sp.Apply(&ProjTx{tx: tx}, ev); err != nil {
+				return fmt.Errorf("projection %s catch-up at offset %d: %w", sp.Name(), ev.JournalOffset, err)
+			}
+			if _, err := tx.Exec(`UPDATE proj_sync_offsets SET applied_offset=? WHERE name=?`,
+				int64(ev.JournalOffset), sp.Name()); err != nil {
+				return err
+			}
+			return tx.Commit()
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (j *Journal) actor(lastOffset uint64, lastHash string) {

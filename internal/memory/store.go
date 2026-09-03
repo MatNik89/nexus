@@ -30,6 +30,7 @@ import (
 
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
 	"github.com/MatNik89/nexus/internal/kernel/journal"
+	"github.com/MatNik89/nexus/internal/security/redact"
 )
 
 // Origin says how a fact entered the system.
@@ -66,6 +67,9 @@ type factPayload struct {
 	Tags        []string              `json:"tags,omitempty"`
 	Trust       contracts.TrustClass  `json:"trust_class"`
 	Sensitivity contracts.Sensitivity `json:"sensitivity"`
+	// Lineage carries the SOURCE chain (tool call ids, block ids) —
+	// approval never erases provenance (Phase-3-r2 codex #7).
+	Lineage []string `json:"lineage,omitempty"`
 }
 
 type decisionPayload struct {
@@ -152,6 +156,7 @@ func (Projection) Init(db *journal.ProjDB) error {
 			tags TEXT NOT NULL DEFAULT '',
 			trust INTEGER NOT NULL,
 			sensitivity INTEGER NOT NULL,
+			lineage TEXT NOT NULL DEFAULT '[]',
 			created INTEGER NOT NULL
 		);
 		CREATE UNIQUE INDEX IF NOT EXISTS ux_mem_supersedes
@@ -170,11 +175,15 @@ func tagBlob(tags []string) string {
 
 func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 	insert := func(f factPayload, status Status, supersedes *string) error {
+		lineage, lerr := json.Marshal(f.Lineage)
+		if lerr != nil {
+			return lerr
+		}
 		res, err := tx.Exec(`INSERT INTO mem_facts
-			(id, profile_id, content, origin, status, supersedes, tags, trust, sensitivity, created)
-			VALUES(?,?,?,?,?,?,?,?,?,?)`,
+			(id, profile_id, content, origin, status, supersedes, tags, trust, sensitivity, lineage, created)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
 			f.ID, string(ev.Envelope.ProfileID), f.Content, string(f.Origin), string(status),
-			supersedes, tagBlob(f.Tags), int(f.Trust), int(f.Sensitivity), int64(ev.JournalOffset))
+			supersedes, tagBlob(f.Tags), int(f.Trust), int(f.Sensitivity), string(lineage), int64(ev.JournalOffset))
 		if err != nil {
 			return fmt.Errorf("memory: fact insert: %w", err)
 		}
@@ -274,19 +283,41 @@ type Row struct {
 	Tags        []string
 	Trust       contracts.TrustClass
 	Sensitivity contracts.Sensitivity
+	Lineage     []string
 }
 
 // Store is the memory facade over the profile's ONE journal.
 type Store struct {
-	j   *journal.Journal
-	seq atomic.Uint64
+	j        *journal.Journal
+	redactor redact.Redactor
+	seq      atomic.Uint64
 }
 
-func NewStore(j *journal.Journal) (*Store, error) {
-	if j == nil {
-		return nil, fmt.Errorf("memory: a journal is required (fail closed)")
+// NewStore binds the facade to the profile journal and ITS redactor:
+// content the redactor would rewrite is REFUSED before the append —
+// silently storing different bytes than the user approved would break
+// B8's exact-preview rule and the commit receipt (Phase-3-r2 codex #15).
+func NewStore(j *journal.Journal, r redact.Redactor) (*Store, error) {
+	if j == nil || r == nil {
+		return nil, fmt.Errorf("memory: a journal and its redactor are required (fail closed)")
 	}
-	return &Store{j: j}, nil
+	return &Store{j: j, redactor: r}, nil
+}
+
+// refuseSecretContent rejects content the journal redactor would rewrite.
+func (s *Store) refuseSecretContent(content string) error {
+	raw, err := json.Marshal(content)
+	if err != nil {
+		return fmt.Errorf("memory: %w", err)
+	}
+	red, err := s.redactor.Redact(raw)
+	if err != nil {
+		return fmt.Errorf("memory: redaction check: %w", err)
+	}
+	if string(red) != string(raw) {
+		return fmt.Errorf("memory: content contains a known secret reference — refused (store the secret's LOCATION, never its value)")
+	}
+	return nil
 }
 
 // Profile reports the bound profile (the journal's own binding).
@@ -308,7 +339,7 @@ func (s *Store) append(ctx context.Context, eventType string, payload any) error
 	return err
 }
 
-func explicitDefaults(id, content string, origin Origin, tags []string) factPayload {
+func explicitDefaults(id, content string, origin Origin, tags, lineage []string) factPayload {
 	trust := contracts.TrustToolTrusted
 	if origin == OriginInferred {
 		// Inferences derive from conversation context that may include
@@ -316,19 +347,30 @@ func explicitDefaults(id, content string, origin Origin, tags []string) factPayl
 		trust = contracts.TrustUntrustedExternal
 	}
 	return factPayload{ID: id, Content: content, Origin: origin, Tags: tags,
-		Trust: trust, Sensitivity: contracts.SensitivityConfidential}
+		Trust: trust, Sensitivity: contracts.SensitivityConfidential, Lineage: lineage}
 }
 
 // SaveFact stores one already-approved EXPLICIT fact (the PEP approval
 // flow ran; T18 seeding path).
 func (s *Store) SaveFact(ctx context.Context, id, content string, tags ...string) error {
-	return s.append(ctx, EvFactSaved, explicitDefaults(id, content, OriginExplicit, tags))
+	return s.SaveFactLineage(ctx, id, content, tags, nil)
+}
+
+// SaveFactLineage carries the source chain (Phase-3-r2 codex #7).
+func (s *Store) SaveFactLineage(ctx context.Context, id, content string, tags, lineage []string) error {
+	if err := s.refuseSecretContent(content); err != nil {
+		return err
+	}
+	return s.append(ctx, EvFactSaved, explicitDefaults(id, content, OriginExplicit, tags, lineage))
 }
 
 // Propose enters a fact into the REVIEW state and returns the EXACT
 // content as its preview. Nothing proposed is recallable until accepted.
 func (s *Store) Propose(ctx context.Context, id, content string, origin Origin, tags ...string) (string, error) {
-	if err := s.append(ctx, EvFactProposed, explicitDefaults(id, content, origin, tags)); err != nil {
+	if err := s.refuseSecretContent(content); err != nil {
+		return "", err
+	}
+	if err := s.append(ctx, EvFactProposed, explicitDefaults(id, content, origin, tags, nil)); err != nil {
 		return "", err
 	}
 	return content, nil
@@ -345,8 +387,11 @@ func (s *Store) Reject(ctx context.Context, id string) error {
 // Supersede appends a CORRECTION (strictly linear; validated inside the
 // append transaction).
 func (s *Store) Supersede(ctx context.Context, oldID, newID, content string, tags ...string) error {
+	if err := s.refuseSecretContent(content); err != nil {
+		return err
+	}
 	return s.append(ctx, EvFactSuperseded, supersedePayload{
-		OldID: oldID, New: explicitDefaults(newID, content, OriginExplicit, tags)})
+		OldID: oldID, New: explicitDefaults(newID, content, OriginExplicit, tags, []string{oldID})})
 }
 
 // latestAccepted is THE shared retrieval predicate: accepted, and not
@@ -359,7 +404,7 @@ const maxQueryLen = 256
 const resultLimit = 50
 
 func (s *Store) queryRows(ctx context.Context, where, order string, args ...any) ([]Row, error) {
-	q := `SELECT f.id, f.profile_id, f.content, f.origin, f.status, f.tags, f.trust, f.sensitivity
+	q := `SELECT f.id, f.profile_id, f.content, f.origin, f.status, f.tags, f.trust, f.sensitivity, f.lineage
 		FROM mem_facts f WHERE ` + where + ` ORDER BY ` + order + ` LIMIT ` + fmt.Sprint(resultLimit)
 	rows, err := s.j.QueryProjection(ctx, q, args...)
 	if err != nil {
@@ -369,11 +414,12 @@ func (s *Store) queryRows(ctx context.Context, where, order string, args ...any)
 	var out []Row
 	for rows.Next() {
 		var r Row
-		var p, o, st, tags string
+		var p, o, st, tags, lineage string
 		var tr, se int
-		if err := rows.Scan(&r.ID, &p, &r.Content, &o, &st, &tags, &tr, &se); err != nil {
+		if err := rows.Scan(&r.ID, &p, &r.Content, &o, &st, &tags, &tr, &se, &lineage); err != nil {
 			return nil, fmt.Errorf("memory: %w", err)
 		}
+		json.Unmarshal([]byte(lineage), &r.Lineage)
 		r.Profile = contracts.ProfileID(p)
 		r.Origin, r.Status = Origin(o), Status(st)
 		r.Trust, r.Sensitivity = contracts.TrustClass(tr), contracts.Sensitivity(se)
@@ -418,7 +464,11 @@ func (s *Store) RecallTag(ctx context.Context, tag string) ([]Row, error) {
 	if err != nil {
 		return nil, err
 	}
-	return s.queryRows(ctx, `f.tags LIKE ? AND `+latestAccepted, "f.rowid DESC", "% "+tag+" %")
+	// LIKE metacharacters in the model-controlled tag are ESCAPED — a
+	// "%" tag matches only a literal "%" tag, never everything
+	// (Phase-3-r2 codex #8).
+	esc := strings.NewReplacer("|", "||", "%", "|%", "_", "|_").Replace(tag)
+	return s.queryRows(ctx, `f.tags LIKE ? ESCAPE '|' AND `+latestAccepted, "f.rowid DESC", "% "+esc+" %")
 }
 
 // Exact retrieves the latest-accepted fact with BYTE-EXACT content.

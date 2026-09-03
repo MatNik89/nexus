@@ -76,7 +76,7 @@ func Tools(store *Store, r redact.Redactor) map[contracts.ToolID]effectpath.InPr
 				// append transaction.
 				err = store.Supersede(ctx, args.Supersedes, id, args.Content, args.Tags...)
 			} else {
-				err = store.SaveFact(ctx, id, args.Content, args.Tags...)
+				err = store.SaveFactLineage(ctx, id, args.Content, args.Tags, []string{string(c.ToolCallID)})
 			}
 			if err != nil {
 				return contracts.ToolResult{}, err
@@ -117,19 +117,28 @@ func Tools(store *Store, r redact.Redactor) map[contracts.ToolID]effectpath.InPr
 			// Monotone trust (Phase-3 codex #7): the observation is only
 			// as trusted as its LEAST trusted fact — an accepted inference
 			// derived from untrusted material stays inside the fence.
+			// Lineage UNIONS the stored source chains with this call.
 			trust := contracts.TrustToolTrusted
+			lineage := []string{string(c.ToolCallID)}
+			seen := map[string]bool{string(c.ToolCallID): true}
 			if len(hits) > 0 {
 				body = ""
 				for _, h := range hits {
 					if h.Trust == contracts.TrustUntrustedExternal {
 						trust = contracts.TrustUntrustedExternal
 					}
+					for _, l := range h.Lineage {
+						if !seen[l] {
+							seen[l] = true
+							lineage = append(lineage, l)
+						}
+					}
 					// Known secret references never reach the model
 					// boundary verbatim.
 					body += "- " + redactText(r, h.Content) + "\n"
 				}
 			}
-			return textResultTrust(c, body, nil, trust)
+			return textResultLineage(c, body, nil, trust, lineage)
 		},
 	}
 }
@@ -156,13 +165,17 @@ func textResult(c contracts.ToolCall, text string, receipt *contracts.CommitRece
 }
 
 func textResultTrust(c contracts.ToolCall, text string, receipt *contracts.CommitReceipt, trust contracts.TrustClass) (contracts.ToolResult, error) {
+	return textResultLineage(c, text, receipt, trust, []string{string(c.ToolCallID)})
+}
+
+func textResultLineage(c contracts.ToolCall, text string, receipt *contracts.CommitReceipt, trust contracts.TrustClass, lineage []string) (contracts.ToolResult, error) {
 	sum := sha256.Sum256([]byte(text))
 	block, err := contracts.NewContextBlock(contracts.ContextBlockParams{
 		BlockID: contracts.BlockID("obs-" + string(c.ToolCallID)), Kind: "tool_output",
 		Content: &text, ContentHash: hex.EncodeToString(sum[:]),
 		SourceURI: "nexus://memory", Producer: "memory",
 		Trust: trust, Sensitivity: contracts.SensitivityConfidential,
-		Lineage: []string{string(c.ToolCallID)}, ObservedAt: time.Now().UTC(),
+		Lineage: lineage, ObservedAt: time.Now().UTC(),
 	})
 	if err != nil {
 		return contracts.ToolResult{}, err

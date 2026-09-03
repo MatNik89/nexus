@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"time"
 
@@ -192,8 +193,15 @@ func (c *ChatPlanner) Plan(ctx context.Context, blocks []contracts.ContextBlock)
 	system := systemPrompt
 	if len(c.specs) > 0 {
 		system += toolProtocol
-		for id, spec := range c.specs {
-			system += fmt.Sprintf("- %s: %s\n", id, spec.Description)
+		// Deterministic prompt bytes: sorted tool ids (Phase-3-r2 codex
+		// #17 — map iteration order must never change the plan).
+		ids := make([]string, 0, len(c.specs))
+		for id := range c.specs {
+			ids = append(ids, string(id))
+		}
+		sort.Strings(ids)
+		for _, id := range ids {
+			system += fmt.Sprintf("- %s: %s\n", id, c.specs[contracts.ToolID(id)].Description)
 		}
 	}
 	msgs := []provider.ChatMessage{

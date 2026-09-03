@@ -23,7 +23,7 @@ type ProjTx struct {
 	tx *sql.Tx
 }
 
-var canonicalTableRe = regexp.MustCompile(`(?i)\b(events|journal_meta|projection_offsets)\b`)
+var canonicalTableRe = regexp.MustCompile(`(?i)\b(events|journal_meta|projection_offsets|proj_sync_offsets)\b`)
 
 func guardStatement(query string) error {
 	if canonicalTableRe.MatchString(strings.ToLower(query)) {
@@ -102,6 +102,12 @@ func (j *Journal) applySyncProjections(tx *sql.Tx, ev Event) error {
 	for _, p := range j.syncProjections {
 		if err := p.Apply(restricted, ev); err != nil {
 			return fmt.Errorf("sync projection %s: %w", p.Name(), err)
+		}
+		// Checkpoint advances IN the append transaction: state, event and
+		// checkpoint commit together (catch-up trusts this on reopen).
+		if _, err := tx.Exec(`INSERT INTO proj_sync_offsets(name, applied_offset) VALUES(?1,?2)
+			ON CONFLICT(name) DO UPDATE SET applied_offset=?2`, p.Name(), int64(ev.JournalOffset)); err != nil {
+			return fmt.Errorf("sync projection %s checkpoint: %w", p.Name(), err)
 		}
 	}
 	return nil
@@ -185,6 +191,12 @@ func (j *Journal) QueryProjection(ctx context.Context, query string, args ...any
 	trimmed := strings.TrimSpace(strings.ToLower(query))
 	if !strings.HasPrefix(trimmed, "select") {
 		return nil, fmt.Errorf("NON_CANONICAL_WRITE: projection reads are SELECT-only (fail closed)")
+	}
+	// ONE statement only: a ';' anywhere is rejected — SQLite would happily
+	// run a trailing DELETE (Phase-3-r2 codex #14). Legitimate projection
+	// queries never need semicolons or string literals carrying them.
+	if strings.ContainsRune(query, ';') {
+		return nil, fmt.Errorf("NON_CANONICAL_WRITE: projection reads are single-statement (fail closed)")
 	}
 	if err := guardStatement(query); err != nil {
 		return nil, err

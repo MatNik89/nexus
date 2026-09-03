@@ -199,13 +199,13 @@ func TestFactSurvivesRestartOnlyInItsProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer j2.Close()
-	work2, _ := NewStore(j2)
+	work2, _ := NewStore(j2, redact.None{})
 	jp, err := journal.Open(privatePath, "private", redact.None{}, Events(), NewProjection())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer jp.Close()
-	private2, _ := NewStore(jp)
+	private2, _ := NewStore(jp, redact.None{})
 	hits, err := work2.Recall(ctxT(), "RESTARTFACT")
 	if err != nil || len(hits) != 1 {
 		t.Fatalf("accepted fact did not survive restart: %v %v", hits, err)
@@ -305,5 +305,141 @@ func TestRecallObservationMonotoneTrustAndRedaction(t *testing.T) {
 	}
 	if res.Commit == nil || !res.Commit.ValidFor(ok) || res.Commit.Phase != contracts.PhaseAfterCommit {
 		t.Fatalf("remember returned no valid commit receipt: %+v", res.Commit)
+	}
+}
+
+// Full-state replay: rejected + superseded state also reconstructs from
+// the canonical stream (Phase-3-r2 codex #1 tail).
+func TestReplayReconstructsFullState(t *testing.T) {
+	_, work, _, workPath, _ := seedBoth(t)
+	if _, err := work.Propose(ctxT(), "f-rej", "REPLAYREJECT idea", OriginInferred); err != nil {
+		t.Fatal(err)
+	}
+	if err := work.Reject(ctxT(), "f-rej"); err != nil {
+		t.Fatal(err)
+	}
+	if err := work.SaveFact(ctxT(), "f-sup", "REPLAYSUP v1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := work.Supersede(ctxT(), "f-sup", "f-sup2", "REPLAYSUP v2"); err != nil {
+		t.Fatal(err)
+	}
+	workClose(t, work)
+	dropProjection(t, workPath)
+	j, err := journal.Open(workPath, "work", redact.None{}, Events(), NewProjection())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.Close()
+	s, _ := NewStore(j, redact.None{})
+	rows, err := s.All(ctxT())
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]Row{}
+	for _, r := range rows {
+		byID[r.ID] = r
+	}
+	if byID["f-rej"].Status != StatusRejected {
+		t.Fatalf("rejected state lost in replay: %+v", byID["f-rej"])
+	}
+	if hits, _ := s.Recall(ctxT(), "REPLAYSUP"); len(hits) != 1 || hits[0].ID != "f-sup2" {
+		t.Fatalf("supersession chain lost in replay: %v", hits)
+	}
+}
+
+// Known-secret content is REFUSED before the journal (Phase-3-r2 codex
+// #15): the exact-preview rule means bytes are stored verbatim or not at
+// all — never silently rewritten by redaction.
+func TestSecretContentRefusedNotRewritten(t *testing.T) {
+	layout := testLayout(t)
+	dir, _ := layout.ProfileDir("work")
+	if err := pathxEnsure(layout, dir); err != nil {
+		t.Fatal(err)
+	}
+	const secret = "sk-STORE-SECRET"
+	r := redact.NewKnownRefs(map[string]string{"KEY": secret})
+	j, err := journal.Open(dir+"/journal.db", "work", r, Events(), NewProjection())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.Close()
+	s, err := NewStore(j, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveFact(ctxT(), "f-1", "my key is "+secret); err == nil {
+		t.Fatal("known-secret content accepted (would be silently rewritten by journal redaction)")
+	}
+	if _, err := s.Propose(ctxT(), "f-2", secret, OriginExplicit); err == nil {
+		t.Fatal("known-secret proposal accepted")
+	}
+	rows, _ := s.All(ctxT())
+	if len(rows) != 0 {
+		t.Fatalf("refused content left rows behind: %v", rows)
+	}
+	// Clean content still stores byte-exactly.
+	if err := s.SaveFact(ctxT(), "f-3", "the key lives in the password manager"); err != nil {
+		t.Fatal(err)
+	}
+	hits, _ := s.Exact(ctxT(), "the key lives in the password manager")
+	if len(hits) != 1 {
+		t.Fatalf("clean content not stored byte-exactly: %v", hits)
+	}
+}
+
+// LIKE metacharacters in tags never widen retrieval (Phase-3-r2 codex #8).
+func TestTagLikeMetacharactersEscaped(t *testing.T) {
+	_, work, _, _, _ := seedBoth(t)
+	if err := work.SaveFact(ctxT(), "f-m1", "METATAG fact one", "office"); err != nil {
+		t.Fatal(err)
+	}
+	if err := work.SaveFact(ctxT(), "f-m2", "METATAG fact two", "%"); err != nil {
+		t.Fatal(err)
+	}
+	// "%" retrieves ONLY the literal-% tag, never everything.
+	hits, err := work.RecallTag(ctxT(), "%")
+	if err != nil || len(hits) != 1 || hits[0].ID != "f-m2" {
+		t.Fatalf("%% widened tag retrieval: %v %v", hits, err)
+	}
+	if hits, _ := work.RecallTag(ctxT(), "_"); len(hits) != 0 {
+		t.Fatalf("_ matched arbitrary tags: %v", hits)
+	}
+}
+
+// Fact lineage persists and reaches the recall observation (Phase-3-r2
+// codex #7): approval never erases provenance.
+func TestFactLineageSurvivesToRecall(t *testing.T) {
+	_, work, _, _, _ := seedBoth(t)
+	if err := work.SaveFactLineage(ctxT(), "f-l", "LINEAGETOKEN fact", nil, []string{"tc-origin-1"}); err != nil {
+		t.Fatal(err)
+	}
+	hits, err := work.Recall(ctxT(), "LINEAGETOKEN")
+	if err != nil || len(hits) != 1 || len(hits[0].Lineage) != 1 || hits[0].Lineage[0] != "tc-origin-1" {
+		t.Fatalf("stored lineage lost: %v %v", hits, err)
+	}
+	tools := Tools(work, redact.None{})
+	call, _ := contracts.NewToolCall(contracts.ToolCallParams{
+		ToolCallID: "tc-recall-9", ToolID: "memory_recall",
+		Arguments: []byte(`{"query":"LINEAGETOKEN"}`), ArgsSchemaHash: "memory_recall.v1",
+		Effect: contracts.EffectReadOnly, ExecutionKind: contracts.ExecInProcess,
+		Deadline: timeNowPlusMinute(), AttemptNo: 1, ProfileID: "work",
+	})
+	out, err := tools["memory_recall"](ctxT(), call)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := out.Output[0].Lineage
+	hasOrigin, hasCall := false, false
+	for _, l := range got {
+		if l == "tc-origin-1" {
+			hasOrigin = true
+		}
+		if l == "tc-recall-9" {
+			hasCall = true
+		}
+	}
+	if !hasOrigin || !hasCall {
+		t.Fatalf("observation lineage must union source + call: %v", got)
 	}
 }

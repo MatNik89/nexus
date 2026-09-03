@@ -133,11 +133,10 @@ func TestMemoryToolSpineSurvivesRestart(t *testing.T) {
 		if err != nil {
 			t.Fatalf("composition root: %v", err)
 		}
-		defer j.Close()
 		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
 		sock := socketPath(layout)
-		go d.Serve(ctx, sock)
+		serveDone := make(chan error, 1)
+		go func() { serveDone <- d.Serve(ctx, sock) }()
 		for i := 0; i < 100; i++ {
 			if c, err := net.Dial("unix", sock); err == nil {
 				c.Close()
@@ -148,8 +147,15 @@ func TestMemoryToolSpineSurvivesRestart(t *testing.T) {
 		var out strings.Builder
 		// yolo session: the ASK on memory_remember is journaled
 		// ALLOWED_BY_YOLO instead of blocking on the T24 HITL owner.
-		if err := repl.Run(strings.NewReader(input), &out, sock, true); err != nil {
-			t.Fatal(err)
+		rerr := repl.Run(strings.NewReader(input), &out, sock, true)
+		// Orderly incarnation teardown BEFORE the next one reuses the
+		// socket (Phase-3-r2 codex #16: the flaky gate connected to a
+		// dying daemon).
+		cancel()
+		<-serveDone
+		j.Close()
+		if rerr != nil {
+			t.Fatal(rerr)
 		}
 		return out.String()
 	}
