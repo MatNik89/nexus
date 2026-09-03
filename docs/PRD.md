@@ -65,3 +65,13 @@ uključi se programerski način koji je jači od postojećih alata. Isti "mozak"
 ARCHITECTURE-ESSENTIALS.md (5-15 kritičnih odluka) → hard-questions → CLAUDE.md/AGENTS.md → scaffold.
 **APPROVED by the user 2026-09-03** (identity "one kernel, two profiles, assistant-first" +
 P0 = the 6 capabilities of §4 with §6 done-criteria). Product layer decision #6 (DESIGN-STATUS) closed.
+
+**PRD AMENDMENT (user directive, 2026-09-03) — YOLO/bypass mode, P0:**
+`nexus --yolo` starts a session with NO confirmation prompts (every ASK auto-allows) —
+parity with Hermes yolo and claude/codex bypass-permissions. Scope of the bypass:
+CONFIRMATIONS ONLY. The safety nets stay fully active in yolo: sandbox containment,
+egress policy, journal/audit, secret redaction, profile isolation, the no-self-modification
+golden rule, and every fail-closed DENY. Yolo can be entered only from the local CLI
+(trusted terminal), never activated remotely via a channel. PRD §6 done-criteria are
+evaluated in DEFAULT mode; yolo is the explicit user-opted exception to criterion 4's
+pre-approval, never to criterion 6's containment.

@@ -126,10 +126,17 @@ attested, and gated by the SAME hostile conformance suite — **the suite is the
 the backend is swappable.** The hand-written self-reexec helper (ABI probe → `no_new_privs`
 → Landlock → per-arch seccomp-BPF → irreversible `execveat`, no unsandboxed window, TOCTOU
 fail-closed) remains the P1 hardening path per DESIGN-S0. **P0 command contract is
-deliberately small (HARDQ B4):** promoted absolute ELF executables with a resolved,
-hash-bound read/exec closure (`/usr`, `/lib*`, `/bin`, `/sbin` as dirs; `/etc/ld.so.cache` +
-CA certs as FILE grants — NEVER recursive `/etc`) + disposable RW workdir; scripts, shell
-strings, undeclared child executables REJECTED. Hostile suite on the real deployment host =
+deliberately small (HARDQ B4, refined by the Phase-0 code review 2026-09-03):** promoted
+absolute ELF executables with a SYNTHETIC content-pinned closure — ONLY the target and its
+resolved loader/library dependencies, each copied into a memfd at Prepare time and bound
+via `--ro-bind-data` (path swap and inode truncation are inert) — plus a disposable RW
+workdir. NO blanket `/usr`/`/lib*` dir grants (the earlier dir-grant wording contradicted
+"undeclared child rejected": codex demonstrated `exec /usr/bin/id` under a bound `/usr`);
+an undeclared child executable simply does not exist in the mount namespace. NEVER
+recursive `/etc`; no `/etc` file grants at all in the P0 profile. Scripts, shell strings,
+non-ELF targets REJECTED before any sandbox setup. Syscall floor = real seccomp cBPF
+(pure Go assembler, arm64/amd64; other arches fail closed). Hostile suite on the real
+deployment host =
 go/no-go BEFORE anything RELIES on the sandbox boundary; kernel/ABI floor published (C5);
 doctor preflight (F1) checks bwrap + kernel and offers consented install — bwrap absent →
 exec capability OFF (conversation-only), no weaker fallback. **Win/macOS in v1 =
@@ -234,6 +241,10 @@ synchronous core projections + transaction recipes + daemon-owns-DB/CLI-via-UDS 
 · known-ref secret redaction (C1) · non-text fail-closed reply (C2) · **stuck-detection
 scoped to WITHIN one interactive turn — scheduled/polling occurrences carry an explicit
 continuous-loop policy exempt from the identical-argument breaker (C3; RED in tasks-P0.md)**
+· **YOLO mode `nexus --yolo` (user directive 2026-09-03, HARDQ F2): ASK → ALLOW for the
+session, no prompts/HITL parking; DENY unchanged; sandbox/egress/journal/redaction/
+profile-isolation/golden-rule UNAFFECTED; local-CLI entry only; decisions journaled
+`ALLOWED_BY_YOLO` — yolo disables confirmations, never safety nets**
 · **P0 health = liveness heartbeat + last-occurrence-fired counter (C8)** · **doctor
 preflight (F1): checks kernel/ABI floor, bwrap, data-dir permissions, provider key, Telegram
 token; anything missing → consented install or exact instructions; results are

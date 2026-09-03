@@ -16,14 +16,14 @@ v2 folds REVIEW-TASKS round-1 (codex 15 + kilo 8 findings).
 
 ## Phase 0 — scaffold + go/no-go preflight
 
-**[ ] T01 — Repo scaffold + build gates.**
+**[x] T01 (018a9d7) — Repo scaffold + build gates.**
 Go module `github.com/MatNik89/nexus`; package cut per DESIGN-S0; `CGO_ENABLED=0` enforced
 in Makefile/CI script; static-link check script.
 Trace: E1; HARNESS-PLAN S0/S1 layout.
 Acceptance: `CGO_ENABLED=0 go build ./...` + `go vet ./...` clean; static-check GREEN.
 RED: static-check against a deliberately cgo-tainted build fails.
 
-**[ ] T02 — Sandbox feasibility probe + hostile conformance suite v0 (bwrap).**
+**[x] T02 (6fc4b1e..17888b3) — Sandbox feasibility probe + hostile conformance suite v0 (bwrap).**
 Standalone probe on the REAL deployment host: five capability columns
 (FS_RO/FS_RW/NET_DENY/SYSCALL-floor/PROC_TREE). Hostile cases: `/etc/shadow` read denied;
 any egress denied; workspace RW allowed; dynamic ELF (`/bin/ls`) runs (B4 closure); shebang
@@ -38,7 +38,7 @@ test-owned dir (never recursive real `/etc`); net control reaches only a test-ow
 sink (never uncontrolled egress); process control escapes into a test-owned process tree.
 Each loosened profile MUST turn its boundary check RED.
 
-**[ ] T03 — `nexus doctor` preflight (minimal).**
+**[x] T03 (6fc4b1e..17888b3) — `nexus doctor` preflight (minimal).**
 Checks: kernel/ABI floor · bwrap · data-dir exists/0700/writable · provider key · Telegram
 token. Missing → exact instruction or consented one-command install. Capability-scoped
 results (no key → conversation off; no token → Telegram off; no bwrap → exec off; bad
@@ -147,12 +147,17 @@ RED: `test_adapter_cannot_self_retry` — second use of one grant → `ATTEMPT_N
 `EffectPath` per DESIGN-FIXES-r2 K1/K2 (concrete executor types; unknown kind → reject;
 `classifyEffectPhase` fail-closed). Sandbox executor = contract FAKE here; real backend
 binds in T26 (its integration RED lives there — no stub-skip in this task's own list).
-Trace: DESIGN-FIXES-r2; E5/E8/E9; REVIEW-TASKS fix (no unsatisfiable RED).
-Acceptance: 7 contract REDs GREEN with fakes.
+**Policy mode input (HARDQ F2):** `Decide` takes a session `PolicyMode{Default|Yolo}`;
+Yolo maps ASK → ALLOW and journals `ALLOWED_BY_YOLO`; DENY is unaffected by mode.
+Trace: DESIGN-FIXES-r2; E5/E8/E9; HARDQ F2; REVIEW-TASKS fix (no unsatisfiable RED).
+Acceptance: 7 contract REDs GREEN with fakes; yolo mode REDs GREEN.
 RED: `TestUnknownDecisionDenies` · `TestUnknownExecKindRejectsNotInproc` ·
 `TestAskRequiresExactApproval` · `TestInProcessToolNeverSpawns` ·
 `TestNoAttemptWithoutGrant` · `TestVetoThroughOnErrorReconciles` ·
-`TestExecErrorSkipsAfterToolAndOutput`.
+`TestExecErrorSkipsAfterToolAndOutput` · `TestYoloAllowsAskButNeverDeny` (yolo: ASK
+executes without approval + journal carries ALLOWED_BY_YOLO; DENY still denied) ·
+`TestYoloCannotBeSetByChannelInput` (mode is a session construct, not reachable from a
+message payload).
 
 **[ ] T15 — Provider (APIKey) + structured output (S2.1/S2.3-min).**
 `Provider{Chat/Stream/Capabilities/DataDescriptor}`; OpenAI-compatible HTTP;
@@ -177,7 +182,9 @@ call repeated N× → breaker trips; polling-policy call repeated N× → no tri
 **[ ] T17 — Terminal REPL (14.1-min) + daemon/UDS split + liveness heartbeat.**
 `nexus daemon` owns the DB, emits liveness heartbeat (C8 positive half); `nexus chat`
 REPL over UDS; message render + input + streaming print (REF-brainless-tui P0 subset).
-Trace: PRD §6 item 1; HARDQ B7 (UDS) / C8; REF-brainless-tui.
+`--yolo` flag on the local CLI sets the session PolicyMode (HARDQ F2); the flag is
+surfaced in the prompt/status line so the user always sees the mode.
+Trace: PRD §6 item 1; HARDQ B7 (UDS) / C8 / F2; REF-brainless-tui.
 Acceptance: PRD §6 item 1 — useful conversation from the terminal against the daemon.
 RED: scripted e2e conversation oracle with a DETERMINISTIC fake provider (input → expected
 rendered output through journal) + separately-labeled live-provider smoke; two concurrent
@@ -273,7 +280,11 @@ RED: approve-after-daemon-restart → completes exactly once; replay → `APPROV
 modified args under old approval → rejected (`test_approval_cannot_authorize_modified_
 effect`); **cross-profile (B3 chain):** occurrence/delivery/approval created in `work` can
 NEVER be seen, delivered, or approved via a `private`-bound chat (and vice versa),
-including across restart/replay.
+including across restart/replay; **yolo (F2, policy half):** in yolo the HITL path does
+not park (ASK auto-allows, journaled) and a Telegram message can neither enable yolo nor
+piggyback on it to authorize a DENY-classified effect. (The yolo-with-REAL-sandbox
+integration RED — hostile suite unchanged under yolo — lives in T27, where the real
+backend exists; r4 codex #5.)
 
 ## Phase 6 — sandboxed exec (gated by T02)
 
@@ -309,7 +320,9 @@ adversarial review of the whole P0 before declaring done.
 RED: per-criterion sensitivity — for EACH of the six criteria, a controlled feature-off
 switch or targeted mutation (never reverting the check itself) turns exactly that
 criterion's check RED; tampered binary → signature verification fails; each live probe
-removed or stale-hashed → its capability OFF in the snapshot and no dispatch to it.
+removed or stale-hashed → its capability OFF in the snapshot and no dispatch to it;
+**yolo integration (F2):** with the REAL backend, the hostile sandbox/egress suite passes
+unchanged under `--yolo` (yolo never weakens containment).
 
 ---
 

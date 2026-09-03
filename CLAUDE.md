@@ -83,6 +83,11 @@ invariant-preserving implementation goes through the normal task/review gate.
   `s5-min` = AtomicWriter); full engines are P2/P3 (HARDQ A2).
 - Stuck-detection scoped WITHIN one interactive turn; scheduled/polling occurrences are
   exempt via an explicit continuous-loop policy (HARDQ C3).
+- **YOLO mode (`nexus --yolo`, user directive 2026-09-03, HARDQ F2)** disables
+  CONFIRMATIONS ONLY (ASK → ALLOW, journaled `ALLOWED_BY_YOLO`): DENY, sandbox, egress,
+  journal, redaction, profile isolation and the golden rule stay fully active; entry is
+  local-CLI only — a channel message can never enable it. Never implement yolo as a
+  safety-net switch.
 
 ## Method — SDD per-slice (user's cross-project discipline: topknot)
 Big plan = vision/reference; build one slice at a time from `docs/tasks-P0.md`. Every
