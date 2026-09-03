@@ -90,6 +90,7 @@ type Journal struct {
 	profile    contracts.ProfileID
 	redact     redact.Redactor
 	events     map[string]PayloadValidator
+	syncProjections []SyncProjection
 	leaseToken string
 	reqs       chan appendReq
 	done       chan struct{}
@@ -143,7 +144,7 @@ func procStartTime(pid int) (string, error) {
 // only the given closed event-type set (r2 codex #7). It fails closed on:
 // nil/empty dependencies, a profile mismatch with the database's own
 // binding, a live concurrent writer, or an invalid integrity chain.
-func Open(path string, profile contracts.ProfileID, r redact.Redactor, events map[string]PayloadValidator) (*Journal, error) {
+func Open(path string, profile contracts.ProfileID, r redact.Redactor, events map[string]PayloadValidator, syncProjections ...SyncProjection) (*Journal, error) {
 	if r == nil {
 		return nil, fmt.Errorf("journal open: redactor is required (fail closed)")
 	}
@@ -204,8 +205,18 @@ func Open(path string, profile contracts.ProfileID, r redact.Redactor, events ma
 	}
 
 	j := &Journal{
-		db: db, profile: profile, redact: r,
+		db: db, profile: profile, redact: r, syncProjections: syncProjections,
 		reqs: make(chan appendReq), done: make(chan struct{}), actorDone: make(chan struct{}),
+	}
+	for _, sp := range syncProjections {
+		if sp == nil || sp.Name() == "" {
+			db.Close()
+			return nil, fmt.Errorf("journal open: invalid sync projection (fail closed)")
+		}
+		if err := sp.Init(db); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("journal open: sync projection %s init: %w", sp.Name(), err)
+		}
 	}
 	// Defensive copy: the closed event set must stay closed after Open
 	// (r3 codex #4 — a caller-held map is mutable and racy).
@@ -406,6 +417,16 @@ func (j *Journal) appendOne(p contracts.EnvelopeParams, offset uint64, prevHash 
 		int64(offset), string(env.EventID), string(env.RunID), int64(env.Sequence),
 		string(raw), redactionPolicyVersion, prevHash, integrity,
 	); err != nil {
+		return fail(fmt.Errorf("journal append: %w", err))
+	}
+	// Core-state projections fold IN THIS transaction (B7): event and
+	// derived state commit together or not at all.
+	pendingEv := Event{
+		JournalOffset: offset, Envelope: env,
+		RedactionPolicyVersion: redactionPolicyVersion,
+		IntegrityPrevHash:      prevHash, IntegrityHash: integrity,
+	}
+	if err := j.applySyncProjections(tx, pendingEv); err != nil {
 		return fail(fmt.Errorf("journal append: %w", err))
 	}
 	if testFailCommit != nil {

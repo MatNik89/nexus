@@ -94,7 +94,7 @@ Acceptance: replay fold reproduces state; append is the only write path.
 RED: concurrent appends (two sources) → contiguous sequences, nothing lost; known secret in
 payload → never reaches any sink; SIGKILL at commit boundary → old-or-new.
 
-**[ ] T07 — Synchronous projection harness + generic transaction recipe (B7 core).**
+**[x] T07 (this commit) — Synchronous projection harness + generic transaction recipe (B7 core).**
 Generic harness: a core-state projection folds in the SAME `BEGIN IMMEDIATE` transaction
 as the append (read-your-own-writes), proven with contract-valid FAKE domain rows;
 observability projections lag async via durable offsets. The three CONCRETE recipes land
