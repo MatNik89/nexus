@@ -1,5 +1,14 @@
 DESIGN S0 + SANDBOX
 
+> **CHANGE-RECORD (HARDQ, 2026-09-03 — supersedes parts of this document):**
+> (1) **Sandbox backend:** bwrap is the P0 ENFORCED backend (user decision HARDQ D1); the
+> native Landlock+seccomp helper designed below is the P1 hardening path. Every "no bwrap
+> fallback" / native-first clause below reads accordingly; the hostile conformance suite and
+> fail-closed rules stay binding for BOTH backends. P0 command runtime closure: HARDQ B4.
+> (2) **Transactional Activator** (ActivationPlan/RollbackVault/ReconcilePrepare): NOT a P0
+> build item — P0 ships fail-closed Resolve validation + sealed startup snapshot (HARDQ B9);
+> the Activator design below activates with the first dynamic consumer (extensions, P4+).
+
 # Paketni rez
 
 ```text

@@ -1352,10 +1352,10 @@ podsekciji mora dokazati pripadni ugovor. Bez Annexa spec je 'lista projekata'; 
 | P0.5 Capability-matrix fail-closed | S0.3 | REVIEW2 G1 |
 | P0.6 Config-bounds + process-identity | S1.1/1.2 | REVIEW2 G1 |
 | P0.7 Structured-output never-silent | S2.3 | REVIEW2 G1 |
-| P0.8 Hardware-fit fail-closed | S2.4 | REVIEW2 G1 |
-| P0.9 In-turn verify never-silent | S3.5 | REVIEW2 G1 |
-| P0.11 Shadow-checkpoint integritet | S5.1/5.3 | REVIEW2 G1 |
-| P0.13 Decay-never-destroys-bytes | S9.4 | REVIEW2 G1 |
+| P0.8 Hardware-fit fail-closed (trigger: `local-inference`, ne-P0) | S2.4 | REVIEW2 G1 |
+| P0.9 In-turn verify never-silent (trigger: `coding`, ne-P0) | S3.5 | REVIEW2 G1 |
+| P0.11 Shadow-checkpoint integritet (P0: samo AtomicWriter; ostalo trigger `coding`) | S5.1/5.3 | REVIEW2 G1 |
+| P0.13 Decay-never-destroys-bytes (trigger: P1 `memorija` decay, ne-P0) | S9.4 | REVIEW2 G1 |
 
 
 
@@ -1378,7 +1378,7 @@ podsekciji mora dokazati pripadni ugovor. Bez Annexa spec je 'lista projekata'; 
 - **`TypedError` MUST imati:** `code`, `category` (`VALIDATION|AUTHN|AUTHZ|POLICY|RESOURCE|TIMEOUT|CANCELLED|DEPENDENCY|CONFLICT|INTERNAL|UNKNOWN_EFFECT`), `retryability` (`NEVER|S7_POLICY|AFTER`), `safe_message`, nullable `retry_after`, `origin`, nullable `cause_event_id`; proizvoljni string ne smije upravljati retryjem.
 - **`ContextBlock` MUST imati:** `block_id`, `kind`, `content` ili `content_ref` (točno jedno), `content_hash`, `source_uri`, `producer`, `trust_class` (`SYSTEM|USER|TOOL_TRUSTED|UNTRUSTED_EXTERNAL`), `sensitivity` (`PUBLIC|INTERNAL|CONFIDENTIAL|SECRET`), `lineage[]`, `observed_at`, nullable `expires_at`.
 - **Stateovi MUST biti:** run `CREATED→ADMITTED→RUNNING→{SUCCEEDED|FAILED|CANCELLED|UNKNOWN}`; turn `CREATED→RUNNING→{SUCCEEDED|FAILED|CANCELLED}`; tool attempt `PLANNED→AUTHORIZED→RUNNING→{SUCCEEDED|FAILED|CANCELLED|UNKNOWN}`. `SUCCEEDED|FAILED|CANCELLED` su terminalni; `UNKNOWN` smije prijeći samo u `SUCCEEDED|FAILED|MANUAL_RECOVERY` putem eksplicitnog reconciliation događaja.
-- **Migracija MUST:** čuvati immutable raw event; koristiti jedinstveni registry `schema_id/version`; upcastati monotono verziju-po-verziju; karantenirati nepoznati schema ID/verziju; zabraniti lossy downcast; zapisati `migration_from`, `migration_to`, `migration_id`, `input_hash`, `output_hash`.
+- **Migracija MUST:** čuvati immutable raw event; koristiti jedinstveni registry `schema_id/version`; upcastati monotono verziju-po-verziju; karantenirati nepoznati schema ID/verziju; zabraniti lossy downcast; zapisati `migration_from`, `migration_to`, `migration_id`, `input_hash`, `output_hash`. **P0-scope (HARDQ C7):** u P0 je dovoljan `schema_version` + reject-unknown-neobrađeno (raw input sačuvan); upcast-LANAC + karantena-sink aktiviraju se s prvom stvarnom migracijom (v2) i tada ovaj ugovor vrijedi u cijelosti.
 - **Invarijante:** `sequence` strogo raste po runu; ID i causal parent se ne mijenjaju kroz migraciju; transformacije S8/S9/S10/S11 MUST očuvati `lineage` te smiju samo pooštriti `trust_class`/`sensitivity`; unknown polje se očuva, unknown discriminator se odbija.
 - **RED — `test_s0_rejects_provenance_laundering`:** untrusted `ContextBlock` prođe kroz compaction/upcaster koji ukloni `lineage` i postavi `trust_class=SYSTEM`; prompt assembly MUST vratiti `PROVENANCE_DOWNGRADE`, run ne smije prijeći u `RUNNING`, a model sink mora imati 0 poziva.
 
@@ -1458,13 +1458,13 @@ podsekciji mora dokazati pripadni ugovor. Bez Annexa spec je 'lista projekata'; 
 
 ## P1.6 — `channels→extensions` closure i jezgreni remote-HITL token (codex #10)
 
-- **Vlasnik:** S0.5 deklarira `channels requires extensions+7.3+approval-core`; S6 posjeduje auth/approval, S7 durable wait/resume, S12.4 je samo multi-agent potrošač.
-- **`ChannelAdapterManifest` MUST imati:** `adapter_id`, `adapter_version`, `artifact_digest`, `channel_type`, `permissions[]`, `network_endpoints[]`, `provenance`, `signature`, `lifecycle_entry_id` (S11.5), `supply_chain_attestation_id` (S6.8).
+- **Vlasnik:** S0.5 deklarira DVA puta (HARDQ A1, 2026-09-03): `channel:builtin` (kompajliran u potpisani binary, statička registracija) `requires 7.3 + approval-core (6.0/12.4) + identity (6.6)` — integritet atestira potpis release-artefakta (P1.5); `channel:plugin` (dinamički učitan) `requires extensions + S6.8 + S11.5 + 7.3 + approval-core`. S6 posjeduje auth/approval, S7 durable wait/resume, S12.4 je samo multi-agent potrošač. Isti adapter-interface i conformance suite za oba puta.
+- **`ChannelAdapterManifest` (SAMO `channel:plugin`) MUST imati:** `adapter_id`, `adapter_version`, `artifact_digest`, `channel_type`, `permissions[]`, `network_endpoints[]`, `provenance`, `signature`, `lifecycle_entry_id` (S11.5), `supply_chain_attestation_id` (S6.8). Built-in adapter nosi deskriptor bez extensions-only polja (`adapter_id`, `channel_type`, `permissions[]`, `network_endpoints[]`); njegov digest je digest release binarija.
 - **`ApprovalChallenge` MUST imati:** `challenge_id`, `run_id`, `intent_id`, `payload_hash`, `principal_id`, `channel_identity`, `issued_at`, `expires_at`, `single_use_nonce`, `allowed_decisions[]`.
 - **Stanja HITL-a:** `WAITING→{APPROVED|DENIED|EXPIRED|CANCELLED}`; samo S7 durable transition smije nastaviti run; ponovni odgovor na terminalni challenge je replay.
-- **Invarijante:** channel adapter se ne registrira prije active `extensions` closurea; odgovor mora biti autentificiran kao isti principal+channel binding; token je exact-intent, expiring i single-use; approval ne može proširiti kernel policy; adapter ne može sam nastaviti run.
-- **RED — `test_channels_contract_fails_closed` (tablični):** slučaj A aktivira `channels` bez `extensions/S6.8` attestationa; slučaj B dvaput pošalje isti valjani approval odgovor; A MUST dati `INCOMPLETE_CAPABILITY_CLOSURE`, B `APPROVAL_REPLAY`, a u oba slučaja nema adapter side-effecta niti drugog resumea.
-- **AMENDMENT (hard-questions, unanimous, 2026-09-03):** capability se dijeli na `channel:builtin` i `channel:plugin`. **Built-in** adapteri (P0 Telegram, stdio) su kompajlirani u potpisani binary i registriraju se statički: zahtijevaju SAMO `7.3 (durable delivery) + approval-core (6.0/12.4) + identity (6.6)`; integritet im atestira potpis release-artefakta (P1.5), NE runtime extensions closure. `channels requires extensions + S6.8 + S11.5` vrijedi ISKLJUČIVO za dinamički učitane (`channel:plugin`) adaptere; RED slučaj A testira plugin put i ostaje na snazi. Isti adapter-interface i conformance suite za oba puta. Izvor: HARDQ-CONSOLIDATED A1.
+- **Invarijante:** `channel:plugin` adapter se ne registrira prije active `extensions` closurea; `channel:builtin` adapter se registrira statički i NE prolazi runtime extensions gate (atestiran release-potpisom); odgovor mora biti autentificiran kao isti principal+channel binding; token je exact-intent, expiring i single-use; approval ne može proširiti kernel policy; adapter ne može sam nastaviti run.
+- **RED — `test_channels_contract_fails_closed` (tablični):** slučaj A registrira `channel:plugin` bez `extensions/S6.8` attestationa; slučaj B dvaput pošalje isti valjani approval odgovor (zajednički za builtin i plugin put); A MUST dati `INCOMPLETE_CAPABILITY_CLOSURE`, B `APPROVAL_REPLAY`, a u oba slučaja nema adapter side-effecta niti drugog resumea.
+- *Change-record: builtin/plugin split usvojen jednoglasno u hard-questions rundi (HARDQ-CONSOLIDATED A1, 2026-09-03); prijašnji tekst je gate primjenjivao na sve kanale, što je blokiralo P0 Telegram.*
 
 # P2 — pouzdanost i podaci
 
@@ -1553,21 +1553,21 @@ Ovih 7 ugovora plan je citirao kao gate a nisu bili u Annexu (agy GATE-01). Sad 
 - **RED — `test_structured_output_never_silent_accept`.**
 
 ## P0.8 — Hardware-fit fail-closed
-- **Vlasnik:** S2.4.
+- **Vlasnik:** S2.4. **Activation trigger (HARDQ C6): `local-inference` — NIJE P0 gate;** ID zadržan radi citata.
 - **MUST:** model > izmjereni RAM/VRAM → `Fits=false`+prijedlog kvantizacije, NIKAD OOM-pokušaj.
 - **RED — `test_model_over_capacity_refused_not_oom`.**
 
 ## P0.9 — In-turn verify nikad tiho
-- **Vlasnik:** S3.5.
+- **Vlasnik:** S3.5. **Activation trigger (HARDQ C6): `coding` profil — NIJE P0 gate;** ID zadržan radi citata.
 - **MUST:** dijagnostika (lint/test/exit) vraća se U ISTOM turnu; korak se NE prihvaća dok ne prođe; TIA nije completion-gate dok paired full-suite ne dokaže 0 promašenih regresija.
 - **RED — `test_verify_failure_blocks_step_same_turn`.**
 
 ## P0.11 — Shadow-checkpoint integritet
-- **Vlasnik:** S5.1/5.3.
+- **Vlasnik:** S5.1/5.3. **Activation trigger (HARDQ C6): u P0 vrijedi SAMO `AtomicWriter` klauzula (P0 file-mutacije); shadow-checkpoint/rollback dio gates `coding`/user-workspace mutaciju.**
 - **MUST:** `Rollback` vraća byte-identično pre-stanje za podržani scope (content+eksplicitna metadata); NE dira ne-staged korisničke promjene; snapshot PRIJE svakog FS-efekta; atomic write = stari ILI novi, nikad pola. Potpis receipta = HMAC/ed25519 (ne raw concat, DESIGN-symedit-crypto D2).
 - **RED — `test_rollback_byte_identical`** + **`test_atomic_write_no_partial`.**
 
 ## P0.13 — Decay nikad ne briše bajtove
-- **Vlasnik:** S9.4.
+- **Vlasnik:** S9.4. **Activation trigger (HARDQ B8, 2026-09-03): P1 `memorija` decay — NIJE P0 gate.** P0 memorija = eksplicitne činjenice bez decaya; kad se Decay aktivira (P1, uz izmjeren retrieval problem), ovaj ugovor vrijedi u cijelosti i fact-tip je izuzet (S=∞).
 - **MUST:** `Decay` mijenja RANG ne postojanje; original UVIJEK u hot/warm/cold arhivi; konsolidacija untrusted epizode → gist ostaje UNTRUSTED (P0.3 lineage). `Forget`=tombstone (reverzibilno) ≠ `DATA_PURGE` (P2.1).
 - **RED — `test_decay_never_destroys_bytes`.**

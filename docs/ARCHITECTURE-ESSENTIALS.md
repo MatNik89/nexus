@@ -6,7 +6,10 @@ the full source always wins. Open preconditions are listed at the bottom — thi
 NOT claim go/no-go has been granted.
 
 **Source precedence (when documents disagree):** PRD.md owns product decisions
-(identity/scope — the user adjudicates) > **HARNESS-SPEC Annex A contracts** (the contracts
+(identity/scope — the user adjudicates) > **user-approved HARDQ-CONSOLIDATED resolutions**
+(A/B/C/D/F items, 2026-09-03 — they supersede the specific clauses they amend in Annex A,
+DESIGN-S0, DESIGN-STATUS and SECTION-MAP; the amended owners carry inline change-records) >
+**HARNESS-SPEC Annex A contracts** (the contracts
 only — the SPEC body still carries stale salvage references that the greenfield decision
 C1/HARNESS-PLAN:3 deleted; never revive them via "SPEC wins") > DESIGN-FIXES-r2 /
 DESIGN-*.md (they supersede named older parts) > DESIGN-STATUS (dated status ledger) >
@@ -54,7 +57,11 @@ are separate durable side-effects behind their effect-path owners. File/workspac
 (S5.1/5.3 scope, P0.11) use `AtomicWriter` (tmp → fsync → rename, never in-place) with a
 snapshot taken BEFORE every FS effect; rollback is byte-identical and never touches
 non-staged user changes. Persistence engines (SQLite-WAL spine) provide their own durable
-atomicity contract — do NOT wrap per-record writes in rename.
+atomicity contract — do NOT wrap per-record writes in rename. **Physical commit boundaries
+(HARDQ B7):** WAL + bounded `busy_timeout`; one serialized append actor owns Append +
+sequence allocation; core-state projections fold in the SAME transaction; three named
+`BEGIN IMMEDIATE` recipes commit together: inbox-admission + journal event · occurrence +
+run admission · terminal result + outbox enqueue. Daemon owns the DB; CLI connects via UDS.
 Self-DoS exception: debug telemetry may best-effort drop; state/security/audit classes never.
 → HARNESS-SPEC P0.3/P0.11; S1.3, S5.3, S15; DESIGN-FIXES ownership fix.
 
@@ -130,7 +137,9 @@ exec capability OFF (conversation-only), no weaker fallback. **Win/macOS in v1 =
 → HARDQ D1/B4/C5/F1; DESIGN-S0-sandbox-codex; PLAN-HOLES C2; PRD §6 item 6, §7.
 
 ## E11 — Fail-closed is the default answer to the unknown; egress is a real dialer boundary
-Unknown enum → reject; unknown schema version → QUARANTINE (no downcast, no silent drop);
+Unknown enum → reject; unknown schema ID/version → REJECT unprocessed in P0, raw input
+preserved (the upcast chain + QUARANTINE sink are the v2 migration layer's — HARDQ C7 —
+and never a lossy downcast or silent drop when they activate);
 unknown capability `Resolve` → error; config must not WIDEN the kernel floor
 (`ValidateBounds`); route below capability floor → error; canary token in output → block the
 ENTIRE delivery. Egress is NOT string filtering: policy-aware resolver + dialer that pins
@@ -219,10 +228,19 @@ archmap layer, PROV-O, guardian-LLM. Coding USP trio = P1.
 Pulled into P0 as -min cuts: durable local scheduler + wake catch-up (HARDQ B1) · Telegram
 inbox/outbox + occurrence idempotency (B2) · two obligation types Reminder/Task with
 assistant-grade evidence (B5) · durable HITL suspend/resume (B6) · single append actor +
-synchronous core projections + daemon-owns-DB/CLI-via-UDS (B7) · known-ref secret redaction
-(C1) · non-text fail-closed reply (C2) · doctor preflight with consented prerequisite
-install (F1). Deferred OUT of P0: transactional Activator (B9), Decay+Audn (B8), full
-S7/S5 engines (A2), entropy secret detection, SemanticHealth (C8), upcast chain (C7).
+synchronous core projections + transaction recipes + daemon-owns-DB/CLI-via-UDS (B7, in E4)
+· known-ref secret redaction (C1) · non-text fail-closed reply (C2) · **stuck-detection
+scoped to WITHIN one interactive turn — scheduled/polling occurrences carry an explicit
+continuous-loop policy exempt from the identical-argument breaker (C3; RED in tasks-P0.md)**
+· **P0 health = liveness heartbeat + last-occurrence-fired counter (C8)** · **doctor
+preflight (F1): checks kernel/ABI floor, bwrap, data-dir permissions, provider key, Telegram
+token; anything missing → consented install or exact instructions; results are
+capability-scoped (no key → conversation off; no token → Telegram off; no bwrap → exec off;
+unsafe data-dir → stateful startup blocked); `P0-capable` = all six PRD §6 criteria
+reachable, not sandbox alone.** Deferred OUT of P0: transactional Activator (B9), Decay+Audn
+(B8 — Annex P0.13 relabeled), full S7/S5 engines (A2), entropy secret detection,
+SemanticHealth evaluator (C8), upcast chain + quarantine sink (C7 — Annex P0.1 scoped),
+P0.8/P0.9/P0.11-checkpoint contracts relabeled to their real triggers (C6).
 
 ## Open before P0 code
 1. **Hostile-conformance suite against the bwrap backend on the real deployment host** —

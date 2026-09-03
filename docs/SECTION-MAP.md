@@ -36,7 +36,7 @@ FAZA L (izvršni put, →K):
 
 FAZA M (kontekst/memorija/prompt PUNI, →L):
   S8 puni (8.1-puni/8.2 compaction/8.3 archmap/8.4 cache/8.5 pruning) → 4.4 archmap-integr.   ✅8.3
-  S9 (9.1 sesije/9.2 store/9.3 learn/9.4 Decay+Audn; 9.5/9.6 SAMO persistence+namespace, binding→N/O)   ✅9.2/9.4
+  S9 (9.1 sesije/9.2 store/9.3 learn/9.4 Decay+Audn — Decay+Audn=P1 per HARDQ B8, P0=explicit facts; 9.5/9.6 SAMO persistence+namespace, binding→N/O)   ✅9.2/9.4
   S11 puni (11.2/11.4/11.5/11.6)
 
 FAZA N (orkestracija/observability, →M):
@@ -107,7 +107,7 @@ Inline pod-stavke sad nose status (fix D3/SEC-03).
 **S6** ✅ 6.0 PEP · 6.2 sandbox · 6.9 lifecycle · 🟡 6.1 perm · 6.3 egress · 6.4 secrets · 6.5 injection · 🟠 6.6 authn · 6.8 supply-chain · 🟡 6.7 governance(sidecar) · **✅🟠 6.10 exec-reviewer** (GAPFIX-kilo)
 **S7** ✅ 7.1 taksonomija · 🔵 7.2 queue/lease/fencing · 🟡 7.3 crash+durable-delivery
 **S8** ✅ 8.3 archmap · 🔵 8.2 compaction · 🟡 8.1 window · 8.4 cache · 8.5 pruning
-**S9** ✅ 9.2 store · 9.4 Decay+Audn(P0) · ⬇ 9.4 Dream/MemGit/MemAssoc(v2) · 🟡 9.1 sesije · 9.3 learn · **✅🟠 9.5 PersonalProfile · ✅🟠 9.6 ObligationStore** (GAPFIX-kilo; 9.6 write→journal P0.3)
+**S9** ✅ 9.2 store · 9.4 Decay+Audn(P1 — HARDQ B8 2026-09-03; P0=explicit facts, no decay) · ⬇ 9.4 Dream/MemGit/MemAssoc(v2) · 🟡 9.1 sesije · 9.3 learn · **✅🟠 9.5 PersonalProfile · ✅🟠 9.6 ObligationStore** (GAPFIX-kilo; 9.6 write→journal P0.3)
 **S10** 🟠 10.1 ingest · 10.4 GraphRAG · 🟡 10.6 retrieval-auth · 10.7 quality-gate · 🟡 10.2 chunk · 10.3 hibrid(sqlite-vec) · 🟠 10.5 CAG(reserved→degradira u RAG)
 **S11** 🟡 11.1 assembly · 11.5 skill-lifecycle · 11.6 role-manifest · 🔵 11.2 Reversa · 🟠 11.3 projektne-instr · 🟡 11.4 prompt-opt
 **S12** 🔵 12.1 subagenti · 12.2 DAG(+superstep) · 12.5 A2A · 🟡 12.3 routing(potrošač 2.6) · 12.4 HITL · 12.6 council · **✅🟠 12.7 flows · ✅🟠 12.8 boards** (GAPFIX-codex)
