@@ -151,7 +151,7 @@ func buildFull(t *testing.T, policy Policy, ruleSpec map[string]string, actions 
 		t.Fatal(err)
 	}
 	planner := &scriptedPlanner{actions: actions}
-	l, err := New(planner, path, grants, j, policy, 10, 3)
+	l, err := New(planner, path, grants, j, redact.None{}, policy, 10, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -375,5 +375,25 @@ func TestNeedsApprovalSurfacesNotObserved(t *testing.T) {
 	st, _, ferr := machine.AttemptTable().Fold(contracts.AttemptInvalid, stream, nil)
 	if ferr != nil || st != contracts.AttemptCancelled {
 		t.Fatalf("pre-exec refusal folds to %v (%v), want CANCELLED", st, ferr)
+	}
+}
+
+// Known secret references are scrubbed from error observations BEFORE the
+// model boundary (Phase-2-r2 codex #9 literal).
+func TestErrorObservationRedactsKnownSecrets(t *testing.T) {
+	const secret = "sk-SUPER-SECRET-TOKEN"
+	call := toolCall("read", "tc-1")
+	h := build(t, PolicyInteractive, []Action{{Call: &call}, {Final: strp("done")}})
+	*h.toolErr = fmt.Errorf("upstream refused: Authorization: Bearer %s", secret)
+	r := redact.NewKnownRefs(map[string]string{"PROVIDER_KEY": secret})
+	obs, oerr := errorObservation(r, call, 1, *h.toolErr)
+	if oerr != nil {
+		t.Fatal(oerr)
+	}
+	if strings.Contains(*obs.Content, secret) {
+		t.Fatalf("secret leaked into the observation: %q", *obs.Content)
+	}
+	if !strings.Contains(*obs.Content, "upstream refused") {
+		t.Fatalf("observation lost its causal context: %q", *obs.Content)
 	}
 }

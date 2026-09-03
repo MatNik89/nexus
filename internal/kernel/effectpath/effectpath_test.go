@@ -519,3 +519,58 @@ func TestResultValidationAndEffectfulReceiptRule(t *testing.T) {
 		t.Fatalf("state %v, want FAILED", st)
 	}
 }
+
+// The grant binds to the EXACT call digest: same ids with modified
+// arguments (or any other field) never authorize (Phase-2-r2 codex #4).
+func TestModifiedCallCannotRideOldGrant(t *testing.T) {
+	h := build(t, ModeDefault, map[contracts.ToolID]Decision{"read": DecisionAllow})
+	c := call(t, "read", contracts.EffectReadOnly, contracts.ExecInProcess)
+	g := grantFor(t, h, "op-1", c)
+	mutated := c
+	mutated.Arguments = json.RawMessage(`{"path":"/etc/shadow"}`) // same ids, new payload
+	if _, err := h.path.RunTool(context.Background(), mutated, g); !errors.Is(err, s7min.ErrAttemptNotAuthorized) {
+		t.Fatalf("modified call rode the old grant: %v", err)
+	}
+	if *h.inprocN != 0 {
+		t.Fatal("modified call reached an executor")
+	}
+	// The unmodified call still authorizes.
+	if _, err := h.path.RunTool(context.Background(), c, g); err != nil {
+		t.Fatalf("exact call refused its own grant: %v", err)
+	}
+}
+
+// The call's deadline is PROPAGATED into execution: the executor context
+// expires at call.Deadline, and a read-only call killed by it lands
+// CANCELLED (nothing durable can exist).
+func TestCallDeadlinePropagatedIntoExecution(t *testing.T) {
+	audit := &fakeAudit{}
+	pep, _ := NewPEP(map[contracts.ToolID]Decision{"slow": DecisionAllow},
+		NewApprovals(func() time.Time { return time.Unix(1000, 0) }, time.Minute), audit, ModeDefault)
+	grants := s7min.NewAuthority(func() time.Time { return time.Unix(1000, 0) }, time.Minute)
+	var sawDeadline time.Time
+	inproc := NewInProcessExecutor(map[contracts.ToolID]InProcFunc{
+		"slow": func(ctx context.Context, c contracts.ToolCall) (contracts.ToolResult, error) {
+			dl, ok := ctx.Deadline()
+			if !ok {
+				return contracts.ToolResult{}, fmt.Errorf("no deadline propagated")
+			}
+			sawDeadline = dl
+			<-ctx.Done() // wait for the deadline to kill us
+			return contracts.ToolResult{}, ctx.Err()
+		},
+	})
+	path, _ := NewEffectPath(pep, &recordingMW{}, inproc, NewSandboxedProcessExecutor(&fakeSandbox{}), grants)
+	c := call(t, "slow", contracts.EffectReadOnly, contracts.ExecInProcess)
+	c.Deadline = time.Now().Add(50 * time.Millisecond)
+	g, _ := grants.Issue("op-1", ToolTarget(c))
+	if _, err := path.RunTool(context.Background(), c, g); err == nil {
+		t.Fatal("deadline-killed call returned success")
+	}
+	if !sawDeadline.Equal(c.Deadline) {
+		t.Fatalf("executor deadline %v != call deadline %v", sawDeadline, c.Deadline)
+	}
+	if st, _ := grants.State("op-1"); st != contracts.AttemptCancelled {
+		t.Fatalf("deadline-killed read-only attempt in state %v (want CANCELLED)", st)
+	}
+}

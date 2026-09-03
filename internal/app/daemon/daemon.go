@@ -25,6 +25,7 @@ import (
 	"github.com/MatNik89/nexus/internal/kernel/journal"
 	"github.com/MatNik89/nexus/internal/kernel/loop"
 	"github.com/MatNik89/nexus/internal/kernel/s7min"
+	"github.com/MatNik89/nexus/internal/security/redact"
 )
 
 // Deps are the daemon's collaborators — the composition root (cmd/nexus)
@@ -40,6 +41,10 @@ type Deps struct {
 	Rules          map[contracts.ToolID]effectpath.Decision
 	Tools          map[contracts.ToolID]effectpath.InProcFunc
 	Audit          effectpath.AuditSink
+	// Redactor scrubs known secret references from every outbound error
+	// surface (observations, UDS error frames) — same instance the
+	// journal uses.
+	Redactor redact.Redactor
 }
 
 // Daemon serves chat sessions over a UDS.
@@ -49,8 +54,8 @@ type Daemon struct {
 }
 
 func New(d Deps) (*Daemon, error) {
-	if d.Journal == nil || d.PlannerFactory == nil || d.Audit == nil || d.Authority == nil {
-		return nil, fmt.Errorf("daemon: journal, planner factory, S7 authority and audit sink are required (fail closed)")
+	if d.Journal == nil || d.PlannerFactory == nil || d.Audit == nil || d.Authority == nil || d.Redactor == nil {
+		return nil, fmt.Errorf("daemon: journal, planner factory, S7 authority, audit sink and redactor are required (fail closed)")
 	}
 	if !d.Profile.Valid() {
 		return nil, fmt.Errorf("daemon: a profile is required (fail closed)")
@@ -158,7 +163,7 @@ func (d *Daemon) handle(ctx context.Context, conn net.Conn) {
 		writeFrame(conn, frame{Type: "error", Text: "session setup failed"})
 		return
 	}
-	l, err := loop.New(planner, path, grants, d.deps.Journal, loop.PolicyInteractive, 16, 3)
+	l, err := loop.New(planner, path, grants, d.deps.Journal, d.deps.Redactor, loop.PolicyInteractive, 16, 3)
 	if err != nil {
 		writeFrame(conn, frame{Type: "error", Text: "session setup failed"})
 		return
@@ -184,9 +189,9 @@ func (d *Daemon) handle(ctx context.Context, conn net.Conn) {
 		run := contracts.RunID(fmt.Sprintf("run-%d-%d", session, msgN))
 		final, terr := l.RunTurn(ctx, turn, run, d.deps.Profile, []contracts.ContextBlock{block})
 		if terr != nil {
-			// Message only — never internal state; typed sentinels keep
-			// their names (NEEDS_APPROVAL etc.) for the client to render.
-			writeFrame(conn, frame{Type: "error", Text: terr.Error()})
+			// Typed sentinels keep their names (NEEDS_APPROVAL etc.);
+			// known secret references are scrubbed before the UI boundary.
+			writeFrame(conn, frame{Type: "error", Text: loop.RedactText(d.deps.Redactor, terr.Error())})
 			continue
 		}
 		writeFrame(conn, frame{Type: "final", Text: final})

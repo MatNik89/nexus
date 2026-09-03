@@ -119,42 +119,62 @@ func Extract[T any](ctx context.Context, e *Extractor, class PayloadClass, raw [
 		return zero, fmt.Errorf("structured: %d-class payload invalid — no repair permitted (fail closed): %w", class, err)
 	}
 	// GENERAL: one re-ask, a NEW physical attempt. The transport consumes
-	// the grant; the extractor only issues it and lands the outcome AFTER
-	// salvage, so the S7 record matches what was actually returned
-	// (Phase-2 kilo #6: reporting terminal before salvage understated a
-	// recovered result).
+	// the grant; the extractor issues it and lands the outcome from the
+	// AUTHORITY's actual state on EVERY callback exit (Phase-2-r2 codex
+	// #3: a consumed-then-error callback leaked a RUNNING attempt, and an
+	// unconsumed callback's bytes were ungoverned):
+	//   - callback never consumed → operation CANCELLED, its bytes IGNORED
+	//     (an ungoverned reply is a claim, not a transport result);
+	//   - callback consumed → the attempt is RUNNING and gets exactly one
+	//     terminal outcome below, success only for the value actually
+	//     accepted.
 	var reaskRaw []byte
+	reaskLive := false // consumed, outcome not yet landed
 	if reask != nil {
 		if g, gerr := e.auth.Issue(op, target); gerr == nil {
-			if rr, rerr := reask(ctx, g); rerr == nil {
-				reaskRaw = rr
-				if out, err := decodeStrict(rr, validate); err == nil {
-					e.auth.Report(op, s7min.OutcomeSucceeded)
-					return out, nil
+			rr, rerr := reask(ctx, g)
+			if st, _ := e.auth.State(op); st == contracts.AttemptRunning {
+				reaskLive = true
+				if rerr == nil {
+					reaskRaw = rr
 				}
+			} else {
+				e.auth.Cancel(op) // ungoverned callback: nothing ran
 			}
 		}
 	}
-	// Salvage: re-ask output first, then the original. A salvage hit from
-	// the re-ask output means that PHYSICAL attempt ultimately produced
-	// the accepted value.
-	for _, src := range [][]byte{reaskRaw, raw} {
-		if len(src) == 0 {
-			continue
+	land := func(outcome s7min.Outcome) error {
+		if !reaskLive {
+			return nil
 		}
-		if obj, ok := salvageJSON(src); ok {
+		reaskLive = false
+		return e.auth.Report(op, outcome)
+	}
+	if len(reaskRaw) > 0 {
+		if out, err := decodeStrict(reaskRaw, validate); err == nil {
+			if rerr := land(s7min.OutcomeSucceeded); rerr != nil {
+				return zero, fmt.Errorf("structured: S7 outcome not recorded — value refused (fail closed): %w", rerr)
+			}
+			return out, nil
+		}
+		if obj, ok := salvageJSON(reaskRaw); ok {
 			if out, err := decodeStrict(obj, validate); err == nil {
-				if len(reaskRaw) > 0 && &src[0] == &reaskRaw[0] {
-					e.auth.Report(op, s7min.OutcomeSucceeded)
-				} else if len(reaskRaw) > 0 {
-					e.auth.Report(op, s7min.OutcomeFailedTerminal)
+				if rerr := land(s7min.OutcomeSucceeded); rerr != nil {
+					return zero, fmt.Errorf("structured: S7 outcome not recorded — value refused (fail closed): %w", rerr)
 				}
 				return out, nil
 			}
 		}
 	}
-	if len(reaskRaw) > 0 {
-		e.auth.Report(op, s7min.OutcomeFailedTerminal)
+	// The governed re-ask (if any) produced no accepted value: terminal.
+	if rerr := land(s7min.OutcomeFailedTerminal); rerr != nil {
+		return zero, fmt.Errorf("structured: S7 outcome not recorded (fail closed): %w", rerr)
+	}
+	// Salvage from the ORIGINAL raw as the last rung.
+	if obj, ok := salvageJSON(raw); ok {
+		if out, err := decodeStrict(obj, validate); err == nil {
+			return out, nil
+		}
 	}
 	return zero, fmt.Errorf("structured: output invalid after validate, re-ask and salvage (never silently accepted)")
 }

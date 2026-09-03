@@ -106,7 +106,7 @@ func TestChatRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := p.Chat(context.Background(), []ChatMessage{{Role: "user", Content: "ping"}}, issue(t, auth, "op-chat"))
+	out, err := p.Chat(context.Background(), []ChatMessage{{Role: "user", Content: "ping"}}, issue(t, auth, "op-chat", p.Target()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +133,7 @@ func TestProviderErrorsSurface(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := p.Chat(context.Background(), []ChatMessage{{Role: "user", Content: "x"}}, issue(t, auth, "op-1")); err == nil {
+	if _, err := p.Chat(context.Background(), []ChatMessage{{Role: "user", Content: "x"}}, issue(t, auth, "op-1", p.Target())); err == nil {
 		t.Fatal("HTTP 502 surfaced as content")
 	}
 }
@@ -150,7 +150,7 @@ func TestTransportConsumesGrantExactlyOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	g := issue(t, auth, "op-1")
+	g := issue(t, auth, "op-1", p.Target())
 	msgs := []ChatMessage{{Role: "user", Content: "x"}}
 	if _, err := p.Chat(context.Background(), msgs, g); err != nil {
 		t.Fatal(err)
@@ -165,7 +165,7 @@ func TestTransportConsumesGrantExactlyOnce(t *testing.T) {
 		t.Fatalf("S7 attempt counter %d, must stay 1", n)
 	}
 	// A forged grant never reaches the wire at all.
-	forged := s7min.Grant{OperationID: "op-x", AttemptNo: 1, TargetID: "provider:test", Nonce: "deadbeef"}
+	forged := s7min.Grant{OperationID: "op-x", AttemptNo: 1, TargetID: p.Target(), Nonce: "deadbeef"}
 	if _, err := p.Chat(context.Background(), msgs, forged); !errors.Is(err, s7min.ErrAttemptNotAuthorized) {
 		t.Fatalf("forged grant: %v", err)
 	}
@@ -191,7 +191,7 @@ func TestRedirectOffAllowlistRefused(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := p.Chat(context.Background(), []ChatMessage{{Role: "user", Content: "x"}}, issue(t, auth, "op-1"))
+	out, err := p.Chat(context.Background(), []ChatMessage{{Role: "user", Content: "x"}}, issue(t, auth, "op-1", p.Target()))
 	if err == nil || out.Content == "stolen" {
 		t.Fatalf("redirect off the allowlist followed: %+v %v", out, err)
 	}
@@ -220,9 +220,9 @@ func newAuth() *s7min.Authority {
 	return s7min.NewAuthority(func() time.Time { return time.Unix(1000, 0) }, time.Minute)
 }
 
-func issue(t *testing.T, a *s7min.Authority, op string) s7min.Grant {
+func issue(t *testing.T, a *s7min.Authority, op string, target contracts.TargetID) s7min.Grant {
 	t.Helper()
-	g, err := a.Issue(contracts.OperationID(op), "provider:test")
+	g, err := a.Issue(contracts.OperationID(op), target)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -380,7 +380,7 @@ func TestStreamOrderAndTruncationHonesty(t *testing.T) {
 	}
 	var got strings.Builder
 	if err := p.Stream(context.Background(), []ChatMessage{{Role: "user", Content: "x"}},
-		issue(t, auth, "op-s1"), func(d string) error { got.WriteString(d); return nil }); err != nil {
+		issue(t, auth, "op-s1", p.Target()), func(d string) error { got.WriteString(d); return nil }); err != nil {
 		t.Fatal(err)
 	}
 	if got.String() != "hello" {
@@ -396,7 +396,7 @@ func TestStreamOrderAndTruncationHonesty(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := p2.Stream(context.Background(), []ChatMessage{{Role: "user", Content: "x"}},
-		issue(t, auth, "op-s2"), func(string) error { return nil }); err == nil {
+		issue(t, auth, "op-s2", p2.Target()), func(string) error { return nil }); err == nil {
 		t.Fatal("truncated stream passed as complete")
 	}
 }
@@ -470,5 +470,69 @@ func TestUnknownEffectDiscriminatorReachesNoSink(t *testing.T) {
 	}
 	if sink != 0 || reasks != 0 {
 		t.Fatalf("malformed effect payload reached a sink (sink=%d reasks=%d)", sink, reasks)
+	}
+}
+
+// A grant minted for a DIFFERENT target never reaches this provider's
+// wire (Phase-2-r2 codex #2), and an IP-class check governs the
+// plaintext-loopback exception (r2 codex #11): "127.attacker.example" is
+// a remote DNS name, not loopback.
+func TestProviderTargetBindingAndLoopbackClass(t *testing.T) {
+	srv, calls := fakeOpenAI(t, "ok")
+	t.Setenv("NEXUS_TEST_KEY", "sk-test")
+	auth := newAuth()
+	p, err := NewAPIKey(testConfig(t, srv.URL), auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign := issue(t, auth, "op-f", "provider:somewhere-else")
+	if _, err := p.Chat(context.Background(), []ChatMessage{{Role: "user", Content: "x"}}, foreign); !errors.Is(err, s7min.ErrAttemptNotAuthorized) {
+		t.Fatalf("foreign-target grant reached the wire: %v", err)
+	}
+	if *calls != 0 {
+		t.Fatalf("foreign-target grant produced %d transport calls", *calls)
+	}
+	fake127 := config.Config{
+		ProviderBaseURL: "http://127.attacker.example", ProviderKeyEnv: "NEXUS_TEST_KEY",
+		ProviderModel: "m", EgressAllow: []string{"127.attacker.example"},
+	}
+	if _, err := NewAPIKey(fake127, newAuth()); err == nil {
+		t.Fatal("hostname with a 127. prefix accepted as loopback (bearer key over cleartext)")
+	}
+}
+
+// The re-ask state machine leaks nothing (Phase-2-r2 codex #3):
+// consumed-then-error lands FAILED (never a permanent RUNNING), and an
+// UNCONSUMED callback's bytes are ungoverned — ignored, operation
+// CANCELLED, value never accepted from them.
+func TestReaskStateNeverLeaks(t *testing.T) {
+	// (a) consumed, then network error.
+	e, auth := extractor(t)
+	consumedThenError := func(ctx context.Context, g s7min.Grant) ([]byte, error) {
+		if err := auth.Consume(g); err != nil {
+			t.Fatal(err)
+		}
+		return nil, fmt.Errorf("connection reset")
+	}
+	_, err := Extract[plan](context.Background(), e, ClassGeneral,
+		[]byte(`garbage`), validPlan, "op-a", "provider-a", consumedThenError)
+	if err == nil {
+		t.Fatal("garbage accepted")
+	}
+	if st, _ := auth.State("op-a"); st != contracts.AttemptFailed {
+		t.Fatalf("consumed-then-error attempt leaked in state %v (want FAILED)", st)
+	}
+	// (b) callback returns VALID bytes without consuming the grant.
+	e2, auth2 := extractor(t)
+	ungoverned := func(ctx context.Context, g s7min.Grant) ([]byte, error) {
+		return []byte(`{"steps":7}`), nil // never touched the transport
+	}
+	_, err = Extract[plan](context.Background(), e2, ClassGeneral,
+		[]byte(`garbage`), validPlan, "op-b", "provider-a", ungoverned)
+	if err == nil {
+		t.Fatal("ungoverned callback bytes accepted as a transport result")
+	}
+	if st, _ := auth2.State("op-b"); st != contracts.AttemptCancelled {
+		t.Fatalf("ungoverned re-ask operation in state %v (want CANCELLED)", st)
 	}
 }

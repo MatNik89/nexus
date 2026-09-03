@@ -101,7 +101,7 @@ func testDaemon(t *testing.T, planner loop.Planner, audit effectpath.AuditSink) 
 					Status: contracts.ResultSucceeded, StartedAt: time.Unix(1, 0), FinishedAt: time.Unix(2, 0)}, nil
 			},
 		},
-		Audit: audit,
+		Audit: audit, Redactor: redact.None{},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -338,12 +338,12 @@ func TestFullSpineDeterministicTransport(t *testing.T) {
 	d, err := New(Deps{
 		Journal: j,
 		PlannerFactory: func(deliver func(string) error) (loop.Planner, error) {
-			return planner.NewStreaming(prov, prov, authority, "provider:spine", deliver)
+			return planner.NewStreaming(prov, prov, authority, prov.Target(), deliver)
 		},
 		Authority: authority, Profile: "work",
 		Rules: map[contracts.ToolID]effectpath.Decision{},
 		Tools: map[contracts.ToolID]effectpath.InProcFunc{},
-		Audit: &capturingAudit{},
+		Audit: &capturingAudit{}, Redactor: redact.None{},
 	})
 	if err != nil {
 		t.Fatal(err)

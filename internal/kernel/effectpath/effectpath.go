@@ -55,11 +55,27 @@ var (
 	ErrEffectUnknown = errors.New("EFFECT_UNKNOWN_RECONCILE")
 )
 
-// ToolTarget derives the S7 target a grant must be minted FOR to
-// authorize this exact call — a grant minted for another call can never
-// be replayed here (Phase-2 codex #3).
+// ToolTarget derives the S7 target a grant must be minted FOR from a
+// digest of the EXACT call — ids, arguments, schema hash, effect, kind,
+// deadline, idempotency key and profile. A grant for the same ids with
+// ANY field changed never authorizes (Phase-2-r2 codex #4: id-only
+// binding let a modified call ride an old grant).
 func ToolTarget(c contracts.ToolCall) contracts.TargetID {
-	return contracts.TargetID("tool:" + string(c.ToolID) + "/" + string(c.ToolCallID))
+	h := sha256.New()
+	idem := ""
+	if c.IdempotencyKey != nil {
+		idem = *c.IdempotencyKey
+	}
+	for _, part := range [][]byte{
+		[]byte(c.ToolCallID), []byte(c.ToolID), c.Arguments, []byte(c.ArgsSchemaHash),
+		{byte(c.Effect)}, {byte(c.ExecutionKind)},
+		[]byte(fmt.Sprintf("%d:%d", c.Deadline.UnixNano(), c.AttemptNo)),
+		[]byte(idem), []byte(c.ProfileID),
+	} {
+		fmt.Fprintf(h, "%d:", len(part))
+		h.Write(part)
+	}
+	return contracts.TargetID("tool:" + hex.EncodeToString(h.Sum(nil)))
 }
 
 // AuditSink receives policy-relevant records (the journal owner wires the
@@ -251,6 +267,17 @@ type EffectPath struct {
 	inproc *InProcessExecutor
 	sbproc *SandboxedProcessExecutor
 	grants *s7min.Authority
+	// onStarted (optional) runs AFTER a successful grant consume and
+	// BEFORE dispatch — the journal owner appends attempt.started here, so
+	// the durable record proves consumption preceded any effect (Phase-2-
+	// r2 codex #7). A failed observer parks the attempt UNKNOWN.
+	onStarted func(ctx context.Context, op contracts.OperationID) error
+}
+
+// SetStartObserver wires the journal-owner callback (loop). Sessions are
+// serial per EffectPath; the observer may be swapped between turns.
+func (p *EffectPath) SetStartObserver(fn func(ctx context.Context, op contracts.OperationID) error) {
+	p.onStarted = fn
 }
 
 func NewEffectPath(pep *PEP, mw Middleware, inproc *InProcessExecutor, sbproc *SandboxedProcessExecutor, grants *s7min.Authority) (*EffectPath, error) {
@@ -356,21 +383,47 @@ func (p *EffectPath) RunTool(ctx context.Context, call contracts.ToolCall, grant
 		return contracts.ToolResult{}, p.onErr(ctx, err)
 	}
 	op := grant.OperationID
-	// 5) Execute.
-	out, err := exec.Execute(ctx, call)
+	// 4b) Durable STARTED before dispatch: consumption without its record
+	// is uncertainty — park UNKNOWN rather than run unrecorded.
+	if p.onStarted != nil {
+		if serr := p.onStarted(ctx, op); serr != nil {
+			cause := fmt.Errorf("effectpath: attempt start not durable — dispatch refused: %w", serr)
+			return contracts.ToolResult{}, p.report(ctx, op, s7min.OutcomeUnknown, p.onErr(ctx, cause))
+		}
+	}
+	// 5) Execute under the CALL's deadline (propagated — a call admitted
+	// just before expiry cannot run unbounded). topknot ceiling: the
+	// attempt_timeout/backoff vector is the full S7 engine's (P2/P3); P0
+	// enforces the call deadline at this boundary.
+	execCtx, cancelExec := context.WithDeadline(ctx, call.Deadline)
+	out, err := exec.Execute(execCtx, call)
+	execCause := context.Cause(execCtx) // read BEFORE our own cancel below
+	cancelExec()
 	if err != nil {
-		// Executor error: AfterTool and output are SKIPPED; the result is
-		// explicitly empty; an effectful call parks UNKNOWN (codex #4 —
-		// an irreversible tool may have committed before losing its reply).
+		// A READ-ONLY call killed by ITS OWN deadline/cancel is CANCELLED
+		// (nothing durable can exist); an effectful one still parks
+		// UNKNOWN. Other executor errors classify by effect (codex #4).
+		if execCause != nil && call.Effect == contracts.EffectReadOnly {
+			p.grants.Cancel(op)
+			return contracts.ToolResult{}, p.onErr(ctx, fmt.Errorf("effectpath: tool %q cancelled by deadline: %w", call.ToolID, err))
+		}
 		return contracts.ToolResult{}, p.report(ctx, op, failureOutcome(call, contracts.ToolResult{}), p.onErr(ctx, err))
 	}
-	// 5b) The RESULT must correlate to this exact call (Phase-2 codex #5:
-	// a mis-correlated or invalid-status result is an executor defect,
-	// classified conservatively — never fed onward).
+	// 5b) The RESULT must be CONTRACT-VALID for this exact call (Phase-2
+	// codex #5, r2 #6): correlation, closed status, ordered timestamps,
+	// normalized output blocks, typed-error validity and receipt binding —
+	// through the canonical constructor, never field-picking. A defective
+	// result is classified conservatively and never fed onward.
 	if out.ToolCallID != call.ToolCallID || out.AttemptNo != call.AttemptNo || !out.Status.Valid() {
 		cause := fmt.Errorf("effectpath: executor returned a result that does not correlate to the call (fail closed)")
 		return contracts.ToolResult{}, p.report(ctx, op, failureOutcome(call, contracts.ToolResult{}), p.onErr(ctx, cause))
 	}
+	validated, verr := contracts.NewToolResult(call, out.Status, out.Output, out.Err, out.StartedAt, out.FinishedAt, out.Commit)
+	if verr != nil {
+		cause := fmt.Errorf("effectpath: executor result fails contract validation (fail closed): %w", verr)
+		return contracts.ToolResult{}, p.report(ctx, op, failureOutcome(call, contracts.ToolResult{}), p.onErr(ctx, cause))
+	}
+	out = validated
 	// 6) S6.9 order: After — a veto goes through OnError; an effectful
 	// result without a valid receipt parks UNKNOWN (N3-C02/N4-C03).
 	if verr := p.mw.AfterTool(ctx, call, out); verr != nil {

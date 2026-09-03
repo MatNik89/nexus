@@ -106,7 +106,12 @@ func (c *ChatPlanner) Plan(ctx context.Context, blocks []contracts.ContextBlock)
 			c.auth.Report(op, s7min.OutcomeFailedTerminal)
 			return loop.Action{}, fmt.Errorf("planner: %w", err)
 		}
-		c.auth.Report(op, s7min.OutcomeSucceeded)
+		// A success the S7 authority refuses to record is a claim from an
+		// UNGOVERNED transport — the answer is rejected (Phase-2-r2 codex
+		// #2: a provider that skipped grant consumption returned content).
+		if rerr := c.auth.Report(op, s7min.OutcomeSucceeded); rerr != nil {
+			return loop.Action{}, fmt.Errorf("planner: transport did not consume its grant — reply refused (fail closed): %w", rerr)
+		}
 		final := b.String()
 		return loop.Action{Final: &final}, nil
 	}
@@ -115,6 +120,8 @@ func (c *ChatPlanner) Plan(ctx context.Context, blocks []contracts.ContextBlock)
 		c.auth.Report(op, s7min.OutcomeFailedTerminal)
 		return loop.Action{}, fmt.Errorf("planner: %w", err)
 	}
-	c.auth.Report(op, s7min.OutcomeSucceeded)
+	if rerr := c.auth.Report(op, s7min.OutcomeSucceeded); rerr != nil {
+		return loop.Action{}, fmt.Errorf("planner: transport did not consume its grant — reply refused (fail closed): %w", rerr)
+	}
 	return loop.Action{Final: &out.Content}, nil
 }

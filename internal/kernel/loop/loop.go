@@ -25,6 +25,7 @@ import (
 	"github.com/MatNik89/nexus/internal/kernel/journal"
 	"github.com/MatNik89/nexus/internal/kernel/machine"
 	"github.com/MatNik89/nexus/internal/kernel/s7min"
+	"github.com/MatNik89/nexus/internal/security/redact"
 )
 
 // Action is the planner's closed XOR outcome: exactly one of a final
@@ -56,14 +57,15 @@ type Loop struct {
 	path     *effectpath.EffectPath
 	grants   *s7min.Authority
 	journal  *journal.Journal
+	redactor redact.Redactor
 	policy   Policy
 	maxIters int
 	breakerN int
 }
 
 func New(p Planner, path *effectpath.EffectPath, grants *s7min.Authority, j *journal.Journal,
-	policy Policy, maxIters, breakerN int) (*Loop, error) {
-	if p == nil || path == nil || grants == nil || j == nil {
+	r redact.Redactor, policy Policy, maxIters, breakerN int) (*Loop, error) {
+	if p == nil || path == nil || grants == nil || j == nil || r == nil {
 		return nil, fmt.Errorf("loop: all collaborators are required (fail closed)")
 	}
 	if policy != PolicyInteractive && policy != PolicyContinuous {
@@ -72,7 +74,7 @@ func New(p Planner, path *effectpath.EffectPath, grants *s7min.Authority, j *jou
 	if maxIters <= 0 || breakerN <= 1 {
 		return nil, fmt.Errorf("loop: iteration and breaker bounds must be positive (fail closed)")
 	}
-	return &Loop{planner: p, path: path, grants: grants, journal: j,
+	return &Loop{planner: p, path: path, grants: grants, journal: j, redactor: r,
 		policy: policy, maxIters: maxIters, breakerN: breakerN}, nil
 }
 
@@ -130,8 +132,11 @@ func observeGuard(call contracts.ToolCall, blocks []contracts.ContextBlock) erro
 // influenced (subprocess stderr, upstream bodies) and goes to the model
 // ONLY inside the untrusted fence (Phase-2 codex #8: TOOL_TRUSTED error
 // text was an injection lane). Content is bounded.
-func errorObservation(call contracts.ToolCall, seq int, toolErr error) (contracts.ContextBlock, error) {
-	msg := toolErr.Error()
+// Error text passes the KNOWN-REF redactor before any model/UI boundary
+// (Phase-2-r2 codex #9: a credential inside subprocess stderr would
+// otherwise reach the external provider verbatim).
+func errorObservation(r redact.Redactor, call contracts.ToolCall, seq int, toolErr error) (contracts.ContextBlock, error) {
+	msg := RedactText(r, toolErr.Error())
 	if len(msg) > 1024 {
 		msg = msg[:1024] + "…(truncated)"
 	}
@@ -141,9 +146,27 @@ func errorObservation(call contracts.ToolCall, seq int, toolErr error) (contract
 		BlockID: contracts.BlockID(fmt.Sprintf("obs-err-%s-%d", call.ToolCallID, seq)),
 		Kind:    "tool_error", Content: &content, ContentHash: hex.EncodeToString(sum[:]),
 		SourceURI: "nexus://loop/observation", Producer: "loop",
-		Trust: contracts.TrustUntrustedExternal, Sensitivity: contracts.Sensitivity(1),
+		Trust: contracts.TrustUntrustedExternal, Sensitivity: contracts.SensitivityInternal,
 		Lineage: []string{string(call.ToolCallID)}, ObservedAt: time.Now().UTC(),
 	})
+}
+
+// RedactText applies the known-ref redactor to one plain string (the
+// redactor's native unit is a JSON document).
+func RedactText(r redact.Redactor, s string) string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		return "(unrenderable)"
+	}
+	red, err := r.Redact(b)
+	if err != nil {
+		return "(redaction failed — content withheld)"
+	}
+	var out string
+	if json.Unmarshal(red, &out) != nil {
+		return "(unrenderable)"
+	}
+	return out
 }
 
 // RunTurn executes ONE turn to a final answer or a failure. Every path
@@ -216,8 +239,16 @@ func (l *Loop) RunTurn(ctx context.Context, turn contracts.TurnID, run contracts
 		if err := l.append(ctx, run, profile, turn, machine.EvAttemptAuthorized, next(), &tcID); err != nil {
 			return "", err
 		}
+		// STARTED is appended by the effect path AFTER consume and BEFORE
+		// dispatch (Phase-2-r2 codex #7): the durable record proves
+		// consumption preceded any effect — a crash mid-dispatch replays
+		// as RUNNING and goes to reconciliation, never silently AUTHORIZED.
+		l.path.SetStartObserver(func(obsCtx context.Context, obsOp contracts.OperationID) error {
+			return l.append(obsCtx, run, profile, turn, machine.EvAttemptStarted, next(), &tcID)
+		})
 		out, toolErr := l.path.RunTool(ctx, call, grant)
-		// Journal the attempt lifecycle from the AUTHORITY state.
+		l.path.SetStartObserver(nil)
+		// Journal the attempt terminal from the AUTHORITY state.
 		st, _ := l.grants.State(op)
 		switch st {
 		case contracts.AttemptAuthorized:
@@ -229,16 +260,16 @@ func (l *Loop) RunTurn(ctx context.Context, turn contracts.TurnID, run contracts
 				return "", jerr
 			}
 		case contracts.AttemptSucceeded, contracts.AttemptFailed, contracts.AttemptUnknown:
-			if jerr := l.append(ctx, run, profile, turn, machine.EvAttemptStarted, next(), &tcID); jerr != nil {
-				return failTurn(fmt.Errorf("loop: journal append failed AFTER a physical attempt — treat attempt %s as UNKNOWN pending reconciliation: %w", op, jerr))
-			}
 			terminal := map[contracts.AttemptState]string{
 				contracts.AttemptSucceeded: machine.EvAttemptSucceeded,
 				contracts.AttemptFailed:    machine.EvAttemptFailed,
 				contracts.AttemptUnknown:   machine.EvAttemptLost,
 			}[st]
+			// topknot ceiling: if THIS append fails, the durable stream
+			// already holds STARTED — replay folds RUNNING and the crash-
+			// recovery owner reconciles it; the turn still fails loudly.
 			if jerr := l.append(ctx, run, profile, turn, terminal, next(), &tcID); jerr != nil {
-				return failTurn(fmt.Errorf("loop: journal append failed AFTER a physical attempt — treat attempt %s as UNKNOWN pending reconciliation: %w", op, jerr))
+				return failTurn(fmt.Errorf("loop: terminal append failed — attempt %s stays RUNNING in the journal for reconciliation: %w", op, jerr))
 			}
 		case contracts.AttemptCancelled:
 			if jerr := l.append(ctx, run, profile, turn, machine.EvAttemptCancelled, next(), &tcID); jerr != nil {
@@ -259,7 +290,7 @@ func (l *Loop) RunTurn(ctx context.Context, turn contracts.TurnID, run contracts
 		}
 		if toolErr != nil {
 			// Failure is an OBSERVATION; the turn continues.
-			obs, oerr := errorObservation(call, seq, toolErr)
+			obs, oerr := errorObservation(l.redactor, call, seq, toolErr)
 			if oerr != nil {
 				return failTurn(fmt.Errorf("loop: observation: %w", oerr))
 			}

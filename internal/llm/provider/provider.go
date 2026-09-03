@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -74,14 +75,20 @@ type APIKey struct {
 }
 
 // loopbackHost reports whether the host part names the local machine —
-// the only place plaintext HTTP is tolerated (test/local providers).
+// the only place plaintext HTTP is tolerated (test/local providers). The
+// address CLASS is decided by parsing an IP literal, never by hostname
+// prefix (Phase-2-r2 codex #11: "127.attacker.example" is a remote DNS
+// name, not loopback).
 func loopbackHost(host string) bool {
 	h := host
-	if i := strings.LastIndex(h, ":"); i >= 0 && !strings.HasSuffix(h, "]") {
-		h = h[:i]
+	if hp, _, err := net.SplitHostPort(host); err == nil {
+		h = hp
 	}
-	h = strings.Trim(h, "[]")
-	return h == "localhost" || h == "::1" || strings.HasPrefix(h, "127.")
+	if h == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(h, "[]"))
+	return ip != nil && ip.IsLoopback()
 }
 
 // NewAPIKey builds the provider FAIL-CLOSED: https only (plaintext only
@@ -150,10 +157,20 @@ type chatResponse struct {
 	} `json:"choices"`
 }
 
+// Target is the S7 target every grant for THIS provider must be minted
+// for — a grant minted for anything else never reaches the wire
+// (Phase-2-r2 codex #2: an unbound provider grant was replayable).
+func (p *APIKey) Target() contracts.TargetID {
+	return contracts.TargetID("provider:" + p.host)
+}
+
 // transport performs ONE governed HTTP attempt: the grant is consumed
 // HERE, immediately before the wire — a second call on the same grant
 // fails ATTEMPT_NOT_AUTHORIZED before any bytes leave the process.
 func (p *APIKey) transport(ctx context.Context, g s7min.Grant, body []byte) (*http.Response, error) {
+	if g.TargetID != p.Target() {
+		return nil, fmt.Errorf("provider: grant is not bound to this provider target: %w", s7min.ErrAttemptNotAuthorized)
+	}
 	if err := p.auth.Consume(g); err != nil {
 		return nil, fmt.Errorf("provider: %w", err)
 	}
@@ -218,7 +235,7 @@ func (p *APIKey) Probe(ctx context.Context, resolved config.Resolved) closure.Pr
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	op := contracts.OperationID(fmt.Sprintf("provider-probe-%d", time.Now().UnixNano()))
-	g, err := p.auth.Issue(op, contracts.TargetID("provider:"+p.host))
+	g, err := p.auth.Issue(op, p.Target())
 	if err != nil {
 		pr.Detail = err.Error()
 		return pr
