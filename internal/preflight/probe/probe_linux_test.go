@@ -618,16 +618,79 @@ func TestOriginRunpathBinaryResolves(t *testing.T) {
 
 // --- rootfs is read-only: no library shadowing (r4 kilo #7) ---
 
+// buildDynamicWriter compiles a DYNAMIC C fixture (its closure materializes
+// /nexus-libs and /lib inside), so the write attempts hit real read-only
+// directories — a static helper got ENOENT and proved nothing (r5 codex #2).
+func buildDynamicWriter(t *testing.T) string {
+	t.Helper()
+	cc, err := exec.LookPath("cc")
+	if err != nil {
+		t.Skip("no C compiler for the dynamic writer fixture")
+	}
+	root := t.TempDir()
+	src := filepath.Join(root, "w.c")
+	os.WriteFile(src, []byte(`#include <stdio.h>
+int main(int argc, char **argv){ if(argc<2) return 2; FILE *f=fopen(argv[1],"w"); if(!f){perror("open"); return 1;} fputs("evil",f); fclose(f); return 0; }
+`), 0o644)
+	bin := filepath.Join(root, "writer")
+	if out, err := exec.Command(cc, "-o", bin, src).CombinedOutput(); err != nil {
+		t.Skipf("cc: %v\n%s", err, out)
+	}
+	return bin
+}
+
 func TestRootfsReadOnlyPreventsLibShadowing(t *testing.T) {
 	av := mustDetect(t)
-	hp := helperPath(t)
-	out, err := run(t, av, Spec{Target: hp, Args: []string{"writefile", "/nexus-libs/libc.so.6", "evil"}, WorkDir: wdir(t)})
-	if err == nil {
-		t.Fatalf("write into the loader-searched /nexus-libs SUCCEEDED — shadowing possible:\n%s", out)
+	writer := buildDynamicWriter(t)
+	for _, target := range []string{"/nexus-libs/libc.so.6", "/lib/evil"} {
+		out, err := run(t, av, Spec{Target: writer, Args: []string{target}, WorkDir: wdir(t)})
+		if err == nil {
+			t.Fatalf("write into %s SUCCEEDED — shadowing possible:\n%s", target, out)
+		}
+		if !strings.Contains(out, "Read-only file system") {
+			t.Fatalf("write into %s must fail with EROFS (read-only), got: %v\n%s", target, err, out)
+		}
 	}
-	out, err = run(t, av, Spec{Target: hp, Args: []string{"writefile", "/lib/evil", "evil"}, WorkDir: wdir(t)})
-	if err == nil {
-		t.Fatalf("write into /lib on the rootfs SUCCEEDED — rootfs not read-only:\n%s", out)
+}
+
+// Negative control: with the remount loosened, the SAME writes succeed —
+// proving the assertion above is causal, not vacuous.
+func TestNegativeControlLibWriteSucceedsWithoutRemountRO(t *testing.T) {
+	av := mustDetect(t)
+	writer := buildDynamicWriter(t)
+	spec := Spec{Target: writer, Args: []string{"/nexus-libs/injected.so"}, WorkDir: wdir(t)}
+	spec.loosen.remountRW = true
+	out, err := run(t, av, spec)
+	if err != nil {
+		t.Fatalf("negative control broken — without remount-ro the write must succeed: %v\n%s", err, out)
+	}
+}
+
+func TestQueueBudgetRejectsBeforeAllocation(t *testing.T) {
+	if err := checkQueueBudget(0, maxDepQueue+1); err == nil {
+		t.Fatal("oversized dependency table accepted")
+	}
+	if err := checkQueueBudget(maxDepQueue-1, 2); err == nil {
+		t.Fatal("queue overflow accepted")
+	}
+	if err := checkQueueBudget(0, maxDepQueue); err != nil {
+		t.Fatalf("exact-capacity table refused: %v", err)
+	}
+}
+
+func TestLoadBoundedHonorsAggregateAllowance(t *testing.T) {
+	f := filepath.Join(t.TempDir(), "blob")
+	if err := os.WriteFile(f, make([]byte, 4096), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadBounded(f, 1024); err == nil {
+		t.Fatal("file exceeding the remaining aggregate allowance accepted")
+	}
+	if _, err := loadBounded(f, 0); err == nil {
+		t.Fatal("exhausted allowance accepted")
+	}
+	if b, err := loadBounded(f, 8192); err != nil || len(b) != 4096 {
+		t.Fatalf("within-allowance load failed: %v", err)
 	}
 }
 
@@ -641,8 +704,13 @@ func TestHostileXDGRuntimeDirCannotWidenRoots(t *testing.T) {
 		t.Skip("no home")
 	}
 	t.Setenv("XDG_RUNTIME_DIR", home) // hostile: home is not a valid runtime root shape
-	sub := filepath.Join(home, ".nexus-probe-red")
-	if err := os.MkdirAll(sub, 0o700); err != nil {
+	// Fresh, uniquely named fixture — NEVER a fixed path that could already
+	// exist and get recursively deleted (r5 codex #1).
+	sub, err := os.MkdirTemp(home, ".nexus-probe-red-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(sub, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(sub)

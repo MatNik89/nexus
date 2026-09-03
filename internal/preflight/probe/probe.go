@@ -104,15 +104,25 @@ type Spec struct {
 }
 
 type loosen struct {
-	roBind  string
-	net     bool
-	pidNS   bool
-	seccomp bool
+	roBind    string
+	net       bool
+	pidNS     bool
+	seccomp   bool
+	remountRW bool // skip --remount-ro / (shadowing negative control only)
 }
 
 // ErrNotELF: the launch target is not a native ELF executable (shebang,
 // script, foreign architecture). Refused BEFORE any sandbox is set up.
 var ErrNotELF = fmt.Errorf("launch target is not a native ELF executable (scripts/shebang/foreign-arch rejected)")
+
+// checkQueueBudget rejects a dependency-table expansion BEFORE any node
+// slice is materialized (r5 codex #3).
+func checkQueueBudget(cur, add int) error {
+	if add > maxDepQueue || cur+add > maxDepQueue {
+		return fmt.Errorf("dependency graph exceeds %d pending nodes", maxDepQueue)
+	}
+	return nil
+}
 
 const (
 	maxClosureFiles   = 64
@@ -143,7 +153,14 @@ func nativeMachine() (elf.Machine, error) {
 // most maxClosureOneFile+1 bytes from that same descriptor — validation and
 // allocation share one file, so a swap or grow between stat and read cannot
 // bypass the budget (Phase-0 r4 codex #2).
-func loadBounded(path string) ([]byte, error) {
+func loadBounded(path string, remaining int64) ([]byte, error) {
+	cap := int64(maxClosureOneFile)
+	if remaining < cap {
+		cap = remaining // aggregate allowance enforced BEFORE this allocation
+	}
+	if cap <= 0 {
+		return nil, fmt.Errorf("%s: closure byte budget exhausted", path)
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -153,15 +170,15 @@ func loadBounded(path string) ([]byte, error) {
 	if err != nil || !st.Mode().IsRegular() {
 		return nil, fmt.Errorf("%s: not a regular file (%v)", path, err)
 	}
-	if st.Size() > maxClosureOneFile {
-		return nil, fmt.Errorf("%s exceeds the per-file budget", path)
+	if st.Size() > cap {
+		return nil, fmt.Errorf("%s exceeds the closure byte budget", path)
 	}
-	buf, err := io.ReadAll(io.LimitReader(f, maxClosureOneFile+1))
+	buf, err := io.ReadAll(io.LimitReader(f, cap+1))
 	if err != nil {
 		return nil, err
 	}
-	if int64(len(buf)) > maxClosureOneFile {
-		return nil, fmt.Errorf("%s grew past the per-file budget during read", path)
+	if int64(len(buf)) > cap {
+		return nil, fmt.Errorf("%s grew past the closure byte budget during read", path)
 	}
 	return buf, nil
 }
@@ -293,7 +310,8 @@ func resolveClosure(target string) (files []closureFile, insideTarget string, er
 		return nil
 	}
 
-	targetBuf, err := loadBounded(target)
+	remaining := func() int64 { return int64(maxClosureBytes - total) }
+	targetBuf, err := loadBounded(target, remaining())
 	if err != nil {
 		return nil, "", err
 	}
@@ -310,7 +328,7 @@ func resolveClosure(target string) (files []closureFile, insideTarget string, er
 		return nil, "", err
 	}
 	if rootMeta.interp != "" {
-		ibuf, err := loadBounded(rootMeta.interp)
+		ibuf, err := loadBounded(rootMeta.interp, remaining())
 		if err != nil {
 			closeAll()
 			return nil, "", err
@@ -332,11 +350,15 @@ func resolveClosure(target string) (files []closureFile, insideTarget string, er
 	}
 	var queue []depNode
 	push := func(nodes []depNode) error {
-		if len(queue)+len(nodes) > maxDepQueue {
-			return fmt.Errorf("dependency graph exceeds %d pending nodes", maxDepQueue)
+		if err := checkQueueBudget(len(queue), len(nodes)); err != nil {
+			return err
 		}
 		queue = append(queue, nodes...)
 		return nil
+	}
+	if err := checkQueueBudget(len(queue), len(rootMeta.needed)); err != nil {
+		closeAll()
+		return nil, "", err
 	}
 	var rootNodes []depNode
 	for _, n := range rootMeta.needed {
@@ -366,7 +388,7 @@ func resolveClosure(target string) (files []closureFile, insideTarget string, er
 			closeAll()
 			return nil, "", fmt.Errorf("cannot resolve library %q for %s", node.name, target)
 		}
-		lbuf, err := loadBounded(found)
+		lbuf, err := loadBounded(found, remaining())
 		if err != nil {
 			closeAll()
 			return nil, "", err
@@ -383,6 +405,10 @@ func resolveClosure(target string) (files []closureFile, insideTarget string, er
 		childInherited := node.inherited
 		if !lmeta.isRunpath && len(lmeta.paths) > 0 {
 			childInherited = append(append([]string{}, node.inherited...), lmeta.paths...)
+		}
+		if err := checkQueueBudget(len(queue), len(lmeta.needed)); err != nil {
+			closeAll()
+			return nil, "", err
 		}
 		var childNodes []depNode
 		for _, n := range lmeta.needed {
@@ -631,7 +657,9 @@ func Prepare(av Availability, spec Spec) (*Handle, error) {
 		args = append(args, "--seccomp", fmt.Sprint(fdNum))
 		fdNum++
 	}
-	args = append(args, "--remount-ro", "/")
+	if !spec.loosen.remountRW {
+		args = append(args, "--remount-ro", "/")
+	}
 	args = append(args, insideTarget)
 	args = append(args, spec.Args...)
 	cmd.Args = append([]string{av.BwrapPath}, args...)
