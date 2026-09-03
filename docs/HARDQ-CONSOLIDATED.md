@@ -152,14 +152,24 @@ no longer a P0 build item.
 - **C8 (kilo#12):** P0 health = liveness heartbeat + last-occurrence-fired counter; 15.5
   SemanticHealth deferred with its eval-infra dependencies.
 
-## D. USER-DECISION required
-### D1. P0 sandbox backend: hand-written native helper vs bwrap (kilo#1 vs codex#12/E10)
-Kilo (with the plan's own words: PLAN-HOLES C2 "months, not weeks"; DESIGN-S0 "CURRENT
-PROOF: NOT RUN") argues the native Landlock+seccomp helper is a 2–3 month solo block on the
-critical path of done-criterion 6, and proposes **bwrap (bubblewrap) as the P0 ENFORCED
-backend** behind the same `SandboxBackend` interface + the SAME hostile conformance suite;
-native helper becomes P1 hardening. Codex keeps the native path and adds only the kernel
-floor (C5). This reverses a locked E10 decision → product call, not moderator's.
+## D. USER-DECISION — RESOLVED 2026-09-03
+### D1. P0 sandbox backend → **bwrap (option A), user-approved 2026-09-03**
+**bwrap (bubblewrap) is the P0 ENFORCED backend** behind the `SandboxBackend` interface
+(Probe/Compile/Launch/Attest), fail-closed, attested, and subject to the SAME hostile
+conformance suite as any backend. The hand-written native Landlock+seccomp helper
+(DESIGN-S0) becomes the **P1 hardening path** — the suite is the invariant, the backend is
+swappable. This amends E10/E1: single-binary purity yields for this one component; bwrap is
+a DECLARED install prerequisite (see F1), never a silent dependency. No weaker fallback:
+bwrap absent → exec capability OFF (conversation-only), everything else works.
+
+## F. New user requirement (2026-09-03) — ADOPTED
+### F1. Installer/doctor preflight with guided prerequisite install
+`nexus doctor` runs at install/first-start: checks OS/kernel floor (C5), bwrap presence,
+data-dir permissions, provider key, Telegram token; anything missing → offers CONSENTED
+install (e.g. `apt install bubblewrap`) or exact instructions; setup completes only when
+green. Declined prerequisite → the dependent capability stays fail-closed off (reported as
+`conversation-only` vs `P0-capable`), never a degraded-but-on mode. Maps to 17.3 packaging +
+C5; minimal P0 form = check + consented one-command fix; full wizard = P1 polish.
 
 ## E. PARKED (P1+, do not act now)
 - agy#15 symedit LSP-unavailable fallback tier (contradicts locked "never text-fallback" —

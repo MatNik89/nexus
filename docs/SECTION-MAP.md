@@ -59,6 +59,14 @@ FAZA P (distribucija/service, →O):
 sandbox=**S6.2** (svaki subprocess) · process-tree=**S1.2** (unutar S6.2.Launch) · retry/cancel=**S7** ·
 journal-write=**P0.3/EventJournal paket** (jedini writer; NE S0.3). Effect-path fix: DESIGN-FIXES-r2 K1/K2.
 
+**P0 -min rezovi (HARDQ A2, jednoglasno, 2026-09-03):** K1 rubovi S7/S5 za P0 walking-skeleton
+zadovoljavaju se IMENOVANIM -min ugovorima (isti mehanizam kao S8.1-min/S11.1-min/S16.6-det):
+`s7-min` = AttemptGrant + cancel + no-retry (retryable→FAILED_TERMINAL) · `s5-min` = AtomicWriter ·
+`3.6-min` = persisted schedule + wake catch-up (uvučen u P0) · `7.3-min` = inbox/outbox +
+occurrence-idempotency (uvučen u P0). PUNI engine-i (S7 taxonomija/budgeti/fencing, S5 shadow-git/
+worktree) ostaju u svojim kasnijim fazama. Redoslijed isporuke: HARNESS-SPEC vertikalni sliceovi;
+build-order detalj → HARDQ-CONSOLIDATED A2 → tasks-P0.md.
+
 ---
 
 ## 2) FOLD ADDENDUMA A1-A10 U SEKCIJE (više ne vise kao dodaci)

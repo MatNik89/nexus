@@ -1464,6 +1464,7 @@ podsekciji mora dokazati pripadni ugovor. Bez Annexa spec je 'lista projekata'; 
 - **Stanja HITL-a:** `WAITING→{APPROVED|DENIED|EXPIRED|CANCELLED}`; samo S7 durable transition smije nastaviti run; ponovni odgovor na terminalni challenge je replay.
 - **Invarijante:** channel adapter se ne registrira prije active `extensions` closurea; odgovor mora biti autentificiran kao isti principal+channel binding; token je exact-intent, expiring i single-use; approval ne može proširiti kernel policy; adapter ne može sam nastaviti run.
 - **RED — `test_channels_contract_fails_closed` (tablični):** slučaj A aktivira `channels` bez `extensions/S6.8` attestationa; slučaj B dvaput pošalje isti valjani approval odgovor; A MUST dati `INCOMPLETE_CAPABILITY_CLOSURE`, B `APPROVAL_REPLAY`, a u oba slučaja nema adapter side-effecta niti drugog resumea.
+- **AMENDMENT (hard-questions, unanimous, 2026-09-03):** capability se dijeli na `channel:builtin` i `channel:plugin`. **Built-in** adapteri (P0 Telegram, stdio) su kompajlirani u potpisani binary i registriraju se statički: zahtijevaju SAMO `7.3 (durable delivery) + approval-core (6.0/12.4) + identity (6.6)`; integritet im atestira potpis release-artefakta (P1.5), NE runtime extensions closure. `channels requires extensions + S6.8 + S11.5` vrijedi ISKLJUČIVO za dinamički učitane (`channel:plugin`) adaptere; RED slučaj A testira plugin put i ostaje na snazi. Isti adapter-interface i conformance suite za oba puta. Izvor: HARDQ-CONSOLIDATED A1.
 
 # P2 — pouzdanost i podaci
 
