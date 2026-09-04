@@ -695,3 +695,21 @@ func versionLess(a, b string) bool {
 	}
 	return len(pa) < len(pb)
 }
+
+// ResolveClosureHashes resolves the FULL runtime closure of target
+// (target ELF + loader + every library) and returns the inside-path →
+// sha256 map WITHOUT launching anything (T25 Compile pins the whole
+// closure — Phase-6-r2 codex #2: pinning only the main ELF left
+// dependency substitution open between Compile and Launch).
+func ResolveClosureHashes(target string) (map[string]string, error) {
+	files, _, err := resolveClosure(target)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]string, len(files))
+	for _, cf := range files {
+		out[cf.dest] = cf.hash
+		cf.f.Close()
+	}
+	return out, nil
+}

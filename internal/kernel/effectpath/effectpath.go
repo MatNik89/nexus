@@ -11,9 +11,11 @@
 package effectpath
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -128,7 +130,7 @@ func EffectHash(c contracts.ToolCall) string {
 		idem = *c.IdempotencyKey
 	}
 	for _, part := range [][]byte{
-		[]byte(c.ToolID), c.Arguments, []byte(c.ArgsSchemaHash),
+		[]byte(c.ToolID), canonicalJSON(c.Arguments), []byte(c.ArgsSchemaHash),
 		{byte(c.Effect)}, {byte(c.ExecutionKind)}, []byte(idem), []byte(c.ProfileID),
 	} {
 		// Length-prefix every part: no concatenation ambiguity.
@@ -137,6 +139,41 @@ func EffectHash(c contracts.ToolCall) string {
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }
+
+// canonicalJSON re-encodes a JSON document with DETERMINISTIC object-key
+// order (Go maps marshal sorted). The journal redactor rebuilds payloads
+// through maps, so the byte order of stored arguments can differ from
+// the mint-time order — the hash must bind the CANONICAL form or a
+// journal round trip silently invalidates its own approval (Phase-6:
+// found by the exec spine e2e; C4 intent is unchanged, JSON object key
+// order carries no meaning). Unparsable input hashes as raw bytes.
+func canonicalJSON(raw []byte) []byte {
+	// Duplicate object keys make map-decoding NON-INJECTIVE (last-wins
+	// collapse — Phase-6 kilo #1: {"command":"/bin/echo","command":
+	// "/bin/rm"} would hash equal to the /bin/rm-only document and let a
+	// divergent summary authorize the dangerous value). Such documents
+	// hash as their RAW bytes: a canonical form never contains a
+	// duplicate key, so the two spaces cannot collide.
+	if HasDuplicateJSONKeys(raw) {
+		return raw
+	}
+	var v interface{}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(&v); err != nil {
+		return raw
+	}
+	out, err := json.Marshal(v)
+	if err != nil {
+		return raw
+	}
+	return out
+}
+
+// HasDuplicateJSONKeys delegates to the contracts owner (the check now
+// runs at ToolCall construction — Phase-6 codex #6; kept here as the
+// public seam exectool and the hash use).
+func HasDuplicateJSONKeys(raw []byte) bool { return contracts.HasDuplicateJSONKeys(raw) }
 
 func effectHash(c contracts.ToolCall) string { return EffectHash(c) }
 

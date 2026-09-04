@@ -51,6 +51,9 @@ type Deps struct {
 	// interactive sessions keep surfacing NEEDS_APPROVAL directly.
 	SuspenderFor     func(channelIdentity string) loop.Suspender
 	DurableApprovals effectpath.DurableApprovals
+	// Sandbox is the REAL S6.2 process door (T26). Nil = no passing
+	// sandbox probe: every ExecProcess call refuses fail-closed.
+	Sandbox effectpath.SandboxBackend
 }
 
 // Daemon serves chat sessions over a UDS.
@@ -158,7 +161,7 @@ func (d *Daemon) handle(ctx context.Context, conn net.Conn) {
 	grants := d.deps.Authority
 	path, err := effectpath.NewEffectPath(pep, orderOnlyMW{},
 		effectpath.NewInProcessExecutor(d.deps.Tools),
-		effectpath.NewSandboxedProcessExecutor(noSandbox{}), grants)
+		effectpath.NewSandboxedProcessExecutor(d.sandbox()), grants)
 	if err != nil {
 		writeFrame(conn, frame{Type: "error", Text: "session setup failed"})
 		return
@@ -299,7 +302,7 @@ func (d *Daemon) channelLoop(identity string) (*loop.Loop, error) {
 	}
 	path, err := effectpath.NewEffectPath(pep, orderOnlyMW{},
 		effectpath.NewInProcessExecutor(d.deps.Tools),
-		effectpath.NewSandboxedProcessExecutor(noSandbox{}), d.deps.Authority)
+		effectpath.NewSandboxedProcessExecutor(d.sandbox()), d.deps.Authority)
 	if err != nil {
 		return nil, err
 	}
@@ -343,6 +346,14 @@ func (orderOnlyMW) AfterTool(context.Context, contracts.ToolCall, contracts.Tool
 	return nil
 }
 func (orderOnlyMW) OnError(ctx context.Context, e error) error { return e }
+
+// sandbox returns the wired S6.2 backend or the fail-closed refuser.
+func (d *Daemon) sandbox() effectpath.SandboxBackend {
+	if d.deps.Sandbox != nil {
+		return d.deps.Sandbox
+	}
+	return noSandbox{}
+}
 
 // noSandbox refuses every process execution until the REAL bwrap backend
 // binds (T26) — fail closed, never a fake pass.

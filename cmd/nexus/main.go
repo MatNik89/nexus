@@ -22,6 +22,7 @@ import (
 	"github.com/MatNik89/nexus/internal/approval"
 	"github.com/MatNik89/nexus/internal/channel"
 	"github.com/MatNik89/nexus/internal/channel/telegram"
+	"github.com/MatNik89/nexus/internal/exectool"
 	"github.com/MatNik89/nexus/internal/foundation/atomicwrite"
 	"github.com/MatNik89/nexus/internal/foundation/clockid"
 	"github.com/MatNik89/nexus/internal/foundation/config"
@@ -38,6 +39,7 @@ import (
 	"github.com/MatNik89/nexus/internal/memory"
 	"github.com/MatNik89/nexus/internal/obligation"
 	"github.com/MatNik89/nexus/internal/preflight/doctor"
+	"github.com/MatNik89/nexus/internal/sandbox"
 	"github.com/MatNik89/nexus/internal/schedule"
 	"github.com/MatNik89/nexus/internal/security/redact"
 )
@@ -256,14 +258,15 @@ func (b *daemonBundle) resumeApproved(ctx context.Context, identity, challengeID
 		result = *out.Output[0].Content
 	}
 	// REHYDRATION (Phase-5-r3 codex #1/#2): the ORIGINAL context plus the
-	// approved tool's observation re-enter the original turn; the
-	// challenge id tags this resume cycle's event ids so a turn can
-	// suspend and resume repeatedly.
-	obs, err := resumeObservation(call, result)
+	// approved tool's OWN observation blocks re-enter the original turn —
+	// their trust labels and lineage are PRESERVED (Phase-6 codex #1:
+	// flattening and re-minting them TOOL_TRUSTED laundered untrusted
+	// exec output past the assembler's injection fence).
+	continuation, err := resumeBlocks(blocks, out, call, result)
 	if err != nil {
 		return "", err
 	}
-	final, ferr := b.d.ResumeChannelTurn(ctx, identity, turn, run, challengeID, append(blocks, obs))
+	final, ferr := b.d.ResumeChannelTurn(ctx, identity, turn, run, challengeID, continuation)
 	if merr := b.approvals.MarkResumeCompleted(ctx, challengeID); merr != nil {
 		fmt.Fprintf(os.Stderr, "nexus: resume-completed mark %s: %v\n", challengeID, merr)
 	}
@@ -311,6 +314,25 @@ func (b *daemonBundle) resumeApprovedPending(ctx context.Context) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// resumeBlocks assembles the continuation context: the ORIGINAL blocks
+// plus the tool's OWN observation blocks with trust and lineage
+// PRESERVED (Phase-6 codex #1: flattening exec output and re-minting it
+// TOOL_TRUSTED laundered attacker-controlled text past the assembler's
+// untrusted fence). Only a tool that returned NO blocks gets a synthetic
+// trusted stub.
+func resumeBlocks(original []contracts.ContextBlock, out contracts.ToolResult,
+	call contracts.ToolCall, result string) ([]contracts.ContextBlock, error) {
+	obsBlocks := out.Output
+	if len(obsBlocks) == 0 {
+		obs, err := resumeObservation(call, result)
+		if err != nil {
+			return nil, err
+		}
+		obsBlocks = []contracts.ContextBlock{obs}
+	}
+	return append(append([]contracts.ContextBlock{}, original...), obsBlocks...), nil
 }
 
 // resumeObservation packs the approved tool's result for the resumed turn.
@@ -417,6 +439,20 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 	// task runs) goes through the SAME sealed path as sessions —
 	// ModeDefault, merged sealed tools/rules.
 	allTools := mergedTools(memStore, redactor, oblManager)
+	// REAL sandbox (T25/T26): probe bwrap; a passing probe binds the exec
+	// tool, a failing one leaves every ExecProcess call fail-closed and
+	// the exec capability OFF (deny-default).
+	var execAdapter *exectool.Adapter
+	sbBackend := sandbox.NewBwrap()
+	if rep, perr := sbBackend.Probe(context.Background()); perr == nil {
+		if ad, aerr := exectool.New(sbBackend, rep, redactor, resolved.Config.ExecAllow); aerr == nil {
+			execAdapter = ad
+		}
+	}
+	var execDoor effectpath.SandboxBackend
+	if execAdapter != nil {
+		execDoor = execAdapter
+	}
 	sysPep, err := effectpath.NewPEP(mergedRules(), effectpath.NewApprovals(nil, 5*time.Minute),
 		&journalAudit{j: j, profile: profile}, effectpath.ModeDefault)
 	if err != nil {
@@ -426,7 +462,7 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 	sysPep.SetDurableApprovals(approvals)
 	sysPath, err := effectpath.NewEffectPath(sysPep, systemMW{},
 		effectpath.NewInProcessExecutor(allTools),
-		effectpath.NewSandboxedProcessExecutor(nil), authority)
+		effectpath.NewSandboxedProcessExecutor(execDoor), authority)
 	if err != nil {
 		j.Close()
 		return nil, err
@@ -449,6 +485,13 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 			for k, v := range obligation.Specs() {
 				specs[k] = v
 			}
+			if execAdapter != nil {
+				// The planner offers exec ONLY behind a passing sandbox
+				// probe (deny-default).
+				for k, v := range exectool.Spec() {
+					specs[k] = v
+				}
+			}
 			return pl.WithTools(specs, profile)
 		},
 		Authority: authority, Profile: profile,
@@ -457,6 +500,7 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 		Audit:            &journalAudit{j: j, profile: profile},
 		Redactor:         redactor,
 		DurableApprovals: approvals,
+		Sandbox:          execDoor,
 		SuspenderFor: func(identity string) loop.Suspender {
 			source := "tg:" + identity
 			return func(ctx context.Context, turn contracts.TurnID, run contracts.RunID,
@@ -491,6 +535,11 @@ func (systemMW) OnError(ctx context.Context, e error) error { return e }
 func mergedRules() map[contracts.ToolID]effectpath.Decision {
 	rules := memory.Rules()
 	for k, v := range obligation.Rules() {
+		rules[k] = v
+	}
+	// exec is ALWAYS ASK — the rule exists even when no sandbox is bound
+	// (the process door then refuses fail-closed regardless of policy).
+	for k, v := range exectool.Rules() {
 		rules[k] = v
 	}
 	return rules

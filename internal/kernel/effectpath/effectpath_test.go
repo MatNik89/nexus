@@ -622,3 +622,53 @@ func TestAttemptContextIsS7Owned(t *testing.T) {
 		t.Fatalf("S7 did not cap the deadline at grant expiry: %v (want %v)", dl, g.ExpiresAt)
 	}
 }
+
+// DUPLICATE-KEY injectivity (Phase-6 kilo #1): a duplicate-key document
+// must NEVER hash equal to its last-wins collapse — the approver-visible
+// summary and the executed value could otherwise diverge.
+func TestEffectHashDuplicateKeysDoNotCollapse(t *testing.T) {
+	mk := func(args string) contracts.ToolCall {
+		idem := "ik-dup"
+		c, err := contracts.NewToolCall(contracts.ToolCallParams{
+			ToolCallID: "tc-dup", ToolID: "exec", Arguments: json.RawMessage(args),
+			ArgsSchemaHash: "exec.v1", Effect: contracts.EffectIrreversible,
+			ExecutionKind: contracts.ExecProcess, Deadline: time.Now().Add(time.Hour),
+			AttemptNo: 1, IdempotencyKey: &idem, ProfileID: "work",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	// PRIMARY guard (Phase-6 codex #6): construction REJECTS ambiguous
+	// duplicate member names outright.
+	idemD := "ik-dup"
+	if _, err := contracts.NewToolCall(contracts.ToolCallParams{
+		ToolCallID: "tc-dup", ToolID: "exec",
+		Arguments:      json.RawMessage(`{"command":"/bin/echo","command":"/bin/rm","args":["/"]}`),
+		ArgsSchemaHash: "exec.v1", Effect: contracts.EffectIrreversible,
+		ExecutionKind: contracts.ExecProcess, Deadline: time.Now().Add(time.Hour),
+		AttemptNo: 1, IdempotencyKey: &idemD, ProfileID: "work",
+	}); err == nil {
+		t.Fatal("duplicate-key arguments constructed a valid ToolCall")
+	}
+	// DEFENSE IN DEPTH: even a call that bypassed construction (struct
+	// literal) must not hash equal to its last-wins collapse.
+	collapsed := mk(`{"command":"/bin/rm","args":["/"]}`)
+	dup := collapsed
+	dup.Arguments = json.RawMessage(`{"command":"/bin/echo","command":"/bin/rm","args":["/"]}`)
+	if EffectHash(dup) == EffectHash(collapsed) {
+		t.Fatal("duplicate-key document collapsed to its last-wins form (C4 weakening)")
+	}
+	// Plain reorder of a CLEAN document still unifies (the reorder fix).
+	reordered := mk(`{"args":["/"],"command":"/bin/rm"}`)
+	if EffectHash(reordered) != EffectHash(collapsed) {
+		t.Fatal("clean key reorder no longer unifies")
+	}
+	if !HasDuplicateJSONKeys([]byte(`{"a":1,"b":{"x":1,"x":2}}`)) {
+		t.Fatal("nested duplicate missed")
+	}
+	if HasDuplicateJSONKeys([]byte(`{"a":1,"b":{"x":1},"c":[{"x":1},{"x":2}]}`)) {
+		t.Fatal("false positive on sibling objects")
+	}
+}

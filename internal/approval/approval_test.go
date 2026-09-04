@@ -467,3 +467,39 @@ func TestLegacyContextDegradesNotStrands(t *testing.T) {
 		t.Fatalf("empty slice context: %v %v", good, err)
 	}
 }
+
+// CANONICAL argument hashing (Phase-6 exec-spine find): the journal
+// redactor rebuilds payloads through Go maps, reordering JSON keys — an
+// approval must survive that byte-order change (key order carries no C4
+// meaning), while any VALUE change still invalidates it.
+func TestApprovalSurvivesKeyReorder(t *testing.T) {
+	clock := clockid.NewFake(time.Now())
+	s, _ := open(t, t.TempDir(), clock, "work")
+	minted := call("exec", "tc-1", `{"command":"/bin/ls","args":["/"]}`)
+	ch, err := s.Suspend(ctxT(), "turn-1", "run-1", minted, "tg:chat-42", testBlocks(t, "original request"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Approve(ctxT(), ch.ChallengeID, "tg:chat-42"); err != nil {
+		t.Fatal(err)
+	}
+	// The SAME intent with reordered keys (what a journal round trip
+	// produces) must consume.
+	reordered := call("exec", "tc-1", `{"args":["/"],"command":"/bin/ls"}`)
+	if err := s.ConsumeApproval(ctxT(), reordered); err != nil {
+		t.Fatalf("key-reordered identical intent refused: %v", err)
+	}
+	// A VALUE change is a different effect: never consumable.
+	minted2 := call("exec", "tc-2", `{"command":"/bin/ls","args":["/"]}`)
+	ch2, err := s.Suspend(ctxT(), "turn-2", "run-2", minted2, "tg:chat-42", testBlocks(t, "original request"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Approve(ctxT(), ch2.ChallengeID, "tg:chat-42"); err != nil {
+		t.Fatal(err)
+	}
+	tampered := call("exec", "tc-2", `{"command":"/bin/rm","args":["/"]}`)
+	if err := s.ConsumeApproval(ctxT(), tampered); err == nil {
+		t.Fatal("value-changed effect consumed under the old approval")
+	}
+}

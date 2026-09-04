@@ -6,11 +6,13 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -68,6 +70,17 @@ func main() {
 			fail("ptrace failed differently: %v", err)
 		}
 		fmt.Println("ptrace ok")
+	case "print": // print <text> — echoes argv to stdout (redaction fixture)
+		fmt.Println(strings.Join(os.Args[2:], " "))
+	case "spew": // spew <bytes> — floods stdout (bounded-capture fixture)
+		n, err := strconv.Atoi(os.Args[2])
+		if err != nil {
+			fail("spew: %v", err)
+		}
+		chunk := bytes.Repeat([]byte("x"), 4096)
+		for written := 0; written < n; written += len(chunk) {
+			os.Stdout.Write(chunk)
+		}
 	case "hang": // never exits — timeout/cleanup fixture. NOT select{}: an
 		// empty select trips Go's deadlock detector and self-terminates,
 		// making the timeout test vacuous (Phase-0 r2 kilo #1).
