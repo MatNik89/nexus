@@ -264,7 +264,7 @@ RED: ACK for occurrence N does not close N+1; MarkDone without evidence → reje
 
 ## Phase 5 — Telegram (channel:builtin)
 
-**[ ] T22 — Durable channel ingress/egress (transport-neutral B2 core).**
+**[x] T22 — Durable channel ingress/egress (transport-neutral B2 core).**
 Durable inbox keyed `(adapter_id, channel_identity, update_id)`
 `RECEIVED→ADMITTED→TERMINAL` — normalized message persisted BEFORE offset advance, replay
 returns existing outcome; transactional outbox + stable delivery ID; at-least-once remote
