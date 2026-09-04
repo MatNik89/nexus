@@ -44,6 +44,7 @@ type Adapter struct {
 	backend  sandbox.Backend
 	report   sandbox.ProbeReport
 	redactor redact.Redactor
+	allow    map[string]bool
 }
 
 // New requires a LIVE passing probe report — a dead report refuses
@@ -51,11 +52,18 @@ type Adapter struct {
 // the KNOWN-REF redactor: exec reads the whole host read-only, so its
 // output passes the secret scrub BEFORE any model boundary (Phase-6
 // kilo #2).
-func New(b sandbox.Backend, report sandbox.ProbeReport, r redact.Redactor) (*Adapter, error) {
+func New(b sandbox.Backend, report sandbox.ProbeReport, r redact.Redactor, execAllow []string) (*Adapter, error) {
 	if b == nil || !report.Available || report.ProbeHash == "" || r == nil {
 		return nil, fmt.Errorf("exectool: a live passing sandbox probe and a redactor are required (fail closed)")
 	}
-	return &Adapter{backend: b, report: report, redactor: r}, nil
+	allow := map[string]bool{}
+	for _, p := range execAllow {
+		if !filepath.IsAbs(p) {
+			return nil, fmt.Errorf("exectool: exec_allow entry %q is not absolute (fail closed)", p)
+		}
+		allow[filepath.Clean(p)] = true
+	}
+	return &Adapter{backend: b, report: report, redactor: r, allow: allow}, nil
 }
 
 // Rules is the PEP decision for the exec family: command execution is
@@ -97,6 +105,13 @@ func (a *Adapter) Launch(ctx context.Context, call contracts.ToolCall) (contract
 	}
 	if !filepath.IsAbs(args.Command) {
 		return contracts.ToolResult{}, fmt.Errorf("exectool: command must be an absolute path (no shell strings, fail closed)")
+	}
+	// PROMOTED-TARGET allowlist, DENY-DEFAULT (Phase-6 codex #5): only
+	// programs the owner listed in exec_allow may run — an absolute ELF
+	// interpreter (/bin/sh -c …) is not a loophole unless explicitly
+	// promoted by the owner.
+	if !a.allow[filepath.Clean(args.Command)] {
+		return contracts.ToolResult{}, fmt.Errorf("exectool: %q is not in the exec_allow promoted-target list (deny-default, fail closed)", args.Command)
 	}
 	// Disposable RW workdir per call, under a guarded root; removed after.
 	work, err := os.MkdirTemp("", "nexus-exec-")

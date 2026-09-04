@@ -258,14 +258,15 @@ func (b *daemonBundle) resumeApproved(ctx context.Context, identity, challengeID
 		result = *out.Output[0].Content
 	}
 	// REHYDRATION (Phase-5-r3 codex #1/#2): the ORIGINAL context plus the
-	// approved tool's observation re-enter the original turn; the
-	// challenge id tags this resume cycle's event ids so a turn can
-	// suspend and resume repeatedly.
-	obs, err := resumeObservation(call, result)
+	// approved tool's OWN observation blocks re-enter the original turn —
+	// their trust labels and lineage are PRESERVED (Phase-6 codex #1:
+	// flattening and re-minting them TOOL_TRUSTED laundered untrusted
+	// exec output past the assembler's injection fence).
+	continuation, err := resumeBlocks(blocks, out, call, result)
 	if err != nil {
 		return "", err
 	}
-	final, ferr := b.d.ResumeChannelTurn(ctx, identity, turn, run, challengeID, append(blocks, obs))
+	final, ferr := b.d.ResumeChannelTurn(ctx, identity, turn, run, challengeID, continuation)
 	if merr := b.approvals.MarkResumeCompleted(ctx, challengeID); merr != nil {
 		fmt.Fprintf(os.Stderr, "nexus: resume-completed mark %s: %v\n", challengeID, merr)
 	}
@@ -313,6 +314,25 @@ func (b *daemonBundle) resumeApprovedPending(ctx context.Context) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// resumeBlocks assembles the continuation context: the ORIGINAL blocks
+// plus the tool's OWN observation blocks with trust and lineage
+// PRESERVED (Phase-6 codex #1: flattening exec output and re-minting it
+// TOOL_TRUSTED laundered attacker-controlled text past the assembler's
+// untrusted fence). Only a tool that returned NO blocks gets a synthetic
+// trusted stub.
+func resumeBlocks(original []contracts.ContextBlock, out contracts.ToolResult,
+	call contracts.ToolCall, result string) ([]contracts.ContextBlock, error) {
+	obsBlocks := out.Output
+	if len(obsBlocks) == 0 {
+		obs, err := resumeObservation(call, result)
+		if err != nil {
+			return nil, err
+		}
+		obsBlocks = []contracts.ContextBlock{obs}
+	}
+	return append(append([]contracts.ContextBlock{}, original...), obsBlocks...), nil
 }
 
 // resumeObservation packs the approved tool's result for the resumed turn.
@@ -425,7 +445,7 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 	var execAdapter *exectool.Adapter
 	sbBackend := sandbox.NewBwrap()
 	if rep, perr := sbBackend.Probe(context.Background()); perr == nil {
-		if ad, aerr := exectool.New(sbBackend, rep, redactor); aerr == nil {
+		if ad, aerr := exectool.New(sbBackend, rep, redactor, resolved.Config.ExecAllow); aerr == nil {
 			execAdapter = ad
 		}
 	}

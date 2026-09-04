@@ -254,3 +254,85 @@ func TestOutputBounded(t *testing.T) {
 		t.Fatalf("output unbounded: %d bytes captured", len(out))
 	}
 }
+
+// VERSION-ONLY fake backend rejected (Phase-6 codex #2): a PATH bwrap
+// that answers --version but enforces nothing must never pass Probe —
+// the enforcement canary catches it.
+func TestFakeBwrapRejected(t *testing.T) {
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "bwrap")
+	script := "#!/bin/sh\ncase \"$1\" in --version) echo \"bubblewrap 0.11.0\";; esac\nexit 0\n"
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	b := NewBwrap()
+	if _, err := b.Probe(ctxT()); err == nil {
+		t.Fatal("version-only fake bwrap passed the probe")
+	}
+}
+
+// TARGET SWAP between Compile and Launch refused (Phase-6 codex #3):
+// the policy pins the compile-time bytes.
+func TestLaunchRefusesSwappedTarget(t *testing.T) {
+	b, rep := backend(t)
+	dir := t.TempDir()
+	target := filepath.Join(dir, "prog")
+	orig, err := os.ReadFile("/bin/true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, orig, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pol, err := b.Compile(ctxT(), Spec{Target: target, WorkDir: wdir(t)}, rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repl, err := os.ReadFile("/bin/echo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, repl, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Launch(ctxT(), pol); err == nil {
+		t.Fatal("swapped target bytes launched under the old policy")
+	}
+}
+
+// S7 CANCELLATION reaches the sandbox (Phase-6 codex #4): an
+// already-cancelled context never launches; a live cancel kills the tree.
+func TestCancelledContextNeverLaunches(t *testing.T) {
+	b, rep := backend(t)
+	pol, err := b.Compile(ctxT(), Spec{Target: "/bin/ls", Args: []string{"/"}, WorkDir: wdir(t)}, rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := b.Launch(cancelled, pol); err == nil {
+		t.Fatal("already-cancelled context launched a process")
+	}
+	// Live cancel: a hanging target dies promptly on ctx cancel.
+	hp := helperPath(t)
+	pol2, err := b.Compile(ctxT(), Spec{Target: hp, Args: []string{"hang"},
+		WorkDir: wdir(t), Timeout: 2 * time.Minute}, rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	liveCtx, liveCancel := context.WithCancel(context.Background())
+	p, err := b.Launch(liveCtx, pol2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	start := time.Now()
+	go func() { time.Sleep(300 * time.Millisecond); liveCancel() }()
+	if werr := p.Wait(); werr == nil {
+		t.Fatal("cancelled hang exited cleanly")
+	}
+	if time.Since(start) > 10*time.Second {
+		t.Fatal("cancel did not kill the tree promptly")
+	}
+}

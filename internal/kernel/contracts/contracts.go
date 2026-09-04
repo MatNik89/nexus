@@ -402,6 +402,9 @@ func NewToolCall(p ToolCallParams) (ToolCall, error) {
 	if err := requireID("profile_id", string(p.ProfileID)); err != nil {
 		errs = append(errs, err)
 	}
+	if HasDuplicateJSONKeys(p.Arguments) {
+		errs = append(errs, errors.New("arguments carry duplicate JSON member names (ambiguous, fail closed)"))
+	}
 	if len(p.Arguments) == 0 || !json.Valid(p.Arguments) {
 		errs = append(errs, errors.New("arguments must be valid JSON"))
 	}
@@ -567,4 +570,54 @@ func (e TypedError) Validate() error {
 
 func (e TypedError) Error() string {
 	return fmt.Sprintf("%s [%s/%s]: %s", e.Code, e.Category, e.Retryability, e.SafeMessage)
+}
+
+// HasDuplicateJSONKeys walks the token stream and reports any object
+// carrying the same key twice (any depth). Malformed input reports true
+// (treated as non-canonicalizable — raw bytes).
+func HasDuplicateJSONKeys(raw []byte) bool {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var walk func() bool
+	walk = func() bool {
+		tok, err := dec.Token()
+		if err != nil {
+			return true
+		}
+		switch d := tok.(type) {
+		case json.Delim:
+			switch d {
+			case '{':
+				seen := map[string]bool{}
+				for dec.More() {
+					keyTok, err := dec.Token()
+					if err != nil {
+						return true
+					}
+					key, ok := keyTok.(string)
+					if !ok || seen[key] {
+						return true
+					}
+					seen[key] = true
+					if walk() { // value
+						return true
+					}
+				}
+				if _, err := dec.Token(); err != nil { // closing }
+					return true
+				}
+			case '[':
+				for dec.More() {
+					if walk() {
+						return true
+					}
+				}
+				if _, err := dec.Token(); err != nil { // closing ]
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return walk()
 }

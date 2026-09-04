@@ -31,6 +31,11 @@ type Config struct {
 	TelegramTokenEnv string              `json:"telegram_token_env"`
 	DefaultProfile   contracts.ProfileID `json:"default_profile"`
 	EgressAllow      []string            `json:"egress_allow"`
+	// ExecAllow is the DENY-DEFAULT promoted-target allowlist for the
+	// exec tool: absolute program paths the owner explicitly trusts.
+	// Empty = exec refuses everything (Phase-6 codex #5: without it any
+	// absolute ELF — /bin/sh -c included — was executable once approved).
+	ExecAllow []string `json:"exec_allow"`
 	// SandboxDisabled exists ONLY so an attempt to set it is caught and
 	// rejected: the sandbox is kernel floor, not configuration.
 	SandboxDisabled bool `json:"sandbox_disabled"`
@@ -82,6 +87,7 @@ var keySchema = map[string]keyKind{
 	"telegram_token_env": kindString,
 	"default_profile":    kindString,
 	"egress_allow":       kindStringList,
+	"exec_allow":         kindStringList,
 	"sandbox_disabled":   kindBool,
 }
 
@@ -278,6 +284,8 @@ func applyValue(c *Config, key string, v value) error {
 		c.DefaultProfile = p
 	case "egress_allow":
 		c.EgressAllow = v.list
+	case "exec_allow":
+		c.ExecAllow = v.list
 	case "sandbox_disabled":
 		c.SandboxDisabled = v.b
 	default:
@@ -292,6 +300,11 @@ func ValidateBounds(c Config) error {
 	for _, h := range c.EgressAllow {
 		if strings.Contains(h, "*") {
 			errs = append(errs, fmt.Errorf("egress_allow: wildcard %q widens the kernel floor (rejected)", h))
+		}
+	}
+	for _, p := range c.ExecAllow {
+		if strings.Contains(p, "*") || !strings.HasPrefix(p, "/") {
+			errs = append(errs, fmt.Errorf("exec_allow: %q must be an absolute path without wildcards (rejected)", p))
 		}
 	}
 	if c.SandboxDisabled {

@@ -170,55 +170,10 @@ func canonicalJSON(raw []byte) []byte {
 	return out
 }
 
-// HasDuplicateJSONKeys walks the token stream and reports any object
-// carrying the same key twice (any depth). Malformed input reports true
-// (treated as non-canonicalizable — raw bytes).
-func HasDuplicateJSONKeys(raw []byte) bool {
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.UseNumber()
-	var walk func() bool
-	walk = func() bool {
-		tok, err := dec.Token()
-		if err != nil {
-			return true
-		}
-		switch d := tok.(type) {
-		case json.Delim:
-			switch d {
-			case '{':
-				seen := map[string]bool{}
-				for dec.More() {
-					keyTok, err := dec.Token()
-					if err != nil {
-						return true
-					}
-					key, ok := keyTok.(string)
-					if !ok || seen[key] {
-						return true
-					}
-					seen[key] = true
-					if walk() { // value
-						return true
-					}
-				}
-				if _, err := dec.Token(); err != nil { // closing }
-					return true
-				}
-			case '[':
-				for dec.More() {
-					if walk() {
-						return true
-					}
-				}
-				if _, err := dec.Token(); err != nil { // closing ]
-					return true
-				}
-			}
-		}
-		return false
-	}
-	return walk()
-}
+// HasDuplicateJSONKeys delegates to the contracts owner (the check now
+// runs at ToolCall construction — Phase-6 codex #6; kept here as the
+// public seam exectool and the hash use).
+func HasDuplicateJSONKeys(raw []byte) bool { return contracts.HasDuplicateJSONKeys(raw) }
 
 func effectHash(c contracts.ToolCall) string { return EffectHash(c) }
 

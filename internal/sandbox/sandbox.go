@@ -17,9 +17,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/MatNik89/nexus/internal/preflight/probe"
@@ -49,6 +52,7 @@ type ProbeReport struct {
 type CompiledPolicy struct {
 	spec       Spec
 	probeHash  string
+	targetHash string
 	policyHash string
 }
 
@@ -63,19 +67,34 @@ type Process struct {
 	closure    map[string]string
 	output     *boundedBuffer
 	started    bool
+	done       chan struct{}
+	doneOnce   sync.Once
 }
 
 // Output returns the combined stdout+stderr captured so far (bounded).
 func (p *Process) Output() string { return p.output.String() }
 
 // Wait blocks until exit or timeout kill; the process tree is dead after.
-func (p *Process) Wait() error { return p.handle.Wait() }
+func (p *Process) Wait() error {
+	err := p.handle.Wait()
+	p.finish()
+	return err
+}
+
+func (p *Process) finish() {
+	if p.done != nil {
+		p.doneOnce.Do(func() { close(p.done) })
+	}
+}
 
 // Kill terminates the whole tree.
 func (p *Process) Kill() { p.handle.Kill() }
 
 // Close releases resources.
-func (p *Process) Close() { p.handle.Close() }
+func (p *Process) Close() {
+	p.finish()
+	p.handle.Close()
+}
 
 // Attestation binds a finished (or running) process to the EXACT policy
 // and content-pinned closure it launched under. A consumer accepts a
@@ -97,8 +116,9 @@ type Backend interface {
 
 // Bwrap is the P0 backend over the T02-hardened probe runner.
 type Bwrap struct {
-	av probe.Availability
-	ok bool
+	av        probe.Availability
+	bwrapHash string
+	ok        bool
 }
 
 // NewBwrap constructs the backend; availability is measured by Probe.
@@ -112,10 +132,37 @@ func (b *Bwrap) Probe(ctx context.Context) (ProbeReport, error) {
 	if err != nil {
 		return ProbeReport{}, fmt.Errorf("SANDBOX_CAPABILITY_UNAVAILABLE: %w", err)
 	}
-	b.av, b.ok = av, true
+	// IDENTITY: the probe binds the bwrap BINARY CONTENT, not just its
+	// pathname and self-reported version (Phase-6 codex #2: a fake that
+	// prints a version string must not become the trust anchor).
+	bwrapHash, err := hashFile(av.BwrapPath)
+	if err != nil {
+		return ProbeReport{}, fmt.Errorf("SANDBOX_CAPABILITY_UNAVAILABLE: cannot read the backend binary: %w", err)
+	}
+	// ENFORCEMENT: one live negative control THROUGH this exact backend —
+	// a host directory outside the closure must be INVISIBLE inside. An
+	// unconfined fake passes the version check but fails this.
+	canaryDir, err := os.MkdirTemp("", "nexus-probe-canary-")
+	if err != nil {
+		return ProbeReport{}, err
+	}
+	defer os.RemoveAll(canaryDir)
+	if err := os.WriteFile(filepath.Join(canaryDir, "canary"), []byte("c"), 0o600); err != nil {
+		return ProbeReport{}, err
+	}
+	if _, runErr := probe.Run(av, probe.Spec{Target: "/bin/ls", Args: []string{canaryDir},
+		Timeout: 20 * time.Second}); runErr == nil {
+		return ProbeReport{}, fmt.Errorf("SANDBOX_CAPABILITY_UNAVAILABLE: the backend did NOT confine (closure-external directory visible) — refusing to treat it as a sandbox")
+	}
+	// Positive control: a closure-internal run must still work.
+	if _, runErr := probe.Run(av, probe.Spec{Target: "/bin/ls", Args: []string{"/"},
+		Timeout: 20 * time.Second}); runErr != nil {
+		return ProbeReport{}, fmt.Errorf("SANDBOX_CAPABILITY_UNAVAILABLE: confined positive control failed: %w", runErr)
+	}
+	b.av, b.bwrapHash, b.ok = av, bwrapHash, true
 	return ProbeReport{
 		Available: true, BwrapPath: av.BwrapPath, BwrapVersion: av.BwrapVersion,
-		ProbeHash: digest("probe", av.BwrapPath, av.BwrapVersion),
+		ProbeHash: digest("probe", av.BwrapPath, av.BwrapVersion, bwrapHash),
 	}, nil
 }
 
@@ -139,12 +186,35 @@ func (b *Bwrap) Compile(ctx context.Context, spec Spec, report ProbeReport) (Com
 	if spec.Timeout > 10*time.Minute {
 		return CompiledPolicy{}, fmt.Errorf("sandbox: timeout above the 10-minute ceiling (fail closed)")
 	}
+	// PIN THE EXECUTABLE BYTES at compile time (Phase-6 codex #3): the
+	// policy — and therefore the C4 approval built over its call — binds
+	// the CONTENT that will run, not a mutable pathname. Launch verifies
+	// the memfd-pinned target against this digest.
+	targetHash, err := hashFile(spec.Target)
+	if err != nil {
+		return CompiledPolicy{}, fmt.Errorf("sandbox: cannot pin the launch target (fail closed): %w", err)
+	}
 	return CompiledPolicy{
-		spec:      spec,
-		probeHash: report.ProbeHash,
-		policyHash: digest("policy", spec.Target, strings.Join(spec.Args, "\x00"),
+		spec:       spec,
+		probeHash:  report.ProbeHash,
+		targetHash: targetHash,
+		policyHash: digest("policy", spec.Target, targetHash, strings.Join(spec.Args, "\x00"),
 			spec.WorkDir, spec.Timeout.String(), report.ProbeHash),
 	}, nil
+}
+
+// hashFile is the bounded sha256 of a file's bytes.
+func hashFile(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, io.LimitReader(f, 512<<20)); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // Launch starts the sandboxed process under the sealed policy. The
@@ -152,21 +222,48 @@ func (b *Bwrap) Compile(ctx context.Context, spec Spec, report ProbeReport) (Com
 // identity is the child pid inside the prepared handle; the probe layer
 // owns setpgid + die-with-parent + kill-tree).
 func (b *Bwrap) Launch(ctx context.Context, policy CompiledPolicy) (*Process, error) {
+	// S7 owns cancellation (Phase-6 codex #4): an already-cancelled
+	// attempt context must never start a process, and a later cancel
+	// kills the whole tree.
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("sandbox: attempt context already cancelled — not launching (fail closed): %w", err)
+	}
 	if policy.policyHash == "" {
 		return nil, fmt.Errorf("sandbox: launch requires a compiled policy (fail closed)")
 	}
 	if !b.ok {
 		return nil, fmt.Errorf("sandbox: launch before a passing probe (fail closed)")
 	}
-	if policy.probeHash != digest("probe", b.av.BwrapPath, b.av.BwrapVersion) {
+	// Re-verify the backend binary NOW (TOCTOU on the trust anchor):
+	// a bwrap swapped after the probe invalidates every policy.
+	liveHash, err := hashFile(b.av.BwrapPath)
+	if err != nil || liveHash != b.bwrapHash {
+		return nil, fmt.Errorf("sandbox: the backend binary changed since the probe — refused (fail closed)")
+	}
+	if policy.probeHash != digest("probe", b.av.BwrapPath, b.av.BwrapVersion, b.bwrapHash) {
 		return nil, fmt.Errorf("sandbox: policy was compiled under a DIFFERENT probe — stale measurement (fail closed)")
+	}
+	timeout := policy.spec.Timeout
+	if dl, ok := ctx.Deadline(); ok {
+		if until := time.Until(dl); until < timeout {
+			timeout = until
+		}
+	}
+	if timeout <= 0 {
+		return nil, fmt.Errorf("sandbox: attempt deadline already passed (fail closed)")
 	}
 	h, err := probe.Prepare(b.av, probe.Spec{
 		Target: policy.spec.Target, Args: policy.spec.Args,
-		WorkDir: policy.spec.WorkDir, Timeout: policy.spec.Timeout,
+		WorkDir: policy.spec.WorkDir, Timeout: timeout,
 	})
 	if err != nil {
 		return nil, err
+	}
+	// The memfd-pinned target must be EXACTLY the compile-time content —
+	// a path swapped between Compile and Launch is refused (codex #3).
+	if got := h.ClosureHashes()["/nexus-target"]; got != policy.targetHash {
+		h.Close()
+		return nil, fmt.Errorf("sandbox: launch target bytes changed since Compile — refused (fail closed)")
 	}
 	out := &boundedBuffer{limit: 1 << 20}
 	if err := h.SetOutput(out, out); err != nil {
@@ -177,8 +274,18 @@ func (b *Bwrap) Launch(ctx context.Context, policy CompiledPolicy) (*Process, er
 		h.Close()
 		return nil, err
 	}
-	return &Process{handle: h, policyHash: policy.policyHash,
-		closure: h.ClosureHashes(), output: out, started: true}, nil
+	proc := &Process{handle: h, policyHash: policy.policyHash,
+		closure: h.ClosureHashes(), output: out, started: true,
+		done: make(chan struct{})}
+	// Cancel-watch: S7 cancellation reaches the live tree.
+	go func() {
+		select {
+		case <-ctx.Done():
+			h.Kill()
+		case <-proc.done:
+		}
+	}()
+	return proc, nil
 }
 
 // Attest binds the process to its policy and content-pinned closure. A

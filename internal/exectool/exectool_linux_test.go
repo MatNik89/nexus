@@ -28,6 +28,30 @@ import (
 
 func ctxT() context.Context { return context.Background() }
 
+// testAllow promotes /bin/ls and the freshly built probehelper (its
+// path varies per test) by pre-building it at a STABLE location.
+func testAllow(t *testing.T) []string {
+	t.Helper()
+	return []string{"/bin/ls", stableHelper(t)}
+}
+
+var stableHelperPath string
+
+func stableHelper(t *testing.T) string {
+	t.Helper()
+	if stableHelperPath != "" {
+		return stableHelperPath
+	}
+	bin := filepath.Join(os.TempDir(), "nexus-test-probehelper")
+	cmd := exec.Command("go", "build", "-o", bin, "github.com/MatNik89/nexus/cmd/probehelper")
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("building probehelper: %v\n%s", err, out)
+	}
+	stableHelperPath = bin
+	return bin
+}
+
 func adapter(t *testing.T) *Adapter {
 	t.Helper()
 	b := sandbox.NewBwrap()
@@ -35,7 +59,7 @@ func adapter(t *testing.T) *Adapter {
 	if err != nil {
 		t.Skipf("bwrap unavailable: %v", err)
 	}
-	a, err := New(b, rep, redact.None{})
+	a, err := New(b, rep, redact.None{}, testAllow(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,16 +86,7 @@ func execCall(t *testing.T, id, command string, cmdArgs []string, kind contracts
 	return c
 }
 
-func helperPath(t *testing.T) string {
-	t.Helper()
-	bin := filepath.Join(t.TempDir(), "probehelper")
-	cmd := exec.Command("go", "build", "-o", bin, "github.com/MatNik89/nexus/cmd/probehelper")
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("building probehelper: %v\n%s", err, out)
-	}
-	return bin
-}
+func helperPath(t *testing.T) string { return stableHelper(t) }
 
 // path builds the REAL effect-path with the exec adapter bound and the
 // given mode — exactly the daemon wiring shape.
@@ -241,7 +256,7 @@ func TestExecOutputRedactsKnownSecrets(t *testing.T) {
 		t.Skipf("bwrap unavailable: %v", err)
 	}
 	secret := "sk-live-exec-secret-9999"
-	a, err := New(b, rep, redact.NewKnownRefs(map[string]string{"provider_key": secret}))
+	a, err := New(b, rep, redact.NewKnownRefs(map[string]string{"provider_key": secret}), testAllow(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -264,5 +279,30 @@ func TestExecOutputRedactsKnownSecrets(t *testing.T) {
 	}
 	if !strings.Contains(*res.Output[0].Content, "[REDACTED") {
 		t.Fatalf("redaction marker missing: %q", *res.Output[0].Content)
+	}
+}
+
+// INTERPRETERS are not a loophole (Phase-6 codex #5): /bin/sh is an
+// absolute ELF, but exec is DENY-DEFAULT — only owner-promoted targets
+// run, and the test allowlist does not include a shell.
+func TestShellInterpreterDeniedByDefault(t *testing.T) {
+	a := adapter(t)
+	c := execCall(t, "tc-sh", "/bin/sh", []string{"-c", "echo SHELL_STRING_RAN"}, contracts.ExecProcess, contracts.EffectIrreversible)
+	if _, err := a.Launch(ctxT(), c); err == nil {
+		t.Fatal("un-promoted absolute ELF interpreter executed a shell string")
+	}
+	// And an EMPTY allowlist refuses even /bin/ls (deny-default proper).
+	b := sandbox.NewBwrap()
+	rep, perr := b.Probe(ctxT())
+	if perr != nil {
+		t.Skipf("bwrap unavailable: %v", perr)
+	}
+	bare, err := New(b, rep, redact.None{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2 := execCall(t, "tc-none", "/bin/ls", []string{"/"}, contracts.ExecProcess, contracts.EffectIrreversible)
+	if _, err := bare.Launch(ctxT(), c2); err == nil {
+		t.Fatal("empty exec_allow executed a command (deny-default broken)")
 	}
 }

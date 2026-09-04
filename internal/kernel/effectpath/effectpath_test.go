@@ -640,8 +640,23 @@ func TestEffectHashDuplicateKeysDoNotCollapse(t *testing.T) {
 		}
 		return c
 	}
-	dup := mk(`{"command":"/bin/echo","command":"/bin/rm","args":["/"]}`)
+	// PRIMARY guard (Phase-6 codex #6): construction REJECTS ambiguous
+	// duplicate member names outright.
+	idemD := "ik-dup"
+	if _, err := contracts.NewToolCall(contracts.ToolCallParams{
+		ToolCallID: "tc-dup", ToolID: "exec",
+		Arguments:      json.RawMessage(`{"command":"/bin/echo","command":"/bin/rm","args":["/"]}`),
+		ArgsSchemaHash: "exec.v1", Effect: contracts.EffectIrreversible,
+		ExecutionKind: contracts.ExecProcess, Deadline: time.Now().Add(time.Hour),
+		AttemptNo: 1, IdempotencyKey: &idemD, ProfileID: "work",
+	}); err == nil {
+		t.Fatal("duplicate-key arguments constructed a valid ToolCall")
+	}
+	// DEFENSE IN DEPTH: even a call that bypassed construction (struct
+	// literal) must not hash equal to its last-wins collapse.
 	collapsed := mk(`{"command":"/bin/rm","args":["/"]}`)
+	dup := collapsed
+	dup.Arguments = json.RawMessage(`{"command":"/bin/echo","command":"/bin/rm","args":["/"]}`)
 	if EffectHash(dup) == EffectHash(collapsed) {
 		t.Fatal("duplicate-key document collapsed to its last-wins form (C4 weakening)")
 	}
