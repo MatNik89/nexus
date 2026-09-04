@@ -957,7 +957,10 @@ func (m *Manager) RunTask(ctx context.Context, id string) error {
 		ToolCallID: contracts.ToolCallID("tc-" + string(op)), ToolID: taskToolID,
 		Arguments: args, ArgsSchemaHash: "task_file_note.v1",
 		Effect: contracts.EffectReversible, ExecutionKind: contracts.ExecInProcess,
-		Deadline: m.clock.Now().Add(2 * time.Minute), AttemptNo: 1,
+		// WALL-CLOCK deadline: effectpath enforces it against real time —
+		// a fake-clock deadline is a frozen-clock landmine (found when the
+		// real date crossed the pinned test date).
+		Deadline: time.Now().Add(2 * time.Minute), AttemptNo: 1,
 		IdempotencyKey: &idem, ProfileID: m.j.Profile(),
 	})
 	if err != nil {
