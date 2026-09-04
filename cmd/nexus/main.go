@@ -18,6 +18,7 @@ import (
 	"github.com/MatNik89/nexus/internal/foundation/config"
 	"github.com/MatNik89/nexus/internal/foundation/pathx"
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
+	"github.com/MatNik89/nexus/internal/kernel/effectpath"
 	"github.com/MatNik89/nexus/internal/kernel/journal"
 	"github.com/MatNik89/nexus/internal/kernel/loop"
 	"github.com/MatNik89/nexus/internal/kernel/machine"
@@ -25,6 +26,7 @@ import (
 	"github.com/MatNik89/nexus/internal/llm/planner"
 	"github.com/MatNik89/nexus/internal/llm/provider"
 	"github.com/MatNik89/nexus/internal/memory"
+	"github.com/MatNik89/nexus/internal/obligation"
 	"github.com/MatNik89/nexus/internal/preflight/doctor"
 	"github.com/MatNik89/nexus/internal/schedule"
 	"github.com/MatNik89/nexus/internal/security/redact"
@@ -108,21 +110,25 @@ func runDaemon() int {
 		fmt.Fprintf(os.Stderr, "nexus daemon: %v\n", err)
 		return 2
 	}
-	d, j, sched, err := buildDaemon(layout, resolved)
+	b, err := buildDaemon(layout, resolved)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "nexus daemon: %v\n", err)
 		return 2
 	}
-	defer j.Close()
+	defer b.j.Close()
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	hb := daemon.NewHeartbeat(filepath.Join(layout.SystemDir(), "heartbeat"), 5*time.Second)
 	go hb.Run(ctx)
-	// Durable scheduler: startup sweep + periodic catch-up (T20).
-	go sched.Run(ctx, 30*time.Second, nil)
+	// Durable scheduler: startup sweep + periodic catch-up (T20); every
+	// fire moves its obligation to DELIVERY_PENDING (T21 — the delivery
+	// channel consumes it in T22).
+	go b.sched.Run(ctx, 30*time.Second, func(f schedule.Fired) {
+		b.obl.MarkDue(context.Background(), f)
+	})
 	sock := socketPath(layout)
 	fmt.Printf("nexus daemon %s — profile %s, socket %s\n", version, resolved.Config.DefaultProfile, sock)
-	if err := d.Serve(ctx, sock); err != nil {
+	if err := b.d.Serve(ctx, sock); err != nil {
 		fmt.Fprintf(os.Stderr, "nexus daemon: %v\n", err)
 		return 1
 	}
@@ -133,17 +139,25 @@ func runDaemon() int {
 // redactor, S7 authority, governed provider, streaming planner factory,
 // fail-closed audit) wired exactly as the daemon runs it — and testable
 // against a custom layout (Phase-2-r2 codex #13).
-func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemon.Daemon, *journal.Journal, *schedule.Scheduler, error) {
+// daemonBundle is everything the composition root wires together.
+type daemonBundle struct {
+	d     *daemon.Daemon
+	j     *journal.Journal
+	sched *schedule.Scheduler
+	obl   *obligation.Manager
+}
+
+func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, error) {
 	profile := resolved.Config.DefaultProfile
 	profileDir, err := layout.ProfileDir(profile)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, err
 	}
 	for _, dir := range []string{profileDir, layout.SystemDir()} {
 		if err := pathx.EnsureDir(layout.Base, dir); err != nil {
 			// The base itself may not exist yet: create it 0700 first.
 			if os.MkdirAll(layout.Base, 0o700) != nil || pathx.EnsureDir(layout.Base, dir) != nil {
-				return nil, nil, nil, err
+				return nil, err
 			}
 		}
 	}
@@ -157,32 +171,47 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemon.Daemon,
 	for n, v := range schedule.Events() {
 		events[n] = v
 	}
+	for n, v := range obligation.Events() {
+		events[n] = v
+	}
 	journalPath, _ := layout.ProfileJournal(profile)
 	redactor := redact.NewKnownRefs(knownSecretRefs(resolved.Config))
 	// The ONE profile database: journal + memory projection together
 	// (Annex P0.3 — facts are journal events folded in the same
 	// transaction; no second SQLite file exists).
-	j, err := journal.Open(journalPath, profile, redactor, events, memory.NewProjection(), schedule.NewProjection())
+	j, err := journal.Open(journalPath, profile, redactor, events, memory.NewProjection(), schedule.NewProjection(), obligation.NewProjection())
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("journal: %w", err)
+		return nil, fmt.Errorf("journal: %w", err)
 	}
 	authority := s7min.NewAuthority(nil, 5*time.Minute)
 	prov, err := provider.NewAPIKey(resolved.Config, authority)
 	if err != nil {
 		j.Close()
-		return nil, nil, nil, fmt.Errorf("provider: %w (conversation is a P0 core capability — fix the config and restart)", err)
+		return nil, fmt.Errorf("provider: %w (conversation is a P0 core capability — fix the config and restart)", err)
 	}
 	memStore, err := memory.NewStore(j)
 	if err != nil {
 		j.Close()
-		return nil, nil, nil, fmt.Errorf("memory: %w", err)
+		return nil, fmt.Errorf("memory: %w", err)
 	}
 	sched, err := schedule.New(j, clockid.System{})
 	if err != nil {
 		j.Close()
-		return nil, nil, nil, fmt.Errorf("schedule: %w", err)
+		return nil, fmt.Errorf("schedule: %w", err)
 	}
 	sched.SetCounterFile(filepath.Join(layout.SystemDir(), "last_occurrence_fired"))
+	registry, err := obligation.NewRegistry(map[string]obligation.Handler{
+		"file_note": obligation.FileNoteHandler(profileDir),
+	})
+	if err != nil {
+		j.Close()
+		return nil, err
+	}
+	oblManager, err := obligation.NewManager(j, sched, registry, clockid.System{})
+	if err != nil {
+		j.Close()
+		return nil, err
+	}
 	target := prov.Target() // the provider's OWN grant target — anything else never reaches the wire
 	d, err := daemon.New(daemon.Deps{
 		Journal: j,
@@ -196,19 +225,41 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemon.Daemon,
 			if err != nil {
 				return nil, err
 			}
-			return pl.WithTools(memory.Specs(), profile)
+			specs := memory.Specs()
+			for k, v := range obligation.Specs() {
+				specs[k] = v
+			}
+			return pl.WithTools(specs, profile)
 		},
 		Authority: authority, Profile: profile,
-		Rules:    memory.Rules(), // memory_remember=ASK, memory_recall=ALLOW
-		Tools:    memory.Tools(memStore, redactor),
+		Rules:    mergedRules(),
+		Tools:    mergedTools(memStore, redactor, oblManager),
 		Audit:    &journalAudit{j: j, profile: profile},
 		Redactor: redactor,
 	})
 	if err != nil {
 		j.Close()
-		return nil, nil, nil, err
+		return nil, err
 	}
-	return d, j, sched, nil
+	return &daemonBundle{d: d, j: j, sched: sched, obl: oblManager}, nil
+}
+
+// mergedRules combines every tool family's PEP decisions.
+func mergedRules() map[contracts.ToolID]effectpath.Decision {
+	rules := memory.Rules()
+	for k, v := range obligation.Rules() {
+		rules[k] = v
+	}
+	return rules
+}
+
+// mergedTools combines every tool family's handlers.
+func mergedTools(memStore *memory.Store, r redact.Redactor, m *obligation.Manager) map[contracts.ToolID]effectpath.InProcFunc {
+	tools := memory.Tools(memStore, r)
+	for k, v := range obligation.Tools(m) {
+		tools[k] = v
+	}
+	return tools
 }
 
 // knownSecretRefs feeds the C1 known-ref redactor: every configured

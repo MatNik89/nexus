@@ -247,7 +247,7 @@ fold → once; spring gap → policy applied; suspend-over-due → catch-up on w
 recipe atomicity — SIGKILL between occurrence-fire and run-admission → on restart either
 BOTH are durable or NEITHER (never a fired occurrence without its admitted run).
 
-**[ ] T21 — ObligationStore (9.6-min): Reminder + ONE concrete typed Task.**
+**[x] T21 — ObligationStore (9.6-min): Reminder + ONE concrete typed Task.**
 Writes THROUGH journal; `Reminder`
 `SCHEDULED→DUE→DELIVERY_PENDING→DELIVERED→ACKED|EXPIRED`; concrete P0 Task handler
 **`file_note`** (append a line to a profile-scoped notes file via T05 AtomicWriter;

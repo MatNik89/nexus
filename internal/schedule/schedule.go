@@ -252,16 +252,23 @@ func (s *Scheduler) params(eventType, runID string, payload any) (contracts.Enve
 	}, nil
 }
 
+// CreatedParams builds the validated schedule.created envelope WITHOUT
+// appending — composition seam for atomic cross-package batches (T21:
+// [schedule.created, obligation.created] in one transaction).
+func (s *Scheduler) CreatedParams(id, body string, w WallTime) (contracts.EnvelopeParams, error) {
+	if id == "" || body == "" {
+		return contracts.EnvelopeParams{}, fmt.Errorf("schedule: id and body are required (fail closed)")
+	}
+	if err := w.validate(); err != nil {
+		return contracts.EnvelopeParams{}, err
+	}
+	return s.params(EvScheduleCreated, "run-schedule", createdPayload{ID: id, Body: body, Wall: w})
+}
+
 // CreateReminder persists one one-shot reminder (validated fail-closed;
 // a duplicate id aborts in the projection).
 func (s *Scheduler) CreateReminder(ctx context.Context, id, body string, w WallTime) error {
-	if id == "" || body == "" {
-		return fmt.Errorf("schedule: id and body are required (fail closed)")
-	}
-	if err := w.validate(); err != nil {
-		return err
-	}
-	p, err := s.params(EvScheduleCreated, "run-schedule", createdPayload{ID: id, Body: body, Wall: w})
+	p, err := s.CreatedParams(id, body, w)
 	if err != nil {
 		return err
 	}

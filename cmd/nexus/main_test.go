@@ -59,15 +59,15 @@ func TestCompositionRootServesConversation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	d, j, _, err := buildDaemon(layout, resolved)
+	b, err := buildDaemon(layout, resolved)
 	if err != nil {
 		t.Fatalf("production composition root failed: %v", err)
 	}
-	t.Cleanup(func() { j.Close() })
+	t.Cleanup(func() { b.j.Close() })
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	sock := socketPath(layout)
-	go d.Serve(ctx, sock)
+	go b.d.Serve(ctx, sock)
 	for i := 0; i < 100; i++ {
 		if c, err := net.Dial("unix", sock); err == nil {
 			c.Close()
@@ -129,14 +129,14 @@ func TestMemoryToolSpineSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	runSession := func(input string) string {
-		d, j, _, err := buildDaemon(layout, resolved)
+		b, err := buildDaemon(layout, resolved)
 		if err != nil {
 			t.Fatalf("composition root: %v", err)
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		sock := socketPath(layout)
 		serveDone := make(chan error, 1)
-		go func() { serveDone <- d.Serve(ctx, sock) }()
+		go func() { serveDone <- b.d.Serve(ctx, sock) }()
 		for i := 0; i < 100; i++ {
 			if c, err := net.Dial("unix", sock); err == nil {
 				c.Close()
@@ -153,7 +153,7 @@ func TestMemoryToolSpineSurvivesRestart(t *testing.T) {
 		// dying daemon).
 		cancel()
 		<-serveDone
-		j.Close()
+		b.j.Close()
 		if rerr != nil {
 			t.Fatal(rerr)
 		}
