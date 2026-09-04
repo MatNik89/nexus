@@ -39,7 +39,7 @@ func openProfile(t *testing.T, layout pathx.Layout, p contracts.ProfileID) (*Sto
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { j.Close() })
-	s, err := NewStore(j, redact.None{})
+	s, err := NewStore(j)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +139,7 @@ func TestProfileStampSurvivesRestartAndReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer j2.Close()
-	s2, err := NewStore(j2, redact.None{})
+	s2, err := NewStore(j2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +161,7 @@ func TestProfileStampSurvivesRestartAndReplay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen after projection drop: %v", err)
 	}
-	s3, err := NewStore(j3, redact.None{})
+	s3, err := NewStore(j3)
 	if err != nil {
 		t.Fatal(err)
 	}

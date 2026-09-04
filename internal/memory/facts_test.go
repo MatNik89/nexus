@@ -199,13 +199,13 @@ func TestFactSurvivesRestartOnlyInItsProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer j2.Close()
-	work2, _ := NewStore(j2, redact.None{})
+	work2, _ := NewStore(j2)
 	jp, err := journal.Open(privatePath, "private", redact.None{}, Events(), NewProjection())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer jp.Close()
-	private2, _ := NewStore(jp, redact.None{})
+	private2, _ := NewStore(jp)
 	hits, err := work2.Recall(ctxT(), "RESTARTFACT")
 	if err != nil || len(hits) != 1 {
 		t.Fatalf("accepted fact did not survive restart: %v %v", hits, err)
@@ -331,7 +331,7 @@ func TestReplayReconstructsFullState(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer j.Close()
-	s, _ := NewStore(j, redact.None{})
+	s, _ := NewStore(j)
 	rows, err := s.All(ctxT())
 	if err != nil {
 		t.Fatal(err)
@@ -364,7 +364,7 @@ func TestSecretContentRefusedNotRewritten(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer j.Close()
-	s, err := NewStore(j, r)
+	s, err := NewStore(j)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -441,5 +441,91 @@ func TestFactLineageSurvivesToRecall(t *testing.T) {
 	}
 	if !hasOrigin || !hasCall {
 		t.Fatalf("observation lineage must union source + call: %v", got)
+	}
+}
+
+// A database written by the PREVIOUS revision (v1: no lineage column, no
+// checkpoint) is RESET and rebuilt from the canonical stream at Open —
+// never patched blind (Phase-3-r3 codex #2 literal).
+func TestV1SchemaDatabaseRebuildsAtOpen(t *testing.T) {
+	_, work, _, workPath, _ := seedBoth(t)
+	workClose(t, work)
+	// Emulate the c05bb8b on-disk state: no lineage column, no version.
+	db, err := sqlOpen(workPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		`ALTER TABLE mem_facts DROP COLUMN lineage`,
+		`UPDATE proj_sync_offsets SET version=1 WHERE name='memory_facts'`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db.Close()
+	j, err := journal.Open(workPath, "work", redact.None{}, Events(), NewProjection())
+	if err != nil {
+		t.Fatalf("open over a previous-revision projection failed: %v", err)
+	}
+	defer j.Close()
+	s, _ := NewStore(j)
+	rows, err := s.All(ctxT())
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("v1 database not rebuilt: %v %v", rows, err)
+	}
+	if hits, _ := s.Search(ctxT(), "ZEBRAPROJECT"); len(hits) != 1 {
+		t.Fatalf("rebuilt v1 FTS broken: %v", hits)
+	}
+	// The checkpoint-only corruption case (tables intact, checkpoint
+	// gone) also rebuilds instead of double-inserting.
+	j.Close()
+	db, _ = sqlOpen(workPath)
+	db.Exec(`DELETE FROM proj_sync_offsets WHERE name='memory_facts'`)
+	db.Close()
+	j2, err := journal.Open(workPath, "work", redact.None{}, Events(), NewProjection())
+	if err != nil {
+		t.Fatalf("open with missing checkpoint failed: %v", err)
+	}
+	defer j2.Close()
+	s2, _ := NewStore(j2)
+	if rows, err := s2.All(ctxT()); err != nil || len(rows) != 2 {
+		t.Fatalf("missing-checkpoint rebuild broken: %v %v", rows, err)
+	}
+}
+
+// The production correction path UNIONS provenance (Phase-3-r3 codex #7
+// literal): predecessor lineage ∪ predecessor id ∪ correction call.
+func TestSupersessionUnionsLineageThroughTool(t *testing.T) {
+	_, work, _, _, _ := seedBoth(t)
+	if err := work.SaveFactLineage(ctxT(), "f-orig", "UNIONTOKEN v1", nil, []string{"source-block"}); err != nil {
+		t.Fatal(err)
+	}
+	tools := Tools(work, redact.None{})
+	call, _ := contracts.NewToolCall(contracts.ToolCallParams{
+		ToolCallID: "correction-call", ToolID: "memory_remember",
+		Arguments:      []byte(`{"content":"UNIONTOKEN v2","supersedes":"f-orig"}`),
+		ArgsSchemaHash: "memory_remember.v1",
+		Effect:         contracts.EffectReversible, ExecutionKind: contracts.ExecInProcess,
+		Deadline: timeNowPlusMinute(), AttemptNo: 1, ProfileID: "work",
+		IdempotencyKey: strPtr("ik-u1"),
+	})
+	if _, err := tools["memory_remember"](ctxT(), call); err != nil {
+		t.Fatal(err)
+	}
+	hits, err := work.Recall(ctxT(), "UNIONTOKEN")
+	if err != nil || len(hits) != 1 {
+		t.Fatalf("correction recall: %v %v", hits, err)
+	}
+	want := map[string]bool{"source-block": false, "f-orig": false, "correction-call": false}
+	for _, l := range hits[0].Lineage {
+		if _, ok := want[l]; ok {
+			want[l] = true
+		}
+	}
+	for k, seen := range want {
+		if !seen {
+			t.Fatalf("correction lost lineage element %q: %v", k, hits[0].Lineage)
+		}
 	}
 }

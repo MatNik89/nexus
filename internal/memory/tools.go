@@ -74,7 +74,7 @@ func Tools(store *Store, r redact.Redactor) map[contracts.ToolID]effectpath.InPr
 				// "actually it's Y": the user-visible correction path
 				// (Phase-3 kilo #2) — strictly linear, validated in the
 				// append transaction.
-				err = store.Supersede(ctx, args.Supersedes, id, args.Content, args.Tags...)
+				err = store.SupersedeLineage(ctx, args.Supersedes, id, args.Content, args.Tags, []string{string(c.ToolCallID)})
 			} else {
 				err = store.SaveFactLineage(ctx, id, args.Content, args.Tags, []string{string(c.ToolCallID)})
 			}

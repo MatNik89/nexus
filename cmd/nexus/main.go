@@ -165,7 +165,7 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemon.Daemon,
 		j.Close()
 		return nil, nil, fmt.Errorf("provider: %w (conversation is a P0 core capability — fix the config and restart)", err)
 	}
-	memStore, err := memory.NewStore(j, redactor)
+	memStore, err := memory.NewStore(j)
 	if err != nil {
 		j.Close()
 		return nil, nil, fmt.Errorf("memory: %w", err)

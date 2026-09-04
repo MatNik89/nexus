@@ -30,7 +30,6 @@ import (
 
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
 	"github.com/MatNik89/nexus/internal/kernel/journal"
-	"github.com/MatNik89/nexus/internal/security/redact"
 )
 
 // Origin says how a fact entered the system.
@@ -144,6 +143,22 @@ func NewProjection() *Projection { return &Projection{} }
 
 func (Projection) Name() string { return "memory_facts" }
 
+// Version 2: v1 (one revision old) lacked lineage + checkpoints; a v1
+// database RESETS and rebuilds from the canonical stream.
+func (Projection) Version() int { return 2 }
+
+func (Projection) Reset(db *journal.ProjDB) error {
+	for _, stmt := range []string{
+		`DROP TABLE IF EXISTS mem_facts`,
+		`DROP TABLE IF EXISTS mem_facts_fts`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (Projection) Init(db *journal.ProjDB) error {
 	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS mem_facts (
@@ -234,6 +249,7 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 	case EvFactRejected:
 		return decide(StatusRejected, raw)
 	case EvFactSuperseded:
+		// (lineage union happens below, from the OLD row's stored chain)
 		var p supersedePayload
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return err
@@ -268,6 +284,34 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 		if hasSuccessor {
 			return fmt.Errorf("memory: fact already has a successor — supersession is strictly linear (fail closed)")
 		}
+		// Provenance UNION (Phase-3-r3 codex #7): the correction carries
+		// the predecessor's lineage ∪ the predecessor id ∪ the correction
+		// call's own lineage — approval/correction never erases sources.
+		var oldLineageRaw string
+		lr, err := tx.Query(`SELECT lineage FROM mem_facts WHERE id=?`, p.OldID)
+		if err != nil {
+			return err
+		}
+		if lr.Next() {
+			if err := lr.Scan(&oldLineageRaw); err != nil {
+				lr.Close()
+				return err
+			}
+		}
+		if err := lr.Close(); err != nil {
+			return err
+		}
+		var oldLineage []string
+		json.Unmarshal([]byte(oldLineageRaw), &oldLineage)
+		seen := map[string]bool{}
+		merged := []string{}
+		for _, l := range append(append(oldLineage, p.OldID), p.New.Lineage...) {
+			if l != "" && !seen[l] {
+				seen[l] = true
+				merged = append(merged, l)
+			}
+		}
+		p.New.Lineage = merged
 		return insert(p.New, StatusAccepted, &p.OldID)
 	}
 	return nil // not a memory event
@@ -288,33 +332,33 @@ type Row struct {
 
 // Store is the memory facade over the profile's ONE journal.
 type Store struct {
-	j        *journal.Journal
-	redactor redact.Redactor
-	seq      atomic.Uint64
+	j   *journal.Journal
+	seq atomic.Uint64
 }
 
-// NewStore binds the facade to the profile journal and ITS redactor:
-// content the redactor would rewrite is REFUSED before the append —
-// silently storing different bytes than the user approved would break
-// B8's exact-preview rule and the commit receipt (Phase-3-r2 codex #15).
-func NewStore(j *journal.Journal, r redact.Redactor) (*Store, error) {
-	if j == nil || r == nil {
-		return nil, fmt.Errorf("memory: a journal and its redactor are required (fail closed)")
+// NewStore binds the facade to the profile journal. The exact-bytes check
+// consults the JOURNAL'S OWN redactor (Phase-3-r3 codex #6: an injected
+// redactor copy could disagree with what the append stores — the seam is
+// journal-owned and cannot be mis-wired).
+func NewStore(j *journal.Journal) (*Store, error) {
+	if j == nil {
+		return nil, fmt.Errorf("memory: a journal is required (fail closed)")
 	}
-	return &Store{j: j, redactor: r}, nil
+	return &Store{j: j}, nil
 }
 
-// refuseSecretContent rejects content the journal redactor would rewrite.
+// refuseSecretContent rejects content the JOURNAL's redactor would
+// rewrite — bytes are stored verbatim or not at all (B8 exact preview).
 func (s *Store) refuseSecretContent(content string) error {
 	raw, err := json.Marshal(content)
 	if err != nil {
 		return fmt.Errorf("memory: %w", err)
 	}
-	red, err := s.redactor.Redact(raw)
+	rewrites, err := s.j.RedactorRewrites(raw)
 	if err != nil {
 		return fmt.Errorf("memory: redaction check: %w", err)
 	}
-	if string(red) != string(raw) {
+	if rewrites {
 		return fmt.Errorf("memory: content contains a known secret reference — refused (store the secret's LOCATION, never its value)")
 	}
 	return nil
@@ -387,11 +431,17 @@ func (s *Store) Reject(ctx context.Context, id string) error {
 // Supersede appends a CORRECTION (strictly linear; validated inside the
 // append transaction).
 func (s *Store) Supersede(ctx context.Context, oldID, newID, content string, tags ...string) error {
+	return s.SupersedeLineage(ctx, oldID, newID, content, tags, nil)
+}
+
+// SupersedeLineage carries the correction's own source chain; Apply
+// unions it with the predecessor's stored lineage.
+func (s *Store) SupersedeLineage(ctx context.Context, oldID, newID, content string, tags, lineage []string) error {
 	if err := s.refuseSecretContent(content); err != nil {
 		return err
 	}
 	return s.append(ctx, EvFactSuperseded, supersedePayload{
-		OldID: oldID, New: explicitDefaults(newID, content, OriginExplicit, tags, []string{oldID})})
+		OldID: oldID, New: explicitDefaults(newID, content, OriginExplicit, tags, lineage)})
 }
 
 // latestAccepted is THE shared retrieval predicate: accepted, and not

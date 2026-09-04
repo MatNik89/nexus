@@ -92,7 +92,13 @@ func (p *ProjDB) Query(query string, args ...any) (*sql.Rows, error) {
 // append (state and event commit together or not at all).
 type SyncProjection interface {
 	Name() string
+	// Version identifies the projection SCHEMA: a mismatch with the
+	// durable record triggers Reset + rebuild from the canonical stream
+	// (Phase-3-r3 codex #2: an older schema must never be patched blind).
+	Version() int
 	Init(db *ProjDB) error
+	// Reset drops every derived object this projection owns.
+	Reset(db *ProjDB) error
 	Apply(tx *ProjTx, ev Event) error
 }
 
@@ -105,8 +111,8 @@ func (j *Journal) applySyncProjections(tx *sql.Tx, ev Event) error {
 		}
 		// Checkpoint advances IN the append transaction: state, event and
 		// checkpoint commit together (catch-up trusts this on reopen).
-		if _, err := tx.Exec(`INSERT INTO proj_sync_offsets(name, applied_offset) VALUES(?1,?2)
-			ON CONFLICT(name) DO UPDATE SET applied_offset=?2`, p.Name(), int64(ev.JournalOffset)); err != nil {
+		if _, err := tx.Exec(`INSERT INTO proj_sync_offsets(name, applied_offset, version) VALUES(?1,?2,?3)
+			ON CONFLICT(name) DO UPDATE SET applied_offset=?2`, p.Name(), int64(ev.JournalOffset), p.Version()); err != nil {
 			return fmt.Errorf("sync projection %s checkpoint: %w", p.Name(), err)
 		}
 	}

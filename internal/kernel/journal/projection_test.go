@@ -28,6 +28,11 @@ type fakeCounter struct {
 }
 
 func (f *fakeCounter) Name() string { return "fake_counter" }
+func (f *fakeCounter) Version() int { return 1 }
+func (f *fakeCounter) Reset(db *ProjDB) error {
+	_, err := db.Exec(`DROP TABLE IF EXISTS fake_state`)
+	return err
+}
 func (f *fakeCounter) Init(db *ProjDB) error {
 	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS fake_state (
 		journal_offset INTEGER PRIMARY KEY, event_type TEXT NOT NULL)`)
@@ -215,8 +220,10 @@ func TestProjectorsIndependent(t *testing.T) {
 // no attacker event exists afterwards.
 type rogueProjection struct{}
 
-func (rogueProjection) Name() string       { return "rogue" }
-func (rogueProjection) Init(*ProjDB) error { return nil }
+func (rogueProjection) Name() string        { return "rogue" }
+func (rogueProjection) Version() int        { return 1 }
+func (rogueProjection) Reset(*ProjDB) error { return nil }
+func (rogueProjection) Init(*ProjDB) error  { return nil }
 func (rogueProjection) Apply(tx *ProjTx, ev Event) error {
 	_, err := tx.Exec(`INSERT INTO events(journal_offset, event_id, run_id, sequence, envelope,
 		redaction_policy_version, integrity_prev_hash, integrity_hash)
@@ -244,7 +251,9 @@ func TestProjectionCanaryWriteRejectedNonCanonical(t *testing.T) {
 // lease check (codex #5): Init runs only under verified ownership.
 type canaryInit struct{ ran *bool }
 
-func (c canaryInit) Name() string { return "canary_init" }
+func (c canaryInit) Name() string        { return "canary_init" }
+func (c canaryInit) Version() int        { return 1 }
+func (c canaryInit) Reset(*ProjDB) error { return nil }
 func (c canaryInit) Init(db *ProjDB) error {
 	*c.ran = true
 	return nil
@@ -271,7 +280,9 @@ func TestSecondOpenerInitNeverRuns(t *testing.T) {
 // forged event exists.
 type rogueInit struct{ stmt string }
 
-func (r rogueInit) Name() string { return "rogue_init" }
+func (r rogueInit) Name() string        { return "rogue_init" }
+func (r rogueInit) Version() int        { return 1 }
+func (r rogueInit) Reset(*ProjDB) error { return nil }
 func (r rogueInit) Init(db *ProjDB) error {
 	_, err := db.Exec(r.stmt)
 	return err
@@ -354,4 +365,35 @@ func TestFoldRecordedRunFromJournal(t *testing.T) {
 			t.Fatalf("intermediate %d: %v want %v", i, intermediates[i], want[i])
 		}
 	}
+}
+
+// The read seam can NEVER mutate projection state (Phase-3-r3 codex #4
+// literal): the multi-statement probe is rejected and rows stay intact.
+func TestQueryProjectionCannotMutate(t *testing.T) {
+	j := openWithProjection(t, t.TempDir(), &fakeCounter{})
+	ctx := context.Background()
+	for i := 1; i <= 2; i++ {
+		if _, err := j.Append(ctx, params("run-a", fmt.Sprintf("e%d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, q := range map[string]string{
+		"multi-statement": `SELECT event_type FROM fake_state; DELETE FROM fake_state; SELECT 1`,
+		"plain-delete":    `DELETE FROM fake_state`,
+		"insert":          `INSERT INTO fake_state(journal_offset, event_type) VALUES(99,'forged')`,
+		"canonical-read":  `SELECT journal_offset FROM events`,
+	} {
+		if _, err := j.QueryProjection(ctx, q); err == nil || !strings.Contains(err.Error(), "NON_CANONICAL_WRITE") {
+			t.Fatalf("%s: probe not rejected: %v", name, err)
+		}
+	}
+	if got := countFake(t, j); got != 2 {
+		t.Fatalf("a rejected probe mutated projection state: %d rows", got)
+	}
+	// The legitimate single-statement read still works.
+	rows, err := j.QueryProjection(ctx, `SELECT COUNT(*) FROM fake_state`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows.Close()
 }

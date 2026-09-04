@@ -277,3 +277,56 @@ func TestToolPlanningSealedSpecs(t *testing.T) {
 		t.Fatalf("final not delivered to the sink: %q", delivered)
 	}
 }
+
+// Tool prompts are BYTE-DETERMINISTIC across fresh spec maps (Phase-3-r3
+// codex #10 literal): map iteration order never changes the plan input.
+type promptCapturingChat struct {
+	auth   *s7min.Authority
+	system string
+}
+
+func (f *promptCapturingChat) Chat(ctx context.Context, msgs []provider.ChatMessage, g s7min.Grant) (provider.ChatOutput, error) {
+	if err := f.auth.Consume(g); err != nil {
+		return provider.ChatOutput{}, err
+	}
+	for _, m := range msgs {
+		if m.Role == "system" {
+			f.system = m.Content
+		}
+	}
+	return provider.ChatOutput{Content: "ok"}, nil
+}
+
+func TestToolPromptDeterministic(t *testing.T) {
+	auth := s7min.NewAuthority(nil, time.Minute)
+	b := userBlockForPlan(t)
+	prompts := map[string]bool{}
+	for i := 0; i < 8; i++ {
+		fc := &promptCapturingChat{auth: auth}
+		p, err := New(fc, auth, "provider:test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		specs := map[contracts.ToolID]effectpath.ToolSpec{
+			"zeta_tool":  {Effect: contracts.EffectReadOnly, ExecutionKind: contracts.ExecInProcess, ArgsSchemaHash: "v1", Description: "z"},
+			"alpha_tool": {Effect: contracts.EffectReadOnly, ExecutionKind: contracts.ExecInProcess, ArgsSchemaHash: "v1", Description: "a"},
+			"mid_tool":   {Effect: contracts.EffectReadOnly, ExecutionKind: contracts.ExecInProcess, ArgsSchemaHash: "v1", Description: "m"},
+		}
+		if _, err := p.WithTools(specs, "work"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := p.Plan(context.Background(), []contracts.ContextBlock{b}); err != nil {
+			t.Fatal(err)
+		}
+		prompts[fc.system] = true
+	}
+	if len(prompts) != 1 {
+		t.Fatalf("system prompt varied across %d byte-distinct forms", len(prompts))
+	}
+	for pr := range prompts {
+		ia, im, iz := strings.Index(pr, "alpha_tool"), strings.Index(pr, "mid_tool"), strings.Index(pr, "zeta_tool")
+		if !(ia < im && im < iz) {
+			t.Fatalf("tool list not sorted: %d %d %d", ia, im, iz)
+		}
+	}
+}
