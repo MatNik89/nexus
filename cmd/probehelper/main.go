@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -69,6 +70,8 @@ func main() {
 			fail("ptrace failed differently: %v", err)
 		}
 		fmt.Println("ptrace ok")
+	case "print": // print <text> — echoes argv to stdout (redaction fixture)
+		fmt.Println(strings.Join(os.Args[2:], " "))
 	case "spew": // spew <bytes> — floods stdout (bounded-capture fixture)
 		n, err := strconv.Atoi(os.Args[2])
 		if err != nil {

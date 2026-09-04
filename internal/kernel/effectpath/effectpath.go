@@ -148,6 +148,15 @@ func EffectHash(c contracts.ToolCall) string {
 // found by the exec spine e2e; C4 intent is unchanged, JSON object key
 // order carries no meaning). Unparsable input hashes as raw bytes.
 func canonicalJSON(raw []byte) []byte {
+	// Duplicate object keys make map-decoding NON-INJECTIVE (last-wins
+	// collapse — Phase-6 kilo #1: {"command":"/bin/echo","command":
+	// "/bin/rm"} would hash equal to the /bin/rm-only document and let a
+	// divergent summary authorize the dangerous value). Such documents
+	// hash as their RAW bytes: a canonical form never contains a
+	// duplicate key, so the two spaces cannot collide.
+	if HasDuplicateJSONKeys(raw) {
+		return raw
+	}
 	var v interface{}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
@@ -159,6 +168,56 @@ func canonicalJSON(raw []byte) []byte {
 		return raw
 	}
 	return out
+}
+
+// HasDuplicateJSONKeys walks the token stream and reports any object
+// carrying the same key twice (any depth). Malformed input reports true
+// (treated as non-canonicalizable — raw bytes).
+func HasDuplicateJSONKeys(raw []byte) bool {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var walk func() bool
+	walk = func() bool {
+		tok, err := dec.Token()
+		if err != nil {
+			return true
+		}
+		switch d := tok.(type) {
+		case json.Delim:
+			switch d {
+			case '{':
+				seen := map[string]bool{}
+				for dec.More() {
+					keyTok, err := dec.Token()
+					if err != nil {
+						return true
+					}
+					key, ok := keyTok.(string)
+					if !ok || seen[key] {
+						return true
+					}
+					seen[key] = true
+					if walk() { // value
+						return true
+					}
+				}
+				if _, err := dec.Token(); err != nil { // closing }
+					return true
+				}
+			case '[':
+				for dec.More() {
+					if walk() {
+						return true
+					}
+				}
+				if _, err := dec.Token(); err != nil { // closing ]
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return walk()
 }
 
 func effectHash(c contracts.ToolCall) string { return EffectHash(c) }

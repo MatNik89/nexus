@@ -23,6 +23,7 @@ import (
 	"github.com/MatNik89/nexus/internal/kernel/effectpath"
 	"github.com/MatNik89/nexus/internal/kernel/s7min"
 	"github.com/MatNik89/nexus/internal/sandbox"
+	"github.com/MatNik89/nexus/internal/security/redact"
 )
 
 func ctxT() context.Context { return context.Background() }
@@ -34,7 +35,7 @@ func adapter(t *testing.T) *Adapter {
 	if err != nil {
 		t.Skipf("bwrap unavailable: %v", err)
 	}
-	a, err := New(b, rep)
+	a, err := New(b, rep, redact.None{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -218,5 +219,50 @@ func TestPruningPreservesExitAndTail(t *testing.T) {
 	small := "short output"
 	if pruneOutput(small) != small {
 		t.Fatal("small output mangled")
+	}
+}
+
+// Duplicate argument keys are refused at the door (Phase-6 kilo #1).
+func TestDuplicateArgKeysRejected(t *testing.T) {
+	a := adapter(t)
+	c := execCall(t, "tc-dup", "/bin/ls", nil, contracts.ExecProcess, contracts.EffectIrreversible)
+	c.Arguments = json.RawMessage(`{"command":"/bin/echo","command":"/bin/rm","args":["/"]}`)
+	if _, err := a.Launch(ctxT(), c); err == nil {
+		t.Fatal("duplicate-key args executed (last-wins divergence)")
+	}
+}
+
+// Known secret references are scrubbed from exec output BEFORE the model
+// boundary (Phase-6 kilo #2): exec reads the whole host read-only.
+func TestExecOutputRedactsKnownSecrets(t *testing.T) {
+	b := sandbox.NewBwrap()
+	rep, err := b.Probe(ctxT())
+	if err != nil {
+		t.Skipf("bwrap unavailable: %v", err)
+	}
+	secret := "sk-live-exec-secret-9999"
+	a, err := New(b, rep, redact.NewKnownRefs(map[string]string{"provider_key": secret}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// DETERMINISTIC lane: the secret sits in the RW workdir — hidden from
+	// the adapter (it only makes the dir), visible to the child. exectool
+	// mints its own workdir, so route through a helper that PRINTS its
+	// argv instead: the secret enters as an argument and must not survive
+	// into the observation.
+	hp := helperPath(t)
+	c := execCall(t, "tc-sec", hp, []string{"print", secret}, contracts.ExecProcess, contracts.EffectIrreversible)
+	res, lerr := a.Launch(ctxT(), c)
+	if lerr != nil {
+		t.Fatalf("print run failed: %v", lerr)
+	}
+	if len(res.Output) != 1 || res.Output[0].Content == nil {
+		t.Fatal("no observation")
+	}
+	if strings.Contains(*res.Output[0].Content, secret) {
+		t.Fatal("known secret escaped into the exec observation")
+	}
+	if !strings.Contains(*res.Output[0].Content, "[REDACTED") {
+		t.Fatalf("redaction marker missing: %q", *res.Output[0].Content)
 	}
 }

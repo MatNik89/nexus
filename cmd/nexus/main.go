@@ -425,7 +425,7 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 	var execAdapter *exectool.Adapter
 	sbBackend := sandbox.NewBwrap()
 	if rep, perr := sbBackend.Probe(context.Background()); perr == nil {
-		if ad, aerr := exectool.New(sbBackend, rep); aerr == nil {
+		if ad, aerr := exectool.New(sbBackend, rep, redactor); aerr == nil {
 			execAdapter = ad
 		}
 	}

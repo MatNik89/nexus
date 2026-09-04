@@ -25,6 +25,7 @@ import (
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
 	"github.com/MatNik89/nexus/internal/kernel/effectpath"
 	"github.com/MatNik89/nexus/internal/sandbox"
+	"github.com/MatNik89/nexus/internal/security/redact"
 )
 
 // ToolID is the sealed identity of the exec tool.
@@ -40,17 +41,21 @@ type execArgs struct {
 
 // Adapter runs exec calls through the REAL sandbox backend.
 type Adapter struct {
-	backend sandbox.Backend
-	report  sandbox.ProbeReport
+	backend  sandbox.Backend
+	report   sandbox.ProbeReport
+	redactor redact.Redactor
 }
 
 // New requires a LIVE passing probe report — a dead report refuses
-// construction (fail closed; the composition root keeps exec off).
-func New(b sandbox.Backend, report sandbox.ProbeReport) (*Adapter, error) {
-	if b == nil || !report.Available || report.ProbeHash == "" {
-		return nil, fmt.Errorf("exectool: a live passing sandbox probe is required (fail closed)")
+// construction (fail closed; the composition root keeps exec off) — and
+// the KNOWN-REF redactor: exec reads the whole host read-only, so its
+// output passes the secret scrub BEFORE any model boundary (Phase-6
+// kilo #2).
+func New(b sandbox.Backend, report sandbox.ProbeReport, r redact.Redactor) (*Adapter, error) {
+	if b == nil || !report.Available || report.ProbeHash == "" || r == nil {
+		return nil, fmt.Errorf("exectool: a live passing sandbox probe and a redactor are required (fail closed)")
 	}
-	return &Adapter{backend: b, report: report}, nil
+	return &Adapter{backend: b, report: report, redactor: r}, nil
 }
 
 // Rules is the PEP decision for the exec family: command execution is
@@ -78,6 +83,11 @@ func (a *Adapter) Launch(ctx context.Context, call contracts.ToolCall) (contract
 	}
 	if call.ExecutionKind != contracts.ExecProcess {
 		return contracts.ToolResult{}, fmt.Errorf("exectool: execution kind %d is not ExecProcess (fail closed)", call.ExecutionKind)
+	}
+	if effectpath.HasDuplicateJSONKeys(call.Arguments) {
+		// Last-wins duplicate keys let the approver-visible summary and
+		// the executed value diverge (Phase-6 kilo #1) — refused.
+		return contracts.ToolResult{}, fmt.Errorf("exectool: duplicate argument keys (fail closed)")
 	}
 	dec := json.NewDecoder(bytes.NewReader(call.Arguments))
 	dec.DisallowUnknownFields()
@@ -124,7 +134,7 @@ func (a *Adapter) Launch(ctx context.Context, call contracts.ToolCall) (contract
 	if waitErr != nil {
 		status = "exit status: " + waitErr.Error()
 	}
-	content := status + "\n" + pruneOutput(proc.Output())
+	content := status + "\n" + pruneOutput(redactText(a.redactor, proc.Output()))
 	now := time.Now().UTC()
 	res := contracts.ResultSucceeded
 	if waitErr != nil {
@@ -150,6 +160,24 @@ func (a *Adapter) Launch(ctx context.Context, call contracts.ToolCall) (contract
 			AttemptNo: call.AttemptNo, ContentHash: att.ClosureDigest,
 		},
 	}, nil
+}
+
+// redactText scrubs known secret references from subprocess output
+// before the model boundary (the redactor works on JSON documents).
+func redactText(r redact.Redactor, s string) string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		return "(unrenderable)"
+	}
+	red, err := r.Redact(b)
+	if err != nil {
+		return "(redaction failed — content withheld)"
+	}
+	var out string
+	if json.Unmarshal(red, &out) != nil {
+		return "(unrenderable)"
+	}
+	return out
 }
 
 // hashHex is the sha256 hex of content (block integrity currency).
