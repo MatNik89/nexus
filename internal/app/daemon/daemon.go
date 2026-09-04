@@ -248,7 +248,7 @@ func (d *Daemon) RunChannelTurn(ctx context.Context, identity string, updateID i
 // projection is the upgrade when replay latency is measurable (P1).
 func (d *Daemon) completedTurnFinal(turn contracts.TurnID) (string, bool) {
 	final, found := "", false
-	d.deps.Journal.Replay(0, func(ev journal.Event) error {
+	err := d.deps.Journal.Replay(0, func(ev journal.Event) error {
 		if ev.Envelope.EventType == "turn.succeeded" && ev.Envelope.TurnID != nil && *ev.Envelope.TurnID == turn {
 			var p struct {
 				Final string `json:"final"`
@@ -259,6 +259,12 @@ func (d *Daemon) completedTurnFinal(turn contracts.TurnID) (string, bool) {
 		}
 		return nil
 	})
+	if err != nil {
+		// FAIL CLOSED (Phase-5-r4 codex #3): a final observed during a
+		// replay that later fails integrity verification is not evidence —
+		// never serve a recovered outcome from a corrupt canonical stream.
+		return "", false
+	}
 	return final, found
 }
 

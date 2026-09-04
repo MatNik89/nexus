@@ -11,6 +11,7 @@ package daemon
 import (
 	"bufio"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -448,5 +449,62 @@ func TestRedeliveredUpdateCannotRerunCompletedTurn(t *testing.T) {
 	// A different update id is a fresh turn.
 	if _, err := d.RunChannelTurn(context.Background(), "chat-42", 8, "next"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Completed-turn recovery FAILS CLOSED on a corrupt journal (Phase-5-r4
+// codex #3): a final observed during a replay whose integrity chain later
+// breaks is never served as a recovered outcome.
+func TestRecoveryFailsClosedOnCorruptJournal(t *testing.T) {
+	p := &blockCapturingPlanner{}
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "journal.db")
+	ev := map[string]journal.PayloadValidator{}
+	for _, n := range machine.EventTypes() {
+		ev[n] = nil
+	}
+	j, err := journal.Open(dbPath, "work", redact.None{}, ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { j.Close() })
+	d, err := New(Deps{
+		Journal:        j,
+		PlannerFactory: func(deliver func(string) error) (loop.Planner, error) { return p, nil },
+		Authority:      s7min.NewAuthority(nil, time.Minute),
+		Profile:        "work",
+		Rules:          map[contracts.ToolID]effectpath.Decision{},
+		Tools:          map[contracts.ToolID]effectpath.InProcFunc{},
+		Audit:          &capturingAudit{}, Redactor: redact.None{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.RunChannelTurn(context.Background(), "chat-42", 7, "hello"); err != nil {
+		t.Fatal(err)
+	}
+	// Append one more event AFTER the completed turn, then corrupt it —
+	// the chain now breaks after the final was observed.
+	if _, err := j.Append(context.Background(), contracts.EnvelopeParams{
+		SchemaID: "nexus.event", SchemaVersion: 1,
+		EventID: "ev-tail-1", EventType: machine.EvRunCreated, RunID: "run-tail",
+		EmittedAt: time.Now().UTC(), ActorType: contracts.ActorSystem, ActorID: "test",
+		PrincipalID: "nexus", WorkspaceID: "local", ProfileID: "work", AttemptNo: 1,
+		Payload: []byte(`{"x":1}`), PayloadHash: "recomputed",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`UPDATE events SET integrity_hash='deadbeef' WHERE event_id='ev-tail-1'`); err != nil {
+		t.Fatal(err)
+	}
+	// Redelivery: recovery must refuse — the corrupt stream is not
+	// evidence; the caller gets the duplicate-turn error instead.
+	if _, err := d.RunChannelTurn(context.Background(), "chat-42", 7, "hello"); err == nil {
+		t.Fatal("recovered a final from a journal that fails integrity verification")
 	}
 }

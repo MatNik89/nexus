@@ -663,16 +663,12 @@ func telegramHandler(b *daemonBundle) telegram.Handler {
 			// confirms by re-approving a FRESH challenge over the same
 			// exact intent — never a blind auto-retry (Phase-5-r3 kilo #1).
 			id := strings.TrimSpace(text[len("retry "):])
-			turn, run, call, blocks, err := b.approvals.ConsumedCall(ctx, id, source)
-			if err != nil {
-				return "Nothing to retry for " + id + ": " + err.Error(), nil
-			}
-			ch, serr := b.approvals.Suspend(ctx, turn, run, call, source, blocks)
-			if serr != nil {
-				return "Retry failed: " + serr.Error(), nil
-			}
-			if merr := b.approvals.MarkResumeCompleted(ctx, id); merr != nil {
-				return "Retry failed: " + merr.Error(), nil
+			// ONE atomic batch closes the old reconcile item and issues
+			// the fresh challenge (Phase-5-r4 codex #1) — a crash can
+			// never leave two consumable authorizations.
+			ch, rerr := b.approvals.RetryChallenge(ctx, id, source)
+			if rerr != nil {
+				return "Nothing to retry for " + id + ": " + rerr.Error(), nil
 			}
 			return ch.Summary, nil
 		case strings.HasPrefix(lower, "deny "):

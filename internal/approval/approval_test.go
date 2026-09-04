@@ -16,6 +16,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -367,4 +369,101 @@ func testBlocks(t *testing.T, text string) []contracts.ContextBlock {
 		t.Fatal(err)
 	}
 	return []contracts.ContextBlock{b}
+}
+
+// RETRY is ONE atomic batch (Phase-5-r4 codex #1): a SIGKILL inside the
+// close-old+issue-new recipe leaves BOTH-or-NEITHER — never the old
+// reconcile item open alongside a new live challenge (two consumable
+// authorizations for one UNKNOWN effect).
+func TestRetryRecipeAtomicUnderSigkill(t *testing.T) {
+	if os.Getenv("APPR_RETRY_CHILD") == "1" {
+		retryCrashChild()
+		return
+	}
+	dir := t.TempDir()
+	// Parent prepares the CONSUMED-and-open state WITHOUT the kill seam.
+	clock := clockid.NewFake(time.Now())
+	s, j := open(t, dir, clock, "work")
+	c := call("fs_delete", "tc-1", `{"path":"/tmp/x"}`)
+	ch, err := s.Suspend(ctxT(), "turn-1", "run-1", c, "tg:chat-42", testBlocks(t, "original request"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Approve(ctxT(), ch.ChallengeID, "tg:chat-42"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ConsumeApproval(ctxT(), c); err != nil {
+		t.Fatal(err)
+	}
+	j.Close()
+	// Child runs RetryChallenge and dies mid-batch.
+	cmd := exec.Command(os.Args[0], "-test.run", "TestRetryRecipeAtomicUnderSigkill")
+	cmd.Env = append(os.Environ(), "APPR_RETRY_CHILD=1", "APPR_RETRY_DIR="+dir,
+		"APPR_RETRY_ID="+ch.ChallengeID, "NEXUS_TEST_KILL_MID_BATCH=1")
+	if err := cmd.Run(); err == nil {
+		t.Fatal("child survived the mid-batch kill seam")
+	}
+	// Reopen: the batch must be all-or-nothing.
+	s2, _ := open(t, dir, clock, "work")
+	openOld, err := s2.ConsumedUnfinished(ctxT())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := s2.Pending(ctxT())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(openOld) == 1 && len(pending) == 1 {
+		t.Fatalf("retry recipe torn: old reconcile item open AND a new challenge live (two authorizations)")
+	}
+	if len(openOld) == 0 && len(pending) == 0 {
+		t.Fatal("retry recipe lost BOTH sides")
+	}
+	// Recovery: a clean retry now yields exactly one live challenge and
+	// closes the old item exactly once.
+	if len(openOld) == 1 {
+		if _, err := s2.RetryChallenge(ctxT(), ch.ChallengeID, "tg:chat-42"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	openOld, _ = s2.ConsumedUnfinished(ctxT())
+	pending, _ = s2.Pending(ctxT())
+	if len(openOld) != 0 || len(pending) != 1 {
+		t.Fatalf("post-recovery state: open=%d pending=%d (want 0/1)", len(openOld), len(pending))
+	}
+	// The closed item can never be retried again.
+	if _, err := s2.RetryChallenge(ctxT(), ch.ChallengeID, "tg:chat-42"); err == nil {
+		t.Fatal("closed reconcile item retried twice")
+	}
+}
+
+func retryCrashChild() {
+	dir := os.Getenv("APPR_RETRY_DIR")
+	j, err := journal.Open(filepath.Join(dir, "work.db"), "work", redact.None{}, Events(), NewProjection())
+	if err != nil {
+		os.Exit(1)
+	}
+	s, err := NewStore(j, clockid.NewFake(time.Now()))
+	if err != nil {
+		os.Exit(1)
+	}
+	s.RetryChallenge(context.Background(), os.Getenv("APPR_RETRY_ID"), "tg:chat-42") // dies mid-batch
+	os.Exit(0)
+}
+
+// LEGACY v1 suspension rows (no persisted context) degrade to an
+// observation-only resume instead of stranding an approvable challenge
+// (Phase-5-r4 codex #2); corrupt context stays fail-closed.
+func TestLegacyContextDegradesNotStrands(t *testing.T) {
+	blocks, err := parseContextJSON("")
+	if err != nil || blocks != nil {
+		t.Fatalf("legacy empty context must degrade to nil blocks: %v %v", blocks, err)
+	}
+	if _, err := parseContextJSON("{corrupt"); err == nil {
+		t.Fatal("corrupt context accepted")
+	}
+	good, err := parseContextJSON("[]")
+	if err != nil || len(good) != 0 {
+		t.Fatalf("empty slice context: %v %v", good, err)
+	}
 }

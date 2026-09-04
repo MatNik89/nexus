@@ -347,6 +347,68 @@ func (s *Store) Suspend(ctx context.Context, turn contracts.TurnID, run contract
 	return Challenge{ChallengeID: id, Summary: summary}, nil
 }
 
+// RetryChallenge is the E9 reconcile recipe (Phase-5-r4 codex #1): it
+// closes the CONSUMED-and-open challenge AND issues the fresh replacement
+// in ONE AppendBatch — a crash can never leave both the old reconcile
+// item open and a new challenge live, so the effect can never accumulate
+// two consumable authorizations.
+func (s *Store) RetryChallenge(ctx context.Context, oldID, source string) (Challenge, error) {
+	turn, run, c, blocks, err := s.ConsumedCall(ctx, oldID, source)
+	if err != nil {
+		return Challenge{}, err
+	}
+	hash := effectHash(c)
+	rb := make([]byte, 12)
+	if _, err := rand.Read(rb); err != nil {
+		return Challenge{}, err
+	}
+	id := "ch-" + hex.EncodeToString(rb)
+	callJSON, err := json.Marshal(c)
+	if err != nil {
+		return Challenge{}, err
+	}
+	contextJSON := []byte("")
+	if blocks != nil {
+		if contextJSON, err = json.Marshal(blocks); err != nil {
+			return Challenge{}, err
+		}
+	} else {
+		// Legacy v1 suspension without context: carry an empty slice so
+		// the v2 payload validator holds.
+		contextJSON = []byte("[]")
+	}
+	summary := fmt.Sprintf("APPROVAL NEEDED [%s]: tool %s with args %s (profile %s). Reply approve %s or deny %s.",
+		id, c.ToolID, string(c.Arguments), c.ProfileID, id, id)
+	payload := suspendedPayload{
+		ChallengeID: id, TurnID: string(turn), RunID: string(run),
+		EffectHash: hash, Summary: summary,
+		ExpiresUnix:    s.clock.Now().Add(DefaultChallengeTTL).Unix(),
+		ExpectedSource: source, Call: callJSON, Context: contextJSON}
+	rawPayload, err := json.Marshal(payload)
+	if err != nil {
+		return Challenge{}, err
+	}
+	rewrites, err := s.j.RedactorRewrites(rawPayload)
+	if err != nil {
+		return Challenge{}, err
+	}
+	if rewrites {
+		return Challenge{}, fmt.Errorf("approval: the challenge would expose a known secret to the approver — refused (fail closed)")
+	}
+	closeP, err := s.params(EvResumeCompleted, decisionPayload{ChallengeID: oldID, Source: "retry"})
+	if err != nil {
+		return Challenge{}, err
+	}
+	suspendP, err := s.params(EvTurnSuspended, payload)
+	if err != nil {
+		return Challenge{}, err
+	}
+	if _, err := s.j.AppendBatch(ctx, []contracts.EnvelopeParams{closeP, suspendP}); err != nil {
+		return Challenge{}, err
+	}
+	return Challenge{ChallengeID: id, Summary: summary}, nil
+}
+
 // Pending lists live (unexpired, undecided) challenges.
 func (s *Store) Pending(ctx context.Context) ([]Challenge, error) {
 	rows, err := s.j.QueryProjection(ctx,
@@ -542,11 +604,26 @@ func (s *Store) SuspendedCall(ctx context.Context, id, source string) (contracts
 	if err := json.Unmarshal([]byte(raw), &c); err != nil {
 		return "", "", contracts.ToolCall{}, nil, err
 	}
-	var blocks []contracts.ContextBlock
-	if err := json.Unmarshal([]byte(rawCtx), &blocks); err != nil {
+	blocks, err := parseContextJSON(rawCtx)
+	if err != nil {
 		return "", "", contracts.ToolCall{}, nil, err
 	}
 	return contracts.TurnID(turn), contracts.RunID(run), c, blocks, nil
+}
+
+// parseContextJSON restores a suspension's context blocks. A row folded
+// from a PRE-v2 suspension event has no context (Phase-5-r4 codex #2):
+// it degrades to an observation-only resume (nil blocks) instead of
+// stranding an approvable challenge behind a JSON error.
+func parseContextJSON(raw string) ([]contracts.ContextBlock, error) {
+	if raw == "" {
+		return nil, nil // legacy v1 suspension: no persisted context
+	}
+	var blocks []contracts.ContextBlock
+	if err := json.Unmarshal([]byte(raw), &blocks); err != nil {
+		return nil, fmt.Errorf("approval: suspension context corrupt (fail closed): %w", err)
+	}
+	return blocks, nil
 }
 
 // MarkResumeCompleted closes a CONSUMED challenge's resume — the E9
@@ -602,8 +679,8 @@ func (s *Store) ConsumedCall(ctx context.Context, id, source string) (contracts.
 	if err := json.Unmarshal([]byte(raw), &c); err != nil {
 		return "", "", contracts.ToolCall{}, nil, err
 	}
-	var blocks []contracts.ContextBlock
-	if err := json.Unmarshal([]byte(rawCtx), &blocks); err != nil {
+	blocks, err := parseContextJSON(rawCtx)
+	if err != nil {
 		return "", "", contracts.ToolCall{}, nil, err
 	}
 	return contracts.TurnID(turn), contracts.RunID(run), c, blocks, nil
