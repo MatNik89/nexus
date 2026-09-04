@@ -10,6 +10,7 @@ package schedule
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -452,8 +453,8 @@ func TestV1ScheduleEventRequiresMigration(t *testing.T) {
 	if err == nil {
 		t.Fatal("a v1 schedule event opened silently (must fail MIGRATION_REQUIRED)")
 	}
-	if !strings.Contains(err.Error(), "MIGRATION_REQUIRED") {
-		t.Fatalf("wrong failure class: %v", err)
+	if !errors.Is(err, ErrMigrationRequired) {
+		t.Fatalf("failure is not the TYPED migration sentinel: %v", err)
 	}
 }
 
@@ -582,4 +583,81 @@ func TestMirrorFailureSurfaces(t *testing.T) {
 	if n, _ := s.LastOccurrenceFired(ctxT()); n != 1 {
 		t.Fatalf("authoritative counter %d", n)
 	}
+}
+
+// SIGKILL EXACTLY BETWEEN recipe members (Phase-4-r4 codex #8): a child
+// dies mid-batch (after the first insert, before commit) via the
+// test-build seam — NOTHING from that batch is durable, and the reopened
+// scheduler fires the reminder exactly once afterwards. A sequential-
+// append implementation would leave the first event and fail this.
+func TestSweepKilledMidBatchLeavesNothing(t *testing.T) {
+	if os.Getenv("SCHED_MIDBATCH_CHILD") == "1" {
+		midBatchChildMain()
+		return
+	}
+	dir := t.TempDir()
+	cmd := exec.Command(os.Args[0], "-test.run", "TestSweepKilledMidBatchLeavesNothing")
+	cmd.Env = append(os.Environ(), "SCHED_MIDBATCH_CHILD=1", "SCHED_CRASH_DIR="+dir,
+		"NEXUS_TEST_KILL_MID_BATCH=1")
+	if err := cmd.Run(); err == nil {
+		t.Fatal("child survived the mid-batch SIGKILL seam")
+	}
+	events := Events()
+	for _, n := range machine.EventTypes() {
+		events[n] = nil
+	}
+	j, err := journal.Open(filepath.Join(dir, "journal.db"), "work", redact.None{}, events, NewProjection())
+	if err != nil {
+		t.Fatalf("reopen after mid-batch kill: %v", err)
+	}
+	defer j.Close()
+	counts := map[string]int{}
+	if err := j.Replay(0, func(ev journal.Event) error {
+		counts[ev.Envelope.EventType]++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The schedule exists; the KILLED batch left NOTHING (no occurrence,
+	// no run events).
+	if counts[EvScheduleCreated] != 1 {
+		t.Fatalf("workload vacuous: %v", counts)
+	}
+	if counts[EvOccurrenceFired] != 0 || counts[machine.EvRunCreated] != 0 || counts[machine.EvRunAdmitted] != 0 {
+		t.Fatalf("mid-batch kill left partial recipe events: %v", counts)
+	}
+	// Recovery: the reminder is still unfired and fires exactly once.
+	clock := clockid.NewFake(utc(2026, 9, 4, 13, 0))
+	s, err := New(j, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fired, err := s.Sweep(ctxT())
+	if err != nil || len(fired) != 1 {
+		t.Fatalf("post-crash recovery fire: %v %v", fired, err)
+	}
+}
+
+func midBatchChildMain() {
+	dir := os.Getenv("SCHED_CRASH_DIR")
+	events := Events()
+	for _, n := range machine.EventTypes() {
+		events[n] = nil
+	}
+	j, err := journal.Open(filepath.Join(dir, "journal.db"), "work", redact.None{}, events, NewProjection())
+	if err != nil {
+		os.Exit(1)
+	}
+	clock := clockid.NewFake(utc(2026, 9, 4, 10, 0))
+	s, err := New(j, clock)
+	if err != nil {
+		os.Exit(1)
+	}
+	if err := s.CreateReminder(context.Background(), "rem-mid", "mid batch", WallTime{
+		Year: 2026, Month: 9, Day: 4, Hour: 11, Minute: 0, TZ: "Europe/Zagreb"}); err != nil {
+		os.Exit(1)
+	}
+	clock.Advance(2 * time.Hour)
+	s.Sweep(context.Background()) // dies inside the batch via the seam
+	os.Exit(0)                    // unreachable if the seam fired
 }

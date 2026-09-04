@@ -125,3 +125,45 @@ func TestNoDegradedButOn(t *testing.T) {
 		}
 	}
 }
+
+// Scheduler observability is FAIL-CLOSED in doctor (Phase-4-r4 codex #7):
+// a malformed counter, an unreadable mirror, and a non-empty health file
+// are all OFF — only ENOENT-before-first-fire and a clean state are OK.
+func TestSchedulerObservabilityFailClosed(t *testing.T) {
+	find := func(checks []Check, name string) Check {
+		for _, c := range checks {
+			if c.Name == name {
+				return c
+			}
+		}
+		t.Fatalf("check %s missing", name)
+		return Check{}
+	}
+	env := func(t *testing.T) Env { return healthyEnv(t) }
+	// Baseline: absent files are OK.
+	e := env(t)
+	checks := Run(e)
+	if find(checks, "scheduler-fires").Status != StatusOK || find(checks, "scheduler-health").Status != StatusOK {
+		t.Fatal("absent scheduler files must be OK before the first fire")
+	}
+	// Malformed counter → OFF.
+	e2 := env(t)
+	os.MkdirAll(filepath.Join(e2.DataDir, "system"), 0o700)
+	os.WriteFile(filepath.Join(e2.DataDir, "system", "last_occurrence_fired"), []byte("not-a-number\n"), 0o600)
+	if find(Run(e2), "scheduler-fires").Status != StatusOff {
+		t.Fatal("malformed counter mirror reported OK")
+	}
+	// Non-empty health file → OFF.
+	e3 := env(t)
+	os.MkdirAll(filepath.Join(e3.DataDir, "system"), 0o700)
+	os.WriteFile(filepath.Join(e3.DataDir, "system", "scheduler_health"), []byte("schedule: counter mirror: boom"), 0o600)
+	if find(Run(e3), "scheduler-health").Status != StatusOff {
+		t.Fatal("recorded sweep failure reported OK")
+	}
+	// Unreadable health state (path is a DIRECTORY) → OFF.
+	e4 := env(t)
+	os.MkdirAll(filepath.Join(e4.DataDir, "system", "scheduler_health"), 0o700)
+	if find(Run(e4), "scheduler-health").Status != StatusOff {
+		t.Fatal("unreadable health mirror reported OK")
+	}
+}

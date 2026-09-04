@@ -60,7 +60,8 @@ func build(t *testing.T) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	events := Events(reg)
+	cap := NewDoneCapability()
+	events := Events(reg, cap)
 	for n, v := range schedule.Events() {
 		events[n] = v
 	}
@@ -79,7 +80,7 @@ func build(t *testing.T) *harness {
 	}
 	auth := s7min.NewAuthority(nil, time.Minute)
 	lazy := &LazyRunner{}
-	m, err := NewManager(j, sched, reg, clock, lazy, auth, dir)
+	m, err := NewManager(j, sched, reg, clock, lazy, auth, dir, cap)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,7 +248,8 @@ func TestLifecycleSurvivesRestart(t *testing.T) {
 	}
 	h.m.Journal().Close()
 	reg, _ := NewRegistry(map[string]Kind{"file_note": {Handler: FileNoteHandler(h.dir), ValidateParams: ValidateFileNoteParams}})
-	events := Events(reg)
+	cap2 := NewDoneCapability()
+	events := Events(reg, cap2)
 	for n, v := range schedule.Events() {
 		events[n] = v
 	}
@@ -261,7 +263,7 @@ func TestLifecycleSurvivesRestart(t *testing.T) {
 	defer j.Close()
 	sched, _ := schedule.New(j, h.clock)
 	auth2 := s7min.NewAuthority(nil, time.Minute)
-	m2, err := NewManager(j, sched, reg, h.clock, &LazyRunner{}, auth2, h.dir)
+	m2, err := NewManager(j, sched, reg, h.clock, &LazyRunner{}, auth2, h.dir, cap2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -396,12 +398,12 @@ func TestProjectionEnforcesExecutionProtocol(t *testing.T) {
 	}
 	// Forged attestation with NO claim: aborted.
 	ep, _ := h.m.params(EvTaskExecuted, executedPayload{ID: "task-p", OperationID: "op-forged",
-		ExpectedPath: "/tmp/notes.txt", MarkerLine: "[task-p] protocol"})
+		MarkerLine: "[task-p] protocol"})
 	if _, err := h.m.j.Append(ctxT(), ep); err == nil {
 		t.Fatal("attestation without a claim accepted")
 	}
-	// Forged DONE with no attestation: aborted.
-	dp, _ := h.m.params(EvTaskDone, donePayload{ID: "task-p", MarkerLine: "[task-p] protocol", Verifier: "postcondition-verifier"})
+	// Forged DONE with no attestation: aborted (even WITH the capability).
+	dp, _ := h.m.params(EvTaskDone, donePayload{ID: "task-p", MarkerLine: "[task-p] protocol", Verifier: "postcondition-verifier", Cap: string(h.m.cap)})
 	if _, err := h.m.j.Append(ctxT(), dp); err == nil {
 		t.Fatal("done without an attested execution accepted")
 	}
@@ -416,25 +418,25 @@ func TestProjectionEnforcesExecutionProtocol(t *testing.T) {
 	}
 	// Attestation under the WRONG operation: aborted.
 	ew, _ := h.m.params(EvTaskExecuted, executedPayload{ID: "task-p", OperationID: "op-two",
-		ExpectedPath: "/tmp/notes.txt", MarkerLine: "[task-p] protocol"})
+		MarkerLine: "[task-p] protocol"})
 	if _, err := h.m.j.Append(ctxT(), ew); err == nil {
 		t.Fatal("attestation under an unclaimed operation accepted")
 	}
 	// A forged marker under the VALID claim aborts (the projection
 	// recomputes the canonical expectation — r3 codex #10).
 	efm, _ := h.m.params(EvTaskExecuted, executedPayload{ID: "task-p", OperationID: "op-one",
-		ExpectedPath: "/tmp/notes.txt", MarkerLine: "[task-p] forged content"})
+		MarkerLine: "[task-p] forged content"})
 	if _, err := h.m.j.Append(ctxT(), efm); err == nil {
 		t.Fatal("forged marker accepted under a valid claim")
 	}
 	// Correct attestation (canonical marker + notes path) lands ONCE.
 	eok, _ := h.m.params(EvTaskExecuted, executedPayload{ID: "task-p", OperationID: "op-one",
-		ExpectedPath: "/tmp/notes.txt", MarkerLine: "[task-p] protocol"})
+		MarkerLine: "[task-p] protocol"})
 	if _, err := h.m.j.Append(ctxT(), eok); err != nil {
 		t.Fatal(err)
 	}
 	eagain, _ := h.m.params(EvTaskExecuted, executedPayload{ID: "task-p", OperationID: "op-one",
-		ExpectedPath: "/tmp/notes.txt", MarkerLine: "[task-p] protocol"})
+		MarkerLine: "[task-p] protocol"})
 	if _, err := h.m.j.Append(ctxT(), eagain); err == nil {
 		t.Fatal("attestation overwrite accepted")
 	}
@@ -478,29 +480,117 @@ func TestDeliveryReceiptAndGestureRequired(t *testing.T) {
 	}
 }
 
-// The live-executor lease (Phase-4-r3 codex #2): two PARALLEL governed
-// executions of one task — exactly one runs; the file carries ONE line.
+// The live-executor lease (Phase-4-r3 codex #2, r4 #3): call A is HELD
+// INSIDE the claim→effect window by a blocking handler while call B
+// enters with a DISTINCT operation — B must be refused by the lease, and
+// the file carries ONE line.
 func TestParallelExecutionSingleEffect(t *testing.T) {
-	h := build(t)
+	dir := t.TempDir()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	blockingKind := Kind{
+		ValidateParams: ValidateFileNoteParams,
+		Handler: func(ctx context.Context, taskID, params string) (string, string, error) {
+			close(entered)
+			<-release // A is now parked INSIDE the window
+			return FileNoteHandler(dir)(ctx, taskID, params)
+		},
+	}
+	h := buildWithKind(t, dir, "file_note", blockingKind)
 	if err := h.m.CreateTask(ctxT(), "task-par", "file_note", `{"note":"parallel"}`); err != nil {
 		t.Fatal(err)
 	}
-	errs := make(chan error, 2)
-	for i := 0; i < 2; i++ {
-		go func() { errs <- h.m.RunTask(ctxT(), "task-par") }()
+	aDone := make(chan error, 1)
+	go func() { aDone <- h.m.RunTask(ctxT(), "task-par") }()
+	<-entered // A holds the window
+	bErr := h.m.RunTask(ctxT(), "task-par")
+	if bErr == nil || !strings.Contains(bErr.Error(), "in progress") {
+		t.Fatalf("second executor entered the claim→effect window: %v", bErr)
 	}
-	failures := 0
-	for i := 0; i < 2; i++ {
-		if e := <-errs; e != nil {
-			failures++
-		}
+	close(release)
+	if err := <-aDone; err != nil {
+		t.Fatal(err)
 	}
-	if failures != 1 {
-		t.Fatalf("want exactly one refused parallel execution, got %d failures", failures)
-	}
-	b, _ := os.ReadFile(filepath.Join(h.dir, "notes.txt"))
+	b, _ := os.ReadFile(filepath.Join(dir, "notes.txt"))
 	if n := strings.Count(string(b), "[task-par] parallel"); n != 1 {
 		t.Fatalf("parallel execution wrote the note %d times: %q", n, b)
+	}
+}
+
+// buildWithKind builds the production-shaped harness around a custom kind.
+func buildWithKind(t *testing.T, dir, kindName string, k Kind) *harness {
+	t.Helper()
+	clock := clockid.NewFake(time.Date(2026, 9, 4, 10, 0, 0, 0, time.UTC))
+	reg, err := NewRegistry(map[string]Kind{kindName: k})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cap := NewDoneCapability()
+	events := Events(reg, cap)
+	for n, v := range schedule.Events() {
+		events[n] = v
+	}
+	for _, n := range machine.EventTypes() {
+		events[n] = nil
+	}
+	j, err := journal.Open(filepath.Join(dir, "journal.db"), "work", redact.None{}, events,
+		schedule.NewProjection(), NewProjection())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { j.Close() })
+	sched, err := schedule.New(j, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth := s7min.NewAuthority(nil, time.Minute)
+	lazy := &LazyRunner{}
+	m, err := NewManager(j, sched, reg, clock, lazy, auth, dir, cap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pep, err := effectpath.NewPEP(Rules(), effectpath.NewApprovals(nil, time.Minute), nopAudit{}, effectpath.ModeYolo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := effectpath.NewEffectPath(pep, nopMW{},
+		effectpath.NewInProcessExecutor(Tools(m)),
+		effectpath.NewSandboxedProcessExecutor(nil), auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lazy.R = path
+	sched.SetFireDecorator(m.FireParams)
+	return &harness{m: m, sched: sched, clock: clock, dir: dir, path: filepath.Join(dir, "journal.db")}
+}
+
+// The DONE admission capability (r4 codex #5): the FULL forged chain —
+// valid claim, canonical marker, matching done, plausible verifier —
+// dies at the capability gate; only the verifying manager holds it.
+func TestForgedDoneChainDiesAtCapability(t *testing.T) {
+	h := build(t)
+	if err := h.m.CreateTask(ctxT(), "task-f", "file_note", `{"note":"forged"}`); err != nil {
+		t.Fatal(err)
+	}
+	i1, _ := h.m.params(EvTaskIntent, intentPayload{ID: "task-f", OperationID: "op-f"})
+	if _, err := h.m.j.Append(ctxT(), i1); err != nil {
+		t.Fatal(err)
+	}
+	e1, _ := h.m.params(EvTaskExecuted, executedPayload{ID: "task-f", OperationID: "op-f",
+		MarkerLine: "[task-f] forged"})
+	if _, err := h.m.j.Append(ctxT(), e1); err != nil {
+		t.Fatal(err)
+	}
+	// No capability / wrong capability: refused at ADMISSION.
+	for name, cap := range map[string]string{"missing": "", "wrong": "deadbeef"} {
+		d, _ := h.m.params(EvTaskDone, donePayload{ID: "task-f",
+			MarkerLine: "[task-f] forged", Verifier: "postcondition-verifier", Cap: cap})
+		if _, err := h.m.j.Append(ctxT(), d); err == nil {
+			t.Fatalf("%s-capability forged DONE accepted — no note exists, no checker ran", name)
+		}
+	}
+	if st, _ := h.m.Status(ctxT(), "task-f"); st == StateDone {
+		t.Fatal("forged chain closed the task")
 	}
 }
 

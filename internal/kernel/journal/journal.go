@@ -24,6 +24,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
+	"testing"
 
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
 	"github.com/MatNik89/nexus/internal/security/redact"
@@ -535,6 +537,12 @@ func (j *Journal) appendBatch(batch []contracts.EnvelopeParams, firstOffset uint
 		}
 		evs = append(evs, ev)
 		offset, hash = ev.JournalOffset+1, ev.IntegrityHash
+		// Crash-consistency seam (test builds only): SIGKILL between
+		// recipe members — the transaction must leave NOTHING durable.
+		if len(evs) == 1 && len(prepared) > 1 && testing.Testing() &&
+			os.Getenv("NEXUS_TEST_KILL_MID_BATCH") == "1" {
+			syscall.Kill(os.Getpid(), syscall.SIGKILL)
+		}
 	}
 	if testFailCommit != nil {
 		if err := testFailCommit(); err != nil {

@@ -19,7 +19,10 @@ package obligation
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -38,6 +41,9 @@ import (
 	"github.com/MatNik89/nexus/internal/kernel/s7min"
 	"github.com/MatNik89/nexus/internal/schedule"
 )
+
+// ErrMigrationRequired is the TYPED unrecoverable-legacy-shape failure.
+var ErrMigrationRequired = errors.New("MIGRATION_REQUIRED")
 
 // State is the closed obligation lifecycle state.
 type State string
@@ -114,15 +120,19 @@ type intentPayload struct {
 }
 
 type executedPayload struct {
-	ID           string `json:"id"`
-	OperationID  string `json:"operation_id"`
-	ExpectedPath string `json:"expected_path"`
-	MarkerLine   string `json:"marker_line"`
-	Reconciled   bool   `json:"reconciled,omitempty"`
+	ID          string `json:"id"`
+	OperationID string `json:"operation_id"`
+	MarkerLine  string `json:"marker_line"`
+	Reconciled  bool   `json:"reconciled,omitempty"`
 }
 
 type donePayload struct {
 	ID string `json:"id"`
+	// Cap is the process-local ADMISSION CAPABILITY: only the manager
+	// (which ran the checker) holds it — a generic in-process producer
+	// cannot mint a DONE (Phase-4-r4 codex #5). The capability gates
+	// APPEND only; replay never re-checks it (restart mints a new one).
+	Cap string `json:"cap"`
 	// MarkerLine + Verifier bind DONE to the verified artifact and the
 	// independent verifier identity (checker != worker; Phase-4-r3 codex
 	// #10). topknot ceiling: cryptographic verifier attestation is
@@ -132,11 +142,26 @@ type donePayload struct {
 	Verifier   string `json:"verifier"`
 }
 
+// DoneCapability is the opaque admission token binding task_done appends
+// to the verifying manager.
+type DoneCapability string
+
+// NewDoneCapability mints a fresh process-local capability.
+func NewDoneCapability() DoneCapability {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		panic(err) // no entropy = no process
+	}
+	return DoneCapability(hex.EncodeToString(b))
+}
+
 // Events returns the payload validators — the kind discriminator AND
 // each kind's params schema are SEALED at the JOURNAL boundary (Phase-4
-// codex #13, r3 #5/#9): a forged in-process producer cannot admit an
-// unknown kind, malformed params, or a marker-ambiguous id.
-func Events(reg *Registry) map[string]journal.PayloadValidator {
+// codex #13, r3 #5/#9), and task_done requires the manager's admission
+// CAPABILITY (r4 codex #5): a forged in-process producer cannot admit an
+// unknown kind, malformed params, a marker-ambiguous id, or an
+// unverified DONE.
+func Events(reg *Registry, cap DoneCapability) map[string]journal.PayloadValidator {
 	allowed := map[string]func(string) error{"reminder": func(string) error { return nil }}
 	if reg != nil {
 		for k, v := range reg.kinds {
@@ -209,8 +234,8 @@ func Events(reg *Registry) map[string]journal.PayloadValidator {
 			if err := json.Unmarshal(raw, &p); err != nil {
 				return err
 			}
-			if p.ID == "" || p.OperationID == "" || p.ExpectedPath == "" || p.MarkerLine == "" {
-				return fmt.Errorf("obligation: execution attestation requires operation id, path and marker line")
+			if p.ID == "" || p.OperationID == "" || p.MarkerLine == "" {
+				return fmt.Errorf("obligation: execution attestation requires operation id and marker line")
 			}
 			return nil
 		},
@@ -221,6 +246,9 @@ func Events(reg *Registry) map[string]journal.PayloadValidator {
 			}
 			if p.ID == "" || p.MarkerLine == "" || p.Verifier == "" || p.Verifier == "file_note-handler" {
 				return fmt.Errorf("obligation: done requires the verified marker and an independent verifier identity")
+			}
+			if cap == "" || p.Cap != string(cap) {
+				return fmt.Errorf("obligation: done without the verifying manager's admission capability (fail closed)")
 			}
 			return nil
 		},
@@ -335,7 +363,8 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 			return err
 		}
 		if p.Producer == "" || p.ReceiptID == "" {
-			return fmt.Errorf("obligation: delivery without its receipt identity (fail closed)")
+			// A v1 delivered payload carried only the occurrence id.
+			return fmt.Errorf("obligation: a previous-revision delivered event carries no receipt identity: %w", ErrMigrationRequired)
 		}
 		// The REAL delivery instant + producer persist (codex #2): ack
 		// grading consumes these durable values, never synthesized ones.
@@ -347,7 +376,8 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 			return err
 		}
 		if p.Source == "" {
-			return fmt.Errorf("obligation: ack without its gesture source (fail closed)")
+			// A v1 acked payload carried only the occurrence id.
+			return fmt.Errorf("obligation: a previous-revision acked event carries no gesture source: %w", ErrMigrationRequired)
 		}
 		return step(p.OccurrenceID, EvAcked, ", acked_by=?", p.Source)
 	case EvExpired:
@@ -381,7 +411,7 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 		// Legacy shapes (no operation id / no marker) are unrecoverable:
 		// fail loudly, never reinterpret (Phase-4-r3 codex #12 / kilo).
 		if p.OperationID == "" || p.MarkerLine == "" {
-			return fmt.Errorf("obligation: MIGRATION_REQUIRED — a previous-revision task_executed carries no claim/marker")
+			return fmt.Errorf("obligation: a previous-revision task_executed carries no claim/marker: %w", ErrMigrationRequired)
 		}
 		// The marker is DETERMINISTIC from the task's own canonical
 		// params — the projection RECOMPUTES it, so a forged attestation
@@ -404,12 +434,12 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 		if expected, eerr := expectedMarker(p.ID, tp); eerr != nil || p.MarkerLine != expected {
 			return fmt.Errorf("obligation: attested marker does not match the task's canonical expectation (forged attestation — fail closed)")
 		}
-		if !strings.HasSuffix(p.ExpectedPath, "/notes.txt") {
-			return fmt.Errorf("obligation: attested path is not the notes file (fail closed)")
-		}
-		res, err := tx.Exec(`UPDATE obl_obligations SET expected_path=?, marker_line=?
+		// NO path in the event: the artifact identity is the canonical
+		// profile notes file, derived by the profile-bound manager —
+		// an attacker-chosen path cannot exist (r4 codex #5).
+		res, err := tx.Exec(`UPDATE obl_obligations SET marker_line=?
 			WHERE id=? AND status=? AND intent_op=? AND intent_op!='' AND marker_line=''`,
-			p.ExpectedPath, p.MarkerLine, p.ID, string(StateOpen), p.OperationID)
+			p.MarkerLine, p.ID, string(StateOpen), p.OperationID)
 		if err != nil {
 			return err
 		}
@@ -448,7 +478,7 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 		// the verifier graded, from a non-worker verifier (codex #18/#10):
 		// a done for an unattested task or with a mismatched marker aborts.
 		if p.MarkerLine == "" || p.Verifier == "" {
-			return fmt.Errorf("obligation: MIGRATION_REQUIRED — a previous-revision task_done carries no verification identity")
+			return fmt.Errorf("obligation: a previous-revision task_done carries no verification identity: %w", ErrMigrationRequired)
 		}
 		res, err := tx.Exec(`UPDATE obl_obligations SET status=? WHERE id=? AND marker_line=? AND marker_line!=''`,
 			string(next), p.ID, p.MarkerLine)
@@ -583,16 +613,17 @@ type Manager struct {
 	runner   EffectRunner
 	auth     *s7min.Authority
 	notesDir string // IMMUTABLE profile-bound reconcile root (B3 — no globals)
+	cap      DoneCapability
 	inflight sync.Map
 	seq      atomic.Uint64
 }
 
 func NewManager(j *journal.Journal, s *schedule.Scheduler, r *Registry, c clockid.Clock,
-	runner EffectRunner, auth *s7min.Authority, notesDir string) (*Manager, error) {
-	if j == nil || s == nil || r == nil || c == nil || runner == nil || auth == nil || notesDir == "" {
-		return nil, fmt.Errorf("obligation: journal, scheduler, registry, clock, effect runner, S7 authority and notes dir are required (fail closed)")
+	runner EffectRunner, auth *s7min.Authority, notesDir string, cap DoneCapability) (*Manager, error) {
+	if j == nil || s == nil || r == nil || c == nil || runner == nil || auth == nil || notesDir == "" || cap == "" {
+		return nil, fmt.Errorf("obligation: journal, scheduler, registry, clock, effect runner, S7 authority, notes dir and done capability are required (fail closed)")
 	}
-	return &Manager{j: j, sched: s, reg: r, clock: c, runner: runner, auth: auth, notesDir: notesDir}, nil
+	return &Manager{j: j, sched: s, reg: r, clock: c, runner: runner, auth: auth, notesDir: notesDir, cap: cap}, nil
 }
 
 func (m *Manager) Journal() *journal.Journal { return m.j }
@@ -842,7 +873,7 @@ func (m *Manager) executeGoverned(ctx context.Context, id, opSuffix string) (str
 			probablePath := filepath.Join(m.notesDir, "notes.txt")
 			present, ferr := fileContainsLine(probablePath, probableLine)
 			if ferr == nil && present {
-				if err := m.attestExecution(ctx, id, op, probablePath, probableLine, true); err != nil {
+				if err := m.attestExecution(ctx, id, op, probableLine, true); err != nil {
 					return "", "", err
 				}
 				return probablePath, probableLine, nil
@@ -864,7 +895,7 @@ func (m *Manager) executeGoverned(ctx context.Context, id, opSuffix string) (str
 	if err != nil {
 		return "", "", fmt.Errorf("obligation: handler: %w", err)
 	}
-	if err := m.attestExecution(ctx, id, op, path, line, false); err != nil {
+	if err := m.attestExecution(ctx, id, op, line, false); err != nil {
 		return "", "", err
 	}
 	return path, line, nil
@@ -875,7 +906,9 @@ func (m *Manager) executeGoverned(ctx context.Context, id, opSuffix string) (str
 // intent/reconcile/attest sequence, so the model path and this
 // programmatic path share ONE discipline.
 func (m *Manager) RunTask(ctx context.Context, id string) error {
-	op := contracts.OperationID(fmt.Sprintf("task-%s-%d", id, m.clock.Now().UnixNano()))
+	// seq guarantees distinct operations even under a pinned test clock
+	// (r4 codex #3: identical ops made the parallel RED vacuous).
+	op := contracts.OperationID(fmt.Sprintf("task-%s-%d-%d", id, m.clock.Now().UnixNano(), m.seq.Add(1)))
 	args, err := json.Marshal(map[string]string{"task_id": id})
 	if err != nil {
 		return err
@@ -917,8 +950,8 @@ func (m *Manager) probableMarker(id, taskParams string) (string, error) {
 	return expectedMarker(id, taskParams)
 }
 
-func (m *Manager) attestExecution(ctx context.Context, id, op, path, line string, reconciled bool) error {
-	p, err := m.params(EvTaskExecuted, executedPayload{ID: id, OperationID: op, ExpectedPath: path, MarkerLine: line, Reconciled: reconciled})
+func (m *Manager) attestExecution(ctx context.Context, id, op, line string, reconciled bool) error {
+	p, err := m.params(EvTaskExecuted, executedPayload{ID: id, OperationID: op, MarkerLine: line, Reconciled: reconciled})
 	if err != nil {
 		return err
 	}
@@ -934,16 +967,18 @@ func (m *Manager) attestExecution(ctx context.Context, id, op, path, line string
 // (replay determinism forbids filesystem reads inside the projection
 // transaction); the marker artifact itself is append-stable.
 func (m *Manager) MarkTaskDone(ctx context.Context, id string) error {
-	_, _, _, markerLine, expPath, status, err := m.taskRow(ctx, id)
+	_, _, _, markerLine, _, status, err := m.taskRow(ctx, id)
 	if err != nil {
 		return err
 	}
 	if status != StateOpen {
 		return fmt.Errorf("obligation: task %s is not OPEN", id)
 	}
-	if markerLine == "" || expPath == "" {
+	if markerLine == "" {
 		return fmt.Errorf("obligation: done refused — the task has no attested execution (E13: no evidence, no done)")
 	}
+	// The artifact identity is CANONICAL: the profile-bound notes file.
+	expPath := filepath.Join(m.notesDir, "notes.txt")
 	present, err := fileContainsLine(expPath, markerLine)
 	if err != nil {
 		return fmt.Errorf("obligation: postcondition verify: %w", err)
@@ -960,7 +995,7 @@ func (m *Manager) MarkTaskDone(ctx context.Context, id string) error {
 	if !verdict.Pass {
 		return fmt.Errorf("obligation: done refused — the postcondition does not verify (the task's marker line is absent)")
 	}
-	p, err := m.params(EvTaskDone, donePayload{ID: id, MarkerLine: markerLine, Verifier: "postcondition-verifier"})
+	p, err := m.params(EvTaskDone, donePayload{ID: id, MarkerLine: markerLine, Verifier: "postcondition-verifier", Cap: string(m.cap)})
 	if err != nil {
 		return err
 	}

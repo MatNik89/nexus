@@ -144,13 +144,24 @@ func Run(e Env) []Check {
 
 	// 6b: scheduler health mirror — a non-empty file is a live failure.
 	healthPath := filepath.Join(e.DataDir, "system", "scheduler_health")
-	if hb, herr := os.ReadFile(healthPath); herr == nil && strings.TrimSpace(string(hb)) != "" {
+	if hb, herr := os.ReadFile(healthPath); herr == nil {
+		if v := strings.TrimSpace(string(hb)); v != "" {
+			checks = append(checks, Check{Name: "scheduler-health", Capability: "obligations",
+				Status: StatusOff, Detail: "last sweep failed: " + v,
+				Fix: "inspect the daemon log; the next successful sweep clears this"})
+		} else {
+			checks = append(checks, Check{Name: "scheduler-health", Capability: "obligations",
+				Status: StatusOK, Detail: "no sweep failures recorded"})
+		}
+	} else if os.IsNotExist(herr) {
 		checks = append(checks, Check{Name: "scheduler-health", Capability: "obligations",
-			Status: StatusOff, Detail: "last sweep failed: " + strings.TrimSpace(string(hb)),
-			Fix: "inspect the daemon log; the next successful sweep clears this"})
+			Status: StatusOK, Detail: "no health mirror yet (daemon not started)"})
 	} else {
+		// EACCES/EISDIR/I-O is broken observability, never health
+		// (Phase-4-r4 codex #7).
 		checks = append(checks, Check{Name: "scheduler-health", Capability: "obligations",
-			Status: StatusOK, Detail: "no sweep failures recorded"})
+			Status: StatusOff, Detail: "health mirror unreadable: " + herr.Error(),
+			Fix: "fix permissions on " + healthPath})
 	}
 
 	// 5. Telegram token → telegram capability.

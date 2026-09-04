@@ -132,19 +132,27 @@ func runDaemon() int {
 	// means healthy.
 	go func() {
 		healthPath := filepath.Join(layout.SystemDir(), "scheduler_health")
-		t := time.NewTicker(30 * time.Second)
+		mirror := func() {
+			msg := ""
+			if herr := b.sched.Health(); herr != nil {
+				msg = herr.Error()
+				fmt.Fprintf(os.Stderr, "nexus daemon: scheduler: %v\n", herr)
+			}
+			if werr := atomicwrite.Write(healthPath, []byte(msg), 0o600); werr != nil {
+				// The mirror ITSELF failing is loud, never silent
+				// (Phase-4-r4 codex #7).
+				fmt.Fprintf(os.Stderr, "nexus daemon: health mirror: %v\n", werr)
+			}
+		}
+		mirror() // immediate: the startup sweep's outcome is captured
+		t := time.NewTicker(5 * time.Second)
 		defer t.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				msg := ""
-				if herr := b.sched.Health(); herr != nil {
-					msg = herr.Error()
-					fmt.Fprintf(os.Stderr, "nexus daemon: scheduler: %v\n", herr)
-				}
-				atomicwrite.Write(healthPath, []byte(msg), 0o600)
+				mirror()
 			}
 		}
 	}()
@@ -199,7 +207,8 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 	for n, v := range schedule.Events() {
 		events[n] = v
 	}
-	for n, v := range obligation.Events(registry) {
+	doneCap := obligation.NewDoneCapability()
+	for n, v := range obligation.Events(registry, doneCap) {
 		events[n] = v
 	}
 
@@ -230,7 +239,7 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 	}
 	sched.SetCounterFile(filepath.Join(layout.SystemDir(), "last_occurrence_fired"))
 	lazyRunner := &obligation.LazyRunner{}
-	oblManager, err := obligation.NewManager(j, sched, registry, clockid.System{}, lazyRunner, authority, profileDir)
+	oblManager, err := obligation.NewManager(j, sched, registry, clockid.System{}, lazyRunner, authority, profileDir, doneCap)
 	if err != nil {
 		j.Close()
 		return nil, err

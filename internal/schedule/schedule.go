@@ -20,6 +20,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -213,7 +214,7 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 			// ORIGINAL promise is unrecoverable and deriving one at
 			// replay would depend on the CURRENT tzdata (non-
 			// deterministic replay — Phase-4-r3 codex #12). Fail loudly.
-			return fmt.Errorf("schedule: MIGRATION_REQUIRED — a v1 schedule.created has no resolved due instant; re-create the reminder")
+			return fmt.Errorf("schedule: a v1 schedule.created has no resolved due instant (re-create the reminder): %w", ErrMigrationRequired)
 		}
 		if _, err := tx.Exec(`INSERT INTO sched_schedules(id, body, wall, due_utc, fired, created) VALUES(?,?,?,?,0,?)`,
 			p.ID, p.Body, string(wall), p.DueUTC, int64(ev.JournalOffset)); err != nil {
@@ -244,6 +245,10 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 }
 
 const errAlreadyFired = "ALREADY_FIRED"
+
+// ErrMigrationRequired is the TYPED unrecoverable-legacy-shape failure:
+// operators distinguish migration from corruption via errors.Is.
+var ErrMigrationRequired = errors.New("MIGRATION_REQUIRED")
 
 // FireDecorator lets an owner (the obligation store) add its own events
 // to the SAME fire batch — the crash window between occurrence-fire and
