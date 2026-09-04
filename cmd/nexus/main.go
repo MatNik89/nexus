@@ -228,7 +228,7 @@ func runDaemon() int {
 			fmt.Fprintln(os.Stderr, "nexus daemon: telegram token set but no chat bindings (NEXUS_TELEGRAM_BINDINGS=\"chatid=profile,...\") — adapter stays OFF (deny-default)")
 		default:
 			adapter, aerr := telegram.New(telegram.Config{
-				APIBase:  "https://api.telegram.org",
+				APIBase:  resolved.Config.TelegramAPIBase,
 				TokenEnv: resolved.Config.TelegramTokenEnv,
 				Bindings: bindings,
 				Profile:  b.profile,
@@ -749,7 +749,7 @@ func runDoctorP0() int {
 	} else if len(bindings) == 0 {
 		tgWhy = "no chat bindings (NEXUS_TELEGRAM_BINDINGS)"
 	} else if adapter, aerr := telegram.New(telegram.Config{
-		APIBase: "https://api.telegram.org", TokenEnv: resolved.Config.TelegramTokenEnv,
+		APIBase: resolved.Config.TelegramAPIBase, TokenEnv: resolved.Config.TelegramTokenEnv,
 		Bindings: bindings, Profile: resolved.Config.DefaultProfile,
 	}, mustProbeCore(layout, resolved), func(context.Context, channel.Inbound) (string, error) { return "", nil }); aerr != nil {
 		tgWhy = aerr.Error()

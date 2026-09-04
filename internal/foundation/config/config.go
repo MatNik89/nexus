@@ -25,12 +25,15 @@ import (
 
 // Config is the single typed configuration (E3: no map[string]any).
 type Config struct {
-	ProviderBaseURL  string              `json:"provider_base_url"`
-	ProviderKeyEnv   string              `json:"provider_key_env"`
-	ProviderModel    string              `json:"provider_model"`
-	TelegramTokenEnv string              `json:"telegram_token_env"`
-	DefaultProfile   contracts.ProfileID `json:"default_profile"`
-	EgressAllow      []string            `json:"egress_allow"`
+	ProviderBaseURL  string `json:"provider_base_url"`
+	ProviderKeyEnv   string `json:"provider_key_env"`
+	ProviderModel    string `json:"provider_model"`
+	TelegramTokenEnv string `json:"telegram_token_env"`
+	// TelegramAPIBase overrides the Bot API endpoint (local bot-api
+	// server, acceptance harness); default is the production URL.
+	TelegramAPIBase string              `json:"telegram_api_base"`
+	DefaultProfile  contracts.ProfileID `json:"default_profile"`
+	EgressAllow     []string            `json:"egress_allow"`
 	// ExecAllow is the DENY-DEFAULT promoted-target allowlist for the
 	// exec tool: absolute program paths the owner explicitly trusts.
 	// Empty = exec refuses everything (Phase-6 codex #5: without it any
@@ -85,6 +88,7 @@ var keySchema = map[string]keyKind{
 	"provider_key_env":   kindString,
 	"provider_model":     kindString,
 	"telegram_token_env": kindString,
+	"telegram_api_base":  kindString,
 	"default_profile":    kindString,
 	"egress_allow":       kindStringList,
 	"exec_allow":         kindStringList,
@@ -108,6 +112,7 @@ func defaults() Config {
 	return Config{
 		ProviderKeyEnv:   "NEXUS_API_KEY",
 		TelegramTokenEnv: "NEXUS_TELEGRAM_TOKEN",
+		TelegramAPIBase:  "https://api.telegram.org",
 		DefaultProfile:   "private",
 	}
 }
@@ -276,6 +281,8 @@ func applyValue(c *Config, key string, v value) error {
 		c.ProviderModel = v.str
 	case "telegram_token_env":
 		c.TelegramTokenEnv = v.str
+	case "telegram_api_base":
+		c.TelegramAPIBase = v.str
 	case "default_profile":
 		p := contracts.ProfileID(v.str)
 		if !p.Valid() {
