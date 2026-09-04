@@ -319,7 +319,7 @@ round. Reviews: docs/REVIEW-PHASE5*.md.
 
 ## Phase 6 — sandboxed exec (gated by T02)
 
-**[ ] T25 — SandboxBackend + bwrap backend (S6.2-P0).**
+**[x] T25 (446a12b..e78771f) — SandboxBackend + bwrap backend (S6.2-P0).**
 `SandboxBackend{Probe,Compile,Launch,Attest}`; bwrap: B4 closure (`/usr`,`/lib*`,`/bin`,
 `/sbin` dirs; `/etc/ld.so.cache`+CA certs FILE grants; never recursive `/etc`), disposable
 RW workdir, net unshared, S1.2 identity inside Launch; promoted absolute ELF only;
@@ -329,13 +329,26 @@ Acceptance: T02 hostile suite re-run through the REAL backend → GREEN.
 RED: `/etc/shadow` → EACCES; egress denied; `/bin/ls` runs; shebang rejected; timeout →
 tree dead; attestation mismatch → result untrusted.
 
-**[ ] T26 — Exec tool on the effect-path.**
+**[x] T26 (c2884ce..e78771f) — Exec tool on the effect-path.**
 `ExecutionKind=ExecProcess` sealed; one-shot exec through T14 EffectPath → T25 backend;
 observation pruning preserves exit status + error lines.
 Trace: E5/E8; DESIGN-FIXES; PRD §6 item 6.
 Acceptance: model-requested command runs sandboxed e2e, ASK path exercised.
 RED: `TestReadOnlyProcessStillSandboxed` (real-backend integration — owned HERE);
 unknown kind → reject.
+
+**Phase 6 convergence (2026-09-05, merged to main):** deep + full security-surface
+integration review (mandatory gate b), 5 rounds (codex/kilo/agy): r1 codex FAIL 6
+(trust laundering on resume, version-only fake backend, pathname-not-bytes intent,
+severed S7 cancel, interpreter loophole, dup-key ambiguity) + kilo FAIL 2 (dup-key
+hash collapse, unredacted exec output) → folds: resumeBlocks trust preservation,
+backend trust root (root-owned canonical path before any behavioral canary), FULL
+runtime-closure pin in policyHash, ctx cancel-watch, deny-default exec_allow,
+duplicate-JSON rejection at ToolCall construction, exec-output redaction → r3 caught
+a process failure (pre-commit ablation checkout shipped dead code — real code landed
+b575e3a) → r5 3×PASS. Real find en route: journal redaction reordered JSON keys and
+self-invalidated every multi-key approval (EffectHash now canonical + injective).
+Reviews: docs/REVIEW-PHASE6*.md.
 
 ## Phase 7 — P0 closure
 
