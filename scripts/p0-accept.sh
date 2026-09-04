@@ -8,8 +8,16 @@ set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
+# The acceptance signer's allowed_signers hash is PINNED into the graded
+# binary (-ldflags): the binary itself is the trust anchor (r3 codex #1).
+KEY="${NEXUS_RELEASE_KEY:?set NEXUS_RELEASE_KEY to the owner ssh private key}"
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nexus"
+mkdir -p "$CONF_DIR"
+SIGNERS="$CONF_DIR/allowed_signers"
+printf 'owner %s\n' "$(cat "$KEY.pub")" > "$SIGNERS"
+FP="$(sha256sum "$SIGNERS" | cut -d' ' -f1)"
 BIN="$WORK/nexus"
-CGO_ENABLED=0 go build -o "$BIN" "$ROOT/cmd/nexus"
+CGO_ENABLED=0 go build -ldflags "-X main.acceptanceSignerFingerprint=$FP" -o "$BIN" "$ROOT/cmd/nexus"
 DIGEST="$(sha256sum "$BIN" | cut -d' ' -f1)"
 echo "acceptance: grading binary sha256=$DIGEST"
 cd "$ROOT"
@@ -17,7 +25,6 @@ NEXUS_ACCEPT_BIN="$BIN" CGO_ENABLED=0 go test -count=1 -timeout 900s ./internal/
 # The attestation is SIGNED (T27-r2 codex #2: a plain JSON is forgeable
 # by any process that can write the config dir). NEXUS_RELEASE_KEY names
 # the owner ssh key; doctor verifies against <config>/nexus/allowed_signers.
-KEY="${NEXUS_RELEASE_KEY:?set NEXUS_RELEASE_KEY to the owner ssh private key}"
 OUT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nexus/system"
 mkdir -p "$OUT_DIR"
 cat > "$OUT_DIR/acceptance.json" <<JSON

@@ -48,6 +48,13 @@ import (
 
 var version = "0.0.1-p0"
 
+// acceptanceSignerFingerprint pins the sha256 of the allowed_signers
+// file at BUILD time (-ldflags -X). The trust anchor is therefore the
+// binary itself (installed via the signed release), not a user-writable
+// file an attacker without the owner key could replace (T27-r3 codex
+// #1). Empty = this build cannot grant P0-capable.
+var acceptanceSignerFingerprint string
+
 func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
@@ -871,25 +878,44 @@ func verifyAcceptanceAttestation(layout pathx.Layout) (bool, string) {
 	if hex.EncodeToString(h.Sum(nil)) != att.BinarySHA256 {
 		return false, "this binary is NOT the one the acceptance suite graded (digest mismatch, fail closed)"
 	}
-	// PROVENANCE (T27-r2 codex #2): the attestation must carry the
-	// owner's signature — an unsigned JSON in a user-writable directory
-	// is not evidence. Verified against <config>/nexus/allowed_signers
-	// in the nexus-acceptance namespace.
+	// PROVENANCE (T27-r2 codex #2, hardened per r3 codex #1): the
+	// attestation must carry the owner's signature, the trust anchor
+	// (allowed_signers) must hash to the fingerprint COMPILED INTO this
+	// binary, and the verifier is a FIXED root-owned executable — a
+	// key-less attacker can neither replace the anchor nor shim the
+	// verifier. A rebuilt binary with a different pin is outside the
+	// boundary: the owner installs only signed releases.
+	if acceptanceSignerFingerprint == "" {
+		return false, "this build carries no pinned acceptance signer (build via scripts/p0-accept.sh)"
+	}
 	attPath := filepath.Join(layout.SystemDir(), "acceptance.json")
 	sigPath := attPath + ".sig"
 	signers := filepath.Join(layout.Base, "allowed_signers")
 	if _, err := os.Stat(sigPath); err != nil {
 		return false, "acceptance attestation is UNSIGNED — run scripts/p0-accept.sh with NEXUS_RELEASE_KEY"
 	}
-	if _, err := os.Stat(signers); err != nil {
+	signersBytes, err := os.ReadFile(signers)
+	if err != nil {
 		return false, "no allowed_signers file at " + signers + " (install the owner public key)"
+	}
+	sum := sha256.Sum256(signersBytes)
+	if hex.EncodeToString(sum[:]) != acceptanceSignerFingerprint {
+		return false, "allowed_signers does NOT match the fingerprint pinned in this binary (trust anchor replaced, fail closed)"
+	}
+	const verifier = "/usr/bin/ssh-keygen"
+	vst, err := os.Stat(verifier)
+	if err != nil {
+		return false, verifier + " missing (openssh-client is a declared prerequisite)"
+	}
+	if sys, ok := vst.Sys().(*syscall.Stat_t); !ok || sys.Uid != 0 || vst.Mode().Perm()&0o022 != 0 {
+		return false, verifier + " is not a root-owned, non-writable executable (fail closed)"
 	}
 	attFile, err := os.Open(attPath)
 	if err != nil {
 		return false, err.Error()
 	}
 	defer attFile.Close()
-	cmd := exec.Command("ssh-keygen", "-Y", "verify", "-f", signers, "-I", "owner",
+	cmd := exec.Command(verifier, "-Y", "verify", "-f", signers, "-I", "owner",
 		"-n", "nexus-acceptance", "-s", sigPath)
 	cmd.Stdin = attFile
 	if out, err := cmd.CombinedOutput(); err != nil {

@@ -12,6 +12,7 @@ package acceptance
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -24,6 +25,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	_ "modernc.org/sqlite"
 	"time"
 )
 
@@ -73,14 +76,15 @@ func nexusBin(t *testing.T) string {
 // world is one black-box NEXUS installation: its own XDG base, scripted
 // provider, and (optionally) a fake Bot API.
 type world struct {
-	t        *testing.T
-	base     string // XDG_CONFIG_HOME
-	provider *httptest.Server
-	script   func(last string) string
-	stepMu   sync.Mutex
-	step     int
-	bot      *fakeBot
-	extraEnv []string
+	t         *testing.T
+	base      string // XDG_CONFIG_HOME
+	provider  *httptest.Server
+	script    func(last string) string
+	stepMu    sync.Mutex
+	step      int
+	bot       *fakeBot
+	extraEnv  []string
+	pinnedBin string
 }
 
 func newWorld(t *testing.T, execAllow []string) *world {
@@ -710,6 +714,31 @@ func writeAttestationDigest(t *testing.T, w *world, digest string) {
 	}
 }
 
+// pinnedDoctorBin builds (once per world) a nexus binary whose
+// acceptance-signer fingerprint pins THIS world's allowed_signers.
+func (w *world) pinnedDoctorBin(t *testing.T) string {
+	t.Helper()
+	if w.pinnedBin != "" {
+		return w.pinnedBin
+	}
+	w.ownerKey(t) // ensures allowed_signers exists
+	signers, err := os.ReadFile(filepath.Join(w.base, "nexus", "allowed_signers"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(signers)
+	bin := filepath.Join(w.base, "nexus-pinned")
+	cmd := exec.Command("go", "build",
+		"-ldflags", "-X main.acceptanceSignerFingerprint="+hex.EncodeToString(sum[:]),
+		"-o", bin, "github.com/MatNik89/nexus/cmd/nexus")
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("pinned build: %v\n%s", err, out)
+	}
+	w.pinnedBin = bin
+	return bin
+}
+
 // ownerKey lazily creates the world's owner ssh key + allowed_signers.
 func (w *world) ownerKey(t *testing.T) string {
 	t.Helper()
@@ -728,6 +757,23 @@ func (w *world) ownerKey(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return key
+}
+
+// obligationStatus reads the durable projection DIRECTLY from the
+// profile SQLite file (read-only, external-tool equivalent — the harness
+// never links the implementation's stores).
+func (w *world) obligationStatus(t *testing.T, profile, id string) string {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(w.base, "nexus", "profiles", profile, "journal.db")+"?mode=ro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var st string
+	if err := db.QueryRow(`SELECT status FROM obl_obligations WHERE id=?`, id).Scan(&st); err != nil {
+		t.Fatalf("obligation %s: %v", id, err)
+	}
+	return st
 }
 
 func ctxT() context.Context { return context.Background() }
@@ -794,8 +840,12 @@ func TestDoctorP0GrantLive(t *testing.T) {
 	requireBwrap(t)
 	w := newWorld(t, nil)
 	w.withTelegram(t)
+	// The grant path needs a binary whose acceptance-signer fingerprint
+	// PINS this world's allowed_signers (r3 codex #1: the anchor is the
+	// binary, not a replaceable file).
+	pinned := w.pinnedDoctorBin(t)
 	run := func(env []string) (string, int) {
-		cmd := exec.Command(nexusBin(t), "doctor", "--p0")
+		cmd := exec.Command(pinned, "doctor", "--p0")
 		cmd.Env = env
 		out, _ := cmd.CombinedOutput()
 		return string(out), cmd.ProcessState.ExitCode()
@@ -806,7 +856,7 @@ func TestDoctorP0GrantLive(t *testing.T) {
 	if codeNoAtt == 0 || strings.Contains(outNoAtt, "P0-capable") {
 		t.Fatalf("grant minted without an acceptance attestation (exit %d):\n%s", codeNoAtt, outNoAtt)
 	}
-	writeAttestation(t, w, nexusBin(t))
+	writeAttestation(t, w, w.pinnedDoctorBin(t))
 	out, code := run(w.env())
 	if code != 0 || !strings.Contains(out, "P0-capable") {
 		t.Fatalf("live world not granted P0-capable (exit %d):\n%s", code, out)
@@ -818,6 +868,52 @@ func TestDoctorP0GrantLive(t *testing.T) {
 	if codeForged == 0 || strings.Contains(outForged, "P0-capable") {
 		t.Fatalf("unsigned attestation granted (exit %d):\n%s", codeForged, outForged)
 	}
+	// REPLACING THE TRUST ANCHOR with a rogue key + rogue signature is a
+	// key-less forgery — the binary-pinned fingerprint refuses it
+	// (r3 codex #1 probe 1).
+	rogueAnchor := filepath.Join(w.base, "rogue_anchor_key")
+	if out, err := exec.Command("ssh-keygen", "-t", "ed25519", "-N", "", "-C", "ra", "-f", rogueAnchor).CombinedOutput(); err != nil {
+		t.Fatalf("rogue anchor keygen: %v\n%s", err, out)
+	}
+	signersPath := filepath.Join(w.base, "nexus", "allowed_signers")
+	origSigners, err := os.ReadFile(signersPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roguePub, _ := os.ReadFile(rogueAnchor + ".pub")
+	if err := os.WriteFile(signersPath, []byte("owner "+string(roguePub)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	attP := filepath.Join(w.base, "nexus", "system", "acceptance.json")
+	os.Remove(attP + ".sig")
+	if out, err := exec.Command("ssh-keygen", "-Y", "sign", "-f", rogueAnchor, "-n", "nexus-acceptance", attP).CombinedOutput(); err != nil {
+		t.Fatalf("rogue anchor sign: %v\n%s", err, out)
+	}
+	outAnchor, codeAnchor := run(w.env())
+	if codeAnchor == 0 || strings.Contains(outAnchor, "P0-capable") {
+		t.Fatalf("replaced trust anchor granted (exit %d):\n%s", codeAnchor, outAnchor)
+	}
+	if err := os.WriteFile(signersPath, origSigners, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeAttestation(t, w, w.pinnedDoctorBin(t))
+	// A PATH ssh-keygen SHIM cannot spoof the verifier — the binary uses
+	// the fixed root-owned /usr/bin/ssh-keygen (r3 codex #1 probe 2).
+	shimDir := filepath.Join(w.base, "shim")
+	os.MkdirAll(shimDir, 0o700)
+	os.WriteFile(filepath.Join(shimDir, "ssh-keygen"), []byte("#!/bin/sh\nexit 0\n"), 0o755)
+	os.Remove(attP + ".sig") // unsigned + zero-exit shim: must STILL refuse
+	envShim := append([]string{}, w.env()...)
+	for i, e := range envShim {
+		if strings.HasPrefix(e, "PATH=") {
+			envShim[i] = "PATH=" + shimDir + ":" + strings.TrimPrefix(e, "PATH=")
+		}
+	}
+	outShim, codeShim := run(envShim)
+	if codeShim == 0 || strings.Contains(outShim, "P0-capable") {
+		t.Fatalf("PATH-shimmed verifier granted (exit %d):\n%s", codeShim, outShim)
+	}
+	writeAttestation(t, w, w.pinnedDoctorBin(t))
 	// A WRONG-KEY signature (not in allowed_signers) withdraws the grant
 	// — this is the branch the ssh-keygen verify itself carries.
 	rogue := filepath.Join(w.base, "rogue_key")
@@ -833,14 +929,14 @@ func TestDoctorP0GrantLive(t *testing.T) {
 	if codeRogue == 0 || strings.Contains(outRogue, "P0-capable") {
 		t.Fatalf("rogue-signed attestation granted (exit %d):\n%s", codeRogue, outRogue)
 	}
-	writeAttestation(t, w, nexusBin(t))
+	writeAttestation(t, w, w.pinnedDoctorBin(t))
 	// A TAMPERED digest withdraws the grant.
 	writeAttestationDigest(t, w, "deadbeef")
 	outBad, codeBad := run(w.env())
 	if codeBad == 0 || strings.Contains(outBad, "P0-capable") {
 		t.Fatalf("grant survived a digest mismatch (exit %d):\n%s", codeBad, outBad)
 	}
-	writeAttestation(t, w, nexusBin(t))
+	writeAttestation(t, w, w.pinnedDoctorBin(t))
 	// SENSITIVITY: drop the bot token → telegram OFF, grant withdrawn.
 	var envNoTok []string
 	for _, e := range w.env() {
@@ -940,6 +1036,12 @@ func TestSealedOffStartupRunsNoConsumers(t *testing.T) {
 		}
 	}
 	bot.mu.Unlock()
+	// DURABLE state must be UNCHANGED by the refused incarnation
+	// (T27-r3 codex #2: a pre-seal sweep would have advanced this to
+	// DELIVERY_PENDING without any message ever appearing).
+	if st := w.obligationStatus(t, "private", "rem-seal"); st != "SCHEDULED" {
+		t.Fatalf("sealed-OFF startup advanced durable state: obligation %q (want SCHEDULED)", st)
+	}
 	// Incarnation 3: healthy again — the reminder arrives now.
 	w.rewriteConfig(t, func(cfg map[string]any) { cfg["provider_base_url"] = deadProv.URL })
 	w.rewriteConfig(t, func(cfg map[string]any) {
