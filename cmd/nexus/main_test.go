@@ -32,6 +32,7 @@ import (
 	"github.com/MatNik89/nexus/internal/kernel/journal"
 	"github.com/MatNik89/nexus/internal/obligation"
 	"github.com/MatNik89/nexus/internal/sandbox"
+	"github.com/MatNik89/nexus/internal/schedule"
 	"github.com/MatNik89/nexus/internal/security/redact"
 )
 
@@ -1122,5 +1123,45 @@ func TestResumePreservesObservationTrust(t *testing.T) {
 	}
 	if len(cont2) != 2 || cont2[1].Trust != contracts.TrustToolTrusted {
 		t.Fatalf("empty-output fallback broken: %+v", cont2)
+	}
+}
+
+// SENT-gated reminder receipts (T27 codex #2 / kilo #3): a failing wire
+// leaves the occurrence DELIVERY_PENDING with ONE stable outbox row; the
+// receipt is minted only after the channel proves SENT.
+func TestReminderReceiptOnlyFromSent(t *testing.T) {
+	b := hitlBundle(t, "TG_RCPT")
+	if err := b.obl.CreateReminder(context.Background(), "rem-rcpt", "receipt honesty",
+		schedule.WallTime{Year: 2026, Month: 1, Day: 2, Hour: 9, Minute: 0, TZ: "Europe/Zagreb"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.sched.Sweep(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := b.obl.Status(context.Background(), "rem-rcpt"); st != obligation.StateDeliveryPending {
+		t.Fatalf("not DELIVERY_PENDING after sweep: %v", st)
+	}
+	// Pass 1+2: the wire is DEAD (definite pre-wire failure on flush) —
+	// the occurrence must NOT be marked delivered, and repeated passes
+	// must not multiply outbox rows (stable id).
+	b.deliverPendingReminders(context.Background(), "chat-42")
+	b.chanCore.Flush(context.Background(), func(o channel.Outbound) error {
+		return fmt.Errorf("wire down (definite)")
+	})
+	b.deliverPendingReminders(context.Background(), "chat-42")
+	if st, _ := b.obl.Status(context.Background(), "rem-rcpt"); st != obligation.StateDeliveryPending {
+		t.Fatalf("receipt minted without a SENT transition: %v", st)
+	}
+	pendingRows, _ := b.chanCore.Pending(context.Background())
+	if len(pendingRows) != 1 {
+		t.Fatalf("stable-id violated: %d outbox rows for one occurrence", len(pendingRows))
+	}
+	// The wire recovers: flush SENDS, the next pass mints the receipt.
+	if err := b.chanCore.Flush(context.Background(), func(o channel.Outbound) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	b.deliverPendingReminders(context.Background(), "chat-42")
+	if st, _ := b.obl.Status(context.Background(), "rem-rcpt"); st != obligation.StateDelivered {
+		t.Fatalf("proven SENT did not mint the receipt: %v", st)
 	}
 }

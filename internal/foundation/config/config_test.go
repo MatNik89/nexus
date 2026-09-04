@@ -238,3 +238,24 @@ func TestRejectedValueNotEchoed(t *testing.T) {
 		})
 	}
 }
+
+// telegram_api_base is production-or-loopback ONLY (T27 codex #4: the
+// bot token rides in the URL path — an arbitrary host is exfiltration).
+func TestTelegramAPIBaseLoopbackOnly(t *testing.T) {
+	base := Config{DefaultProfile: "private"}
+	ok := func(u string) error {
+		c := base
+		c.TelegramAPIBase = u
+		return ValidateBounds(c)
+	}
+	for _, good := range []string{"", "https://api.telegram.org", "http://127.0.0.1:8081", "http://localhost:9000", "https://127.0.0.1:8443"} {
+		if err := ok(good); err != nil {
+			t.Fatalf("legit base %q rejected: %v", good, err)
+		}
+	}
+	for _, bad := range []string{"http://evil.example.com", "https://attacker.tld/bot", "ftp://127.0.0.1", "http://10.0.0.5:1234", "not-a-url"} {
+		if err := ok(bad); err == nil {
+			t.Fatalf("token-exfiltration base %q accepted", bad)
+		}
+	}
+}

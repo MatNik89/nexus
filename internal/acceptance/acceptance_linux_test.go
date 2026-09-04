@@ -805,3 +805,40 @@ func TestDoctorP0GrantLive(t *testing.T) {
 		t.Fatalf("wrong criterion went off:\n%s", out2)
 	}
 }
+
+// SEALED-snapshot ENFORCEMENT (T27 codex #1): when the startup provider
+// probe fails, the daemon REFUSES to serve even though the provider
+// recovers immediately after — no consumer runs against a capability the
+// sealed snapshot marked OFF.
+func TestSealedOffCapabilityNeverServes(t *testing.T) {
+	w := newWorld(t, nil)
+	// The provider fails EXACTLY the first request (the startup probe)
+	// and works forever after — codex's recovering-provider scenario.
+	var failedOnce sync.Mutex
+	failed := false
+	orig := w.script
+	w.script = func(last string) string {
+		if orig != nil {
+			return orig(last)
+		}
+		return "echo: " + last
+	}
+	handler := w.provider.Config.Handler
+	w.provider.Config.Handler = http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		failedOnce.Lock()
+		first := !failed
+		failed = true
+		failedOnce.Unlock()
+		if first {
+			http.Error(rw, "provider warming up", http.StatusServiceUnavailable)
+			return
+		}
+		handler.ServeHTTP(rw, r)
+	})
+	_, _ = w.daemon()
+	// The daemon must have refused to serve: the chat gets no reply.
+	out, _ := w.chat("hello after recovery", false)
+	if strings.Contains(out, "echo:") && strings.Contains(out, "hello after recovery") {
+		t.Fatalf("daemon served a conversation although the sealed snapshot marked it OFF: %q", out)
+	}
+}

@@ -204,32 +204,7 @@ func runDaemon() int {
 				case <-ctx.Done():
 					return
 				case <-t.C:
-					pending, perr := b.obl.PendingDeliveries(ctx)
-					if perr != nil {
-						continue
-					}
-					for _, d := range pending {
-						// STABLE id derived from the occurrence: a crash
-						// anywhere in this loop re-enters idempotently —
-						// never a second outbox row (T27 codex #2).
-						dlvID := deliveryIDFor(d.OccurrenceID)
-						if _, qerr := b.chanCore.EnqueueReplyID(ctx, dlvID, "telegram", ownerChat, b.profile,
-							"Reminder: "+d.Body+" (reply: ack "+d.OccurrenceID+")"); qerr != nil {
-							continue
-						}
-						// The receipt is minted ONLY from the channel
-						// owner's proven SENT transition — an enqueue or
-						// an UNKNOWN in-flight row is NOT delivery
-						// evidence (T27 codex #2 / kilo #3).
-						st, serr := b.chanCore.DeliveryStatus(ctx, dlvID)
-						if serr != nil || st != "SENT" {
-							continue // retry next tick; UNKNOWN reconciles
-						}
-						if merr := b.obl.MarkDelivered(ctx, d.OccurrenceID,
-							obligation.DeliveryReceipt{Producer: "telegram", ReceiptID: dlvID}); merr != nil {
-							fmt.Fprintf(os.Stderr, "nexus daemon: reminder delivery mark %s: %v\n", d.OccurrenceID, merr)
-						}
-					}
+					b.deliverPendingReminders(ctx, ownerChat)
 				}
 			}
 		}()
@@ -909,6 +884,33 @@ func mustProbeCore(layout pathx.Layout, resolved config.Resolved) *channel.Core 
 		return nil
 	}
 	return c
+}
+
+// deliverPendingReminders is ONE pass of the reminder delivery loop:
+// enqueue under the occurrence-stable id (idempotent), then mint the
+// delivery receipt ONLY from the channel owner's proven SENT transition
+// (T27 codex #2 / kilo #3 — an enqueue or an UNKNOWN in-flight row is
+// never delivery evidence).
+func (b *daemonBundle) deliverPendingReminders(ctx context.Context, ownerChat string) {
+	pending, perr := b.obl.PendingDeliveries(ctx)
+	if perr != nil {
+		return
+	}
+	for _, d := range pending {
+		dlvID := deliveryIDFor(d.OccurrenceID)
+		if _, qerr := b.chanCore.EnqueueReplyID(ctx, dlvID, "telegram", ownerChat, b.profile,
+			"Reminder: "+d.Body+" (reply: ack "+d.OccurrenceID+")"); qerr != nil {
+			continue
+		}
+		st, serr := b.chanCore.DeliveryStatus(ctx, dlvID)
+		if serr != nil || st != "SENT" {
+			continue // retry next tick; UNKNOWN reconciles
+		}
+		if merr := b.obl.MarkDelivered(ctx, d.OccurrenceID,
+			obligation.DeliveryReceipt{Producer: "telegram", ReceiptID: dlvID}); merr != nil {
+			fmt.Fprintf(os.Stderr, "nexus daemon: reminder delivery mark %s: %v\n", d.OccurrenceID, merr)
+		}
+	}
 }
 
 // deliveryIDFor derives the STABLE outbox delivery id of an occurrence.
