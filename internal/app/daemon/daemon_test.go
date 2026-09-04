@@ -428,9 +428,16 @@ func TestRedeliveredUpdateCannotRerunCompletedTurn(t *testing.T) {
 	if _, err := d.RunChannelTurn(context.Background(), "chat-42", 7, "hello"); err != nil {
 		t.Fatal(err)
 	}
-	// Redelivery of update 7: the completed turn must NOT run again.
-	if _, err := d.RunChannelTurn(context.Background(), "chat-42", 7, "hello"); err == nil {
-		t.Fatal("redelivered update re-ran a completed turn")
+	// Redelivery of update 7: the completed turn must NOT run again —
+	// and the DURABLE original final is recovered instead of an error
+	// (Phase-5-r3 codex #3: a crash between turn completion and channel
+	// delivery must not turn a success into a false failure).
+	recovered, err := d.RunChannelTurn(context.Background(), "chat-42", 7, "hello")
+	if err != nil {
+		t.Fatalf("redelivery of a completed turn errored instead of recovering the final: %v", err)
+	}
+	if recovered != "ok" {
+		t.Fatalf("recovered final %q, want the original %q", recovered, "ok")
 	}
 	p.mu.Lock()
 	runs := len(p.blocks)

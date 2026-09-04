@@ -397,7 +397,7 @@ func TestTelegramSpineEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ch, err := b.approvals.Suspend(context.Background(), "turn-h", "run-h", hc, "tg:chat-42")
+	ch, err := b.approvals.Suspend(context.Background(), "turn-h", "run-h", hc, "tg:chat-42", testBlocks(t, "original request"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -662,7 +662,7 @@ func shortDeadlineCall(t *testing.T, d time.Duration) contracts.ToolCall {
 func TestDelayedApprovalResumes(t *testing.T) {
 	b := hitlBundle(t, "TG_DELAY")
 	c := shortDeadlineCall(t, 50*time.Millisecond)
-	ch, err := b.approvals.Suspend(context.Background(), "turn-dl", "run-dl", c, "tg:chat-42")
+	ch, err := b.approvals.Suspend(context.Background(), "turn-dl", "run-dl", c, "tg:chat-42", testBlocks(t, "original request"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -688,7 +688,7 @@ func TestDelayedApprovalResumes(t *testing.T) {
 func TestApproveReplayAfterCrashResumes(t *testing.T) {
 	b := hitlBundle(t, "TG_CRASH")
 	c := shortDeadlineCall(t, time.Hour)
-	ch, err := b.approvals.Suspend(context.Background(), "turn-cr", "run-cr", c, "tg:chat-42")
+	ch, err := b.approvals.Suspend(context.Background(), "turn-cr", "run-cr", c, "tg:chat-42", testBlocks(t, "original request"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -713,7 +713,7 @@ func TestApproveReplayAfterCrashResumes(t *testing.T) {
 	c2 := shortDeadlineCall(t, time.Hour)
 	c2b, _ := json.Marshal(map[string]string{"content": "second"})
 	_ = c2b
-	ch2, err := b.approvals.Suspend(context.Background(), "turn-cr2", "run-cr2", c2, "tg:chat-42")
+	ch2, err := b.approvals.Suspend(context.Background(), "turn-cr2", "run-cr2", c2, "tg:chat-42", testBlocks(t, "original request"))
 	if err == nil {
 		if err := b.approvals.Approve(context.Background(), ch2.ChallengeID, "tg:chat-42"); err != nil {
 			t.Fatal(err)
@@ -735,7 +735,7 @@ func TestApproveReplayAfterCrashResumes(t *testing.T) {
 func TestStartupScanResumesApproved(t *testing.T) {
 	b := hitlBundle(t, "TG_SCAN")
 	c := shortDeadlineCall(t, time.Hour)
-	ch, err := b.approvals.Suspend(context.Background(), "turn-sc", "run-sc", c, "tg:chat-42")
+	ch, err := b.approvals.Suspend(context.Background(), "turn-sc", "run-sc", c, "tg:chat-42", testBlocks(t, "original request"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -801,5 +801,215 @@ func TestSuspendedTurnHonestState(t *testing.T) {
 	if count("turn.resumed") != 1 || count("turn.succeeded") != 1 {
 		t.Fatalf("resume did not complete the ORIGINAL turn: resumed=%d succeeded=%d",
 			count("turn.resumed"), count("turn.succeeded"))
+	}
+}
+
+func testBlocks(t *testing.T, text string) []contracts.ContextBlock {
+	t.Helper()
+	b, err := contracts.NewContextBlock(contracts.ContextBlockParams{
+		BlockID: "blk-1", Kind: "user_message", Content: &text,
+		ContentHash: "0000000000000000000000000000000000000000000000000000000000000000",
+		SourceURI:   "nexus://telegram/chat-42", Producer: "telegram",
+		Trust: contracts.TrustUser, Sensitivity: contracts.Sensitivity(1),
+		Lineage: []string{}, ObservedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return []contracts.ContextBlock{b}
+}
+
+// REHYDRATION carries the ORIGINAL context (Phase-5-r3 codex #1): the
+// continuation request after approve must contain the user's original
+// message — not only a synthetic tool stub.
+func TestResumeRehydratesOriginalContext(t *testing.T) {
+	var mu sync.Mutex
+	var bodies []string
+	step := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		buf := make([]byte, 1<<16)
+		n, _ := r.Body.Read(buf)
+		mu.Lock()
+		bodies = append(bodies, string(buf[:n]))
+		mu.Unlock()
+		step++
+		reply := `{"action":"tool","tool_id":"memory_remember","arguments":{"content":"fact"}}`
+		if step > 1 {
+			reply = "saved it"
+		}
+		b, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{
+			"message": map[string]string{"role": "assistant", "content": reply}}}})
+		w.Write(b)
+	}))
+	t.Cleanup(srv.Close)
+	host := strings.TrimPrefix(srv.URL, "http://")
+	t.Setenv("NEXUS_TG_CTX_KEY", "sk-x")
+	base := filepath.Join(t.TempDir(), "nexus")
+	os.MkdirAll(base, 0o700)
+	cfgJSON := fmt.Sprintf(`{"provider_base_url":%q,"provider_key_env":"NEXUS_TG_CTX_KEY",
+		"provider_model":"m","egress_allow":[%q],"default_profile":"private"}`, srv.URL, host)
+	os.WriteFile(filepath.Join(base, "config.json"), []byte(cfgJSON), 0o600)
+	resolved, err := config.Resolve(filepath.Join(base, "config.json"), "", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := buildDaemon(pathx.Layout{Base: base}, resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.j.Close()
+	h := telegramHandler(b)
+	marker := "REHYDRATE-MARKER remember this exact request"
+	reply, err := h(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 1,
+		Text: marker, Profile: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := challengeIDFrom(t, reply)
+	if _, err := h(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 2,
+		Text: "approve " + id, Profile: "private"}); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) < 2 {
+		t.Fatalf("continuation never reached the planner: %d requests", len(bodies))
+	}
+	last := bodies[len(bodies)-1]
+	if !strings.Contains(last, "REHYDRATE-MARKER") {
+		t.Fatalf("resume lost the original context: continuation request lacks the user's message")
+	}
+}
+
+// A turn can suspend and resume MORE THAN ONCE (Phase-5-r3 codex #2):
+// two sequential ASK tools in one turn — both approvals resume, event ids
+// never collide, the final lands.
+func TestSecondSuspensionResumes(t *testing.T) {
+	step := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		step++
+		var reply string
+		switch step {
+		case 1: // original turn → first ASK tool
+			reply = `{"action":"tool","tool_id":"memory_remember","arguments":{"content":"first"}}`
+		case 2: // resume 1 continuation → SECOND ASK tool
+			reply = `{"action":"tool","tool_id":"memory_remember","arguments":{"content":"second"}}`
+		default: // resume 2 continuation → final
+			reply = "both done"
+		}
+		b, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{
+			"message": map[string]string{"role": "assistant", "content": reply}}}})
+		w.Write(b)
+	}))
+	t.Cleanup(srv.Close)
+	host := strings.TrimPrefix(srv.URL, "http://")
+	t.Setenv("NEXUS_TG_TWO_KEY", "sk-x")
+	base := filepath.Join(t.TempDir(), "nexus")
+	os.MkdirAll(base, 0o700)
+	cfgJSON := fmt.Sprintf(`{"provider_base_url":%q,"provider_key_env":"NEXUS_TG_TWO_KEY",
+		"provider_model":"m","egress_allow":[%q],"default_profile":"private"}`, srv.URL, host)
+	os.WriteFile(filepath.Join(base, "config.json"), []byte(cfgJSON), 0o600)
+	resolved, err := config.Resolve(filepath.Join(base, "config.json"), "", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := buildDaemon(pathx.Layout{Base: base}, resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.j.Close()
+	h := telegramHandler(b)
+	r1, err := h(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 1,
+		Text: "do two things", Profile: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id1 := challengeIDFrom(t, r1)
+	r2, err := h(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 2,
+		Text: "approve " + id1, Profile: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(r2, "APPROVAL NEEDED") {
+		t.Fatalf("second ASK did not suspend again: %q", r2)
+	}
+	id2 := challengeIDFrom(t, r2)
+	r3, err := h(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 3,
+		Text: "approve " + id2, Profile: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(r3, "both done") {
+		t.Fatalf("second resume did not reach the final (event-id collision?): %q", r3)
+	}
+}
+
+// E9 RECONCILE for a consumed-but-unfinished resume (Phase-5-r3 kilo #1):
+// the startup scan surfaces it to the USER (never a blind retry), and
+// "retry <id>" issues a FRESH challenge over the same exact intent.
+func TestConsumedUnfinishedReconciles(t *testing.T) {
+	b := hitlBundle(t, "TG_E9")
+	c := shortDeadlineCall(t, time.Hour)
+	ch, err := b.approvals.Suspend(context.Background(), "turn-e9", "run-e9", c, "tg:chat-42", testBlocks(t, "original request"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.approvals.Approve(context.Background(), ch.ChallengeID, "tg:chat-42"); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate the crash window: the approval is CONSUMED, the resume
+	// never completed (no EvResumeCompleted).
+	if err := b.approvals.ConsumeApproval(context.Background(), c); err != nil {
+		t.Fatal(err)
+	}
+	// The startup scan surfaces it — and does NOT auto-execute anything.
+	if err := b.resumeApprovedPending(context.Background()); err != nil {
+		t.Fatalf("scan errored: %v", err)
+	}
+	pending, _ := b.chanCore.Pending(context.Background())
+	notice := false
+	for _, p := range pending {
+		if strings.Contains(p.Text, "retry "+ch.ChallengeID) {
+			notice = true
+		}
+	}
+	if !notice {
+		t.Fatalf("consumed-unfinished challenge not surfaced for reconciliation: %v", pending)
+	}
+	// A FOREIGN chat cannot retry it.
+	foreign, err := telegramHandler(b)(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-666", UpdateID: 8,
+		Text: "retry " + ch.ChallengeID, Profile: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(foreign, "Nothing to retry") {
+		t.Fatalf("foreign chat retried a consumed challenge: %q", foreign)
+	}
+	// The owner retries: a FRESH challenge over the same intent.
+	retry, err := telegramHandler(b)(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 9,
+		Text: "retry " + ch.ChallengeID, Profile: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(retry, "APPROVAL NEEDED") {
+		t.Fatalf("retry did not issue a fresh challenge: %q", retry)
+	}
+	newID := challengeIDFrom(t, retry)
+	if newID == ch.ChallengeID {
+		t.Fatal("retry reused the consumed challenge id")
+	}
+	// The old challenge is closed: a second retry finds nothing.
+	again, _ := telegramHandler(b)(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 10,
+		Text: "retry " + ch.ChallengeID, Profile: "private"})
+	if !strings.Contains(again, "Nothing to retry") {
+		t.Fatalf("consumed challenge retryable twice: %q", again)
 	}
 }

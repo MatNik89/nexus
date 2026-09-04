@@ -228,19 +228,50 @@ func (d *Daemon) RunChannelTurn(ctx context.Context, identity string, updateID i
 	if err != nil {
 		return "", err
 	}
-	return l.RunTurn(ctx, turn, run, d.deps.Profile, []contracts.ContextBlock{block})
+	final, err := l.RunTurn(ctx, turn, run, d.deps.Profile, []contracts.ContextBlock{block})
+	if err != nil {
+		// Crash between turn completion and channel delivery (Phase-5-r3
+		// codex #3): the redelivered update re-enters the same turn and
+		// collides on its event ids — recover the DURABLE final from the
+		// journal instead of reporting a false failure.
+		if recovered, ok := d.completedTurnFinal(turn); ok {
+			return recovered, nil
+		}
+		return "", err
+	}
+	return final, nil
+}
+
+// completedTurnFinal recovers the redacted final of an already-succeeded
+// turn from its journaled turn.succeeded payload.
+// topknot ceiling: full-journal replay per recovery lookup — a turn-state
+// projection is the upgrade when replay latency is measurable (P1).
+func (d *Daemon) completedTurnFinal(turn contracts.TurnID) (string, bool) {
+	final, found := "", false
+	d.deps.Journal.Replay(0, func(ev journal.Event) error {
+		if ev.Envelope.EventType == "turn.succeeded" && ev.Envelope.TurnID != nil && *ev.Envelope.TurnID == turn {
+			var p struct {
+				Final string `json:"final"`
+			}
+			if json.Unmarshal(ev.Envelope.Payload, &p) == nil && p.Final != "" {
+				final, found = p.Final, true
+			}
+		}
+		return nil
+	})
+	return final, found
 }
 
 // ResumeChannelTurn rehydrates a SUSPENDED channel turn after its
 // approval (B6, Phase-5-r2 codex #2): the loop re-enters the ORIGINAL
 // turn with the approved tool's observation and continues to a real final.
 func (d *Daemon) ResumeChannelTurn(ctx context.Context, identity string, turn contracts.TurnID,
-	run contracts.RunID, blocks []contracts.ContextBlock) (string, error) {
+	run contracts.RunID, tag string, blocks []contracts.ContextBlock) (string, error) {
 	l, err := d.channelLoop(identity)
 	if err != nil {
 		return "", err
 	}
-	return l.ResumeTurn(ctx, turn, run, d.deps.Profile, blocks)
+	return l.ResumeTurn(ctx, turn, run, d.deps.Profile, tag, blocks)
 }
 
 // channelLoop builds the per-turn channel loop (ModeDefault ALWAYS — F2).

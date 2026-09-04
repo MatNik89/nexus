@@ -233,7 +233,7 @@ type daemonBundle struct {
 // the deadline is deliberately NOT part of the C4 EffectHash, so the
 // refresh cannot alter the approved intent).
 func (b *daemonBundle) resumeApproved(ctx context.Context, identity, challengeID string) (string, error) {
-	turn, run, call, err := b.approvals.SuspendedCall(ctx, challengeID, "tg:"+identity)
+	turn, run, call, blocks, err := b.approvals.SuspendedCall(ctx, challengeID, "tg:"+identity)
 	if err != nil {
 		return "", err
 	}
@@ -245,20 +245,29 @@ func (b *daemonBundle) resumeApproved(ctx context.Context, identity, challengeID
 	}
 	out, err := b.sysPath.RunTool(ctx, call, grant)
 	if err != nil {
-		return "", err
+		// The approval is CONSUMED but the effect did not complete — an E9
+		// UNKNOWN. The challenge stays CONSUMED-and-open; the user gets an
+		// honest reconcile path (retry re-issues a FRESH challenge), never
+		// a blind auto-retry (Phase-5-r3 kilo #1).
+		return "", fmt.Errorf("the approved action did not complete: %w. Reply retry %s to issue a fresh approval", err, challengeID)
 	}
 	result := "done"
 	if len(out.Output) > 0 && out.Output[0].Content != nil {
 		result = *out.Output[0].Content
 	}
-	// Continuation: the approved tool's outcome re-enters the ORIGINAL
-	// turn as an observation and the planner produces the final reply.
+	// REHYDRATION (Phase-5-r3 codex #1/#2): the ORIGINAL context plus the
+	// approved tool's observation re-enter the original turn; the
+	// challenge id tags this resume cycle's event ids so a turn can
+	// suspend and resume repeatedly.
 	obs, err := resumeObservation(call, result)
 	if err != nil {
 		return "", err
 	}
-	final, err := b.d.ResumeChannelTurn(ctx, identity, turn, run, []contracts.ContextBlock{obs})
-	if err != nil {
+	final, ferr := b.d.ResumeChannelTurn(ctx, identity, turn, run, challengeID, append(blocks, obs))
+	if merr := b.approvals.MarkResumeCompleted(ctx, challengeID); merr != nil {
+		fmt.Fprintf(os.Stderr, "nexus: resume-completed mark %s: %v\n", challengeID, merr)
+	}
+	if ferr != nil {
 		// The effect DID run and the approval is consumed — report the
 		// tool result honestly even when the continuation fails.
 		return result, nil
@@ -285,6 +294,20 @@ func (b *daemonBundle) resumeApprovedPending(ctx context.Context) error {
 		}
 		if _, qerr := b.chanCore.EnqueueReply(ctx, "telegram", identity, b.profile, text); qerr != nil {
 			errs = append(errs, fmt.Errorf("resume reply %s: %w", ac.ChallengeID, qerr))
+		}
+	}
+	// E9 reconcile notices (Phase-5-r3 kilo #1): a CONSUMED challenge
+	// whose resume never completed is an UNKNOWN — surface it to the USER
+	// with the retry path; never auto-retry.
+	open, oerr := b.approvals.ConsumedUnfinished(ctx)
+	if oerr != nil {
+		errs = append(errs, oerr)
+	}
+	for _, oc := range open {
+		identity := strings.TrimPrefix(oc.ExpectedSource, "tg:")
+		msg := "Approval " + oc.ChallengeID + " was consumed but its action may not have completed. Reply retry " + oc.ChallengeID + " to issue a fresh approval, or ignore this if it is done."
+		if _, qerr := b.chanCore.EnqueueReply(ctx, "telegram", identity, b.profile, msg); qerr != nil {
+			errs = append(errs, fmt.Errorf("reconcile notice %s: %w", oc.ChallengeID, qerr))
 		}
 	}
 	return errors.Join(errs...)
@@ -437,8 +460,8 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 		SuspenderFor: func(identity string) loop.Suspender {
 			source := "tg:" + identity
 			return func(ctx context.Context, turn contracts.TurnID, run contracts.RunID,
-				call contracts.ToolCall) (string, error) {
-				ch, err := approvals.Suspend(ctx, turn, run, call, source)
+				call contracts.ToolCall, blocks []contracts.ContextBlock) (string, error) {
+				ch, err := approvals.Suspend(ctx, turn, run, call, source, blocks)
 				if err != nil {
 					return "", err
 				}
@@ -625,7 +648,7 @@ func telegramHandler(b *daemonBundle) telegram.Handler {
 				// never ran, a replayed approve completes it instead of
 				// stranding the action. A foreign source still fails here
 				// because SuspendedCall is source-bound.
-				if _, _, _, aerr := b.approvals.SuspendedCall(ctx, id, source); aerr != nil {
+				if _, _, _, _, aerr := b.approvals.SuspendedCall(ctx, id, source); aerr != nil {
 					return "Approval failed: " + err.Error(), nil
 				}
 			}
@@ -635,6 +658,23 @@ func telegramHandler(b *daemonBundle) telegram.Handler {
 				return "Approved " + id + " but the resume failed: " + rerr.Error(), nil
 			}
 			return "Approved " + id + ". " + result, nil
+		case strings.HasPrefix(lower, "retry "):
+			// E9 reconcile for a CONSUMED-but-unfinished resume: the user
+			// confirms by re-approving a FRESH challenge over the same
+			// exact intent — never a blind auto-retry (Phase-5-r3 kilo #1).
+			id := strings.TrimSpace(text[len("retry "):])
+			turn, run, call, blocks, err := b.approvals.ConsumedCall(ctx, id, source)
+			if err != nil {
+				return "Nothing to retry for " + id + ": " + err.Error(), nil
+			}
+			ch, serr := b.approvals.Suspend(ctx, turn, run, call, source, blocks)
+			if serr != nil {
+				return "Retry failed: " + serr.Error(), nil
+			}
+			if merr := b.approvals.MarkResumeCompleted(ctx, id); merr != nil {
+				return "Retry failed: " + merr.Error(), nil
+			}
+			return ch.Summary, nil
 		case strings.HasPrefix(lower, "deny "):
 			id := strings.TrimSpace(text[len("deny "):])
 			if err := b.approvals.Deny(ctx, id, source); err != nil {

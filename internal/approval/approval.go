@@ -41,6 +41,11 @@ const (
 	EvApprovalReceived = "approval.received"
 	EvApprovalDenied   = "approval.denied"
 	EvApprovalConsumed = "approval.consumed"
+	// EvResumeCompleted closes the resume: without it a CONSUMED
+	// challenge is an E9 UNKNOWN (the effect may or may not have run) and
+	// the startup scan surfaces it for USER reconciliation — never a
+	// blind retry (Phase-5-r3 kilo #1).
+	EvResumeCompleted = "approval.resume_completed"
 )
 
 // Challenge is what the approver sees.
@@ -71,6 +76,10 @@ type suspendedPayload struct {
 	ExpectedSource string `json:"expected_source"`
 	// Call is the canonical ToolCall JSON — resume re-executes EXACTLY it.
 	Call json.RawMessage `json:"call"`
+	// Context is the suspended turn's live context-block slice — resume
+	// REHYDRATES the original conversation, not a synthetic stub
+	// (Phase-5-r3 codex #1).
+	Context json.RawMessage `json:"context"`
 }
 
 type decisionPayload struct {
@@ -102,8 +111,8 @@ func Events() map[string]journal.PayloadValidator {
 				return err
 			}
 			if p.ChallengeID == "" || p.TurnID == "" || p.RunID == "" || p.EffectHash == "" ||
-				p.ExpiresUnix == 0 || p.ExpectedSource == "" || len(p.Call) == 0 {
-				return fmt.Errorf("approval: suspension requires challenge, turn, run, effect hash, expiry, expected source and the call")
+				p.ExpiresUnix == 0 || p.ExpectedSource == "" || len(p.Call) == 0 || len(p.Context) == 0 {
+				return fmt.Errorf("approval: suspension requires challenge, turn, run, effect hash, expiry, expected source, the call and its context")
 			}
 			return nil
 		},
@@ -118,6 +127,16 @@ func Events() map[string]journal.PayloadValidator {
 			}
 			return nil
 		},
+		EvResumeCompleted: func(raw json.RawMessage) error {
+			var p decisionPayload
+			if err := json.Unmarshal(raw, &p); err != nil {
+				return err
+			}
+			if p.ChallengeID == "" {
+				return fmt.Errorf("approval: resume completion requires the challenge id")
+			}
+			return nil
+		},
 	}
 }
 
@@ -128,7 +147,7 @@ type Projection struct{}
 func NewProjection() *Projection { return &Projection{} }
 
 func (Projection) Name() string { return "approval" }
-func (Projection) Version() int { return 1 }
+func (Projection) Version() int { return 2 }
 
 func (Projection) Init(db *journal.ProjDB) error {
 	_, err := db.Exec(`
@@ -141,8 +160,10 @@ func (Projection) Init(db *journal.ProjDB) error {
 			expires_unix INTEGER NOT NULL,
 			expected_source TEXT NOT NULL,
 			call_json TEXT NOT NULL,
+			context_json TEXT NOT NULL,
 			status TEXT NOT NULL, -- PENDING | APPROVED | DENIED | CONSUMED
 			decided_by TEXT NOT NULL DEFAULT '',
+			resume_done INTEGER NOT NULL DEFAULT 0,
 			created INTEGER NOT NULL
 		);
 	`)
@@ -163,10 +184,10 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 			return err
 		}
 		if _, err := tx.Exec(`INSERT INTO appr_challenges
-			(challenge_id, turn_id, run_id, effect_hash, summary, expires_unix, expected_source, call_json, status, created)
-			VALUES(?,?,?,?,?,?,?,?,?,?)`,
+			(challenge_id, turn_id, run_id, effect_hash, summary, expires_unix, expected_source, call_json, context_json, status, created)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
 			p.ChallengeID, p.TurnID, p.RunID, p.EffectHash, p.Summary, p.ExpiresUnix,
-			p.ExpectedSource, string(p.Call), "PENDING", int64(ev.JournalOffset)); err != nil {
+			p.ExpectedSource, string(p.Call), string(p.Context), "PENDING", int64(ev.JournalOffset)); err != nil {
 			return fmt.Errorf("approval: challenge insert: %w", err)
 		}
 	case EvApprovalReceived:
@@ -216,6 +237,19 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 		if n, _ := res.RowsAffected(); n != 1 {
 			return fmt.Errorf("approval: consumption does not match an approved exact effect (fail closed)")
 		}
+	case EvResumeCompleted:
+		var p decisionPayload
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return err
+		}
+		res, err := tx.Exec(`UPDATE appr_challenges SET resume_done=1
+			WHERE challenge_id=? AND status='CONSUMED' AND resume_done=0`, p.ChallengeID)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return fmt.Errorf("approval: resume completion for a challenge that is not CONSUMED-and-open (fail closed)")
+		}
 	}
 	return nil
 }
@@ -258,7 +292,7 @@ func (s *Store) params(eventType string, payload any) (contracts.EnvelopeParams,
 // journal redactor would rewrite is REFUSED — a secret in tool args
 // must never reach an approver's phone (codex #8).
 func (s *Store) Suspend(ctx context.Context, turn contracts.TurnID, run contracts.RunID,
-	c contracts.ToolCall, expectedSource string) (Challenge, error) {
+	c contracts.ToolCall, expectedSource string, blocks []contracts.ContextBlock) (Challenge, error) {
 	if !turn.Valid() || !run.Valid() || expectedSource == "" {
 		return Challenge{}, fmt.Errorf("approval: turn, run and the expected decision source are required (fail closed)")
 	}
@@ -278,13 +312,20 @@ func (s *Store) Suspend(ctx context.Context, turn contracts.TurnID, run contract
 	if err != nil {
 		return Challenge{}, err
 	}
+	if len(blocks) == 0 {
+		return Challenge{}, fmt.Errorf("approval: suspension requires the turn context (fail closed — resume must rehydrate it)")
+	}
+	contextJSON, err := json.Marshal(blocks)
+	if err != nil {
+		return Challenge{}, err
+	}
 	summary := fmt.Sprintf("APPROVAL NEEDED [%s]: tool %s with args %s (profile %s). Reply approve %s or deny %s.",
 		id, c.ToolID, string(c.Arguments), c.ProfileID, id, id)
 	payload := suspendedPayload{
 		ChallengeID: id, TurnID: string(turn), RunID: string(run),
 		EffectHash: hash, Summary: summary,
 		ExpiresUnix:    s.clock.Now().Add(DefaultChallengeTTL).Unix(),
-		ExpectedSource: expectedSource, Call: callJSON}
+		ExpectedSource: expectedSource, Call: callJSON, Context: contextJSON}
 	rawPayload, err := json.Marshal(payload)
 	if err != nil {
 		return Challenge{}, err
@@ -483,23 +524,87 @@ func (s *Store) Approved(ctx context.Context) ([]ApprovedChallenge, error) {
 
 // SuspendedCall returns the suspended turn/run ids AND canonical call of
 // an APPROVED challenge — resume rehydrates the ORIGINAL turn (B6).
-func (s *Store) SuspendedCall(ctx context.Context, id, source string) (contracts.TurnID, contracts.RunID, contracts.ToolCall, error) {
+func (s *Store) SuspendedCall(ctx context.Context, id, source string) (contracts.TurnID, contracts.RunID, contracts.ToolCall, []contracts.ContextBlock, error) {
 	rows, err := s.j.QueryProjection(ctx,
-		`SELECT turn_id, run_id, call_json FROM appr_challenges WHERE challenge_id=? AND status='APPROVED' AND expected_source=?`, id, source)
+		`SELECT turn_id, run_id, call_json, context_json FROM appr_challenges WHERE challenge_id=? AND status='APPROVED' AND expected_source=?`, id, source)
 	if err != nil {
-		return "", "", contracts.ToolCall{}, err
+		return "", "", contracts.ToolCall{}, nil, err
 	}
 	defer rows.Close()
 	if !rows.Next() {
-		return "", "", contracts.ToolCall{}, fmt.Errorf("approval: no approved challenge %q (fail closed)", id)
+		return "", "", contracts.ToolCall{}, nil, fmt.Errorf("approval: no approved challenge %q (fail closed)", id)
 	}
-	var turn, run, raw string
-	if err := rows.Scan(&turn, &run, &raw); err != nil {
-		return "", "", contracts.ToolCall{}, err
+	var turn, run, raw, rawCtx string
+	if err := rows.Scan(&turn, &run, &raw, &rawCtx); err != nil {
+		return "", "", contracts.ToolCall{}, nil, err
 	}
 	var c contracts.ToolCall
 	if err := json.Unmarshal([]byte(raw), &c); err != nil {
-		return "", "", contracts.ToolCall{}, err
+		return "", "", contracts.ToolCall{}, nil, err
 	}
-	return contracts.TurnID(turn), contracts.RunID(run), c, nil
+	var blocks []contracts.ContextBlock
+	if err := json.Unmarshal([]byte(rawCtx), &blocks); err != nil {
+		return "", "", contracts.ToolCall{}, nil, err
+	}
+	return contracts.TurnID(turn), contracts.RunID(run), c, blocks, nil
+}
+
+// MarkResumeCompleted closes a CONSUMED challenge's resume — the E9
+// reconcile scan stops surfacing it (Phase-5-r3 kilo #1).
+func (s *Store) MarkResumeCompleted(ctx context.Context, id string) error {
+	p, err := s.params(EvResumeCompleted, decisionPayload{ChallengeID: id, Source: "resume"})
+	if err != nil {
+		return err
+	}
+	_, err = s.j.Append(ctx, p)
+	return err
+}
+
+// ConsumedUnfinished lists CONSUMED challenges whose resume never
+// completed: the effect may or may not have run (E9 UNKNOWN) — the owner
+// reconciles with the USER; never a blind retry.
+func (s *Store) ConsumedUnfinished(ctx context.Context) ([]ApprovedChallenge, error) {
+	rows, err := s.j.QueryProjection(ctx,
+		`SELECT challenge_id, expected_source FROM appr_challenges WHERE status='CONSUMED' AND resume_done=0 ORDER BY created`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ApprovedChallenge
+	for rows.Next() {
+		var c ApprovedChallenge
+		if err := rows.Scan(&c.ChallengeID, &c.ExpectedSource); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// ConsumedCall returns the canonical call+context of a CONSUMED-but-open
+// challenge, source-bound — the retry command re-issues a FRESH challenge
+// over the same exact intent after the user confirms (E9 reconcile).
+func (s *Store) ConsumedCall(ctx context.Context, id, source string) (contracts.TurnID, contracts.RunID, contracts.ToolCall, []contracts.ContextBlock, error) {
+	rows, err := s.j.QueryProjection(ctx,
+		`SELECT turn_id, run_id, call_json, context_json FROM appr_challenges WHERE challenge_id=? AND status='CONSUMED' AND resume_done=0 AND expected_source=?`, id, source)
+	if err != nil {
+		return "", "", contracts.ToolCall{}, nil, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return "", "", contracts.ToolCall{}, nil, fmt.Errorf("approval: no open consumed challenge %q (fail closed)", id)
+	}
+	var turn, run, raw, rawCtx string
+	if err := rows.Scan(&turn, &run, &raw, &rawCtx); err != nil {
+		return "", "", contracts.ToolCall{}, nil, err
+	}
+	var c contracts.ToolCall
+	if err := json.Unmarshal([]byte(raw), &c); err != nil {
+		return "", "", contracts.ToolCall{}, nil, err
+	}
+	var blocks []contracts.ContextBlock
+	if err := json.Unmarshal([]byte(rawCtx), &blocks); err != nil {
+		return "", "", contracts.ToolCall{}, nil, err
+	}
+	return contracts.TurnID(turn), contracts.RunID(run), c, blocks, nil
 }

@@ -67,7 +67,7 @@ func TestApproveAfterRestartCompletesOnce(t *testing.T) {
 	clock := clockid.NewFake(time.Now())
 	s, j := open(t, dir, clock, "work")
 	c := call("rm_file", "tc-1", `{"path":"/tmp/x"}`)
-	ch, err := s.Suspend(ctxT(), "turn-1", "run-1", c, "tg:chat-42")
+	ch, err := s.Suspend(ctxT(), "turn-1", "run-1", c, "tg:chat-42", testBlocks(t, "original request"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +103,7 @@ func TestApprovalReplayRejected(t *testing.T) {
 	clock := clockid.NewFake(time.Now())
 	s, _ := open(t, t.TempDir(), clock, "work")
 	c := call("rm_file", "tc-1", `{"path":"/tmp/x"}`)
-	ch, err := s.Suspend(ctxT(), "turn-1", "run-1", c, "tg:chat-42")
+	ch, err := s.Suspend(ctxT(), "turn-1", "run-1", c, "tg:chat-42", testBlocks(t, "original request"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +126,7 @@ func TestApprovalCannotAuthorizeModifiedEffect(t *testing.T) {
 	clock := clockid.NewFake(time.Now())
 	s, _ := open(t, t.TempDir(), clock, "work")
 	c := call("rm_file", "tc-1", `{"path":"/tmp/x"}`)
-	ch, err := s.Suspend(ctxT(), "turn-1", "run-1", c, "tg:chat-42")
+	ch, err := s.Suspend(ctxT(), "turn-1", "run-1", c, "tg:chat-42", testBlocks(t, "original request"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +148,7 @@ func TestExpiredChallengeDead(t *testing.T) {
 	clock := clockid.NewFake(time.Now())
 	s, _ := open(t, t.TempDir(), clock, "work")
 	c := call("rm_file", "tc-1", `{"path":"/tmp/x"}`)
-	ch, err := s.Suspend(ctxT(), "turn-1", "run-1", c, "tg:chat-42")
+	ch, err := s.Suspend(ctxT(), "turn-1", "run-1", c, "tg:chat-42", testBlocks(t, "original request"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +168,7 @@ func TestCrossProfileChallengeInvisible(t *testing.T) {
 	work, _ := open(t, dir, clock, "work")
 	private, _ := open(t, dir, clock, "private")
 	c := call("rm_file", "tc-1", `{"path":"/tmp/x"}`)
-	ch, err := work.Suspend(ctxT(), "turn-1", "run-1", c, "tg:chat-42")
+	ch, err := work.Suspend(ctxT(), "turn-1", "run-1", c, "tg:chat-42", testBlocks(t, "original request"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,7 +189,7 @@ func TestDenyClosesChallenge(t *testing.T) {
 	clock := clockid.NewFake(time.Now())
 	s, _ := open(t, t.TempDir(), clock, "work")
 	c := call("rm_file", "tc-1", `{"path":"/tmp/x"}`)
-	ch, err := s.Suspend(ctxT(), "turn-1", "run-1", c, "tg:chat-42")
+	ch, err := s.Suspend(ctxT(), "turn-1", "run-1", c, "tg:chat-42", testBlocks(t, "original request"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +214,7 @@ func TestChallengeSummaryNamesEffect(t *testing.T) {
 	clock := clockid.NewFake(time.Now())
 	s, _ := open(t, t.TempDir(), clock, "work")
 	c := call("rm_file", "tc-9", `{"path":"/home/x/notes.txt"}`)
-	ch, err := s.Suspend(ctxT(), "turn-1", "run-1", c, "tg:chat-42")
+	ch, err := s.Suspend(ctxT(), "turn-1", "run-1", c, "tg:chat-42", testBlocks(t, "original request"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +230,7 @@ func TestForeignSourceCannotDecide(t *testing.T) {
 	clock := clockid.NewFake(time.Now())
 	s, _ := open(t, t.TempDir(), clock, "work")
 	c := call("fs_delete", "tc-1", `{"path":"/tmp/x"}`)
-	ch, err := s.Suspend(ctxT(), "turn-1", "run-1", c, "tg:chat-42")
+	ch, err := s.Suspend(ctxT(), "turn-1", "run-1", c, "tg:chat-42", testBlocks(t, "original request"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,7 +259,7 @@ func TestApprovalExpiresAtConsume(t *testing.T) {
 	clock := clockid.NewFake(time.Now())
 	s, _ := open(t, t.TempDir(), clock, "work")
 	c := call("fs_delete", "tc-1", `{"path":"/tmp/x"}`)
-	ch, err := s.Suspend(ctxT(), "turn-1", "run-1", c, "tg:chat-42")
+	ch, err := s.Suspend(ctxT(), "turn-1", "run-1", c, "tg:chat-42", testBlocks(t, "original request"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,14 +290,14 @@ func TestChallengeRefusesSecretExposure(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := call("web_post", "tc-1", `{"auth":"`+secret+`"}`)
-	if _, serr := s.Suspend(ctxT(), "turn-1", "run-1", c, "tg:chat-42"); serr == nil {
+	if _, serr := s.Suspend(ctxT(), "turn-1", "run-1", c, "tg:chat-42", testBlocks(t, "original request")); serr == nil {
 		t.Fatal("challenge exposing a known secret was created")
 	}
 	if p, _ := s.Pending(ctxT()); len(p) != 0 {
 		t.Fatalf("refused challenge left state behind: %v", p)
 	}
 	// A clean call on the same store still works (the refusal is per-payload).
-	if _, serr := s.Suspend(ctxT(), "turn-2", "run-2", call("fs_delete", "tc-2", `{"path":"/tmp/x"}`), "tg:chat-42"); serr != nil {
+	if _, serr := s.Suspend(ctxT(), "turn-2", "run-2", call("fs_delete", "tc-2", `{"path":"/tmp/x"}`), "tg:chat-42", testBlocks(t, "original request")); serr != nil {
 		t.Fatal(serr)
 	}
 }
@@ -309,7 +309,7 @@ func TestProjectionRefusesExpiredDecision(t *testing.T) {
 	clock := clockid.NewFake(time.Now())
 	s, j := open(t, t.TempDir(), clock, "work")
 	c := call("fs_delete", "tc-1", `{"path":"/tmp/x"}`)
-	ch, err := s.Suspend(ctxT(), "turn-1", "run-1", c, "tg:chat-42")
+	ch, err := s.Suspend(ctxT(), "turn-1", "run-1", c, "tg:chat-42", testBlocks(t, "original request"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,15 +339,32 @@ func TestChallengeIDsUnpredictable(t *testing.T) {
 	clock := clockid.NewFake(time.Now())
 	s, _ := open(t, t.TempDir(), clock, "work")
 	c := call("fs_delete", "tc-1", `{"path":"/tmp/x"}`)
-	ch1, err := s.Suspend(ctxT(), "turn-1", "run-1", c, "tg:chat-42")
+	ch1, err := s.Suspend(ctxT(), "turn-1", "run-1", c, "tg:chat-42", testBlocks(t, "original request"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	ch2, err := s.Suspend(ctxT(), "turn-2", "run-2", c, "tg:chat-42")
+	ch2, err := s.Suspend(ctxT(), "turn-2", "run-2", c, "tg:chat-42", testBlocks(t, "original request"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if ch1.ChallengeID == ch2.ChallengeID {
 		t.Fatalf("challenge ids derived from the effect hash: %s == %s", ch1.ChallengeID, ch2.ChallengeID)
 	}
+}
+
+// testBlocks builds a minimal USER context slice for Suspend (resume
+// rehydration currency).
+func testBlocks(t *testing.T, text string) []contracts.ContextBlock {
+	t.Helper()
+	b, err := contracts.NewContextBlock(contracts.ContextBlockParams{
+		BlockID: "blk-1", Kind: "user_message", Content: &text,
+		ContentHash: "0000000000000000000000000000000000000000000000000000000000000000",
+		SourceURI:   "nexus://telegram/chat-42", Producer: "telegram",
+		Trust: contracts.TrustUser, Sensitivity: contracts.Sensitivity(1),
+		Lineage: []string{}, ObservedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return []contracts.ContextBlock{b}
 }
