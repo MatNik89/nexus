@@ -155,7 +155,7 @@ func Open(path string, profile contracts.ProfileID, r redact.Redactor, events ma
 	if len(events) == 0 {
 		return nil, fmt.Errorf("journal open: a closed event-type set is required (fail closed)")
 	}
-	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(FULL)", path)
+	dsn := fmt.Sprintf("file:%s?_txlock=immediate&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(FULL)", path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("journal open: %w", err)

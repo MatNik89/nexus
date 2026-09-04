@@ -23,6 +23,7 @@ import (
 	"github.com/MatNik89/nexus/internal/app/repl"
 	"github.com/MatNik89/nexus/internal/foundation/config"
 	"github.com/MatNik89/nexus/internal/foundation/pathx"
+	"github.com/MatNik89/nexus/internal/obligation"
 )
 
 func TestCompositionRootServesConversation(t *testing.T) {
@@ -169,5 +170,112 @@ func TestMemoryToolSpineSurvivesRestart(t *testing.T) {
 	out2 := runSession("what is the SPINEFACT?\n")
 	if !strings.Contains(out2, "the SPINEFACT is alive") {
 		t.Fatalf("fact did not survive the restart through the production spine: %q", out2)
+	}
+}
+
+// The Phase-4 production-spine literal: reminder_set through the REAL
+// spine (REPL → planner tool call → PEP → obligation+schedule batch) →
+// DAEMON RESTART → the due reminder fires with its obligation moved to
+// DELIVERY_PENDING in the SAME batch — then delivered + acked, with the
+// ack correlated to the exact occurrence.
+func TestReminderSpineAcrossRestart(t *testing.T) {
+	step := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		step++
+		reply := ""
+		switch step {
+		case 1: // set a reminder DUE IN THE PAST (fires on the next sweep)
+			reply = `{"action":"tool","tool_id":"reminder_set","arguments":{"id":"rem-spine","body":"spine reminder","year":2026,"month":1,"day":2,"hour":9,"minute":0,"tz":"Europe/Zagreb"}}`
+		case 2:
+			reply = "reminder placed"
+		case 3: // after restart: acknowledge the delivered occurrence
+			reply = `{"action":"tool","tool_id":"reminder_ack","arguments":{"occurrence_id":"occ-rem-spine#1"}}`
+		default:
+			reply = "acknowledged"
+		}
+		b, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{
+			"message": map[string]string{"role": "assistant", "content": reply}}}})
+		w.Write(b)
+	}))
+	t.Cleanup(srv.Close)
+	host := strings.TrimPrefix(srv.URL, "http://")
+	t.Setenv("NEXUS_SPINE3_KEY", "sk-spine3")
+	base := filepath.Join(t.TempDir(), "nexus")
+	if err := os.MkdirAll(base, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfgJSON := fmt.Sprintf(`{"provider_base_url":%q,"provider_key_env":"NEXUS_SPINE3_KEY",
+		"provider_model":"m","egress_allow":[%q],"default_profile":"private"}`, srv.URL, host)
+	if err := os.WriteFile(filepath.Join(base, "config.json"), []byte(cfgJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	layout := pathx.Layout{Base: base}
+	resolved, err := config.Resolve(filepath.Join(base, "config.json"), "", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := func(input string, sweep bool) (string, *daemonBundle) {
+		b, err := buildDaemon(layout, resolved)
+		if err != nil {
+			t.Fatalf("composition root: %v", err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		sock := socketPath(layout)
+		serveDone := make(chan error, 1)
+		go func() { serveDone <- b.d.Serve(ctx, sock) }()
+		for i := 0; i < 100; i++ {
+			if c, err := net.Dial("unix", sock); err == nil {
+				c.Close()
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if sweep {
+			// The startup catch-up sweep, exactly as runDaemon runs it —
+			// the decorated batch fires the overdue occurrence.
+			if _, err := b.sched.Sweep(context.Background()); err != nil {
+				t.Fatalf("startup sweep: %v", err)
+			}
+		}
+		var out strings.Builder
+		if input != "" {
+			if err := repl.Run(strings.NewReader(input), &out, sock, true); err != nil {
+				t.Fatal(err)
+			}
+		}
+		cancel()
+		<-serveDone
+		return out.String(), b
+	}
+	// Session 1: place the reminder through the spine, then shut down.
+	out1, b1 := session("remind me\n", false)
+	if !strings.Contains(out1, "reminder placed") {
+		t.Fatalf("reminder_set turn broken: %q", out1)
+	}
+	if st, err := b1.obl.Status(context.Background(), "rem-spine"); err != nil || st != obligation.StateScheduled {
+		t.Fatalf("obligation not SCHEDULED after set: %v %v", st, err)
+	}
+	b1.j.Close()
+	// Session 2 (RESTART): the sweep fires the missed occurrence and the
+	// obligation lands DELIVERY_PENDING in the SAME batch; deliver + ack
+	// through the spine.
+	_, b2 := session("", true)
+	st, err := b2.obl.Status(context.Background(), "rem-spine")
+	if err != nil || st != obligation.StateDeliveryPending {
+		b2.j.Close()
+		t.Fatalf("fired obligation not DELIVERY_PENDING after restart: %v %v", st, err)
+	}
+	if err := b2.obl.MarkDelivered(context.Background(), "occ-rem-spine#1"); err != nil {
+		b2.j.Close()
+		t.Fatal(err)
+	}
+	b2.j.Close()
+	out3, b3 := session("ack it\n", false)
+	defer b3.j.Close()
+	if !strings.Contains(out3, "acknowledged") {
+		t.Fatalf("ack turn broken: %q", out3)
+	}
+	if st, err := b3.obl.Status(context.Background(), "rem-spine"); err != nil || st != obligation.StateAcked {
+		t.Fatalf("final state %v (%v), want ACKED", st, err)
 	}
 }

@@ -171,7 +171,7 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 	for n, v := range schedule.Events() {
 		events[n] = v
 	}
-	for n, v := range obligation.Events() {
+	for n, v := range obligation.Events("file_note") {
 		events[n] = v
 	}
 	journalPath, _ := layout.ProfileJournal(profile)
@@ -207,11 +207,34 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 		j.Close()
 		return nil, err
 	}
-	oblManager, err := obligation.NewManager(j, sched, registry, clockid.System{})
+	obligation.SetNotesDir(profileDir)
+	lazyRunner := &obligation.LazyRunner{}
+	oblManager, err := obligation.NewManager(j, sched, registry, clockid.System{}, lazyRunner, authority)
 	if err != nil {
 		j.Close()
 		return nil, err
 	}
+	// Reminder firing joins the scheduler batch (no crash window between
+	// occurrence-fire and obligation admission).
+	sched.SetFireDecorator(oblManager.FireParams)
+	// System EffectPath: the manager's programmatic dispatch (scheduled
+	// task runs) goes through the SAME sealed path as sessions —
+	// ModeDefault, merged sealed tools/rules.
+	allTools := mergedTools(memStore, redactor, oblManager)
+	sysPep, err := effectpath.NewPEP(mergedRules(), effectpath.NewApprovals(nil, 5*time.Minute),
+		&journalAudit{j: j, profile: profile}, effectpath.ModeDefault)
+	if err != nil {
+		j.Close()
+		return nil, err
+	}
+	sysPath, err := effectpath.NewEffectPath(sysPep, systemMW{},
+		effectpath.NewInProcessExecutor(allTools),
+		effectpath.NewSandboxedProcessExecutor(nil), authority)
+	if err != nil {
+		j.Close()
+		return nil, err
+	}
+	lazyRunner.R = sysPath
 	target := prov.Target() // the provider's OWN grant target — anything else never reaches the wire
 	d, err := daemon.New(daemon.Deps{
 		Journal: j,
@@ -233,7 +256,7 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 		},
 		Authority: authority, Profile: profile,
 		Rules:    mergedRules(),
-		Tools:    mergedTools(memStore, redactor, oblManager),
+		Tools:    allTools,
 		Audit:    &journalAudit{j: j, profile: profile},
 		Redactor: redactor,
 	})
@@ -243,6 +266,15 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 	}
 	return &daemonBundle{d: d, j: j, sched: sched, obl: oblManager}, nil
 }
+
+// systemMW is the order-only S6.9 seam for the system EffectPath.
+type systemMW struct{}
+
+func (systemMW) BeforeTool(context.Context, contracts.ToolCall) error { return nil }
+func (systemMW) AfterTool(context.Context, contracts.ToolCall, contracts.ToolResult) error {
+	return nil
+}
+func (systemMW) OnError(ctx context.Context, e error) error { return e }
 
 // mergedRules combines every tool family's PEP decisions.
 func mergedRules() map[contracts.ToolID]effectpath.Decision {

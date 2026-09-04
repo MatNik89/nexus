@@ -5,28 +5,37 @@
 // (SCHEDULED→DUE→DELIVERY_PENDING→DELIVERED→ACKED|EXPIRED) and ONE
 // concrete typed Task (file_note). Every mutation writes THROUGH the
 // journal (P0.3); lifecycle legality is a default-reject machine table
-// applied INSIDE the append transaction, so an illegal jump aborts the
-// event itself. Acks correlate to the SAME occurrence id (an ack for N
-// never closes N+1), and a Task is DONE only through a checker-verified
-// postcondition (checker != worker, T12) — never a prose claim.
+// applied INSIDE the append transaction. Reminder firing joins the
+// scheduler's batch via the FireDecorator — there is NO crash window
+// between occurrence-fire and obligation admission (Phase-4 codex #1).
+//
+// Task execution runs THROUGH the sealed EffectPath (S6.0 decision + S7
+// grant — Phase-4 codex #3): the executable is a registered in-process
+// TOOL; execution journals an INTENT before dispatch and an attested
+// marker-line postcondition after (codex #5); DONE exists only through
+// the checker-verified presence of the task's immutable marker line
+// (codex #6 — a whole-file hash breaks under later legitimate appends).
 package obligation
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/MatNik89/nexus/internal/foundation/atomicwrite"
 	"github.com/MatNik89/nexus/internal/foundation/clockid"
 	"github.com/MatNik89/nexus/internal/kernel/checker"
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
+	"github.com/MatNik89/nexus/internal/kernel/effectpath"
 	"github.com/MatNik89/nexus/internal/kernel/journal"
 	"github.com/MatNik89/nexus/internal/kernel/machine"
+	"github.com/MatNik89/nexus/internal/kernel/s7min"
 	"github.com/MatNik89/nexus/internal/schedule"
 )
 
@@ -54,6 +63,7 @@ const (
 	EvDelivered       = "obligation.delivered"
 	EvAcked           = "obligation.acked"
 	EvExpired         = "obligation.expired"
+	EvTaskIntent      = "obligation.task_exec_intent"
 	EvTaskExecuted    = "obligation.task_executed"
 	EvTaskDone        = "obligation.task_done"
 )
@@ -89,7 +99,7 @@ func taskTable() *machine.Table[State] {
 
 type createdPayload struct {
 	ID         string `json:"id"`
-	Kind       string `json:"kind"` // "reminder" | task kind
+	Kind       string `json:"kind"` // "reminder" | registered task kind
 	Body       string `json:"body"`
 	TaskParams string `json:"task_params,omitempty"`
 }
@@ -98,18 +108,31 @@ type occurrencePayload struct {
 	OccurrenceID string `json:"occurrence_id"`
 }
 
+type intentPayload struct {
+	ID          string `json:"id"`
+	OperationID string `json:"operation_id"`
+}
+
 type executedPayload struct {
-	ID             string `json:"id"`
-	ExpectedPath   string `json:"expected_path"`
-	ExpectedSHA256 string `json:"expected_sha256"`
+	ID           string `json:"id"`
+	ExpectedPath string `json:"expected_path"`
+	MarkerLine   string `json:"marker_line"`
+	Reconciled   bool   `json:"reconciled,omitempty"`
 }
 
 type donePayload struct {
 	ID string `json:"id"`
 }
 
-// Events returns the payload validators for the journal's closed set.
-func Events() map[string]journal.PayloadValidator {
+// Events returns the payload validators — the kind discriminator is
+// SEALED against {"reminder"} ∪ the registered task kinds (Phase-4 codex
+// #13: a crafted canonical event with an unknown kind must not survive
+// replay as an OPEN task).
+func Events(taskKinds ...string) map[string]journal.PayloadValidator {
+	allowed := map[string]bool{"reminder": true}
+	for _, k := range taskKinds {
+		allowed[k] = true
+	}
 	occV := func(raw json.RawMessage) error {
 		var p occurrencePayload
 		if err := json.Unmarshal(raw, &p); err != nil {
@@ -129,16 +152,29 @@ func Events() map[string]journal.PayloadValidator {
 			if p.ID == "" || p.Kind == "" {
 				return fmt.Errorf("obligation: id and kind are required")
 			}
+			if !allowed[p.Kind] {
+				return fmt.Errorf("obligation: unknown obligation kind (fail closed; sealed set)")
+			}
 			return nil
 		},
 		EvDue: occV, EvDeliveryPending: occV, EvDelivered: occV, EvAcked: occV, EvExpired: occV,
+		EvTaskIntent: func(raw json.RawMessage) error {
+			var p intentPayload
+			if err := json.Unmarshal(raw, &p); err != nil {
+				return err
+			}
+			if p.ID == "" || p.OperationID == "" {
+				return fmt.Errorf("obligation: intent requires task and operation ids")
+			}
+			return nil
+		},
 		EvTaskExecuted: func(raw json.RawMessage) error {
 			var p executedPayload
 			if err := json.Unmarshal(raw, &p); err != nil {
 				return err
 			}
-			if p.ID == "" || p.ExpectedPath == "" || p.ExpectedSHA256 == "" {
-				return fmt.Errorf("obligation: execution attestation requires path and hash")
+			if p.ID == "" || p.ExpectedPath == "" || p.MarkerLine == "" {
+				return fmt.Errorf("obligation: execution attestation requires path and marker line")
 			}
 			return nil
 		},
@@ -162,7 +198,7 @@ type Projection struct{}
 func NewProjection() *Projection { return &Projection{} }
 
 func (Projection) Name() string { return "obligation" }
-func (Projection) Version() int { return 1 }
+func (Projection) Version() int { return 2 } // v2: delivered_at + intent + marker columns
 
 func (Projection) Init(db *journal.ProjDB) error {
 	_, err := db.Exec(`
@@ -173,8 +209,10 @@ func (Projection) Init(db *journal.ProjDB) error {
 			status TEXT NOT NULL,
 			occurrence_id TEXT,
 			task_params TEXT NOT NULL DEFAULT '',
+			intent_op TEXT NOT NULL DEFAULT '',
 			expected_path TEXT NOT NULL DEFAULT '',
-			expected_sha256 TEXT NOT NULL DEFAULT '',
+			marker_line TEXT NOT NULL DEFAULT '',
+			delivered_at INTEGER NOT NULL DEFAULT 0,
 			created INTEGER NOT NULL
 		);
 		CREATE UNIQUE INDEX IF NOT EXISTS ux_obl_occurrence
@@ -190,7 +228,7 @@ func (Projection) Reset(db *journal.ProjDB) error {
 
 func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 	raw := ev.Envelope.Payload
-	step := func(occ, event string) error {
+	step := func(occ, event string, extra string, extraArgs ...any) error {
 		rows, err := tx.Query(`SELECT id, status FROM obl_obligations WHERE occurrence_id=?`, occ)
 		if err != nil {
 			return err
@@ -214,7 +252,9 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 		if err != nil {
 			return fmt.Errorf("obligation: %w", err)
 		}
-		if _, err := tx.Exec(`UPDATE obl_obligations SET status=? WHERE id=?`, string(next), id); err != nil {
+		q := `UPDATE obl_obligations SET status=?` + extra + ` WHERE id=?`
+		args := append([]any{string(next)}, append(extraArgs, id)...)
+		if _, err := tx.Exec(q, args...); err != nil {
 			return err
 		}
 		return nil
@@ -244,38 +284,53 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return err
 		}
-		return step(p.OccurrenceID, EvDue)
+		return step(p.OccurrenceID, EvDue, "")
 	case EvDeliveryPending:
 		var p occurrencePayload
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return err
 		}
-		return step(p.OccurrenceID, EvDeliveryPending)
+		return step(p.OccurrenceID, EvDeliveryPending, "")
 	case EvDelivered:
 		var p occurrencePayload
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return err
 		}
-		return step(p.OccurrenceID, EvDelivered)
+		// The REAL delivery instant persists (Phase-4 codex #2/agy #2):
+		// ack grading consumes this durable value, never a synthesized one.
+		return step(p.OccurrenceID, EvDelivered, ", delivered_at=?", ev.Envelope.EmittedAt.UnixNano())
 	case EvAcked:
 		var p occurrencePayload
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return err
 		}
-		return step(p.OccurrenceID, EvAcked)
+		return step(p.OccurrenceID, EvAcked, "")
 	case EvExpired:
 		var p occurrencePayload
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return err
 		}
-		return step(p.OccurrenceID, EvExpired)
+		return step(p.OccurrenceID, EvExpired, "")
+	case EvTaskIntent:
+		var p intentPayload
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return err
+		}
+		res, err := tx.Exec(`UPDATE obl_obligations SET intent_op=? WHERE id=? AND status=?`,
+			p.OperationID, p.ID, string(StateOpen))
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return fmt.Errorf("obligation: intent for an unknown or closed task (fail closed)")
+		}
 	case EvTaskExecuted:
 		var p executedPayload
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return err
 		}
-		res, err := tx.Exec(`UPDATE obl_obligations SET expected_path=?, expected_sha256=?
-			WHERE id=? AND status=?`, p.ExpectedPath, p.ExpectedSHA256, p.ID, string(StateOpen))
+		res, err := tx.Exec(`UPDATE obl_obligations SET expected_path=?, marker_line=?
+			WHERE id=? AND status=?`, p.ExpectedPath, p.MarkerLine, p.ID, string(StateOpen))
 		if err != nil {
 			return err
 		}
@@ -317,37 +372,62 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 	return nil
 }
 
-// Handler executes ONE typed task kind and returns the postcondition it
-// claims (path + expected sha256) — the CHECKER, not the handler, decides
-// done (E13).
-type Handler func(ctx context.Context, params string) (expectedPath, expectedSHA256 string, err error)
+// Handler executes ONE typed task kind and returns the IMMUTABLE marker
+// line it wrote (path + exact line) — the CHECKER, not the handler,
+// decides done (E13).
+type Handler func(ctx context.Context, taskID, params string) (path, markerLine string, err error)
 
-// FileNoteHandler appends a note line to the profile-scoped notes file
-// via the T05 AtomicWriter and returns the resulting content hash.
+// fileNoteMu serializes note appends (Phase-4 codex #6: concurrent
+// read-modify-replace would lose one line).
+var fileNoteMu sync.Mutex
+
+// FileNoteHandler appends "[<task-id>] <note>" via the T05 AtomicWriter —
+// the marker line is the task's stable, per-task postcondition artifact.
 func FileNoteHandler(dir string) Handler {
-	return func(ctx context.Context, params string) (string, string, error) {
+	return func(ctx context.Context, taskID, params string) (string, string, error) {
 		var p struct {
 			Note string `json:"note"`
 		}
 		if err := json.Unmarshal([]byte(params), &p); err != nil || p.Note == "" {
 			return "", "", fmt.Errorf("file_note: a non-empty note is required (fail closed)")
 		}
+		if strings.ContainsAny(p.Note, "\n\r") {
+			return "", "", fmt.Errorf("file_note: a note is one line (fail closed)")
+		}
+		line := "[" + taskID + "] " + p.Note
 		path := filepath.Join(dir, "notes.txt")
+		fileNoteMu.Lock()
+		defer fileNoteMu.Unlock()
 		existing, err := os.ReadFile(path)
 		if err != nil && !os.IsNotExist(err) {
 			return "", "", err
 		}
-		content := append(existing, []byte(p.Note+"\n")...)
-		if err := atomicwrite.Write(path, content, 0o600); err != nil {
+		if err := atomicwrite.Write(path, append(existing, []byte(line+"\n")...), 0o600); err != nil {
 			return "", "", err
 		}
-		sum := sha256.Sum256(content)
-		return path, hex.EncodeToString(sum[:]), nil
+		return path, line, nil
 	}
 }
 
-// Registry is the CLOSED task-handler set; it can never be empty (the
-// typed-handler path must exist, ledger acceptance).
+// fileContainsLine is the postcondition verifier (checker != worker: it
+// re-reads the REAL file).
+func fileContainsLine(path, line string) (bool, error) {
+	b, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	for _, l := range strings.Split(string(b), "\n") {
+		if l == line {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// Registry is the CLOSED task-handler set; it can never be empty.
 type Registry struct {
 	handlers map[string]Handler
 }
@@ -366,20 +446,39 @@ func NewRegistry(handlers map[string]Handler) (*Registry, error) {
 	return &Registry{handlers: cp}, nil
 }
 
-// Manager is the obligation facade over the profile's ONE journal.
-type Manager struct {
-	j     *journal.Journal
-	sched *schedule.Scheduler
-	reg   *Registry
-	clock clockid.Clock
-	seq   atomic.Uint64
+// Kinds lists the registered task kinds (seals the event validator).
+func (r *Registry) Kinds() []string {
+	out := make([]string, 0, len(r.handlers))
+	for k := range r.handlers {
+		out = append(out, k)
+	}
+	return out
 }
 
-func NewManager(j *journal.Journal, s *schedule.Scheduler, r *Registry, c clockid.Clock) (*Manager, error) {
-	if j == nil || s == nil || r == nil || c == nil {
-		return nil, fmt.Errorf("obligation: journal, scheduler, registry and clock are required (fail closed)")
+// EffectRunner is the sealed execution seam (the EffectPath — S6.0
+// decision, S7 grant, receipt discipline). Task handlers NEVER run
+// outside it (Phase-4 codex #3).
+type EffectRunner interface {
+	RunTool(ctx context.Context, call contracts.ToolCall, grant s7min.Grant) (contracts.ToolResult, error)
+}
+
+// Manager is the obligation facade over the profile's ONE journal.
+type Manager struct {
+	j      *journal.Journal
+	sched  *schedule.Scheduler
+	reg    *Registry
+	clock  clockid.Clock
+	runner EffectRunner
+	auth   *s7min.Authority
+	seq    atomic.Uint64
+}
+
+func NewManager(j *journal.Journal, s *schedule.Scheduler, r *Registry, c clockid.Clock,
+	runner EffectRunner, auth *s7min.Authority) (*Manager, error) {
+	if j == nil || s == nil || r == nil || c == nil || runner == nil || auth == nil {
+		return nil, fmt.Errorf("obligation: journal, scheduler, registry, clock, effect runner and S7 authority are required (fail closed)")
 	}
-	return &Manager{j: j, sched: s, reg: r, clock: c}, nil
+	return &Manager{j: j, sched: s, reg: r, clock: c, runner: runner, auth: auth}, nil
 }
 
 func (m *Manager) Journal() *journal.Journal { return m.j }
@@ -399,6 +498,21 @@ func (m *Manager) params(eventType string, payload any) (contracts.EnvelopeParam
 	}, nil
 }
 
+// FireParams is the schedule.FireDecorator: the DUE + DELIVERY_PENDING
+// transitions join the scheduler's fire batch — one transaction, no
+// crash window (Phase-4 codex #1).
+func (m *Manager) FireParams(f schedule.Fired) ([]contracts.EnvelopeParams, error) {
+	dueP, err := m.params(EvDue, occurrencePayload{OccurrenceID: f.OccurrenceID})
+	if err != nil {
+		return nil, err
+	}
+	pendP, err := m.params(EvDeliveryPending, occurrencePayload{OccurrenceID: f.OccurrenceID})
+	if err != nil {
+		return nil, err
+	}
+	return []contracts.EnvelopeParams{dueP, pendP}, nil
+}
+
 // CreateReminder creates the schedule AND the obligation in ONE atomic
 // batch — a reminder can never exist without its schedule or vice versa.
 func (m *Manager) CreateReminder(ctx context.Context, id, body string, w schedule.WallTime) error {
@@ -415,7 +529,7 @@ func (m *Manager) CreateReminder(ctx context.Context, id, body string, w schedul
 }
 
 // CreateTask creates one typed task; unknown kinds fail closed against
-// the registry.
+// the registry (and against the sealed event validator).
 func (m *Manager) CreateTask(ctx context.Context, id, kind, taskParams string) error {
 	if id == "" {
 		return fmt.Errorf("obligation: task id is required (fail closed)")
@@ -431,18 +545,14 @@ func (m *Manager) CreateTask(ctx context.Context, id, kind, taskParams string) e
 	return err
 }
 
-// MarkDue transitions the fired occurrence DUE → DELIVERY_PENDING in one
-// atomic batch (the scheduler fired it; delivery is now owed).
+// MarkDue exists for callers OUTSIDE the scheduler batch (tests, manual
+// recovery); production firing uses FireParams in the scheduler batch.
 func (m *Manager) MarkDue(ctx context.Context, f schedule.Fired) error {
-	dueP, err := m.params(EvDue, occurrencePayload{OccurrenceID: f.OccurrenceID})
+	batch, err := m.FireParams(f)
 	if err != nil {
 		return err
 	}
-	pendP, err := m.params(EvDeliveryPending, occurrencePayload{OccurrenceID: f.OccurrenceID})
-	if err != nil {
-		return err
-	}
-	_, err = m.j.AppendBatch(ctx, []contracts.EnvelopeParams{dueP, pendP})
+	_, err = m.j.AppendBatch(ctx, batch)
 	return err
 }
 
@@ -460,25 +570,25 @@ func (m *Manager) MarkDelivered(ctx context.Context, occ string) error {
 	return m.occEvent(ctx, EvDelivered, occ)
 }
 
-// MarkAcked closes the occurrence — the checker's B5 grading (delivery +
-// ack for the SAME occurrence) runs before the journal transition; the
-// projection's occurrence binding plus the default-reject table make an
-// ack for any other occurrence impossible.
+// MarkAcked closes the occurrence. The checker grades REAL artifacts
+// (Phase-4 codex #2): the delivery evidence carries the PERSISTED
+// delivered_at from the durable obligation.delivered event — an ack
+// without a durable delivery record cannot pass.
 func (m *Manager) MarkAcked(ctx context.Context, occ string) error {
-	// Grade with the T12 checker: both records must exist for THIS
-	// occurrence and in a legal order (delivered state proves delivery).
-	st, err := m.statusByOccurrence(ctx, occ)
+	st, deliveredAt, err := m.occurrenceState(ctx, occ)
 	if err != nil {
 		return err
 	}
-	now := m.clock.Now()
+	if deliveredAt.IsZero() {
+		return fmt.Errorf("obligation: ack refused — no durable delivery receipt for occurrence %s (B5)", occ)
+	}
 	contract := checker.AcceptanceContract{ID: "occ:" + occ, Worker: "reminder-channel",
 		Criteria: []checker.Criterion{{DeliveredAndAcked: &occ}}}
 	verdict, err := checker.Grade(contract, []checker.Evidence{
-		{Contract: "occ:" + occ, Producer: "obligation-store",
-			Delivery: &checker.DeliveryEvidence{OccurrenceID: occ, DeliveredAt: now.Add(-1)}},
-		{Contract: "occ:" + occ, Producer: "obligation-store",
-			Ack: &checker.AckEvidence{OccurrenceID: occ, AckAt: now}},
+		{Contract: "occ:" + occ, Producer: "journal-projection",
+			Delivery: &checker.DeliveryEvidence{OccurrenceID: occ, DeliveredAt: deliveredAt}},
+		{Contract: "occ:" + occ, Producer: "user-gesture",
+			Ack: &checker.AckEvidence{OccurrenceID: occ, AckAt: m.clock.Now()}},
 	})
 	if err != nil {
 		return fmt.Errorf("obligation: ack grading: %w", err)
@@ -494,22 +604,118 @@ func (m *Manager) MarkExpired(ctx context.Context, occ string) error {
 	return m.occEvent(ctx, EvExpired, occ)
 }
 
-// RunTask executes the task's typed handler and journals the attested
-// postcondition (path + expected hash) — execution and DONE stay separate.
-func (m *Manager) RunTask(ctx context.Context, id string) error {
-	kind, taskParams, err := m.taskInfo(ctx, id)
+// taskToolID is the sealed tool the EffectPath dispatches for task
+// execution (registered by Tools()).
+const taskToolID = "task_file_note"
+
+// executeGoverned is the ONE task-execution sequence, invoked ONLY from
+// inside the sealed task tool (both the model path and RunTask land
+// here): intent journaled BEFORE the effect; an earlier intent without
+// attestation RECONCILES against the real file before any retry (the
+// note is never appended twice — codex #5); the attestation lands after.
+func (m *Manager) executeGoverned(ctx context.Context, id, opSuffix string) (string, string, error) {
+	kind, taskParams, intentOp, markerLine, _, status, err := m.taskRow(ctx, id)
 	if err != nil {
-		return err
+		return "", "", err
+	}
+	if status != StateOpen {
+		return "", "", fmt.Errorf("obligation: task %s is not OPEN (fail closed)", id)
 	}
 	h := m.reg.handlers[kind]
 	if h == nil {
-		return fmt.Errorf("obligation: no handler for kind %q (fail closed)", kind)
+		return "", "", fmt.Errorf("obligation: no handler for kind %q (fail closed)", kind)
 	}
-	path, sum, err := h(ctx, taskParams)
+	if markerLine != "" {
+		return "", "", fmt.Errorf("obligation: task %s already has an attested execution", id)
+	}
+	if intentOp != "" {
+		if probableLine, perr := m.probableMarker(id, taskParams); perr == nil {
+			probablePath := filepath.Join(m.notesDirFor(), "notes.txt")
+			present, ferr := fileContainsLine(probablePath, probableLine)
+			if ferr == nil && present {
+				if err := m.attestExecution(ctx, id, probablePath, probableLine, true); err != nil {
+					return "", "", err
+				}
+				return probablePath, probableLine, nil
+			}
+		}
+		// Not present: the append never happened; dispatch is safe.
+	}
+	intentP, err := m.params(EvTaskIntent, intentPayload{ID: id, OperationID: "op-" + opSuffix})
 	if err != nil {
-		return fmt.Errorf("obligation: handler: %w", err)
+		return "", "", err
 	}
-	p, err := m.params(EvTaskExecuted, executedPayload{ID: id, ExpectedPath: path, ExpectedSHA256: sum})
+	if _, err := m.j.Append(ctx, intentP); err != nil {
+		return "", "", err
+	}
+	path, line, err := h(ctx, id, taskParams)
+	if err != nil {
+		return "", "", fmt.Errorf("obligation: handler: %w", err)
+	}
+	if err := m.attestExecution(ctx, id, path, line, false); err != nil {
+		return "", "", err
+	}
+	return path, line, nil
+}
+
+// RunTask dispatches the task's sealed tool THROUGH the EffectPath
+// (S6.0 decision + S7 grant — codex #3); the tool owns the
+// intent/reconcile/attest sequence, so the model path and this
+// programmatic path share ONE discipline.
+func (m *Manager) RunTask(ctx context.Context, id string) error {
+	op := contracts.OperationID(fmt.Sprintf("task-%s-%d", id, m.clock.Now().UnixNano()))
+	args, err := json.Marshal(map[string]string{"task_id": id})
+	if err != nil {
+		return err
+	}
+	idem := "idem-" + string(op)
+	call, err := contracts.NewToolCall(contracts.ToolCallParams{
+		ToolCallID: contracts.ToolCallID("tc-" + string(op)), ToolID: taskToolID,
+		Arguments: args, ArgsSchemaHash: "task_file_note.v1",
+		Effect: contracts.EffectReversible, ExecutionKind: contracts.ExecInProcess,
+		Deadline: m.clock.Now().Add(2 * time.Minute), AttemptNo: 1,
+		IdempotencyKey: &idem, ProfileID: m.j.Profile(),
+	})
+	if err != nil {
+		return err
+	}
+	grant, err := m.auth.Issue(op, effectpath.ToolTarget(call))
+	if err != nil {
+		return err
+	}
+	if _, err := m.runner.RunTool(ctx, call, grant); err != nil {
+		return fmt.Errorf("obligation: governed execution: %w", err)
+	}
+	return nil
+}
+
+// notesDir is set by the composition (FileNoteHandler dir); reconcile
+// needs it to locate the deterministic marker.
+var notesDir atomic.Value
+
+// SetNotesDir records the profile notes directory for reconcile.
+func SetNotesDir(dir string) { notesDir.Store(dir) }
+
+func (m *Manager) notesDirFor() string {
+	if v, ok := notesDir.Load().(string); ok {
+		return v
+	}
+	return "."
+}
+
+// probableMarker recomputes the deterministic marker for reconcile.
+func (m *Manager) probableMarker(id, taskParams string) (string, error) {
+	var p struct {
+		Note string `json:"note"`
+	}
+	if err := json.Unmarshal([]byte(taskParams), &p); err != nil || p.Note == "" {
+		return "", fmt.Errorf("obligation: unreconstructable marker")
+	}
+	return "[" + id + "] " + p.Note, nil
+}
+
+func (m *Manager) attestExecution(ctx context.Context, id, path, line string, reconciled bool) error {
+	p, err := m.params(EvTaskExecuted, executedPayload{ID: id, ExpectedPath: path, MarkerLine: line, Reconciled: reconciled})
 	if err != nil {
 		return err
 	}
@@ -518,34 +724,38 @@ func (m *Manager) RunTask(ctx context.Context, id string) error {
 }
 
 // MarkTaskDone grades the POSTCONDITION with the T12 checker: the
-// verifier re-reads the file (checker != worker) and the content hash
-// must equal the handler's attested expectation. A claim with an
-// unchanged/absent file grades FAIL and the task stays open.
+// verifier re-reads the real file (checker != worker) and the task's
+// IMMUTABLE marker line must be present. A claim with an unchanged file
+// grades FAIL and the task stays open. topknot ceiling: the gap between
+// the verifier read and the DONE append tolerates external truncation
+// (replay determinism forbids filesystem reads inside the projection
+// transaction); the marker artifact itself is append-stable.
 func (m *Manager) MarkTaskDone(ctx context.Context, id string) error {
-	expPath, expSum, err := m.taskExpectation(ctx, id)
+	_, _, _, markerLine, expPath, status, err := m.taskRow(ctx, id)
 	if err != nil {
 		return err
 	}
-	if expPath == "" || expSum == "" {
+	if status != StateOpen {
+		return fmt.Errorf("obligation: task %s is not OPEN", id)
+	}
+	if markerLine == "" || expPath == "" {
 		return fmt.Errorf("obligation: done refused — the task has no attested execution (E13: no evidence, no done)")
 	}
-	// Independent verification: read the REAL file now.
-	b, err := os.ReadFile(expPath)
+	present, err := fileContainsLine(expPath, markerLine)
 	if err != nil {
 		return fmt.Errorf("obligation: postcondition verify: %w", err)
 	}
-	sum := sha256.Sum256(b)
 	contract := checker.AcceptanceContract{ID: "task:" + id, Worker: "file_note-handler",
-		Criteria: []checker.Criterion{{FileHashIs: &checker.FileHashCriterion{Path: expPath, SHA256: expSum}}}}
+		Criteria: []checker.Criterion{{FileContainsLine: &checker.FileLineCriterion{Path: expPath, Line: markerLine}}}}
 	verdict, err := checker.Grade(contract, []checker.Evidence{
 		{Contract: "task:" + id, Producer: "postcondition-verifier",
-			FileHash: &checker.FileHashEvidence{Path: expPath, SHA256: hex.EncodeToString(sum[:])}},
+			FileLine: &checker.FileLineEvidence{Path: expPath, Line: markerLine, Present: present}},
 	})
 	if err != nil {
 		return fmt.Errorf("obligation: done grading: %w", err)
 	}
 	if !verdict.Pass {
-		return fmt.Errorf("obligation: done refused — the postcondition does not verify (file content diverges from the attested state)")
+		return fmt.Errorf("obligation: done refused — the postcondition does not verify (the task's marker line is absent)")
 	}
 	p, err := m.params(EvTaskDone, donePayload{ID: id})
 	if err != nil {
@@ -573,48 +783,60 @@ func (m *Manager) Status(ctx context.Context, id string) (State, error) {
 	return State(s), rows.Err()
 }
 
-func (m *Manager) statusByOccurrence(ctx context.Context, occ string) (State, error) {
-	rows, err := m.j.QueryProjection(ctx, `SELECT status FROM obl_obligations WHERE occurrence_id=?`, occ)
+// DeliveredAt exposes the persisted durable delivery instant.
+func (m *Manager) DeliveredAt(ctx context.Context, occ string) (time.Time, error) {
+	_, at, err := m.occurrenceState(ctx, occ)
+	return at, err
+}
+
+func (m *Manager) occurrenceState(ctx context.Context, occ string) (State, time.Time, error) {
+	rows, err := m.j.QueryProjection(ctx, `SELECT status, delivered_at FROM obl_obligations WHERE occurrence_id=?`, occ)
 	if err != nil {
-		return "", err
+		return "", time.Time{}, err
 	}
 	defer rows.Close()
 	if !rows.Next() {
-		return "", fmt.Errorf("obligation: no obligation bound to occurrence %q", occ)
+		return "", time.Time{}, fmt.Errorf("obligation: no obligation bound to occurrence %q", occ)
 	}
 	var s string
-	if err := rows.Scan(&s); err != nil {
-		return "", err
+	var at int64
+	if err := rows.Scan(&s, &at); err != nil {
+		return "", time.Time{}, err
 	}
-	return State(s), rows.Err()
+	var t time.Time
+	if at > 0 {
+		t = time.Unix(0, at).UTC()
+	}
+	return State(s), t, rows.Err()
 }
 
-func (m *Manager) taskInfo(ctx context.Context, id string) (kind, taskParams string, err error) {
-	rows, err := m.j.QueryProjection(ctx, `SELECT kind, task_params FROM obl_obligations WHERE id=?`, id)
-	if err != nil {
-		return "", "", err
+func (m *Manager) taskRow(ctx context.Context, id string) (kind, taskParams, intentOp, markerLine, expPath string, status State, err error) {
+	rows, qerr := m.j.QueryProjection(ctx,
+		`SELECT kind, task_params, intent_op, marker_line, expected_path, status FROM obl_obligations WHERE id=?`, id)
+	if qerr != nil {
+		return "", "", "", "", "", "", qerr
 	}
 	defer rows.Close()
 	if !rows.Next() {
-		return "", "", fmt.Errorf("obligation: unknown task %q", id)
+		return "", "", "", "", "", "", fmt.Errorf("obligation: unknown task %q", id)
 	}
-	if err := rows.Scan(&kind, &taskParams); err != nil {
-		return "", "", err
+	var st string
+	if err := rows.Scan(&kind, &taskParams, &intentOp, &markerLine, &expPath, &st); err != nil {
+		return "", "", "", "", "", "", err
 	}
-	return kind, taskParams, rows.Err()
+	return kind, taskParams, intentOp, markerLine, expPath, State(st), rows.Err()
 }
 
-func (m *Manager) taskExpectation(ctx context.Context, id string) (path, sum string, err error) {
-	rows, err := m.j.QueryProjection(ctx, `SELECT expected_path, expected_sha256 FROM obl_obligations WHERE id=?`, id)
-	if err != nil {
-		return "", "", err
+// LazyRunner breaks the composition cycle (tools need the manager, the
+// EffectPath needs the tools, the manager needs the EffectPath): wire the
+// real runner after construction; dispatch before wiring fails closed.
+type LazyRunner struct {
+	R EffectRunner
+}
+
+func (l *LazyRunner) RunTool(ctx context.Context, call contracts.ToolCall, grant s7min.Grant) (contracts.ToolResult, error) {
+	if l.R == nil {
+		return contracts.ToolResult{}, fmt.Errorf("obligation: effect runner not wired yet (fail closed)")
 	}
-	defer rows.Close()
-	if !rows.Next() {
-		return "", "", fmt.Errorf("obligation: unknown task %q", id)
-	}
-	if err := rows.Scan(&path, &sum); err != nil {
-		return "", "", err
-	}
-	return path, sum, rows.Err()
+	return l.R.RunTool(ctx, call, grant)
 }

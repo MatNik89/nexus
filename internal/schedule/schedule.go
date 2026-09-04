@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,8 +39,10 @@ const (
 	EvOccurrenceFired = "schedule.occurrence_fired"
 )
 
-// overdueGrace: a fire later than this past due carries the OVERDUE notice.
-const overdueGrace = 60 * time.Second
+// OverduePolicy: a fire later than one sweep interval past due carries
+// the OVERDUE notice — the tolerance IS the mechanism's own tick, not a
+// hidden number (Phase-4 codex #10; boundary REDs pin both sides).
+const DefaultSweepInterval = 30 * time.Second
 
 // WallTime is the user's LOCAL time intent, persisted verbatim (B1: the
 // wall time + zone is the source of truth; UTC is derived at evaluation).
@@ -57,28 +60,44 @@ func (w WallTime) validate() error {
 		w.Day < 1 || w.Day > 31 || w.Hour < 0 || w.Hour > 23 || w.Minute < 0 || w.Minute > 59 {
 		return fmt.Errorf("schedule: impossible wall time (fail closed)")
 	}
-	if _, err := time.LoadLocation(w.TZ); err != nil {
+	loc, err := time.LoadLocation(w.TZ)
+	if err != nil {
 		return fmt.Errorf("schedule: unknown IANA zone (fail closed)")
+	}
+	// Civil-date roundtrip (Phase-4 codex #9): 2026-02-30 must not
+	// silently normalize into March. A DST gap moves only the CLOCK, so
+	// Y/M/D must survive the roundtrip exactly.
+	lt := time.Date(w.Year, w.Month, w.Day, w.Hour, w.Minute, 0, 0, loc)
+	if lt.Year() != w.Year || lt.Month() != w.Month || lt.Day() != w.Day {
+		return fmt.Errorf("schedule: the requested civil date does not exist (fail closed)")
 	}
 	return nil
 }
 
-// dueUTC derives the firing instant: dst=ONCE_FIRST — for an autumn fold
-// the FIRST (earlier-UTC) occurrence wins; a spring-gap wall time is
-// normalized forward by the zone rules.
+// dueUTC derives the firing instant ONCE, at admission (Phase-4 codex
+// #7: the promised instant is PERSISTED — a later tzdata change never
+// moves it and replay is deterministic). dst=ONCE_FIRST: the EARLIEST
+// instant carrying the requested wall time wins, found by scanning the
+// plausible fold window (covers 30-minute zones like Lord Howe and
+// historic non-hour shifts — Phase-4 codex #8); a spring-gap wall time
+// normalizes forward by the zone rules.
 func (w WallTime) dueUTC() (time.Time, error) {
 	loc, err := time.LoadLocation(w.TZ)
 	if err != nil {
 		return time.Time{}, err
 	}
 	t := time.Date(w.Year, w.Month, w.Day, w.Hour, w.Minute, 0, 0, loc)
-	// ONCE_FIRST: if the same wall time also exists one hour earlier in
-	// UTC (fold), take the earlier instant.
-	earlier := t.Add(-time.Hour)
-	if sameWall(earlier, w, loc) {
-		t = earlier
+	// ONCE_FIRST: scan up to 3h of earlier instants minute by minute and
+	// take the EARLIEST that still names the same wall time (fold deltas
+	// are 30m/1h/2h in practice; the scan is admission-time only).
+	earliest := t
+	for d := time.Minute; d <= 3*time.Hour; d += time.Minute {
+		c := t.Add(-d)
+		if sameWall(c, w, loc) {
+			earliest = c
+		}
 	}
-	return t.UTC(), nil
+	return earliest.UTC(), nil
 }
 
 func sameWall(t time.Time, w WallTime, loc *time.Location) bool {
@@ -102,6 +121,9 @@ type createdPayload struct {
 	ID   string   `json:"id"`
 	Body string   `json:"body"`
 	Wall WallTime `json:"wall"`
+	// DueUTC is the instant SELECTED at admission (unixnano): the wall
+	// intent stays for audit, the promise is this number (codex #7).
+	DueUTC int64 `json:"due_utc"`
 }
 
 type firedPayload struct {
@@ -120,6 +142,9 @@ func Events() map[string]journal.PayloadValidator {
 			}
 			if p.ID == "" || p.Body == "" {
 				return fmt.Errorf("schedule: id and body are required")
+			}
+			if p.DueUTC <= 0 {
+				return fmt.Errorf("schedule: a resolved due instant is required")
 			}
 			return p.Wall.validate()
 		},
@@ -145,7 +170,7 @@ type Projection struct{}
 func NewProjection() *Projection { return &Projection{} }
 
 func (Projection) Name() string { return "schedule" }
-func (Projection) Version() int { return 1 }
+func (Projection) Version() int { return 2 } // v2: persisted due_utc (codex #7)
 
 func (Projection) Init(db *journal.ProjDB) error {
 	_, err := db.Exec(`
@@ -153,6 +178,7 @@ func (Projection) Init(db *journal.ProjDB) error {
 			id TEXT PRIMARY KEY,
 			body TEXT NOT NULL,
 			wall TEXT NOT NULL,
+			due_utc INTEGER NOT NULL,
 			fired INTEGER NOT NULL DEFAULT 0,
 			created INTEGER NOT NULL
 		);
@@ -181,8 +207,8 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 		if err != nil {
 			return err
 		}
-		if _, err := tx.Exec(`INSERT INTO sched_schedules(id, body, wall, fired, created) VALUES(?,?,?,0,?)`,
-			p.ID, p.Body, string(wall), int64(ev.JournalOffset)); err != nil {
+		if _, err := tx.Exec(`INSERT INTO sched_schedules(id, body, wall, due_utc, fired, created) VALUES(?,?,?,?,0,?)`,
+			p.ID, p.Body, string(wall), p.DueUTC, int64(ev.JournalOffset)); err != nil {
 			return fmt.Errorf("schedule: create: %w", err) // dup id = PK violation → append aborted
 		}
 	case EvOccurrenceFired:
@@ -199,7 +225,7 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 			return err
 		}
 		if n != 1 {
-			return fmt.Errorf("schedule: occurrence fired for an unknown or already-fired schedule (fail closed)")
+			return fmt.Errorf("schedule: %s: occurrence fired for an unknown or already-fired schedule (fail closed)", errAlreadyFired)
 		}
 		if _, err := tx.Exec(`INSERT INTO sched_meta(key, value) VALUES('last_occurrence_fired', 1)
 			ON CONFLICT(key) DO UPDATE SET value = value + 1`); err != nil {
@@ -209,20 +235,40 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 	return nil
 }
 
+const errAlreadyFired = "ALREADY_FIRED"
+
+// FireDecorator lets an owner (the obligation store) add its own events
+// to the SAME fire batch — the crash window between occurrence-fire and
+// obligation admission does not exist (Phase-4 codex #1).
+type FireDecorator func(f Fired) ([]contracts.EnvelopeParams, error)
+
 // Scheduler is the sweep owner over the profile's ONE journal.
 type Scheduler struct {
-	j           *journal.Journal
-	clock       clockid.Clock
-	counterFile string
-	mu          sync.Mutex
-	seq         uint64
+	j             *journal.Journal
+	clock         clockid.Clock
+	counterFile   string
+	sweepInterval time.Duration
+	decorator     FireDecorator
+	mu            sync.Mutex
+	seq           uint64
 }
 
 func New(j *journal.Journal, c clockid.Clock) (*Scheduler, error) {
 	if j == nil || c == nil {
 		return nil, fmt.Errorf("schedule: a journal and a clock are required (fail closed)")
 	}
-	return &Scheduler{j: j, clock: c}, nil
+	return &Scheduler{j: j, clock: c, sweepInterval: DefaultSweepInterval}, nil
+}
+
+// SetFireDecorator wires the obligation owner's same-batch events.
+func (s *Scheduler) SetFireDecorator(d FireDecorator) { s.decorator = d }
+
+// SetSweepInterval also sets the overdue tolerance (the policy IS the
+// tick — a fire within one interval of due is on time).
+func (s *Scheduler) SetSweepInterval(d time.Duration) {
+	if d > 0 {
+		s.sweepInterval = d
+	}
 }
 
 // Journal exposes the underlying journal (test/composition seam).
@@ -254,7 +300,8 @@ func (s *Scheduler) params(eventType, runID string, payload any) (contracts.Enve
 
 // CreatedParams builds the validated schedule.created envelope WITHOUT
 // appending — composition seam for atomic cross-package batches (T21:
-// [schedule.created, obligation.created] in one transaction).
+// [schedule.created, obligation.created] in one transaction). The due
+// instant is RESOLVED HERE, once (codex #7).
 func (s *Scheduler) CreatedParams(id, body string, w WallTime) (contracts.EnvelopeParams, error) {
 	if id == "" || body == "" {
 		return contracts.EnvelopeParams{}, fmt.Errorf("schedule: id and body are required (fail closed)")
@@ -262,7 +309,11 @@ func (s *Scheduler) CreatedParams(id, body string, w WallTime) (contracts.Envelo
 	if err := w.validate(); err != nil {
 		return contracts.EnvelopeParams{}, err
 	}
-	return s.params(EvScheduleCreated, "run-schedule", createdPayload{ID: id, Body: body, Wall: w})
+	due, err := w.dueUTC()
+	if err != nil {
+		return contracts.EnvelopeParams{}, err
+	}
+	return s.params(EvScheduleCreated, "run-schedule", createdPayload{ID: id, Body: body, Wall: w, DueUTC: due.UnixNano()})
 }
 
 // CreateReminder persists one one-shot reminder (validated fail-closed;
@@ -280,23 +331,18 @@ func (s *Scheduler) CreateReminder(ctx context.Context, id, body string, w WallT
 // ones — the startup/wake/periodic catch-up in one place. Each fire is
 // the atomic B7 batch [occurrence_fired, run.created, run.admitted].
 func (s *Scheduler) Sweep(ctx context.Context) ([]Fired, error) {
-	rows, err := s.j.QueryProjection(ctx, `SELECT id, body, wall FROM sched_schedules WHERE fired=0 ORDER BY created`)
+	rows, err := s.j.QueryProjection(ctx, `SELECT id, body, due_utc FROM sched_schedules WHERE fired=0 ORDER BY created`)
 	if err != nil {
 		return nil, fmt.Errorf("schedule: sweep: %w", err)
 	}
 	type pending struct {
 		id, body string
-		wall     WallTime
+		dueNano  int64
 	}
 	var candidates []pending
 	for rows.Next() {
 		var p pending
-		var wall string
-		if err := rows.Scan(&p.id, &p.body, &wall); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		if err := json.Unmarshal([]byte(wall), &p.wall); err != nil {
+		if err := rows.Scan(&p.id, &p.body, &p.dueNano); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -308,10 +354,9 @@ func (s *Scheduler) Sweep(ctx context.Context) ([]Fired, error) {
 	now := s.clock.Now()
 	var fired []Fired
 	for _, c := range candidates {
-		due, err := c.wall.dueUTC()
-		if err != nil {
-			return fired, err
-		}
+		// The PERSISTED admission-time instant is the promise (codex #7):
+		// no recomputation, no tzdata drift.
+		due := time.Unix(0, c.dueNano).UTC()
 		if now.Before(due) {
 			continue
 		}
@@ -320,7 +365,9 @@ func (s *Scheduler) Sweep(ctx context.Context) ([]Fired, error) {
 			OccurrenceID: "occ-" + c.id + "#1", // stable: one-shot sequence 1
 			RunID:        "run-occ-" + c.id + "#1",
 			Body:         c.body,
-			Overdue:      now.Sub(due) > overdueGrace,
+			// The overdue policy IS the sweep interval: a fire within one
+			// tick of due is on time (codex #10; boundary REDs).
+			Overdue: now.Sub(due) >= s.sweepInterval,
 		}
 		occP, err := s.params(EvOccurrenceFired, f.RunID, firedPayload{
 			ScheduleID: c.id, OccurrenceID: f.OccurrenceID, Overdue: f.Overdue})
@@ -338,18 +385,39 @@ func (s *Scheduler) Sweep(ctx context.Context) ([]Fired, error) {
 			return fired, err
 		}
 		admittedP.Payload = turnPayload
-		// THE B7 recipe: one transaction, all three durable or none.
-		if _, err := s.j.AppendBatch(ctx, []contracts.EnvelopeParams{occP, createdP, admittedP}); err != nil {
+		batch := []contracts.EnvelopeParams{occP, createdP, admittedP}
+		// The obligation owner's events join the SAME transaction — no
+		// crash window between fire and admission (codex #1).
+		if s.decorator != nil {
+			extra, derr := s.decorator(f)
+			if derr != nil {
+				return fired, fmt.Errorf("schedule: fire decorator %s: %w", c.id, derr)
+			}
+			batch = append(batch, extra...)
+		}
+		// THE B7 recipe: one transaction, everything durable or nothing.
+		if _, err := s.j.AppendBatch(ctx, batch); err != nil {
+			if strings.Contains(err.Error(), errAlreadyFired) {
+				continue // a concurrent sweep fired it first: benign, once-only holds
+			}
 			return fired, fmt.Errorf("schedule: fire %s: %w", c.id, err)
 		}
 		fired = append(fired, f)
 	}
-	if len(fired) > 0 && s.counterFile != "" {
-		if n, err := s.LastOccurrenceFired(ctx); err == nil {
-			atomicwrite.Write(s.counterFile, []byte(fmt.Sprintf("%d\n", n)), 0o600)
-		}
-	}
+	s.mirrorCounter(ctx)
 	return fired, nil
+}
+
+// mirrorCounter reconciles the C8 observability file from the
+// AUTHORITATIVE projection on every sweep (codex #11: a crash between
+// batch and mirror must self-heal on the next tick).
+func (s *Scheduler) mirrorCounter(ctx context.Context) {
+	if s.counterFile == "" {
+		return
+	}
+	if n, err := s.LastOccurrenceFired(ctx); err == nil {
+		atomicwrite.Write(s.counterFile, []byte(fmt.Sprintf("%d\n", n)), 0o600)
+	}
 }
 
 // LastOccurrenceFired reports the C8 positive-liveness counter.

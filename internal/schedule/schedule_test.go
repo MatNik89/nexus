@@ -82,7 +82,7 @@ func TestRestartBeforeDueFiresOnce(t *testing.T) {
 	}
 	// "Restart": fresh scheduler over the same journal.
 	s.Journal().Close()
-	clock.Advance(31 * time.Minute) // now 10:31 UTC = 12:31 CEST, due passed by 1m
+	clock.Advance(30*time.Minute + 10*time.Second) // 10s past due: inside one sweep interval
 	s2 := reopenSched(t, path, clock)
 	fired, err = s2.Sweep(ctxT())
 	if err != nil || len(fired) != 1 {
@@ -265,5 +265,151 @@ func TestScheduleValidation(t *testing.T) {
 	}
 	if err := s.CreateReminder(ctxT(), "r-dup", "y", good); err == nil {
 		t.Fatal("duplicate schedule id accepted")
+	}
+}
+
+// The overdue policy IS the sweep interval — exact boundary REDs
+// (Phase-4 codex #10).
+func TestOverdueBoundaryIsSweepInterval(t *testing.T) {
+	mk := func(advance time.Duration) Fired {
+		clock := clockid.NewFake(utc(2026, 9, 4, 10, 0))
+		s, _ := openSched(t, t.TempDir(), clock)
+		if err := s.CreateReminder(ctxT(), "rem-b", "boundary", WallTime{
+			Year: 2026, Month: 9, Day: 4, Hour: 12, Minute: 30, TZ: "Europe/Zagreb",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		clock.Advance(30*time.Minute + advance) // due at +30m
+		fired, err := s.Sweep(ctxT())
+		if err != nil || len(fired) != 1 {
+			t.Fatalf("sweep: %v %v", fired, err)
+		}
+		return fired[0]
+	}
+	if f := mk(DefaultSweepInterval - time.Second); f.Overdue {
+		t.Fatal("fire within one sweep interval marked OVERDUE")
+	}
+	if f := mk(DefaultSweepInterval); !f.Overdue {
+		t.Fatal("fire one full interval late not marked OVERDUE")
+	}
+}
+
+// Lord Howe 30-minute fold (Phase-4 codex #8): dst=ONCE_FIRST holds for
+// non-one-hour zones — the EARLIEST instant carrying the wall time wins.
+// 2026-04-05: 02:00 LHDT (+11) → 01:30 LHST (+10:30); 01:45 occurs twice
+// (14:45 UTC and 15:15 UTC on 2026-04-04).
+func TestLordHoweHalfHourFoldFiresFirst(t *testing.T) {
+	clock := clockid.NewFake(utc(2026, 4, 4, 10, 0))
+	s, _ := openSched(t, t.TempDir(), clock)
+	if err := s.CreateReminder(ctxT(), "rem-lh", "half-hour fold", WallTime{
+		Year: 2026, Month: 4, Day: 5, Hour: 1, Minute: 45, TZ: "Australia/Lord_Howe",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 14:44 UTC: before the FIRST 01:45 → nothing.
+	clock.Advance(4*time.Hour + 44*time.Minute)
+	if fired, _ := s.Sweep(ctxT()); len(fired) != 0 {
+		t.Fatalf("fired before the first Lord Howe occurrence: %v", fired)
+	}
+	// 14:46 UTC: the FIRST 01:45 has passed → exactly one fire.
+	clock.Advance(2 * time.Minute)
+	fired, err := s.Sweep(ctxT())
+	if err != nil || len(fired) != 1 {
+		t.Fatalf("ONCE_FIRST failed for a 30-minute fold: %v %v", fired, err)
+	}
+	// 15:16 UTC (the second 01:45): no refire.
+	clock.Advance(30 * time.Minute)
+	if fired, _ := s.Sweep(ctxT()); len(fired) != 0 {
+		t.Fatalf("half-hour fold double fire: %v", fired)
+	}
+}
+
+// Impossible civil dates are refused, never normalized (Phase-4 codex #9).
+func TestImpossibleCivilDateRefused(t *testing.T) {
+	clock := clockid.NewFake(utc(2026, 1, 1, 0, 0))
+	s, _ := openSched(t, t.TempDir(), clock)
+	if err := s.CreateReminder(ctxT(), "r-feb30", "x", WallTime{
+		Year: 2026, Month: 2, Day: 30, Hour: 10, TZ: "Europe/Zagreb",
+	}); err == nil {
+		t.Fatal("2026-02-30 accepted (would silently normalize into March)")
+	}
+	// The spring-gap normalization (clock only, same civil date) stays legal.
+	if err := s.CreateReminder(ctxT(), "r-gap", "x", WallTime{
+		Year: 2026, Month: 3, Day: 29, Hour: 2, Minute: 30, TZ: "Europe/Zagreb",
+	}); err != nil {
+		t.Fatalf("DST-gap wall time refused: %v", err)
+	}
+}
+
+// The persisted admission-time instant is the promise (Phase-4 codex #7):
+// replayed/rebuilt projections carry the SAME due_utc from the canonical
+// payload, and the autumn-fold decision survives a restart between the
+// two occurrences (codex #14).
+func TestPersistedDueSurvivesRestartBetweenFoldOccurrences(t *testing.T) {
+	clock := clockid.NewFake(utc(2026, 10, 24, 20, 0))
+	s, path := openSched(t, t.TempDir(), clock)
+	if err := s.CreateReminder(ctxT(), "rem-fold", "fold", WallTime{
+		Year: 2026, Month: 10, Day: 25, Hour: 2, Minute: 30, TZ: "Europe/Zagreb",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Fire at the FIRST occurrence (00:31 UTC).
+	clock.Advance(4*time.Hour + 31*time.Minute)
+	fired, err := s.Sweep(ctxT())
+	if err != nil || len(fired) != 1 {
+		t.Fatalf("first-occurrence fire: %v %v", fired, err)
+	}
+	// RESTART between the two occurrences.
+	s.Journal().Close()
+	clock.Advance(time.Hour) // now past the SECOND 02:30
+	s2 := reopenSched(t, path, clock)
+	if fired, _ := s2.Sweep(ctxT()); len(fired) != 0 {
+		t.Fatalf("restart between fold occurrences refired: %v", fired)
+	}
+}
+
+// Two CONCURRENT sweeps produce exactly ONE durable occurrence (the
+// projection's fired flag aborts the loser's batch; the loser skips it as
+// benign — Phase-4 codex #14).
+func TestConcurrentSweepsFireOnce(t *testing.T) {
+	clock := clockid.NewFake(utc(2026, 9, 4, 10, 0))
+	s, _ := openSched(t, t.TempDir(), clock)
+	if err := s.CreateReminder(ctxT(), "rem-c", "concurrent", WallTime{
+		Year: 2026, Month: 9, Day: 4, Hour: 11, Minute: 0, TZ: "Europe/Zagreb",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(2 * time.Hour)
+	type res struct {
+		fired []Fired
+		err   error
+	}
+	results := make(chan res, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			f, err := s.Sweep(ctxT())
+			results <- res{f, err}
+		}()
+	}
+	total := 0
+	for i := 0; i < 2; i++ {
+		r := <-results
+		if r.err != nil {
+			t.Fatalf("concurrent sweep errored: %v", r.err)
+		}
+		total += len(r.fired)
+	}
+	if total != 1 {
+		t.Fatalf("concurrent sweeps produced %d fires (want exactly 1)", total)
+	}
+	occ := 0
+	s.Journal().Replay(0, func(ev journal.Event) error {
+		if ev.Envelope.EventType == EvOccurrenceFired {
+			occ++
+		}
+		return nil
+	})
+	if occ != 1 {
+		t.Fatalf("%d durable occurrences (want 1)", occ)
 	}
 }
