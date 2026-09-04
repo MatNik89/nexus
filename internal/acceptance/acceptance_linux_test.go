@@ -818,6 +818,21 @@ func TestDoctorP0GrantLive(t *testing.T) {
 	if codeForged == 0 || strings.Contains(outForged, "P0-capable") {
 		t.Fatalf("unsigned attestation granted (exit %d):\n%s", codeForged, outForged)
 	}
+	// A WRONG-KEY signature (not in allowed_signers) withdraws the grant
+	// — this is the branch the ssh-keygen verify itself carries.
+	rogue := filepath.Join(w.base, "rogue_key")
+	if out, err := exec.Command("ssh-keygen", "-t", "ed25519", "-N", "", "-C", "rogue", "-f", rogue).CombinedOutput(); err != nil {
+		t.Fatalf("rogue keygen: %v\n%s", err, out)
+	}
+	attPath := filepath.Join(w.base, "nexus", "system", "acceptance.json")
+	os.Remove(attPath + ".sig")
+	if out, err := exec.Command("ssh-keygen", "-Y", "sign", "-f", rogue, "-n", "nexus-acceptance", attPath).CombinedOutput(); err != nil {
+		t.Fatalf("rogue sign: %v\n%s", err, out)
+	}
+	outRogue, codeRogue := run(w.env())
+	if codeRogue == 0 || strings.Contains(outRogue, "P0-capable") {
+		t.Fatalf("rogue-signed attestation granted (exit %d):\n%s", codeRogue, outRogue)
+	}
 	writeAttestation(t, w, nexusBin(t))
 	// A TAMPERED digest withdraws the grant.
 	writeAttestationDigest(t, w, "deadbeef")
