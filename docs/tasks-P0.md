@@ -233,6 +233,8 @@ accepted fact recallable after restart, only in its profile.
 
 ## Phase 4 — scheduler + obligations
 
+**DONE 2026-09-04** — merged to main; deep review 11 rounds (codex/kilo/agy), 20 findings folded, final 3× PASS zero findings (ablation-verified both sides).
+
 **[x] T20 — 3.6-min durable scheduler + occurrence counter.**
 Persisted occurrence (UTC + IANA + `dst=ONCE_FIRST` + `missed_run=COALESCE`), stable
 occurrence ID, T05 clock seams, single-process overlap rule; startup + wake (D-Bus
