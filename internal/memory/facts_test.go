@@ -378,6 +378,14 @@ func TestSecretContentRefusedNotRewritten(t *testing.T) {
 	if len(rows) != 0 {
 		t.Fatalf("refused content left rows behind: %v", rows)
 	}
+	// A secret smuggled into a TAG is refused too — the gate covers the
+	// whole payload (Phase-3-r4 codex #4 literal).
+	if err := s.SaveFact(ctxT(), "f-tag", "safe fact", secret); err == nil {
+		t.Fatal("known-secret tag accepted (stored tag would be rewritten under the receipt)")
+	}
+	if rows, _ := s.All(ctxT()); len(rows) != 0 {
+		t.Fatalf("refused tag content left rows behind: %v", rows)
+	}
 	// Clean content still stores byte-exactly.
 	if err := s.SaveFact(ctxT(), "f-3", "the key lives in the password manager"); err != nil {
 		t.Fatal(err)
@@ -450,14 +458,19 @@ func TestFactLineageSurvivesToRecall(t *testing.T) {
 func TestV1SchemaDatabaseRebuildsAtOpen(t *testing.T) {
 	_, work, _, workPath, _ := seedBoth(t)
 	workClose(t, work)
-	// Emulate the c05bb8b on-disk state: no lineage column, no version.
+	// Emulate the ACTUAL previous-revision on-disk state (Phase-3-r4
+	// codex #2): the old TWO-COLUMN checkpoint table (no version column)
+	// and a mem_facts without lineage — the migration itself is under
+	// test, not just the version comparison.
 	db, err := sqlOpen(workPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, stmt := range []string{
 		`ALTER TABLE mem_facts DROP COLUMN lineage`,
-		`UPDATE proj_sync_offsets SET version=1 WHERE name='memory_facts'`,
+		`DROP TABLE proj_sync_offsets`,
+		`CREATE TABLE proj_sync_offsets (name TEXT PRIMARY KEY, applied_offset INTEGER NOT NULL)`,
+		`INSERT INTO proj_sync_offsets(name, applied_offset) VALUES('memory_facts', 4)`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
 			t.Fatal(err)

@@ -347,23 +347,6 @@ func NewStore(j *journal.Journal) (*Store, error) {
 	return &Store{j: j}, nil
 }
 
-// refuseSecretContent rejects content the JOURNAL's redactor would
-// rewrite — bytes are stored verbatim or not at all (B8 exact preview).
-func (s *Store) refuseSecretContent(content string) error {
-	raw, err := json.Marshal(content)
-	if err != nil {
-		return fmt.Errorf("memory: %w", err)
-	}
-	rewrites, err := s.j.RedactorRewrites(raw)
-	if err != nil {
-		return fmt.Errorf("memory: redaction check: %w", err)
-	}
-	if rewrites {
-		return fmt.Errorf("memory: content contains a known secret reference — refused (store the secret's LOCATION, never its value)")
-	}
-	return nil
-}
-
 // Profile reports the bound profile (the journal's own binding).
 func (s *Store) Profile() contracts.ProfileID { return s.j.Profile() }
 
@@ -371,6 +354,17 @@ func (s *Store) append(ctx context.Context, eventType string, payload any) error
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("memory: %w", err)
+	}
+	// The exact-bytes gate covers the WHOLE event payload — content, tags,
+	// ids, everything the journal would redact (Phase-3-r4 codex #4: a
+	// secret smuggled into a tag earned a receipt while the stored tag was
+	// rewritten). Bytes commit verbatim or not at all.
+	rewrites, rerr := s.j.RedactorRewrites(raw)
+	if rerr != nil {
+		return fmt.Errorf("memory: redaction check: %w", rerr)
+	}
+	if rewrites {
+		return fmt.Errorf("memory: payload contains a known secret reference — refused (store the secret's LOCATION, never its value)")
 	}
 	_, err = s.j.Append(ctx, contracts.EnvelopeParams{
 		SchemaID: "nexus.event", SchemaVersion: 1,
@@ -402,18 +396,12 @@ func (s *Store) SaveFact(ctx context.Context, id, content string, tags ...string
 
 // SaveFactLineage carries the source chain (Phase-3-r2 codex #7).
 func (s *Store) SaveFactLineage(ctx context.Context, id, content string, tags, lineage []string) error {
-	if err := s.refuseSecretContent(content); err != nil {
-		return err
-	}
 	return s.append(ctx, EvFactSaved, explicitDefaults(id, content, OriginExplicit, tags, lineage))
 }
 
 // Propose enters a fact into the REVIEW state and returns the EXACT
 // content as its preview. Nothing proposed is recallable until accepted.
 func (s *Store) Propose(ctx context.Context, id, content string, origin Origin, tags ...string) (string, error) {
-	if err := s.refuseSecretContent(content); err != nil {
-		return "", err
-	}
 	if err := s.append(ctx, EvFactProposed, explicitDefaults(id, content, origin, tags, nil)); err != nil {
 		return "", err
 	}
@@ -437,9 +425,6 @@ func (s *Store) Supersede(ctx context.Context, oldID, newID, content string, tag
 // SupersedeLineage carries the correction's own source chain; Apply
 // unions it with the predecessor's stored lineage.
 func (s *Store) SupersedeLineage(ctx context.Context, oldID, newID, content string, tags, lineage []string) error {
-	if err := s.refuseSecretContent(content); err != nil {
-		return err
-	}
 	return s.append(ctx, EvFactSuperseded, supersedePayload{
 		OldID: oldID, New: explicitDefaults(newID, content, OriginExplicit, tags, lineage)})
 }

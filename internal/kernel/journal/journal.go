@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -540,7 +541,17 @@ func (j *Journal) RedactorRewrites(raw []byte) (bool, error) {
 	if err != nil {
 		return true, fmt.Errorf("journal redactor: %w", err)
 	}
-	return string(red) != string(raw), nil
+	if string(red) == string(raw) {
+		return false, nil
+	}
+	// Redaction re-serializes JSON, so byte inequality alone is not a
+	// rewrite — compare the decoded VALUES (a real redaction changes
+	// content, not just formatting).
+	var a, b any
+	if json.Unmarshal(raw, &a) != nil || json.Unmarshal(red, &b) != nil {
+		return true, nil // non-JSON that changed: treat as rewritten
+	}
+	return !reflect.DeepEqual(a, b), nil
 }
 
 func (j *Journal) Replay(from uint64, fn func(Event) error) error {
