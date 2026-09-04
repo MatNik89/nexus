@@ -9,6 +9,7 @@ package obligation
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -714,18 +715,68 @@ func TestArmedWindowRaceAndDisarm(t *testing.T) {
 	if _, err := h.m.j.Append(ctxT(), d); err != nil {
 		t.Fatalf("legitimate armed append refused: %v", err)
 	}
-	// DISARM on failure: a cancelled/failed append leaves no authority.
+	// DISARM on failure (causal — Phase-4-r7 codex #3): a fully ATTESTED
+	// task's MarkTaskDone fails deterministically AFTER arming; the gate
+	// must hold ZERO tickets afterwards and the retry self-heals.
+	// Removing the disarm calls fails the zero-tickets assertion.
 	if err := h.m.CreateTask(ctxT(), "task-x", "file_note", `{"note":"strand"}`); err != nil {
 		t.Fatal(err)
 	}
-	cancelled, cancel := context.WithCancel(context.Background())
-	cancel()                                  // admission select loses immediately
-	_ = h.m.MarkTaskDone(cancelled, "task-x") // fails (unattested anyway) — must not strand
-	// Whatever happened, no ticket for task-x survives: a raw append with
-	// ANY nonce fails.
-	d2, _ := h.m.params(EvTaskDone, donePayload{ID: "task-x",
-		MarkerLine: "[task-x] strand", Verifier: "postcondition-verifier", Nonce: "deadbeefdeadbeefdeadbeefdeadbeef"})
-	if _, err := h.m.j.Append(ctxT(), d2); err == nil {
-		t.Fatal("stranded authority consumed after a cancelled request")
+	if err := h.m.RunTask(ctxT(), "task-x"); err != nil {
+		t.Fatal(err)
+	}
+	h.m.testPostArmFail = func() error { return fmt.Errorf("injected post-arm failure") }
+	if err := h.m.MarkTaskDone(ctxT(), "task-x"); err == nil {
+		t.Fatal("injected post-arm failure swallowed")
+	}
+	h.m.testPostArmFail = nil
+	h.m.gate.mu.Lock()
+	stranded := len(h.m.gate.tickets)
+	h.m.gate.mu.Unlock()
+	if stranded != 0 {
+		t.Fatalf("%d ticket(s) stranded after a failed request (disarm missing)", stranded)
+	}
+	// The retry self-heals.
+	if err := h.m.MarkTaskDone(ctxT(), "task-x"); err != nil {
+		t.Fatalf("retry after disarm refused: %v", err)
+	}
+}
+
+// The live nonce authorizes EXACTLY its (id, marker) tuple (Phase-4-r7
+// codex #4): the REAL armed nonce with a wrong id or wrong marker is
+// refused; the exact tuple still lands once. Deleting the tuple
+// comparison in consume fails this.
+func TestLiveNonceTupleBinding(t *testing.T) {
+	h := build(t)
+	for _, id := range []string{"task-t1", "task-t2"} {
+		if err := h.m.CreateTask(ctxT(), id, "file_note", `{"note":"tuple"}`); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.m.RunTask(ctxT(), id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	nonce, err := h.m.gate.arm("task-t1", "[task-t1] tuple")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The REAL live nonce with a WRONG task id (t2's chain is attested).
+	dWrongID, _ := h.m.params(EvTaskDone, donePayload{ID: "task-t2",
+		MarkerLine: "[task-t2] tuple", Verifier: "postcondition-verifier", Nonce: nonce})
+	if _, err := h.m.j.Append(ctxT(), dWrongID); err == nil {
+		t.Fatal("live nonce authorized a DIFFERENT task")
+	}
+	// The real live nonce with a WRONG marker.
+	dWrongMarker, _ := h.m.params(EvTaskDone, donePayload{ID: "task-t1",
+		MarkerLine: "[task-t1] forged-marker", Verifier: "postcondition-verifier", Nonce: nonce})
+	if _, err := h.m.j.Append(ctxT(), dWrongMarker); err == nil {
+		t.Fatal("live nonce authorized a DIFFERENT marker")
+	}
+	// Wrong-tuple attempts did NOT consume the ticket: the exact tuple
+	// still lands.
+	dOK, _ := h.m.params(EvTaskDone, donePayload{ID: "task-t1",
+		MarkerLine: "[task-t1] tuple", Verifier: "postcondition-verifier", Nonce: nonce})
+	if _, err := h.m.j.Append(ctxT(), dOK); err != nil {
+		t.Fatalf("exact tuple refused: %v", err)
 	}
 }
