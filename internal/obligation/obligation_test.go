@@ -60,8 +60,8 @@ func build(t *testing.T) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cap := NewDoneCapability()
-	events := Events(reg, cap)
+	gate := NewDoneGate()
+	events := Events(reg, gate)
 	for n, v := range schedule.Events() {
 		events[n] = v
 	}
@@ -80,7 +80,7 @@ func build(t *testing.T) *harness {
 	}
 	auth := s7min.NewAuthority(nil, time.Minute)
 	lazy := &LazyRunner{}
-	m, err := NewManager(j, sched, reg, clock, lazy, auth, dir, cap)
+	m, err := NewManager(j, sched, reg, clock, lazy, auth, dir, gate)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -248,8 +248,8 @@ func TestLifecycleSurvivesRestart(t *testing.T) {
 	}
 	h.m.Journal().Close()
 	reg, _ := NewRegistry(map[string]Kind{"file_note": {Handler: FileNoteHandler(h.dir), ValidateParams: ValidateFileNoteParams}})
-	cap2 := NewDoneCapability()
-	events := Events(reg, cap2)
+	gate2 := NewDoneGate()
+	events := Events(reg, gate2)
 	for n, v := range schedule.Events() {
 		events[n] = v
 	}
@@ -263,7 +263,7 @@ func TestLifecycleSurvivesRestart(t *testing.T) {
 	defer j.Close()
 	sched, _ := schedule.New(j, h.clock)
 	auth2 := s7min.NewAuthority(nil, time.Minute)
-	m2, err := NewManager(j, sched, reg, h.clock, &LazyRunner{}, auth2, h.dir, cap2)
+	m2, err := NewManager(j, sched, reg, h.clock, &LazyRunner{}, auth2, h.dir, gate2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -403,7 +403,7 @@ func TestProjectionEnforcesExecutionProtocol(t *testing.T) {
 		t.Fatal("attestation without a claim accepted")
 	}
 	// Forged DONE with no attestation: aborted (even WITH the capability).
-	dp, _ := h.m.params(EvTaskDone, donePayload{ID: "task-p", MarkerLine: "[task-p] protocol", Verifier: "postcondition-verifier", Cap: string(h.m.cap)})
+	dp, _ := h.m.params(EvTaskDone, donePayload{ID: "task-p", MarkerLine: "[task-p] protocol", Verifier: "postcondition-verifier"})
 	if _, err := h.m.j.Append(ctxT(), dp); err == nil {
 		t.Fatal("done without an attested execution accepted")
 	}
@@ -525,8 +525,8 @@ func buildWithKind(t *testing.T, dir, kindName string, k Kind) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cap := NewDoneCapability()
-	events := Events(reg, cap)
+	gate := NewDoneGate()
+	events := Events(reg, gate)
 	for n, v := range schedule.Events() {
 		events[n] = v
 	}
@@ -545,7 +545,7 @@ func buildWithKind(t *testing.T, dir, kindName string, k Kind) *harness {
 	}
 	auth := s7min.NewAuthority(nil, time.Minute)
 	lazy := &LazyRunner{}
-	m, err := NewManager(j, sched, reg, clock, lazy, auth, dir, cap)
+	m, err := NewManager(j, sched, reg, clock, lazy, auth, dir, gate)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -581,16 +581,62 @@ func TestForgedDoneChainDiesAtCapability(t *testing.T) {
 	if _, err := h.m.j.Append(ctxT(), e1); err != nil {
 		t.Fatal(err)
 	}
-	// No capability / wrong capability: refused at ADMISSION.
-	for name, cap := range map[string]string{"missing": "", "wrong": "deadbeef"} {
-		d, _ := h.m.params(EvTaskDone, donePayload{ID: "task-f",
-			MarkerLine: "[task-f] forged", Verifier: "postcondition-verifier", Cap: cap})
-		if _, err := h.m.j.Append(ctxT(), d); err == nil {
-			t.Fatalf("%s-capability forged DONE accepted — no note exists, no checker ran", name)
-		}
+	// UNARMED done: refused at ADMISSION — and nothing recoverable exists
+	// in canonical bytes (the gate is out-of-band).
+	d, _ := h.m.params(EvTaskDone, donePayload{ID: "task-f",
+		MarkerLine: "[task-f] forged", Verifier: "postcondition-verifier"})
+	if _, err := h.m.j.Append(ctxT(), d); err == nil {
+		t.Fatal("unarmed forged DONE accepted — no note exists, no checker ran")
 	}
 	if st, _ := h.m.Status(ctxT(), "task-f"); st == StateDone {
 		t.Fatal("forged chain closed the task")
+	}
+}
+
+// The r5 codex #1 literal: after a LEGITIMATE completion, replaying the
+// canonical stream yields NOTHING that can arm a second task's DONE —
+// the ticket is single-use and out-of-band.
+func TestReplayedDoneDisclosesNoCapability(t *testing.T) {
+	h := build(t)
+	// Legit completion of task A.
+	if err := h.m.CreateTask(ctxT(), "task-a", "file_note", `{"note":"legit"}`); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.m.RunTask(ctxT(), "task-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.m.MarkTaskDone(ctxT(), "task-a"); err != nil {
+		t.Fatal(err)
+	}
+	// Adversary replays the WHOLE canonical stream hunting a bearer.
+	if err := h.m.j.Replay(0, func(ev journal.Event) error {
+		if strings.Contains(string(ev.Envelope.Payload), "cap") {
+			t.Fatalf("canonical bytes carry a capability field: %s", ev.Envelope.Payload)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Forge task B's full chain with everything replay COULD offer.
+	if err := h.m.CreateTask(ctxT(), "task-b", "file_note", `{"note":"victim"}`); err != nil {
+		t.Fatal(err)
+	}
+	i, _ := h.m.params(EvTaskIntent, intentPayload{ID: "task-b", OperationID: "op-b"})
+	if _, err := h.m.j.Append(ctxT(), i); err != nil {
+		t.Fatal(err)
+	}
+	e, _ := h.m.params(EvTaskExecuted, executedPayload{ID: "task-b", OperationID: "op-b",
+		MarkerLine: "[task-b] victim"})
+	if _, err := h.m.j.Append(ctxT(), e); err != nil {
+		t.Fatal(err)
+	}
+	d, _ := h.m.params(EvTaskDone, donePayload{ID: "task-b",
+		MarkerLine: "[task-b] victim", Verifier: "postcondition-verifier"})
+	if _, err := h.m.j.Append(ctxT(), d); err == nil {
+		t.Fatal("post-replay forged DONE accepted (bearer leaked or gate not single-use)")
+	}
+	if st, _ := h.m.Status(ctxT(), "task-b"); st == StateDone {
+		t.Fatal("victim task closed without verification")
 	}
 }
 

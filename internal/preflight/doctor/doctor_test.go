@@ -167,3 +167,21 @@ func TestSchedulerObservabilityFailClosed(t *testing.T) {
 		t.Fatal("unreadable health mirror reported OK")
 	}
 }
+
+// A live-daemon heartbeat with a MISSING health mirror is OFF — the
+// startup health write failed (Phase-4-r5 codex #4).
+func TestLiveDaemonMissingHealthMirrorIsOff(t *testing.T) {
+	e := healthyEnv(t)
+	sys := filepath.Join(e.DataDir, "system")
+	os.MkdirAll(sys, 0o700)
+	os.WriteFile(filepath.Join(sys, "heartbeat"), []byte("beat"), 0o600) // fresh mtime
+	got := Check{}
+	for _, c := range Run(e) {
+		if c.Name == "scheduler-health" {
+			got = c
+		}
+	}
+	if got.Status != StatusOff {
+		t.Fatalf("live daemon without a health mirror reported %v", got)
+	}
+}

@@ -121,30 +121,29 @@ func runDaemon() int {
 	defer cancel()
 	hb := daemon.NewHeartbeat(filepath.Join(layout.SystemDir(), "heartbeat"), 5*time.Second)
 	go hb.Run(ctx)
-	// Durable scheduler: startup sweep + periodic catch-up (T20). The
-	// FireDecorator already moved each fired obligation to
-	// DELIVERY_PENDING inside the fire batch — no post-fire callback
-	// exists to fail (Phase-4-r2 codex #21); the T22 channel consumes
-	// DELIVERY_PENDING. Sweep failures surface via sched.Health().
+	// Durable scheduler: SYNCHRONOUS startup sweep first — its outcome is
+	// mirrored to the health file BEFORE the daemon serves anyone, so a
+	// startup failure can never be lost in the async window (Phase-4-r5
+	// codex #4). Then the periodic catch-up loop. The FireDecorator moved
+	// each fired obligation to DELIVERY_PENDING inside the fire batch.
+	healthPath := filepath.Join(layout.SystemDir(), "scheduler_health")
+	writeHealth := func(err error) {
+		msg := ""
+		if err != nil {
+			msg = err.Error()
+			fmt.Fprintf(os.Stderr, "nexus daemon: scheduler: %v\n", err)
+		}
+		if werr := atomicwrite.Write(healthPath, []byte(msg), 0o600); werr != nil {
+			fmt.Fprintf(os.Stderr, "nexus daemon: health mirror: %v\n", werr)
+		}
+	}
+	_, startupErr := b.sched.Sweep(ctx)
+	writeHealth(startupErr)
 	go b.sched.Run(ctx, 30*time.Second, nil)
 	// Scheduler health mirror (Phase-4-r3 codex #4): sweep failures land
 	// in system/scheduler_health where doctor reads them; an empty file
 	// means healthy.
 	go func() {
-		healthPath := filepath.Join(layout.SystemDir(), "scheduler_health")
-		mirror := func() {
-			msg := ""
-			if herr := b.sched.Health(); herr != nil {
-				msg = herr.Error()
-				fmt.Fprintf(os.Stderr, "nexus daemon: scheduler: %v\n", herr)
-			}
-			if werr := atomicwrite.Write(healthPath, []byte(msg), 0o600); werr != nil {
-				// The mirror ITSELF failing is loud, never silent
-				// (Phase-4-r4 codex #7).
-				fmt.Fprintf(os.Stderr, "nexus daemon: health mirror: %v\n", werr)
-			}
-		}
-		mirror() // immediate: the startup sweep's outcome is captured
 		t := time.NewTicker(5 * time.Second)
 		defer t.Stop()
 		for {
@@ -152,7 +151,7 @@ func runDaemon() int {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				mirror()
+				writeHealth(b.sched.Health())
 			}
 		}
 	}()
@@ -207,8 +206,8 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 	for n, v := range schedule.Events() {
 		events[n] = v
 	}
-	doneCap := obligation.NewDoneCapability()
-	for n, v := range obligation.Events(registry, doneCap) {
+	doneGate := obligation.NewDoneGate()
+	for n, v := range obligation.Events(registry, doneGate) {
 		events[n] = v
 	}
 
@@ -239,7 +238,7 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 	}
 	sched.SetCounterFile(filepath.Join(layout.SystemDir(), "last_occurrence_fired"))
 	lazyRunner := &obligation.LazyRunner{}
-	oblManager, err := obligation.NewManager(j, sched, registry, clockid.System{}, lazyRunner, authority, profileDir, doneCap)
+	oblManager, err := obligation.NewManager(j, sched, registry, clockid.System{}, lazyRunner, authority, profileDir, doneGate)
 	if err != nil {
 		j.Close()
 		return nil, err

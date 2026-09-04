@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/MatNik89/nexus/internal/preflight/probe"
 )
@@ -154,8 +155,18 @@ func Run(e Env) []Check {
 				Status: StatusOK, Detail: "no sweep failures recorded"})
 		}
 	} else if os.IsNotExist(herr) {
-		checks = append(checks, Check{Name: "scheduler-health", Capability: "obligations",
-			Status: StatusOK, Detail: "no health mirror yet (daemon not started)"})
+		// A LIVE daemon (fresh heartbeat) with NO health mirror means the
+		// startup health write failed — that is broken observability, not
+		// a never-started daemon (Phase-4-r5 codex #4).
+		hbPath := filepath.Join(e.DataDir, "system", "heartbeat")
+		if info, hbErr := os.Stat(hbPath); hbErr == nil && time.Since(info.ModTime()) < time.Minute {
+			checks = append(checks, Check{Name: "scheduler-health", Capability: "obligations",
+				Status: StatusOff, Detail: "daemon is live but its health mirror is missing",
+				Fix: "inspect daemon stderr; the mirror write is failing"})
+		} else {
+			checks = append(checks, Check{Name: "scheduler-health", Capability: "obligations",
+				Status: StatusOK, Detail: "no health mirror yet (daemon not started)"})
+		}
 	} else {
 		// EACCES/EISDIR/I-O is broken observability, never health
 		// (Phase-4-r4 codex #7).

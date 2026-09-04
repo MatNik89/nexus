@@ -19,8 +19,6 @@ package obligation
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -128,40 +126,53 @@ type executedPayload struct {
 
 type donePayload struct {
 	ID string `json:"id"`
-	// Cap is the process-local ADMISSION CAPABILITY: only the manager
-	// (which ran the checker) holds it — a generic in-process producer
-	// cannot mint a DONE (Phase-4-r4 codex #5). The capability gates
-	// APPEND only; replay never re-checks it (restart mints a new one).
-	Cap string `json:"cap"`
 	// MarkerLine + Verifier bind DONE to the verified artifact and the
 	// independent verifier identity (checker != worker; Phase-4-r3 codex
-	// #10). topknot ceiling: cryptographic verifier attestation is
-	// outside P0 — the projection enforces marker equality and a
-	// non-worker verifier identity.
+	// #10). The admission CAPABILITY is out-of-band (DoneGate) and NEVER
+	// serialized into canonical bytes (Phase-4-r5 codex #1: a persisted
+	// bearer would leak through Replay).
 	MarkerLine string `json:"marker_line"`
 	Verifier   string `json:"verifier"`
 }
 
-// DoneCapability is the opaque admission token binding task_done appends
-// to the verifying manager.
-type DoneCapability string
+// DoneGate is the OUT-OF-BAND admission capability for task_done: the
+// verifying manager ARMS a single-use per-task ticket immediately before
+// its append; the journal-side validator CONSUMES it. The authority
+// never appears in canonical bytes, so Replay discloses nothing
+// (Phase-4-r5 codex #1); a producer without this exact object cannot
+// arm. Replay/catch-up never re-runs validators, so restarts fold old
+// DONE events untouched.
+type DoneGate struct {
+	mu      sync.Mutex
+	tickets map[string]bool // taskID + "|" + marker → armed
+}
 
-// NewDoneCapability mints a fresh process-local capability.
-func NewDoneCapability() DoneCapability {
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
-		panic(err) // no entropy = no process
+func NewDoneGate() *DoneGate { return &DoneGate{tickets: map[string]bool{}} }
+
+func (g *DoneGate) arm(id, marker string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.tickets[id+"|"+marker] = true
+}
+
+func (g *DoneGate) consume(id, marker string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	k := id + "|" + marker
+	if !g.tickets[k] {
+		return false
 	}
-	return DoneCapability(hex.EncodeToString(b))
+	delete(g.tickets, k) // single-use
+	return true
 }
 
 // Events returns the payload validators — the kind discriminator AND
 // each kind's params schema are SEALED at the JOURNAL boundary (Phase-4
-// codex #13, r3 #5/#9), and task_done requires the manager's admission
-// CAPABILITY (r4 codex #5): a forged in-process producer cannot admit an
-// unknown kind, malformed params, a marker-ambiguous id, or an
-// unverified DONE.
-func Events(reg *Registry, cap DoneCapability) map[string]journal.PayloadValidator {
+// codex #13, r3 #5/#9), and task_done consumes the manager's OUT-OF-BAND
+// single-use gate ticket (r4/r5 codex #5/#1): a forged in-process
+// producer cannot admit an unknown kind, malformed params, a
+// marker-ambiguous id, or an unverified DONE.
+func Events(reg *Registry, gate *DoneGate) map[string]journal.PayloadValidator {
 	allowed := map[string]func(string) error{"reminder": func(string) error { return nil }}
 	if reg != nil {
 		for k, v := range reg.kinds {
@@ -247,8 +258,8 @@ func Events(reg *Registry, cap DoneCapability) map[string]journal.PayloadValidat
 			if p.ID == "" || p.MarkerLine == "" || p.Verifier == "" || p.Verifier == "file_note-handler" {
 				return fmt.Errorf("obligation: done requires the verified marker and an independent verifier identity")
 			}
-			if cap == "" || p.Cap != string(cap) {
-				return fmt.Errorf("obligation: done without the verifying manager's admission capability (fail closed)")
+			if gate == nil || !gate.consume(p.ID, p.MarkerLine) {
+				return fmt.Errorf("obligation: done without the verifying manager's armed admission ticket (fail closed)")
 			}
 			return nil
 		},
@@ -613,17 +624,17 @@ type Manager struct {
 	runner   EffectRunner
 	auth     *s7min.Authority
 	notesDir string // IMMUTABLE profile-bound reconcile root (B3 — no globals)
-	cap      DoneCapability
+	gate     *DoneGate
 	inflight sync.Map
 	seq      atomic.Uint64
 }
 
 func NewManager(j *journal.Journal, s *schedule.Scheduler, r *Registry, c clockid.Clock,
-	runner EffectRunner, auth *s7min.Authority, notesDir string, cap DoneCapability) (*Manager, error) {
-	if j == nil || s == nil || r == nil || c == nil || runner == nil || auth == nil || notesDir == "" || cap == "" {
-		return nil, fmt.Errorf("obligation: journal, scheduler, registry, clock, effect runner, S7 authority, notes dir and done capability are required (fail closed)")
+	runner EffectRunner, auth *s7min.Authority, notesDir string, gate *DoneGate) (*Manager, error) {
+	if j == nil || s == nil || r == nil || c == nil || runner == nil || auth == nil || notesDir == "" || gate == nil {
+		return nil, fmt.Errorf("obligation: journal, scheduler, registry, clock, effect runner, S7 authority, notes dir and done gate are required (fail closed)")
 	}
-	return &Manager{j: j, sched: s, reg: r, clock: c, runner: runner, auth: auth, notesDir: notesDir, cap: cap}, nil
+	return &Manager{j: j, sched: s, reg: r, clock: c, runner: runner, auth: auth, notesDir: notesDir, gate: gate}, nil
 }
 
 func (m *Manager) Journal() *journal.Journal { return m.j }
@@ -995,7 +1006,9 @@ func (m *Manager) MarkTaskDone(ctx context.Context, id string) error {
 	if !verdict.Pass {
 		return fmt.Errorf("obligation: done refused — the postcondition does not verify (the task's marker line is absent)")
 	}
-	p, err := m.params(EvTaskDone, donePayload{ID: id, MarkerLine: markerLine, Verifier: "postcondition-verifier", Cap: string(m.cap)})
+	// ARM the single-use out-of-band ticket immediately before the append.
+	m.gate.arm(id, markerLine)
+	p, err := m.params(EvTaskDone, donePayload{ID: id, MarkerLine: markerLine, Verifier: "postcondition-verifier"})
 	if err != nil {
 		return err
 	}
