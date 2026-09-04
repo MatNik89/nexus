@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -294,20 +295,82 @@ func Open(path string, profile contracts.ProfileID, r redact.Redactor, events ma
 		closeErr := db.Close()
 		return nil, fmt.Errorf("journal open: %w", errors.Join(err, relErr, closeErr))
 	}
-	// Projection Init runs ONLY under our verified ownership (Phase-1B
-	// codex #5: a rejected second opener must never get a DB handle to
-	// mutate through Init) and only through the RESTRICTED handle
-	// (Phase-1B-r2 codex #2: a raw *sql.DB let Init forge canonical rows).
-	for _, sp := range syncProjections {
-		if err := sp.Init(&ProjDB{db: db}); err != nil {
-			relErr := releaseLease()
-			closeErr := db.Close()
-			return nil, fmt.Errorf("journal open: sync projection %s init: %w", sp.Name(), errors.Join(err, relErr, closeErr))
-		}
+	// Projection schema + CATCH-UP run ONLY under our verified ownership
+	// (Phase-1B codex #5) and only through RESTRICTED handles. A version
+	// mismatch or missing checkpoint RESETS the projection and rebuilds it
+	// from the canonical stream (Phase-3-r2 codex #1, r3 #2) — derived
+	// state is never patched blind.
+	if err := j.catchupProjections(lastOffset); err != nil {
+		relErr := releaseLease()
+		closeErr := db.Close()
+		return nil, fmt.Errorf("journal open: projection catch-up: %w", errors.Join(err, relErr, closeErr))
 	}
 
 	go j.actor(lastOffset, lastHash)
 	return j, nil
+}
+
+// catchupProjections replays canonical events into every sync projection
+// whose durable checkpoint is behind head. Deleting a projection's
+// checkpoint row (and its tables) is the REBUILD path: the next Open
+// refolds from offset zero.
+func (j *Journal) catchupProjections(head uint64) error {
+	if len(j.syncProjections) == 0 {
+		return nil
+	}
+	if _, err := j.db.Exec(`CREATE TABLE IF NOT EXISTS proj_sync_offsets (
+		name TEXT PRIMARY KEY, applied_offset INTEGER NOT NULL,
+		version INTEGER NOT NULL DEFAULT 0)`); err != nil {
+		return err
+	}
+	// Older databases carry the table without the version column.
+	j.db.Exec(`ALTER TABLE proj_sync_offsets ADD COLUMN version INTEGER NOT NULL DEFAULT 0`)
+	pdb := &ProjDB{db: j.db}
+	for _, sp := range j.syncProjections {
+		var cp uint64
+		var ver int
+		err := j.db.QueryRow(`SELECT applied_offset, version FROM proj_sync_offsets WHERE name=?`, sp.Name()).Scan(&cp, &ver)
+		missing := err == sql.ErrNoRows
+		if err != nil && !missing {
+			return err
+		}
+		if missing || ver != sp.Version() {
+			// RESET + rebuild: no checkpoint, or a schema from another
+			// revision — derived state is dropped and refolded whole.
+			if err := sp.Reset(pdb); err != nil {
+				return fmt.Errorf("projection %s reset: %w", sp.Name(), err)
+			}
+			if _, err := j.db.Exec(`INSERT INTO proj_sync_offsets(name, applied_offset, version) VALUES(?1,0,?2)
+				ON CONFLICT(name) DO UPDATE SET applied_offset=0, version=?2`, sp.Name(), sp.Version()); err != nil {
+				return err
+			}
+			cp = 0
+		}
+		if err := sp.Init(pdb); err != nil {
+			return fmt.Errorf("projection %s init: %w", sp.Name(), err)
+		}
+		if cp >= head {
+			continue
+		}
+		if err := j.Replay(cp, func(ev Event) error {
+			tx, err := j.db.Begin()
+			if err != nil {
+				return err
+			}
+			defer tx.Rollback()
+			if err := sp.Apply(&ProjTx{tx: tx}, ev); err != nil {
+				return fmt.Errorf("projection %s catch-up at offset %d: %w", sp.Name(), ev.JournalOffset, err)
+			}
+			if _, err := tx.Exec(`UPDATE proj_sync_offsets SET applied_offset=? WHERE name=?`,
+				int64(ev.JournalOffset), sp.Name()); err != nil {
+				return err
+			}
+			return tx.Commit()
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (j *Journal) actor(lastOffset uint64, lastHash string) {
@@ -469,6 +532,28 @@ func (j *Journal) Append(ctx context.Context, p contracts.EnvelopeParams) (Event
 // Replay folds every event with journal_offset > from, in order, VERIFYING
 // the integrity chain as it streams (r2 codex #1: replay must not serve
 // tampered history). Verification always starts from offset 0 internally.
+// RedactorRewrites reports whether the journal's OWN redactor would
+// rewrite raw — the fail-closed seam for exact-bytes consumers (Phase-3-
+// r3 codex #6: an independently injected redactor copy could disagree
+// with what the append actually stores).
+func (j *Journal) RedactorRewrites(raw []byte) (bool, error) {
+	red, err := j.redact.Redact(raw)
+	if err != nil {
+		return true, fmt.Errorf("journal redactor: %w", err)
+	}
+	if string(red) == string(raw) {
+		return false, nil
+	}
+	// Redaction re-serializes JSON, so byte inequality alone is not a
+	// rewrite — compare the decoded VALUES (a real redaction changes
+	// content, not just formatting).
+	var a, b any
+	if json.Unmarshal(raw, &a) != nil || json.Unmarshal(red, &b) != nil {
+		return true, nil // non-JSON that changed: treat as rewritten
+	}
+	return !reflect.DeepEqual(a, b), nil
+}
+
 func (j *Journal) Replay(from uint64, fn func(Event) error) error {
 	if fn == nil {
 		return fmt.Errorf("journal replay: nil callback")

@@ -3,10 +3,13 @@
 package journal
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"regexp"
 	"strings"
+
+	"github.com/MatNik89/nexus/internal/kernel/contracts"
 )
 
 // ProjTx is the RESTRICTED transaction handed to projections: statements
@@ -20,7 +23,7 @@ type ProjTx struct {
 	tx *sql.Tx
 }
 
-var canonicalTableRe = regexp.MustCompile(`(?i)\b(events|journal_meta|projection_offsets)\b`)
+var canonicalTableRe = regexp.MustCompile(`(?i)\b(events|journal_meta|projection_offsets|proj_sync_offsets)\b`)
 
 func guardStatement(query string) error {
 	if canonicalTableRe.MatchString(strings.ToLower(query)) {
@@ -89,7 +92,13 @@ func (p *ProjDB) Query(query string, args ...any) (*sql.Rows, error) {
 // append (state and event commit together or not at all).
 type SyncProjection interface {
 	Name() string
+	// Version identifies the projection SCHEMA: a mismatch with the
+	// durable record triggers Reset + rebuild from the canonical stream
+	// (Phase-3-r3 codex #2: an older schema must never be patched blind).
+	Version() int
 	Init(db *ProjDB) error
+	// Reset drops every derived object this projection owns.
+	Reset(db *ProjDB) error
 	Apply(tx *ProjTx, ev Event) error
 }
 
@@ -99,6 +108,12 @@ func (j *Journal) applySyncProjections(tx *sql.Tx, ev Event) error {
 	for _, p := range j.syncProjections {
 		if err := p.Apply(restricted, ev); err != nil {
 			return fmt.Errorf("sync projection %s: %w", p.Name(), err)
+		}
+		// Checkpoint advances IN the append transaction: state, event and
+		// checkpoint commit together (catch-up trusts this on reopen).
+		if _, err := tx.Exec(`INSERT INTO proj_sync_offsets(name, applied_offset, version) VALUES(?1,?2,?3)
+			ON CONFLICT(name) DO UPDATE SET applied_offset=?2`, p.Name(), int64(ev.JournalOffset), p.Version()); err != nil {
+			return fmt.Errorf("sync projection %s checkpoint: %w", p.Name(), err)
 		}
 	}
 	return nil
@@ -173,3 +188,27 @@ func (p *Projector) Run(apply func(tx *ProjTx, ev Event) error) error {
 		return nil
 	})
 }
+
+// QueryProjection is the GUARDED read path for projection-owned tables:
+// SELECT-only, canonical tables rejected lexically like every projection
+// write (Phase-3 codex #1: projections living in the journal file need a
+// read seam that cannot touch the canon).
+func (j *Journal) QueryProjection(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	trimmed := strings.TrimSpace(strings.ToLower(query))
+	if !strings.HasPrefix(trimmed, "select") {
+		return nil, fmt.Errorf("NON_CANONICAL_WRITE: projection reads are SELECT-only (fail closed)")
+	}
+	// ONE statement only: a ';' anywhere is rejected — SQLite would happily
+	// run a trailing DELETE (Phase-3-r2 codex #14). Legitimate projection
+	// queries never need semicolons or string literals carrying them.
+	if strings.ContainsRune(query, ';') {
+		return nil, fmt.Errorf("NON_CANONICAL_WRITE: projection reads are single-statement (fail closed)")
+	}
+	if err := guardStatement(query); err != nil {
+		return nil, err
+	}
+	return j.db.QueryContext(ctx, query, args...)
+}
+
+// Profile reports the journal's bound profile (projections inherit it).
+func (j *Journal) Profile() contracts.ProfileID { return j.profile }

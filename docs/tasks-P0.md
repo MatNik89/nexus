@@ -208,7 +208,7 @@ CLI clients → zero surfaced `SQLITE_BUSY`; heartbeat stops → detectable with
 
 ## Phase 3 — memory + profiles
 
-**[ ] T18 — Profiles: physical isolation + admission stamping.**
+**[x] T18 — Profiles: physical isolation + admission stamping.**
 Per-profile SQLite file + `system.db` (zero profile payloads); non-null `ProfileID` at
 admission, immutable through the chain; no post-admission mutable global lookup.
 Trace: PRD §6 item 5; HARDQ B3; E14.
@@ -217,7 +217,7 @@ its profile. (Cross-profile delivery/approval integration REDs land in T24.)
 RED: cross-profile memory query → 0 hits; FTS of profile A never returns B tokens;
 restart+replay preserves ProfileID on every row.
 
-**[ ] T19 — Explicit memory (S9.2-min).**
+**[x] T19 — Explicit memory (S9.2-min).**
 "remember X" → exact preview → profile-bound fact (approval ON); inferred → review queue
 (not recallable until accepted); append-only supersession ("actually it's Y" corrects a
 fact in P0); retrieval recency+exact/tag; NO decay (B8). **MEMORY_FORGET and DATA_PURGE

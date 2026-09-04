@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
+	"github.com/MatNik89/nexus/internal/kernel/effectpath"
 	"github.com/MatNik89/nexus/internal/kernel/s7min"
 	"github.com/MatNik89/nexus/internal/llm/provider"
 )
@@ -218,5 +219,114 @@ func TestFailedPlanLandsHonestS7State(t *testing.T) {
 	_, perr := p3.Plan(context.Background(), []contracts.ContextBlock{b})
 	if perr == nil || !strings.Contains(perr.Error(), "S7 landing") {
 		t.Fatalf("landing failure not surfaced: %v", perr)
+	}
+}
+
+// Tool planning is SEALED-spec driven (Phase-3 codex #2/#3): the model
+// chooses tool_id+arguments only; effect/kind/schema come from the
+// registry, the profile from the session; an unknown tool_id is an ERROR;
+// prose replies stay finals.
+func TestToolPlanningSealedSpecs(t *testing.T) {
+	auth := s7min.NewAuthority(nil, time.Minute)
+	fc := &fakeChat{auth: auth, reply: `{"action":"tool","tool_id":"memory_remember","arguments":{"content":"x"}}`}
+	p, err := New(fc, auth, "provider:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.WithTools(map[contracts.ToolID]effectpath.ToolSpec{
+		"memory_remember": {Effect: contracts.EffectReversible, ExecutionKind: contracts.ExecInProcess,
+			ArgsSchemaHash: "v1", Description: "store"},
+	}, "work"); err != nil {
+		t.Fatal(err)
+	}
+	b := userBlockForPlan(t)
+	action, err := p.Plan(context.Background(), []contracts.ContextBlock{b})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action.Call == nil {
+		t.Fatalf("tool reply did not become a call: %+v", action)
+	}
+	c := *action.Call
+	if c.Effect != contracts.EffectReversible || c.ExecutionKind != contracts.ExecInProcess ||
+		c.ArgsSchemaHash != "v1" || c.ProfileID != "work" {
+		t.Fatalf("call not sealed from the registry: %+v", c)
+	}
+	if c.IdempotencyKey == nil || *c.IdempotencyKey == "" {
+		t.Fatal("effectful call minted without an idempotency key")
+	}
+	// Unknown tool id: ERROR, never silently downgraded to text.
+	fc.reply = `{"action":"tool","tool_id":"wipe_disk","arguments":{}}`
+	if _, err := p.Plan(context.Background(), []contracts.ContextBlock{b}); err == nil {
+		t.Fatal("unknown tool id accepted")
+	}
+	// Prose replies stay FINAL and are delivered in one piece.
+	delivered := ""
+	p2, _ := New(&fakeChat{auth: auth, reply: "just an answer"}, auth, "provider:test")
+	p2.deliver = func(d string) error { delivered = d; return nil }
+	if _, err := p2.WithTools(map[contracts.ToolID]effectpath.ToolSpec{
+		"t": {Effect: contracts.EffectReadOnly, ExecutionKind: contracts.ExecInProcess, ArgsSchemaHash: "v1"},
+	}, "work"); err != nil {
+		t.Fatal(err)
+	}
+	action, err = p2.Plan(context.Background(), []contracts.ContextBlock{b})
+	if err != nil || action.Final == nil || *action.Final != "just an answer" {
+		t.Fatalf("prose reply not final: %+v %v", action, err)
+	}
+	if delivered != "just an answer" {
+		t.Fatalf("final not delivered to the sink: %q", delivered)
+	}
+}
+
+// Tool prompts are BYTE-DETERMINISTIC across fresh spec maps (Phase-3-r3
+// codex #10 literal): map iteration order never changes the plan input.
+type promptCapturingChat struct {
+	auth   *s7min.Authority
+	system string
+}
+
+func (f *promptCapturingChat) Chat(ctx context.Context, msgs []provider.ChatMessage, g s7min.Grant) (provider.ChatOutput, error) {
+	if err := f.auth.Consume(g); err != nil {
+		return provider.ChatOutput{}, err
+	}
+	for _, m := range msgs {
+		if m.Role == "system" {
+			f.system = m.Content
+		}
+	}
+	return provider.ChatOutput{Content: "ok"}, nil
+}
+
+func TestToolPromptDeterministic(t *testing.T) {
+	auth := s7min.NewAuthority(nil, time.Minute)
+	b := userBlockForPlan(t)
+	prompts := map[string]bool{}
+	for i := 0; i < 8; i++ {
+		fc := &promptCapturingChat{auth: auth}
+		p, err := New(fc, auth, "provider:test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		specs := map[contracts.ToolID]effectpath.ToolSpec{
+			"zeta_tool":  {Effect: contracts.EffectReadOnly, ExecutionKind: contracts.ExecInProcess, ArgsSchemaHash: "v1", Description: "z"},
+			"alpha_tool": {Effect: contracts.EffectReadOnly, ExecutionKind: contracts.ExecInProcess, ArgsSchemaHash: "v1", Description: "a"},
+			"mid_tool":   {Effect: contracts.EffectReadOnly, ExecutionKind: contracts.ExecInProcess, ArgsSchemaHash: "v1", Description: "m"},
+		}
+		if _, err := p.WithTools(specs, "work"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := p.Plan(context.Background(), []contracts.ContextBlock{b}); err != nil {
+			t.Fatal(err)
+		}
+		prompts[fc.system] = true
+	}
+	if len(prompts) != 1 {
+		t.Fatalf("system prompt varied across %d byte-distinct forms", len(prompts))
+	}
+	for pr := range prompts {
+		ia, im, iz := strings.Index(pr, "alpha_tool"), strings.Index(pr, "mid_tool"), strings.Index(pr, "zeta_tool")
+		if !(ia < im && im < iz) {
+			t.Fatalf("tool list not sorted: %d %d %d", ia, im, iz)
+		}
 	}
 }
