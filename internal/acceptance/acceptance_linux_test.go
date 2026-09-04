@@ -11,8 +11,11 @@ package acceptance
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -27,21 +30,40 @@ import (
 // --- harness plumbing (outside the graded implementation) ---
 
 var (
-	binOnce sync.Once
-	binPath string
-	binErr  error
+	harnessDir string
+	binPath    string
+	binErr     error
 )
+
+// TestMain owns one PRIVATE package-lifetime build dir (T27 codex #5: a
+// fixed basename under the shared TMPDIR let a concurrent export replace
+// the graded artifact after sync.Once bound it). NEXUS_ACCEPT_BIN
+// overrides with a pre-built binary (the attestation script pins the
+// exact bytes it hashes).
+func TestMain(m *testing.M) {
+	var err error
+	harnessDir, err = os.MkdirTemp("", "nexus-acceptance-*")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	if pre := os.Getenv("NEXUS_ACCEPT_BIN"); pre != "" {
+		binPath = pre
+	} else {
+		binPath = filepath.Join(harnessDir, "nexus")
+		cmd := exec.Command("go", "build", "-o", binPath, "github.com/MatNik89/nexus/cmd/nexus")
+		cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
+		if out, berr := cmd.CombinedOutput(); berr != nil {
+			binErr = fmt.Errorf("%v\n%s", berr, out)
+		}
+	}
+	code := m.Run()
+	os.RemoveAll(harnessDir)
+	os.Exit(code)
+}
 
 func nexusBin(t *testing.T) string {
 	t.Helper()
-	binOnce.Do(func() {
-		binPath = filepath.Join(os.TempDir(), "nexus-acceptance-bin")
-		cmd := exec.Command("go", "build", "-o", binPath, "github.com/MatNik89/nexus/cmd/nexus")
-		cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
-		if out, err := cmd.CombinedOutput(); err != nil {
-			binErr = fmt.Errorf("%v\n%s", err, out)
-		}
-	})
 	if binErr != nil {
 		t.Fatalf("building nexus: %v", binErr)
 	}
@@ -307,19 +329,21 @@ func TestCriterion3SensitivityNoChannel(t *testing.T) {
 		t.Fatalf("set failed: %v %q", err, out)
 	}
 	stop()
-	// No telegram wiring at all: a delivery CANNOT be claimed.
+	// Incarnation 2: NO channel. The occurrence fires and must stay
+	// DELIVERY_PENDING — no fake receipt without a wire (fail closed).
 	stop2, _ := w.daemon()
-	defer stop2()
-	time.Sleep(4 * time.Second)
-	// The criterion check (a delivered message) must be RED here — there
-	// is no bot, so there is nothing to assert delivery on. Verify no
-	// false receipt: the daemon must NOT have marked it delivered.
-	// Black-box proof: restart and look for a reconcile/delivery — the
-	// only observable is that no sendMessage endpoint ever existed, so
-	// this sensitivity case passes iff the harness cannot find delivery
-	// evidence (structural: bot==nil).
-	if w.bot != nil {
-		t.Fatal("test wiring error")
+	time.Sleep(3 * time.Second)
+	stop2()
+	// Incarnation 3: NOW wire a channel. If the channel-less incarnation
+	// had minted a false receipt, nothing would deliver here; the
+	// occurrence arriving proves it stayed durably PENDING (black-box
+	// proof of the no-channel fail-closed hold — codex #6).
+	bot := w.withTelegram(t)
+	stop3, _ := w.daemon()
+	defer stop3()
+	late := bot.waitSent(t, "silent reminder", 25*time.Second)
+	if !strings.Contains(late, "occ-rem-silent#1") {
+		t.Fatalf("late delivery lacks the exact occurrence id: %q", late)
 	}
 }
 
@@ -638,7 +662,7 @@ var helperErr error
 func buildHelper(t *testing.T) string {
 	t.Helper()
 	helperOnce.Do(func() {
-		helperBin = filepath.Join(os.TempDir(), "nexus-acceptance-helper")
+		helperBin = filepath.Join(harnessDir, "probehelper")
 		cmd := exec.Command("go", "build", "-o", helperBin, "github.com/MatNik89/nexus/cmd/probehelper")
 		cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 		if out, err := cmd.CombinedOutput(); err != nil {
@@ -649,6 +673,33 @@ func buildHelper(t *testing.T) string {
 		t.Fatalf("building helper: %v", helperErr)
 	}
 	return helperBin
+}
+
+// writeAttestation records an acceptance pass for the EXACT binary.
+func writeAttestation(t *testing.T, w *world, bin string) {
+	t.Helper()
+	f, err := os.Open(bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		t.Fatal(err)
+	}
+	writeAttestationDigest(t, w, hex.EncodeToString(h.Sum(nil)))
+}
+
+func writeAttestationDigest(t *testing.T, w *world, digest string) {
+	t.Helper()
+	dir := filepath.Join(w.base, "nexus", "system")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	att := fmt.Sprintf(`{"binary_sha256":%q,"suite":"internal/acceptance","passed":true,"host":"test","time":"2026-09-05T00:00:00Z"}`, digest)
+	if err := os.WriteFile(filepath.Join(dir, "acceptance.json"), []byte(att), 0o600); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func ctxT() context.Context { return context.Background() }
@@ -721,10 +772,24 @@ func TestDoctorP0GrantLive(t *testing.T) {
 		out, _ := cmd.CombinedOutput()
 		return string(out), cmd.ProcessState.ExitCode()
 	}
+	// WITHOUT the acceptance attestation the grant is refused even with
+	// every capability live (T27 codex #3: no self-certification).
+	outNoAtt, codeNoAtt := run(w.env())
+	if codeNoAtt == 0 || strings.Contains(outNoAtt, "P0-capable") {
+		t.Fatalf("grant minted without an acceptance attestation (exit %d):\n%s", codeNoAtt, outNoAtt)
+	}
+	writeAttestation(t, w, nexusBin(t))
 	out, code := run(w.env())
 	if code != 0 || !strings.Contains(out, "P0-capable") {
 		t.Fatalf("live world not granted P0-capable (exit %d):\n%s", code, out)
 	}
+	// A TAMPERED digest withdraws the grant.
+	writeAttestationDigest(t, w, "deadbeef")
+	outBad, codeBad := run(w.env())
+	if codeBad == 0 || strings.Contains(outBad, "P0-capable") {
+		t.Fatalf("grant survived a digest mismatch (exit %d):\n%s", codeBad, outBad)
+	}
+	writeAttestation(t, w, nexusBin(t))
 	// SENSITIVITY: drop the bot token → telegram OFF, grant withdrawn.
 	var envNoTok []string
 	for _, e := range w.env() {

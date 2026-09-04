@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -181,12 +182,18 @@ func runDaemon() int {
 		if berr != nil {
 			return ""
 		}
+		// Deterministic pick (T27 kilo #4): the LOWEST chat id bound to
+		// this profile — map iteration order must never route reminders.
+		best := int64(0)
 		for chat, prof := range bindings {
-			if contracts.ProfileID(prof) == b.profile {
-				return "chat-" + strconv.FormatInt(chat, 10)
+			if contracts.ProfileID(prof) == b.profile && (best == 0 || chat < best) {
+				best = chat
 			}
 		}
-		return ""
+		if best == 0 {
+			return ""
+		}
+		return "chat-" + strconv.FormatInt(best, 10)
 	}()
 	if ownerChat != "" {
 		go func() {
@@ -202,13 +209,24 @@ func runDaemon() int {
 						continue
 					}
 					for _, d := range pending {
-						dlv, qerr := b.chanCore.EnqueueReply(ctx, "telegram", ownerChat, b.profile,
-							"Reminder: "+d.Body+" (reply: ack "+d.OccurrenceID+")")
-						if qerr != nil {
+						// STABLE id derived from the occurrence: a crash
+						// anywhere in this loop re-enters idempotently —
+						// never a second outbox row (T27 codex #2).
+						dlvID := deliveryIDFor(d.OccurrenceID)
+						if _, qerr := b.chanCore.EnqueueReplyID(ctx, dlvID, "telegram", ownerChat, b.profile,
+							"Reminder: "+d.Body+" (reply: ack "+d.OccurrenceID+")"); qerr != nil {
 							continue
 						}
+						// The receipt is minted ONLY from the channel
+						// owner's proven SENT transition — an enqueue or
+						// an UNKNOWN in-flight row is NOT delivery
+						// evidence (T27 codex #2 / kilo #3).
+						st, serr := b.chanCore.DeliveryStatus(ctx, dlvID)
+						if serr != nil || st != "SENT" {
+							continue // retry next tick; UNKNOWN reconciles
+						}
 						if merr := b.obl.MarkDelivered(ctx, d.OccurrenceID,
-							obligation.DeliveryReceipt{Producer: "telegram", ReceiptID: dlv}); merr != nil {
+							obligation.DeliveryReceipt{Producer: "telegram", ReceiptID: dlvID}); merr != nil {
 							fmt.Fprintf(os.Stderr, "nexus daemon: reminder delivery mark %s: %v\n", d.OccurrenceID, merr)
 						}
 					}
@@ -217,6 +235,7 @@ func runDaemon() int {
 		}()
 	}
 	var chanProbe *closure.ProbeResult
+	var tgAdapter *telegram.Adapter
 	// Telegram (channel:builtin): starts ONLY when the token env var is
 	// set AND at least one chat is bound — deny-default (B3).
 	if tok := os.Getenv(resolved.Config.TelegramTokenEnv); tok != "" {
@@ -235,29 +254,45 @@ func runDaemon() int {
 			}, b.chanCore, telegramHandler(b))
 			if aerr != nil {
 				fmt.Fprintf(os.Stderr, "nexus daemon: telegram: %v\n", aerr)
-			} else if pr := adapter.Probe(ctx, resolved); !pr.Passed {
-				chanProbe = &pr
-				fmt.Fprintf(os.Stderr, "nexus daemon: telegram channel probe failed: %s — adapter stays OFF (fail closed)\n", pr.Detail)
 			} else {
+				pr := adapter.Probe(ctx, resolved)
 				chanProbe = &pr
-				go adapter.Run(ctx, 2*time.Second)
-				fmt.Println("nexus daemon: telegram adapter running (channel probe passed)")
+				tgAdapter = adapter // start decision belongs to the SEALED snapshot
+				if !pr.Passed {
+					fmt.Fprintf(os.Stderr, "nexus daemon: telegram channel probe failed: %s\n", pr.Detail)
+				}
 			}
 		}
 	}
-	// FINAL sealed capability snapshot (T11/T27): every entry is a LIVE
-	// measurement — static placeholders are gone. OFF capabilities log
-	// their reason; nothing dispatches to an OFF capability.
+	// FINAL sealed capability snapshot (T11/T27 codex #1): sealed BEFORE
+	// any consumer starts, and ENFORCED — conversation OFF refuses to
+	// serve at all (fail closed), telegram starts only when its sealed
+	// capability is ON; nothing dispatches to an OFF capability.
 	probes, requested := b.liveProbes(ctx, resolved, b.prov, b.sandboxOK, chanProbe)
-	if snap, serr := sealStartupSnapshot(resolved, probes, requested); serr != nil {
+	snap, serr := sealStartupSnapshot(resolved, probes, requested)
+	if serr != nil {
 		fmt.Fprintf(os.Stderr, "nexus daemon: capability seal: %v\n", serr)
-	} else {
-		for _, st := range snap.List() {
-			state := "ON"
-			if !st.On {
-				state = "OFF (" + st.Reason + ")"
-			}
-			fmt.Printf("nexus daemon: capability %-12s %s\n", st.Name, state)
+		return 1
+	}
+	for _, st := range snap.List() {
+		state := "ON"
+		if !st.On {
+			state = "OFF (" + st.Reason + ")"
+		}
+		fmt.Printf("nexus daemon: capability %-12s %s\n", st.Name, state)
+	}
+	if !snap.On("conversation") {
+		fmt.Fprintf(os.Stderr, "nexus daemon: conversation capability OFF (%s) — refusing to serve (fail closed)\n",
+			snap.Status("conversation").Reason)
+		return 1
+	}
+	if tgAdapter != nil {
+		if snap.On("telegram") {
+			go tgAdapter.Run(ctx, 2*time.Second)
+			fmt.Println("nexus daemon: telegram adapter running (sealed capability ON)")
+		} else {
+			fmt.Fprintf(os.Stderr, "nexus daemon: telegram capability OFF (%s) — adapter not started (fail closed)\n",
+				snap.Status("telegram").Reason)
 		}
 	}
 	sock := socketPath(layout)
@@ -799,6 +834,14 @@ func runDoctorP0() int {
 		add("sandbox", true, "trust-rooted bwrap, enforcement canary passed")
 	}
 
+	// ACCEPTANCE ATTESTATION (T27 codex #3): the doctor never
+	// self-certifies the six criteria — the grant additionally requires
+	// the out-of-implementation acceptance suite to have PASSED against
+	// EXACTLY this binary (sha256-bound attestation from
+	// scripts/p0-accept.sh).
+	attOK, attWhy := verifyAcceptanceAttestation(layout)
+	add("acceptance", attOK, attWhy)
+
 	all := true
 	for _, c := range criteria {
 		state := "LIVE"
@@ -808,11 +851,45 @@ func runDoctorP0() int {
 		fmt.Printf("%s %-14s %s\n", state, c.name, c.why)
 	}
 	if all {
-		fmt.Println("P0-capable — all six PRD §6 capabilities measured live")
+		fmt.Println("P0-capable — all six PRD §6 capabilities measured live AND the acceptance suite attested this exact binary")
 		return 0
 	}
 	fmt.Println("prerequisites-ready at most — criteria above are not all live (fail closed)")
 	return 1
+}
+
+// verifyAcceptanceAttestation binds the grant to the graded binary.
+func verifyAcceptanceAttestation(layout pathx.Layout) (bool, string) {
+	raw, err := os.ReadFile(filepath.Join(layout.SystemDir(), "acceptance.json"))
+	if err != nil {
+		return false, "no acceptance attestation — run scripts/p0-accept.sh on this host"
+	}
+	var att struct {
+		BinarySHA256 string `json:"binary_sha256"`
+		Suite        string `json:"suite"`
+		Passed       bool   `json:"passed"`
+		Time         string `json:"time"`
+	}
+	if json.Unmarshal(raw, &att) != nil || !att.Passed || att.Suite != "internal/acceptance" || att.BinarySHA256 == "" {
+		return false, "acceptance attestation malformed or not a pass (fail closed)"
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return false, err.Error()
+	}
+	f, err := os.Open(self)
+	if err != nil {
+		return false, err.Error()
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return false, err.Error()
+	}
+	if hex.EncodeToString(h.Sum(nil)) != att.BinarySHA256 {
+		return false, "this binary is NOT the one the acceptance suite graded (digest mismatch, fail closed)"
+	}
+	return true, "acceptance suite passed against this exact binary (" + att.Time + ")"
 }
 
 // mustProbeCore opens a throwaway channel core for the doctor's live
@@ -832,6 +909,12 @@ func mustProbeCore(layout pathx.Layout, resolved config.Resolved) *channel.Core 
 		return nil
 	}
 	return c
+}
+
+// deliveryIDFor derives the STABLE outbox delivery id of an occurrence.
+func deliveryIDFor(occ string) string {
+	sum := sha256.Sum256([]byte("reminder-delivery|" + occ))
+	return "dlv-" + hex.EncodeToString(sum[:12])
 }
 
 // telegramBindings parses NEXUS_TELEGRAM_BINDINGS ("chatid=profile,...")

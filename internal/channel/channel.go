@@ -376,23 +376,58 @@ func (c *Core) Admit(ctx context.Context, in Inbound) (AdmitOutcome, error) {
 // folds with its enqueue event in ONE transaction. Returns the stable
 // delivery id.
 func (c *Core) EnqueueReply(ctx context.Context, adapter, identity string, profile contracts.ProfileID, text string) (string, error) {
-	if adapter == "" || identity == "" || text == "" {
-		return "", fmt.Errorf("channel: adapter, identity and text are required (fail closed)")
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%d|%d|%d", adapter, identity, os.Getpid(), time.Now().UnixNano(), c.seq.Add(1))))
+	return c.EnqueueReplyID(ctx, "dlv-"+hex.EncodeToString(sum[:12]), adapter, identity, profile, text)
+}
+
+// EnqueueReplyID enqueues under a CALLER-STABLE delivery id (T27 codex
+// #2: the reminder loop derives the id from the occurrence, so a crash
+// between enqueue and any bookkeeping can never mint a SECOND row for
+// the same notification). Re-enqueueing an existing id is a no-op that
+// returns the id — idempotent by construction.
+func (c *Core) EnqueueReplyID(ctx context.Context, id, adapter, identity string, profile contracts.ProfileID, text string) (string, error) {
+	if id == "" || adapter == "" || identity == "" || text == "" {
+		return "", fmt.Errorf("channel: id, adapter, identity and text are required (fail closed)")
 	}
 	if profile != c.j.Profile() {
 		return "", fmt.Errorf("channel: enqueue profile does not match this journal's binding (fail closed, B3)")
 	}
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%d|%d|%d", adapter, identity, os.Getpid(), time.Now().UnixNano(), c.seq.Add(1))))
-	id := "dlv-" + hex.EncodeToString(sum[:12])
+	if st, err := c.DeliveryStatus(ctx, id); err == nil && st != "" {
+		return id, nil // already durably enqueued (idempotent replay)
+	}
 	p, err := c.params(EvOutboundEnqueued, outboundPayload{
 		DeliveryID: id, AdapterID: adapter, ChannelIdentity: identity, Text: text})
 	if err != nil {
 		return "", err
 	}
 	if _, err := c.j.Append(ctx, p); err != nil {
+		// A raced duplicate aborts on the primary key: idempotent.
+		if st, serr := c.DeliveryStatus(ctx, id); serr == nil && st != "" {
+			return id, nil
+		}
 		return "", err
 	}
 	return id, nil
+}
+
+// DeliveryStatus reports the durable outbox state of one delivery id
+// ("" = unknown id). SENT is the at-least-once PROOF the wire accepted
+// it — the only state a delivery receipt may be minted from.
+func (c *Core) DeliveryStatus(ctx context.Context, id string) (string, error) {
+	rows, err := c.j.QueryProjection(ctx,
+		`SELECT status FROM chan_outbox WHERE delivery_id=?`, id)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return "", rows.Err()
+	}
+	var st string
+	if err := rows.Scan(&st); err != nil {
+		return "", err
+	}
+	return st, nil
 }
 
 func (c *Core) rowsByStatus(ctx context.Context, status string) ([]Outbound, error) {

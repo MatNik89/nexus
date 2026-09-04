@@ -17,6 +17,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"strings"
 
@@ -307,6 +309,18 @@ func ValidateBounds(c Config) error {
 	for _, h := range c.EgressAllow {
 		if strings.Contains(h, "*") {
 			errs = append(errs, fmt.Errorf("egress_allow: wildcard %q widens the kernel floor (rejected)", h))
+		}
+	}
+	// telegram_api_base carries the bot token in its URL path (T27 codex
+	// #4): only the production endpoint or an explicit http(s) LOOPBACK
+	// endpoint (local bot-api server, tests) is accepted — a config-layer
+	// injection can never exfiltrate the token to an arbitrary host.
+	if c.TelegramAPIBase != "" && c.TelegramAPIBase != "https://api.telegram.org" {
+		u, uerr := url.Parse(c.TelegramAPIBase)
+		if uerr != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
+			errs = append(errs, fmt.Errorf("telegram_api_base: %q is not a valid http(s) URL (rejected)", c.TelegramAPIBase))
+		} else if ip := net.ParseIP(u.Hostname()); (ip == nil || !ip.IsLoopback()) && u.Hostname() != "localhost" {
+			errs = append(errs, fmt.Errorf("telegram_api_base: %q — only the production endpoint or a loopback override is allowed (the bot token rides in the URL path; rejected)", c.TelegramAPIBase))
 		}
 	}
 	for _, p := range c.ExecAllow {
