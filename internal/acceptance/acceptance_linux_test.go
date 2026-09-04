@@ -652,3 +652,58 @@ func buildHelper(t *testing.T) string {
 }
 
 func ctxT() context.Context { return context.Background() }
+
+// Release attestation (T27, HARDQ A1 second half): the signed binary —
+// which COMPILES IN the telegram adapter — verifies; a tampered binary
+// fails verification.
+func TestReleaseSignatureTamperDetected(t *testing.T) {
+	if _, err := exec.LookPath("ssh-keygen"); err != nil {
+		t.Skipf("ssh-keygen unavailable: %v", err)
+	}
+	dir := t.TempDir()
+	key := filepath.Join(dir, "release_key")
+	if out, err := exec.Command("ssh-keygen", "-t", "ed25519", "-N", "", "-C", "nexus-release", "-f", key).CombinedOutput(); err != nil {
+		t.Fatalf("keygen: %v\n%s", err, out)
+	}
+	// Sign a private copy of the real binary.
+	bin := filepath.Join(dir, "nexus")
+	src, err := os.ReadFile(nexusBin(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bin, src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	repoRoot, _ := filepath.Abs("../..")
+	if out, err := exec.Command(filepath.Join(repoRoot, "scripts", "release-sign.sh"), bin, key).CombinedOutput(); err != nil {
+		t.Fatalf("sign: %v\n%s", err, out)
+	}
+	pub, err := os.ReadFile(key + ".pub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed := filepath.Join(dir, "allowed_signers")
+	if err := os.WriteFile(allowed, []byte("owner "+string(pub)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	verify := func() error {
+		out, err := exec.Command(filepath.Join(repoRoot, "scripts", "release-verify.sh"),
+			bin, bin+".sig", allowed, "owner").CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("%v: %s", err, out)
+		}
+		return nil
+	}
+	if err := verify(); err != nil {
+		t.Fatalf("clean binary failed verification: %v", err)
+	}
+	// TAMPER one byte → verification must FAIL.
+	tampered := append([]byte{}, src...)
+	tampered[len(tampered)/2] ^= 0xFF
+	if err := os.WriteFile(bin, tampered, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := verify(); err == nil {
+		t.Fatal("tampered binary passed signature verification")
+	}
+}
