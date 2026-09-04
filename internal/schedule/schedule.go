@@ -209,15 +209,11 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 			return err
 		}
 		if p.DueUTC == 0 {
-			// v1 UPCAST (Phase-4-r2 codex #20): an old canonical event
-			// carries only the wall intent — derive the instant
-			// deterministically from the payload instead of firing at
-			// epoch. (Current tzdata; recorded as the upcast rule.)
-			due, derr := p.Wall.dueUTC()
-			if derr != nil {
-				return fmt.Errorf("schedule: v1 upcast: %w", derr)
-			}
-			p.DueUTC = due.UnixNano()
+			// A previous-revision event carries no resolved instant; the
+			// ORIGINAL promise is unrecoverable and deriving one at
+			// replay would depend on the CURRENT tzdata (non-
+			// deterministic replay — Phase-4-r3 codex #12). Fail loudly.
+			return fmt.Errorf("schedule: MIGRATION_REQUIRED — a v1 schedule.created has no resolved due instant; re-create the reminder")
 		}
 		if _, err := tx.Exec(`INSERT INTO sched_schedules(id, body, wall, due_utc, fired, created) VALUES(?,?,?,?,0,?)`,
 			p.ID, p.Body, string(wall), p.DueUTC, int64(ev.JournalOffset)); err != nil {

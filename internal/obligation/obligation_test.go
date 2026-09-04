@@ -54,7 +54,13 @@ func build(t *testing.T) *harness {
 	t.Helper()
 	dir := t.TempDir()
 	clock := clockid.NewFake(time.Date(2026, 9, 4, 10, 0, 0, 0, time.UTC))
-	events := Events("file_note")
+	reg, err := NewRegistry(map[string]Kind{
+		"file_note": {Handler: FileNoteHandler(dir), ValidateParams: ValidateFileNoteParams},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := Events(reg)
 	for n, v := range schedule.Events() {
 		events[n] = v
 	}
@@ -68,12 +74,6 @@ func build(t *testing.T) *harness {
 	}
 	t.Cleanup(func() { j.Close() })
 	sched, err := schedule.New(j, clock)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reg, err := NewRegistry(map[string]Kind{
-		"file_note": {Handler: FileNoteHandler(dir), ValidateParams: ValidateFileNoteParams},
-	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -246,7 +246,8 @@ func TestLifecycleSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.m.Journal().Close()
-	events := Events("file_note")
+	reg, _ := NewRegistry(map[string]Kind{"file_note": {Handler: FileNoteHandler(h.dir), ValidateParams: ValidateFileNoteParams}})
+	events := Events(reg)
 	for n, v := range schedule.Events() {
 		events[n] = v
 	}
@@ -259,7 +260,6 @@ func TestLifecycleSurvivesRestart(t *testing.T) {
 	}
 	defer j.Close()
 	sched, _ := schedule.New(j, h.clock)
-	reg, _ := NewRegistry(map[string]Kind{"file_note": {Handler: FileNoteHandler(h.dir), ValidateParams: ValidateFileNoteParams}})
 	auth2 := s7min.NewAuthority(nil, time.Minute)
 	m2, err := NewManager(j, sched, reg, h.clock, &LazyRunner{}, auth2, h.dir)
 	if err != nil {
@@ -396,12 +396,12 @@ func TestProjectionEnforcesExecutionProtocol(t *testing.T) {
 	}
 	// Forged attestation with NO claim: aborted.
 	ep, _ := h.m.params(EvTaskExecuted, executedPayload{ID: "task-p", OperationID: "op-forged",
-		ExpectedPath: "/x", MarkerLine: "[task-p] fake"})
+		ExpectedPath: "/tmp/notes.txt", MarkerLine: "[task-p] protocol"})
 	if _, err := h.m.j.Append(ctxT(), ep); err == nil {
 		t.Fatal("attestation without a claim accepted")
 	}
 	// Forged DONE with no attestation: aborted.
-	dp, _ := h.m.params(EvTaskDone, donePayload{ID: "task-p"})
+	dp, _ := h.m.params(EvTaskDone, donePayload{ID: "task-p", MarkerLine: "[task-p] protocol", Verifier: "postcondition-verifier"})
 	if _, err := h.m.j.Append(ctxT(), dp); err == nil {
 		t.Fatal("done without an attested execution accepted")
 	}
@@ -416,18 +416,25 @@ func TestProjectionEnforcesExecutionProtocol(t *testing.T) {
 	}
 	// Attestation under the WRONG operation: aborted.
 	ew, _ := h.m.params(EvTaskExecuted, executedPayload{ID: "task-p", OperationID: "op-two",
-		ExpectedPath: "/x", MarkerLine: "[task-p] wrong"})
+		ExpectedPath: "/tmp/notes.txt", MarkerLine: "[task-p] protocol"})
 	if _, err := h.m.j.Append(ctxT(), ew); err == nil {
 		t.Fatal("attestation under an unclaimed operation accepted")
 	}
-	// Correct attestation lands ONCE; a re-attestation aborts.
+	// A forged marker under the VALID claim aborts (the projection
+	// recomputes the canonical expectation — r3 codex #10).
+	efm, _ := h.m.params(EvTaskExecuted, executedPayload{ID: "task-p", OperationID: "op-one",
+		ExpectedPath: "/tmp/notes.txt", MarkerLine: "[task-p] forged content"})
+	if _, err := h.m.j.Append(ctxT(), efm); err == nil {
+		t.Fatal("forged marker accepted under a valid claim")
+	}
+	// Correct attestation (canonical marker + notes path) lands ONCE.
 	eok, _ := h.m.params(EvTaskExecuted, executedPayload{ID: "task-p", OperationID: "op-one",
-		ExpectedPath: "/x", MarkerLine: "[task-p] real"})
+		ExpectedPath: "/tmp/notes.txt", MarkerLine: "[task-p] protocol"})
 	if _, err := h.m.j.Append(ctxT(), eok); err != nil {
 		t.Fatal(err)
 	}
 	eagain, _ := h.m.params(EvTaskExecuted, executedPayload{ID: "task-p", OperationID: "op-one",
-		ExpectedPath: "/y", MarkerLine: "[task-p] overwrite"})
+		ExpectedPath: "/tmp/notes.txt", MarkerLine: "[task-p] protocol"})
 	if _, err := h.m.j.Append(ctxT(), eagain); err == nil {
 		t.Fatal("attestation overwrite accepted")
 	}
@@ -468,5 +475,64 @@ func TestDeliveryReceiptAndGestureRequired(t *testing.T) {
 	}
 	if err := h.m.MarkAcked(ctxT(), f.OccurrenceID, AckGesture{Source: "tool:tc-9"}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// The live-executor lease (Phase-4-r3 codex #2): two PARALLEL governed
+// executions of one task — exactly one runs; the file carries ONE line.
+func TestParallelExecutionSingleEffect(t *testing.T) {
+	h := build(t)
+	if err := h.m.CreateTask(ctxT(), "task-par", "file_note", `{"note":"parallel"}`); err != nil {
+		t.Fatal(err)
+	}
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() { errs <- h.m.RunTask(ctxT(), "task-par") }()
+	}
+	failures := 0
+	for i := 0; i < 2; i++ {
+		if e := <-errs; e != nil {
+			failures++
+		}
+	}
+	if failures != 1 {
+		t.Fatalf("want exactly one refused parallel execution, got %d failures", failures)
+	}
+	b, _ := os.ReadFile(filepath.Join(h.dir, "notes.txt"))
+	if n := strings.Count(string(b), "[task-par] parallel"); n != 1 {
+		t.Fatalf("parallel execution wrote the note %d times: %q", n, b)
+	}
+}
+
+// The durable ack carries its gesture source — replay knows WHO closed
+// the occurrence, and a sourceless canonical ack is rejected (r3 codex #1).
+func TestAckGestureDurable(t *testing.T) {
+	h := build(t)
+	if err := h.m.CreateReminder(ctxT(), "rem-g", "gestured", wall); err != nil {
+		t.Fatal(err)
+	}
+	f := fireDue(t, h)
+	if err := h.m.MarkDelivered(ctxT(), f.OccurrenceID, DeliveryReceipt{Producer: "ch", ReceiptID: "r1"}); err != nil {
+		t.Fatal(err)
+	}
+	// A forged sourceless ack event is refused at admission.
+	bad, _ := h.m.params(EvAcked, occurrencePayload{OccurrenceID: f.OccurrenceID})
+	if _, err := h.m.j.Append(ctxT(), bad); err == nil {
+		t.Fatal("sourceless canonical ack accepted")
+	}
+	if err := h.m.MarkAcked(ctxT(), f.OccurrenceID, AckGesture{Source: "tool:tc-77"}); err != nil {
+		t.Fatal(err)
+	}
+	found := ""
+	h.m.j.Replay(0, func(ev journal.Event) error {
+		if ev.Envelope.EventType == EvAcked {
+			var p ackedPayload
+			jsonUnmarshal(ev.Envelope.Payload, &p)
+			found = p.Source
+		}
+		return nil
+	})
+	if found != "tool:tc-77" {
+		t.Fatalf("ack gesture source not durable: %q", found)
 	}
 }

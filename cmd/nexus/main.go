@@ -14,6 +14,7 @@ import (
 
 	"github.com/MatNik89/nexus/internal/app/daemon"
 	"github.com/MatNik89/nexus/internal/app/repl"
+	"github.com/MatNik89/nexus/internal/foundation/atomicwrite"
 	"github.com/MatNik89/nexus/internal/foundation/clockid"
 	"github.com/MatNik89/nexus/internal/foundation/config"
 	"github.com/MatNik89/nexus/internal/foundation/pathx"
@@ -126,6 +127,27 @@ func runDaemon() int {
 	// exists to fail (Phase-4-r2 codex #21); the T22 channel consumes
 	// DELIVERY_PENDING. Sweep failures surface via sched.Health().
 	go b.sched.Run(ctx, 30*time.Second, nil)
+	// Scheduler health mirror (Phase-4-r3 codex #4): sweep failures land
+	// in system/scheduler_health where doctor reads them; an empty file
+	// means healthy.
+	go func() {
+		healthPath := filepath.Join(layout.SystemDir(), "scheduler_health")
+		t := time.NewTicker(30 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				msg := ""
+				if herr := b.sched.Health(); herr != nil {
+					msg = herr.Error()
+					fmt.Fprintf(os.Stderr, "nexus daemon: scheduler: %v\n", herr)
+				}
+				atomicwrite.Write(healthPath, []byte(msg), 0o600)
+			}
+		}
+	}()
 	sock := socketPath(layout)
 	fmt.Printf("nexus daemon %s — profile %s, socket %s\n", version, resolved.Config.DefaultProfile, sock)
 	if err := b.d.Serve(ctx, sock); err != nil {
@@ -161,6 +183,12 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 			}
 		}
 	}
+	registry, err := obligation.NewRegistry(map[string]obligation.Kind{
+		"file_note": {Handler: obligation.FileNoteHandler(profileDir), ValidateParams: obligation.ValidateFileNoteParams},
+	})
+	if err != nil {
+		return nil, err
+	}
 	events := map[string]journal.PayloadValidator{evPolicyYolo: nil}
 	for _, n := range machine.EventTypes() {
 		events[n] = nil
@@ -171,9 +199,10 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 	for n, v := range schedule.Events() {
 		events[n] = v
 	}
-	for n, v := range obligation.Events("file_note") {
+	for n, v := range obligation.Events(registry) {
 		events[n] = v
 	}
+
 	journalPath, _ := layout.ProfileJournal(profile)
 	redactor := redact.NewKnownRefs(knownSecretRefs(resolved.Config))
 	// The ONE profile database: journal + memory projection together
@@ -200,13 +229,6 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 		return nil, fmt.Errorf("schedule: %w", err)
 	}
 	sched.SetCounterFile(filepath.Join(layout.SystemDir(), "last_occurrence_fired"))
-	registry, err := obligation.NewRegistry(map[string]obligation.Kind{
-		"file_note": {Handler: obligation.FileNoteHandler(profileDir), ValidateParams: obligation.ValidateFileNoteParams},
-	})
-	if err != nil {
-		j.Close()
-		return nil, err
-	}
 	lazyRunner := &obligation.LazyRunner{}
 	oblManager, err := obligation.NewManager(j, sched, registry, clockid.System{}, lazyRunner, authority, profileDir)
 	if err != nil {

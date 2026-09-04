@@ -123,16 +123,25 @@ type executedPayload struct {
 
 type donePayload struct {
 	ID string `json:"id"`
+	// MarkerLine + Verifier bind DONE to the verified artifact and the
+	// independent verifier identity (checker != worker; Phase-4-r3 codex
+	// #10). topknot ceiling: cryptographic verifier attestation is
+	// outside P0 — the projection enforces marker equality and a
+	// non-worker verifier identity.
+	MarkerLine string `json:"marker_line"`
+	Verifier   string `json:"verifier"`
 }
 
-// Events returns the payload validators — the kind discriminator is
-// SEALED against {"reminder"} ∪ the registered task kinds (Phase-4 codex
-// #13: a crafted canonical event with an unknown kind must not survive
-// replay as an OPEN task).
-func Events(taskKinds ...string) map[string]journal.PayloadValidator {
-	allowed := map[string]bool{"reminder": true}
-	for _, k := range taskKinds {
-		allowed[k] = true
+// Events returns the payload validators — the kind discriminator AND
+// each kind's params schema are SEALED at the JOURNAL boundary (Phase-4
+// codex #13, r3 #5/#9): a forged in-process producer cannot admit an
+// unknown kind, malformed params, or a marker-ambiguous id.
+func Events(reg *Registry) map[string]journal.PayloadValidator {
+	allowed := map[string]func(string) error{"reminder": func(string) error { return nil }}
+	if reg != nil {
+		for k, v := range reg.kinds {
+			allowed[k] = v.ValidateParams
+		}
 	}
 	occV := func(raw json.RawMessage) error {
 		var p occurrencePayload
@@ -150,15 +159,31 @@ func Events(taskKinds ...string) map[string]journal.PayloadValidator {
 			if err := json.Unmarshal(raw, &p); err != nil {
 				return err
 			}
-			if p.ID == "" || p.Kind == "" {
-				return fmt.Errorf("obligation: id and kind are required")
+			if !taskIDOK(p.ID) || p.Kind == "" {
+				return fmt.Errorf("obligation: a slug id and kind are required (fail closed)")
 			}
-			if !allowed[p.Kind] {
+			validate, ok := allowed[p.Kind]
+			if !ok {
 				return fmt.Errorf("obligation: unknown obligation kind (fail closed; sealed set)")
+			}
+			if p.Kind != "reminder" {
+				if err := validate(p.TaskParams); err != nil {
+					return fmt.Errorf("obligation: %s params: %w", p.Kind, err)
+				}
 			}
 			return nil
 		},
-		EvDue: occV, EvDeliveryPending: occV, EvAcked: occV, EvExpired: occV,
+		EvDue: occV, EvDeliveryPending: occV, EvExpired: occV,
+		EvAcked: func(raw json.RawMessage) error {
+			var p ackedPayload
+			if err := json.Unmarshal(raw, &p); err != nil {
+				return err
+			}
+			if p.OccurrenceID == "" || p.Source == "" {
+				return fmt.Errorf("obligation: an ack requires its occurrence and gesture source (fail closed)")
+			}
+			return nil
+		},
 		EvDelivered: func(raw json.RawMessage) error {
 			var p deliveredPayload
 			if err := json.Unmarshal(raw, &p); err != nil {
@@ -194,8 +219,8 @@ func Events(taskKinds ...string) map[string]journal.PayloadValidator {
 			if err := json.Unmarshal(raw, &p); err != nil {
 				return err
 			}
-			if p.ID == "" {
-				return fmt.Errorf("obligation: done requires an id")
+			if p.ID == "" || p.MarkerLine == "" || p.Verifier == "" || p.Verifier == "file_note-handler" {
+				return fmt.Errorf("obligation: done requires the verified marker and an independent verifier identity")
 			}
 			return nil
 		},
@@ -209,7 +234,7 @@ type Projection struct{}
 func NewProjection() *Projection { return &Projection{} }
 
 func (Projection) Name() string { return "obligation" }
-func (Projection) Version() int { return 2 } // v2: delivered_at + intent + marker columns
+func (Projection) Version() int { return 3 } // v3: acked_by + protocol-enforced attestation (legacy shapes MIGRATION_REQUIRED)
 
 func (Projection) Init(db *journal.ProjDB) error {
 	_, err := db.Exec(`
@@ -225,6 +250,7 @@ func (Projection) Init(db *journal.ProjDB) error {
 			marker_line TEXT NOT NULL DEFAULT '',
 			delivered_at INTEGER NOT NULL DEFAULT 0,
 			delivered_by TEXT NOT NULL DEFAULT '',
+			acked_by TEXT NOT NULL DEFAULT '',
 			created INTEGER NOT NULL
 		);
 		CREATE UNIQUE INDEX IF NOT EXISTS ux_obl_occurrence
@@ -316,11 +342,14 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 		return step(p.OccurrenceID, EvDelivered, ", delivered_at=?, delivered_by=?",
 			ev.Envelope.EmittedAt.UnixNano(), p.Producer)
 	case EvAcked:
-		var p occurrencePayload
+		var p ackedPayload
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return err
 		}
-		return step(p.OccurrenceID, EvAcked, "")
+		if p.Source == "" {
+			return fmt.Errorf("obligation: ack without its gesture source (fail closed)")
+		}
+		return step(p.OccurrenceID, EvAcked, ", acked_by=?", p.Source)
 	case EvExpired:
 		var p occurrencePayload
 		if err := json.Unmarshal(raw, &p); err != nil {
@@ -349,8 +378,35 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return err
 		}
-		// The attestation must MATCH the claimed operation and land once
-		// (codex #18: an unclaimed or re-attested execution is forged).
+		// Legacy shapes (no operation id / no marker) are unrecoverable:
+		// fail loudly, never reinterpret (Phase-4-r3 codex #12 / kilo).
+		if p.OperationID == "" || p.MarkerLine == "" {
+			return fmt.Errorf("obligation: MIGRATION_REQUIRED — a previous-revision task_executed carries no claim/marker")
+		}
+		// The marker is DETERMINISTIC from the task's own canonical
+		// params — the projection RECOMPUTES it, so a forged attestation
+		// with an arbitrary marker/path aborts even under a valid claim
+		// (Phase-4-r3 codex #10). No filesystem read: replay stays pure.
+		trows, terr := tx.Query(`SELECT task_params FROM obl_obligations WHERE id=?`, p.ID)
+		if terr != nil {
+			return terr
+		}
+		var tp string
+		if trows.Next() {
+			if err := trows.Scan(&tp); err != nil {
+				trows.Close()
+				return err
+			}
+		}
+		if err := trows.Close(); err != nil {
+			return err
+		}
+		if expected, eerr := expectedMarker(p.ID, tp); eerr != nil || p.MarkerLine != expected {
+			return fmt.Errorf("obligation: attested marker does not match the task's canonical expectation (forged attestation — fail closed)")
+		}
+		if !strings.HasSuffix(p.ExpectedPath, "/notes.txt") {
+			return fmt.Errorf("obligation: attested path is not the notes file (fail closed)")
+		}
 		res, err := tx.Exec(`UPDATE obl_obligations SET expected_path=?, marker_line=?
 			WHERE id=? AND status=? AND intent_op=? AND intent_op!='' AND marker_line=''`,
 			p.ExpectedPath, p.MarkerLine, p.ID, string(StateOpen), p.OperationID)
@@ -388,14 +444,19 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 		if err != nil {
 			return fmt.Errorf("obligation: %w", err)
 		}
-		// DONE requires the attested marker (codex #18): a done event for
-		// an unattested task is forged and aborts.
-		res, err := tx.Exec(`UPDATE obl_obligations SET status=? WHERE id=? AND marker_line!=''`, string(next), p.ID)
+		// DONE requires the attested marker AND must carry the SAME marker
+		// the verifier graded, from a non-worker verifier (codex #18/#10):
+		// a done for an unattested task or with a mismatched marker aborts.
+		if p.MarkerLine == "" || p.Verifier == "" {
+			return fmt.Errorf("obligation: MIGRATION_REQUIRED — a previous-revision task_done carries no verification identity")
+		}
+		res, err := tx.Exec(`UPDATE obl_obligations SET status=? WHERE id=? AND marker_line=? AND marker_line!=''`,
+			string(next), p.ID, p.MarkerLine)
 		if err != nil {
 			return err
 		}
 		if n, _ := res.RowsAffected(); n != 1 {
-			return fmt.Errorf("obligation: done without an attested execution (fail closed)")
+			return fmt.Errorf("obligation: done does not match the attested execution (fail closed)")
 		}
 	}
 	return nil
@@ -522,6 +583,7 @@ type Manager struct {
 	runner   EffectRunner
 	auth     *s7min.Authority
 	notesDir string // IMMUTABLE profile-bound reconcile root (B3 — no globals)
+	inflight sync.Map
 	seq      atomic.Uint64
 }
 
@@ -668,6 +730,11 @@ type deliveredPayload struct {
 	ReceiptID    string `json:"receipt_id"`
 }
 
+type ackedPayload struct {
+	OccurrenceID string `json:"occurrence_id"`
+	Source       string `json:"source"`
+}
+
 // MarkDelivered records the durable delivery receipt for the occurrence;
 // a receipt without a producer and id is refused.
 func (m *Manager) MarkDelivered(ctx context.Context, occ string, r DeliveryReceipt) error {
@@ -719,7 +786,12 @@ func (m *Manager) MarkAcked(ctx context.Context, occ string, g AckGesture) error
 	if !verdict.Pass || st != StateDelivered {
 		return fmt.Errorf("obligation: ack refused — occurrence %s is not in DELIVERED (B5)", occ)
 	}
-	return m.occEvent(ctx, EvAcked, occ)
+	p, err := m.params(EvAcked, ackedPayload{OccurrenceID: occ, Source: g.Source})
+	if err != nil {
+		return err
+	}
+	_, err = m.j.Append(ctx, p)
+	return err
 }
 
 // MarkExpired ends an undelivered/unacked occurrence.
@@ -737,6 +809,15 @@ const taskToolID = "task_file_note"
 // attestation RECONCILES against the real file before any retry (the
 // note is never appended twice — codex #5); the attestation lands after.
 func (m *Manager) executeGoverned(ctx context.Context, id, opSuffix string) (string, string, error) {
+	// LIVE-EXECUTOR LEASE (Phase-4-r3 codex #2): the journal lease makes
+	// this process the only writer, and this in-flight map serializes
+	// executions WITHIN it — a second caller cannot enter the
+	// claim→effect window while the first is live; after a crash the map
+	// is empty and the reconcile path takes over.
+	if _, busy := m.inflight.LoadOrStore(id, struct{}{}); busy {
+		return "", "", fmt.Errorf("obligation: task %s execution is in progress (fail closed)", id)
+	}
+	defer m.inflight.Delete(id)
 	kind, taskParams, intentOp, markerLine, _, status, err := m.taskRow(ctx, id)
 	if err != nil {
 		return "", "", err
@@ -820,8 +901,9 @@ func (m *Manager) RunTask(ctx context.Context, id string) error {
 	return nil
 }
 
-// probableMarker recomputes the deterministic marker for reconcile.
-func (m *Manager) probableMarker(id, taskParams string) (string, error) {
+// expectedMarker is THE deterministic marker derivation shared by the
+// handler, reconcile and the projection's forgery check.
+func expectedMarker(id, taskParams string) (string, error) {
 	var p struct {
 		Note string `json:"note"`
 	}
@@ -829,6 +911,10 @@ func (m *Manager) probableMarker(id, taskParams string) (string, error) {
 		return "", fmt.Errorf("obligation: unreconstructable marker")
 	}
 	return "[" + id + "] " + p.Note, nil
+}
+
+func (m *Manager) probableMarker(id, taskParams string) (string, error) {
+	return expectedMarker(id, taskParams)
 }
 
 func (m *Manager) attestExecution(ctx context.Context, id, op, path, line string, reconciled bool) error {
@@ -874,7 +960,7 @@ func (m *Manager) MarkTaskDone(ctx context.Context, id string) error {
 	if !verdict.Pass {
 		return fmt.Errorf("obligation: done refused — the postcondition does not verify (the task's marker line is absent)")
 	}
-	p, err := m.params(EvTaskDone, donePayload{ID: id})
+	p, err := m.params(EvTaskDone, donePayload{ID: id, MarkerLine: markerLine, Verifier: "postcondition-verifier"})
 	if err != nil {
 		return err
 	}

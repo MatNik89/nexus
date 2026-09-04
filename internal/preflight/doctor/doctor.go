@@ -142,6 +142,17 @@ func Run(e Env) []Check {
 			Fix: "fix permissions on " + counterPath})
 	}
 
+	// 6b: scheduler health mirror — a non-empty file is a live failure.
+	healthPath := filepath.Join(e.DataDir, "system", "scheduler_health")
+	if hb, herr := os.ReadFile(healthPath); herr == nil && strings.TrimSpace(string(hb)) != "" {
+		checks = append(checks, Check{Name: "scheduler-health", Capability: "obligations",
+			Status: StatusOff, Detail: "last sweep failed: " + strings.TrimSpace(string(hb)),
+			Fix: "inspect the daemon log; the next successful sweep clears this"})
+	} else {
+		checks = append(checks, Check{Name: "scheduler-health", Capability: "obligations",
+			Status: StatusOK, Detail: "no sweep failures recorded"})
+	}
+
 	// 5. Telegram token → telegram capability.
 	if v, ok := e.LookupEnv("NEXUS_TELEGRAM_TOKEN"); !ok || v == "" {
 		checks = append(checks, Check{

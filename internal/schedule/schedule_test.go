@@ -417,10 +417,12 @@ func TestConcurrentSweepsFireOnce(t *testing.T) {
 	}
 }
 
-// v1 UPCAST (Phase-4-r2 codex #20): a canonical schedule.created WITHOUT
-// due_utc (previous revision) rebuilds with the instant derived from its
-// wall payload — never an epoch-overdue immediate fire.
-func TestV1ScheduleEventUpcastsNotEpochFires(t *testing.T) {
+// A previous-revision schedule.created (no resolved due instant) FAILS
+// OPEN with a typed MIGRATION_REQUIRED — the original promise is
+// unrecoverable and deriving one at replay would be tzdata-dependent
+// (Phase-4-r3 codex #12): never an epoch-overdue fire, never a silently
+// moved instant.
+func TestV1ScheduleEventRequiresMigration(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "journal.db")
 	clock := clockid.NewFake(utc(2026, 9, 4, 10, 0))
@@ -442,15 +444,16 @@ func TestV1ScheduleEventUpcastsNotEpochFires(t *testing.T) {
 		t.Fatal(err)
 	}
 	j.Close()
-	s2 := reopenSched(t, path, clock)
-	// 10:00 UTC now; wall 14:00 CEST = 12:00 UTC — NOT epoch-due.
-	if fired, _ := s2.Sweep(ctxT()); len(fired) != 0 {
-		t.Fatalf("v1 event fired as epoch-overdue: %v", fired)
+	events := Events()
+	for _, n := range machine.EventTypes() {
+		events[n] = nil
 	}
-	clock.Advance(2*time.Hour + time.Minute)
-	fired, err := s2.Sweep(ctxT())
-	if err != nil || len(fired) != 1 {
-		t.Fatalf("upcast v1 schedule did not fire at its wall time: %v %v", fired, err)
+	_, err = journal.Open(path, "work", redact.None{}, events, NewProjection())
+	if err == nil {
+		t.Fatal("a v1 schedule event opened silently (must fail MIGRATION_REQUIRED)")
+	}
+	if !strings.Contains(err.Error(), "MIGRATION_REQUIRED") {
+		t.Fatalf("wrong failure class: %v", err)
 	}
 }
 
@@ -463,16 +466,32 @@ func TestSweepCrashConsistencyUnderSigkill(t *testing.T) {
 		crashChildMain()
 		return
 	}
-	for i := 0; i < 4; i++ {
+	sawWork := false
+	for i := 0; i < 6; i++ {
 		dir := t.TempDir()
+		ready := filepath.Join(dir, "ready")
 		cmd := exec.Command(os.Args[0], "-test.run", "TestSweepCrashConsistencyUnderSigkill")
-		cmd.Env = append(os.Environ(), "SCHED_CRASH_CHILD=1", "SCHED_CRASH_DIR="+dir)
+		cmd.Env = append(os.Environ(), "SCHED_CRASH_CHILD=1", "SCHED_CRASH_DIR="+dir, "SCHED_CRASH_READY="+ready)
 		if err := cmd.Start(); err != nil {
 			t.Fatal(err)
 		}
-		time.Sleep(time.Duration(20+i*15) * time.Millisecond)
-		cmd.Process.Kill()
-		cmd.Wait()
+		// BARRIER: the child signals after its first fire — SIGKILL lands
+		// mid-workload, never before it (non-vacuous by construction).
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, err := os.Stat(ready); err == nil {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		time.Sleep(time.Duration(5+i*7) * time.Millisecond)
+		if err := cmd.Process.Kill(); err != nil {
+			t.Fatalf("iteration %d: kill: %v", i, err)
+		}
+		werr := cmd.Wait()
+		if werr == nil {
+			t.Fatalf("iteration %d: child exited cleanly (SIGKILL never landed)", i)
+		}
 		// Verify the survivor journal: chain intact, recipe atomic.
 		events := Events()
 		for _, n := range machine.EventTypes() {
@@ -496,6 +515,9 @@ func TestSweepCrashConsistencyUnderSigkill(t *testing.T) {
 			j.Close()
 			t.Fatalf("iteration %d: replay: %v", i, err)
 		}
+		if len(occ) > 0 {
+			sawWork = true
+		}
 		for run := range occ {
 			if !admitted[run] {
 				j.Close()
@@ -503,6 +525,9 @@ func TestSweepCrashConsistencyUnderSigkill(t *testing.T) {
 			}
 		}
 		j.Close()
+	}
+	if !sawWork {
+		t.Fatal("oracle vacuous: no killed run ever fired an occurrence")
 	}
 }
 
@@ -522,11 +547,39 @@ func crashChildMain() {
 	if err != nil {
 		os.Exit(1)
 	}
+	ready := os.Getenv("SCHED_CRASH_READY")
 	for i := 0; ; i++ {
 		id := fmt.Sprintf("rem-crash-%d", i)
 		s.CreateReminder(context.Background(), id, "crash fuzz", WallTime{
 			Year: 2026, Month: 9, Day: 4, Hour: 11, Minute: 0, TZ: "Europe/Zagreb"})
 		clock.Advance(2 * time.Hour)
 		s.Sweep(context.Background())
+		if i == 0 && ready != "" {
+			os.WriteFile(ready, []byte("1"), 0o600) // barrier: first fire done
+		}
+	}
+}
+
+// Mirror-write failure SURFACES (Phase-4-r3 codex #4): fires stay
+// durable, the error reaches the caller and Health.
+func TestMirrorFailureSurfaces(t *testing.T) {
+	clock := clockid.NewFake(utc(2026, 9, 4, 10, 0))
+	s, _ := openSched(t, t.TempDir(), clock)
+	s.SetCounterFile("/nonexistent-dir/counter") // unwritable mirror
+	if err := s.CreateReminder(ctxT(), "rem-m", "mirror", WallTime{
+		Year: 2026, Month: 9, Day: 4, Hour: 11, Minute: 0, TZ: "Europe/Zagreb",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(2 * time.Hour)
+	fired, err := s.Sweep(ctxT())
+	if err == nil {
+		t.Fatal("mirror-write failure swallowed")
+	}
+	if len(fired) != 1 {
+		t.Fatalf("the FIRE must stay durable despite the mirror: %v", fired)
+	}
+	if n, _ := s.LastOccurrenceFired(ctxT()); n != 1 {
+		t.Fatalf("authoritative counter %d", n)
 	}
 }
