@@ -651,3 +651,58 @@ func TestFailedOpenSurfacesLeaseReleaseFailure(t *testing.T) {
 		t.Fatalf("lease-release failure swallowed on the failed-open path: %v", err)
 	}
 }
+
+// The B7 recipe primitive: a batch is ONE transaction — an injected
+// commit failure leaves NOTHING durable (never a fired occurrence without
+// its admitted run), and a successful batch chains + replays cleanly.
+func TestAppendBatchAllOrNothing(t *testing.T) {
+	j := open(t, t.TempDir(), redact.None{})
+	ctx := context.Background()
+	if _, err := j.Append(ctx, params("run-a", "e1")); err != nil {
+		t.Fatal(err)
+	}
+	testFailCommit = func() error { return fmt.Errorf("injected crash before commit") }
+	_, err := j.AppendBatch(ctx, []contracts.EnvelopeParams{
+		params("run-b", "e2"), params("run-b", "e3"),
+	})
+	testFailCommit = nil
+	if err == nil {
+		t.Fatal("batch survived an injected commit failure")
+	}
+	count := 0
+	if err := j.Replay(0, func(Event) error { count++; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("partial batch durable: %d events (want only the pre-batch 1)", count)
+	}
+	// A successful batch lands atomically and the chain verifies.
+	evs, err := j.AppendBatch(ctx, []contracts.EnvelopeParams{
+		params("run-b", "e2"), params("run-b", "e3"), params("run-b", "e4"),
+	})
+	if err != nil || len(evs) != 3 {
+		t.Fatalf("batch failed: %v %v", evs, err)
+	}
+	if evs[1].IntegrityPrevHash != evs[0].IntegrityHash || evs[2].IntegrityPrevHash != evs[1].IntegrityHash {
+		t.Fatal("batch events not chained in order")
+	}
+	if err := j.VerifyChain(); err != nil {
+		t.Fatalf("chain broken after batch: %v", err)
+	}
+	// An invalid member ANYWHERE poisons the whole batch.
+	bad := params("run-c", "e5")
+	bad.EventType = "never.registered"
+	if _, err := j.AppendBatch(ctx, []contracts.EnvelopeParams{params("run-c", "e5"), bad}); err == nil {
+		t.Fatal("batch with an invalid member accepted")
+	}
+	count = 0
+	j.Replay(0, func(ev Event) error {
+		if ev.Envelope.RunID == "run-c" {
+			count++
+		}
+		return nil
+	})
+	if count != 0 {
+		t.Fatalf("poisoned batch left %d run-c events", count)
+	}
+}

@@ -233,7 +233,7 @@ accepted fact recallable after restart, only in its profile.
 
 ## Phase 4 — scheduler + obligations
 
-**[ ] T20 — 3.6-min durable scheduler + occurrence counter.**
+**[x] T20 — 3.6-min durable scheduler + occurrence counter.**
 Persisted occurrence (UTC + IANA + `dst=ONCE_FIRST` + `missed_run=COALESCE`), stable
 occurrence ID, T05 clock seams, single-process overlap rule; startup + wake (D-Bus
 PrepareForSleep where available) catch-up sweep — `EvaluateDue` range query, overdue fires
@@ -247,7 +247,7 @@ fold → once; spring gap → policy applied; suspend-over-due → catch-up on w
 recipe atomicity — SIGKILL between occurrence-fire and run-admission → on restart either
 BOTH are durable or NEITHER (never a fired occurrence without its admitted run).
 
-**[ ] T21 — ObligationStore (9.6-min): Reminder + ONE concrete typed Task.**
+**[x] T21 — ObligationStore (9.6-min): Reminder + ONE concrete typed Task.**
 Writes THROUGH journal; `Reminder`
 `SCHEDULED→DUE→DELIVERY_PENDING→DELIVERED→ACKED|EXPIRED`; concrete P0 Task handler
 **`file_note`** (append a line to a profile-scoped notes file via T05 AtomicWriter;

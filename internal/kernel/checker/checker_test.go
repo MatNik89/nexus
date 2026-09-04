@@ -221,3 +221,34 @@ func TestAckBeforeDeliveryFails(t *testing.T) {
 		t.Fatal("legitimate delivery→ack pair failed under redelivery")
 	}
 }
+
+// FileContainsLine grades an immutable marker line (Phase-4 codex #6): a
+// present line passes even when the file later grows; an absent line or a
+// contradictory sighting fails.
+func TestFileContainsLineCriterion(t *testing.T) {
+	line := "[task-1] buy milk"
+	contract := AcceptanceContract{ID: "t", Worker: "w", Criteria: []Criterion{
+		{FileContainsLine: &FileLineCriterion{Path: "notes.txt", Line: line}},
+	}}
+	ok, err := Grade(contract, []Evidence{
+		{Contract: "t", Producer: "verifier", FileLine: &FileLineEvidence{Path: "notes.txt", Line: line, Present: true}},
+	})
+	if err != nil || !ok.Pass {
+		t.Fatalf("present line failed: %+v %v", ok, err)
+	}
+	absent, _ := Grade(contract, []Evidence{
+		{Contract: "t", Producer: "verifier", FileLine: &FileLineEvidence{Path: "notes.txt", Line: line, Present: false}},
+	})
+	if absent.Pass {
+		t.Fatal("absent line graded PASS")
+	}
+	none, _ := Grade(contract, nil)
+	if none.Pass {
+		t.Fatal("no evidence graded PASS")
+	}
+	if _, err := Grade(AcceptanceContract{ID: "t", Worker: "w", Criteria: []Criterion{
+		{FileContainsLine: &FileLineCriterion{Path: "", Line: ""}},
+	}}, nil); err == nil {
+		t.Fatal("empty file-line criterion accepted")
+	}
+}

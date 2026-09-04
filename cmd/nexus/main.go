@@ -14,9 +14,12 @@ import (
 
 	"github.com/MatNik89/nexus/internal/app/daemon"
 	"github.com/MatNik89/nexus/internal/app/repl"
+	"github.com/MatNik89/nexus/internal/foundation/atomicwrite"
+	"github.com/MatNik89/nexus/internal/foundation/clockid"
 	"github.com/MatNik89/nexus/internal/foundation/config"
 	"github.com/MatNik89/nexus/internal/foundation/pathx"
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
+	"github.com/MatNik89/nexus/internal/kernel/effectpath"
 	"github.com/MatNik89/nexus/internal/kernel/journal"
 	"github.com/MatNik89/nexus/internal/kernel/loop"
 	"github.com/MatNik89/nexus/internal/kernel/machine"
@@ -24,7 +27,9 @@ import (
 	"github.com/MatNik89/nexus/internal/llm/planner"
 	"github.com/MatNik89/nexus/internal/llm/provider"
 	"github.com/MatNik89/nexus/internal/memory"
+	"github.com/MatNik89/nexus/internal/obligation"
 	"github.com/MatNik89/nexus/internal/preflight/doctor"
+	"github.com/MatNik89/nexus/internal/schedule"
 	"github.com/MatNik89/nexus/internal/security/redact"
 )
 
@@ -106,19 +111,53 @@ func runDaemon() int {
 		fmt.Fprintf(os.Stderr, "nexus daemon: %v\n", err)
 		return 2
 	}
-	d, j, err := buildDaemon(layout, resolved)
+	b, err := buildDaemon(layout, resolved)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "nexus daemon: %v\n", err)
 		return 2
 	}
-	defer j.Close()
+	defer b.j.Close()
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	hb := daemon.NewHeartbeat(filepath.Join(layout.SystemDir(), "heartbeat"), 5*time.Second)
 	go hb.Run(ctx)
+	// Durable scheduler: SYNCHRONOUS startup sweep first — its outcome is
+	// mirrored to the health file BEFORE the daemon serves anyone, so a
+	// startup failure can never be lost in the async window (Phase-4-r5
+	// codex #4). Then the periodic catch-up loop. The FireDecorator moved
+	// each fired obligation to DELIVERY_PENDING inside the fire batch.
+	healthPath := filepath.Join(layout.SystemDir(), "scheduler_health")
+	writeHealth := func(err error) {
+		msg := ""
+		if err != nil {
+			msg = err.Error()
+			fmt.Fprintf(os.Stderr, "nexus daemon: scheduler: %v\n", err)
+		}
+		if werr := atomicwrite.Write(healthPath, []byte(msg), 0o600); werr != nil {
+			fmt.Fprintf(os.Stderr, "nexus daemon: health mirror: %v\n", werr)
+		}
+	}
+	_, startupErr := b.sched.Sweep(ctx)
+	writeHealth(startupErr)
+	go b.sched.Run(ctx, 30*time.Second, nil)
+	// Scheduler health mirror (Phase-4-r3 codex #4): sweep failures land
+	// in system/scheduler_health where doctor reads them; an empty file
+	// means healthy.
+	go func() {
+		t := time.NewTicker(5 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				writeHealth(b.sched.Health())
+			}
+		}
+	}()
 	sock := socketPath(layout)
 	fmt.Printf("nexus daemon %s — profile %s, socket %s\n", version, resolved.Config.DefaultProfile, sock)
-	if err := d.Serve(ctx, sock); err != nil {
+	if err := b.d.Serve(ctx, sock); err != nil {
 		fmt.Fprintf(os.Stderr, "nexus daemon: %v\n", err)
 		return 1
 	}
@@ -129,19 +168,33 @@ func runDaemon() int {
 // redactor, S7 authority, governed provider, streaming planner factory,
 // fail-closed audit) wired exactly as the daemon runs it — and testable
 // against a custom layout (Phase-2-r2 codex #13).
-func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemon.Daemon, *journal.Journal, error) {
+// daemonBundle is everything the composition root wires together.
+type daemonBundle struct {
+	d     *daemon.Daemon
+	j     *journal.Journal
+	sched *schedule.Scheduler
+	obl   *obligation.Manager
+}
+
+func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, error) {
 	profile := resolved.Config.DefaultProfile
 	profileDir, err := layout.ProfileDir(profile)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	for _, dir := range []string{profileDir, layout.SystemDir()} {
 		if err := pathx.EnsureDir(layout.Base, dir); err != nil {
 			// The base itself may not exist yet: create it 0700 first.
 			if os.MkdirAll(layout.Base, 0o700) != nil || pathx.EnsureDir(layout.Base, dir) != nil {
-				return nil, nil, err
+				return nil, err
 			}
 		}
+	}
+	registry, err := obligation.NewRegistry(map[string]obligation.Kind{
+		"file_note": {Handler: obligation.FileNoteHandler(profileDir), ValidateParams: obligation.ValidateFileNoteParams},
+	})
+	if err != nil {
+		return nil, err
 	}
 	events := map[string]journal.PayloadValidator{evPolicyYolo: nil}
 	for _, n := range machine.EventTypes() {
@@ -150,26 +203,67 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemon.Daemon,
 	for n, v := range memory.Events() {
 		events[n] = v
 	}
+	for n, v := range schedule.Events() {
+		events[n] = v
+	}
+	doneGate := obligation.NewDoneGate()
+	for n, v := range obligation.Events(registry, doneGate) {
+		events[n] = v
+	}
+
 	journalPath, _ := layout.ProfileJournal(profile)
 	redactor := redact.NewKnownRefs(knownSecretRefs(resolved.Config))
 	// The ONE profile database: journal + memory projection together
 	// (Annex P0.3 — facts are journal events folded in the same
 	// transaction; no second SQLite file exists).
-	j, err := journal.Open(journalPath, profile, redactor, events, memory.NewProjection())
+	j, err := journal.Open(journalPath, profile, redactor, events, memory.NewProjection(), schedule.NewProjection(), obligation.NewProjection())
 	if err != nil {
-		return nil, nil, fmt.Errorf("journal: %w", err)
+		return nil, fmt.Errorf("journal: %w", err)
 	}
 	authority := s7min.NewAuthority(nil, 5*time.Minute)
 	prov, err := provider.NewAPIKey(resolved.Config, authority)
 	if err != nil {
 		j.Close()
-		return nil, nil, fmt.Errorf("provider: %w (conversation is a P0 core capability — fix the config and restart)", err)
+		return nil, fmt.Errorf("provider: %w (conversation is a P0 core capability — fix the config and restart)", err)
 	}
 	memStore, err := memory.NewStore(j)
 	if err != nil {
 		j.Close()
-		return nil, nil, fmt.Errorf("memory: %w", err)
+		return nil, fmt.Errorf("memory: %w", err)
 	}
+	sched, err := schedule.New(j, clockid.System{})
+	if err != nil {
+		j.Close()
+		return nil, fmt.Errorf("schedule: %w", err)
+	}
+	sched.SetCounterFile(filepath.Join(layout.SystemDir(), "last_occurrence_fired"))
+	lazyRunner := &obligation.LazyRunner{}
+	oblManager, err := obligation.NewManager(j, sched, registry, clockid.System{}, lazyRunner, authority, profileDir, doneGate)
+	if err != nil {
+		j.Close()
+		return nil, err
+	}
+	// Reminder firing joins the scheduler batch (no crash window between
+	// occurrence-fire and obligation admission).
+	sched.SetFireDecorator(oblManager.FireParams)
+	// System EffectPath: the manager's programmatic dispatch (scheduled
+	// task runs) goes through the SAME sealed path as sessions —
+	// ModeDefault, merged sealed tools/rules.
+	allTools := mergedTools(memStore, redactor, oblManager)
+	sysPep, err := effectpath.NewPEP(mergedRules(), effectpath.NewApprovals(nil, 5*time.Minute),
+		&journalAudit{j: j, profile: profile}, effectpath.ModeDefault)
+	if err != nil {
+		j.Close()
+		return nil, err
+	}
+	sysPath, err := effectpath.NewEffectPath(sysPep, systemMW{},
+		effectpath.NewInProcessExecutor(allTools),
+		effectpath.NewSandboxedProcessExecutor(nil), authority)
+	if err != nil {
+		j.Close()
+		return nil, err
+	}
+	lazyRunner.R = sysPath
 	target := prov.Target() // the provider's OWN grant target — anything else never reaches the wire
 	d, err := daemon.New(daemon.Deps{
 		Journal: j,
@@ -183,19 +277,50 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemon.Daemon,
 			if err != nil {
 				return nil, err
 			}
-			return pl.WithTools(memory.Specs(), profile)
+			specs := memory.Specs()
+			for k, v := range obligation.Specs() {
+				specs[k] = v
+			}
+			return pl.WithTools(specs, profile)
 		},
 		Authority: authority, Profile: profile,
-		Rules:    memory.Rules(), // memory_remember=ASK, memory_recall=ALLOW
-		Tools:    memory.Tools(memStore, redactor),
+		Rules:    mergedRules(),
+		Tools:    allTools,
 		Audit:    &journalAudit{j: j, profile: profile},
 		Redactor: redactor,
 	})
 	if err != nil {
 		j.Close()
-		return nil, nil, err
+		return nil, err
 	}
-	return d, j, nil
+	return &daemonBundle{d: d, j: j, sched: sched, obl: oblManager}, nil
+}
+
+// systemMW is the order-only S6.9 seam for the system EffectPath.
+type systemMW struct{}
+
+func (systemMW) BeforeTool(context.Context, contracts.ToolCall) error { return nil }
+func (systemMW) AfterTool(context.Context, contracts.ToolCall, contracts.ToolResult) error {
+	return nil
+}
+func (systemMW) OnError(ctx context.Context, e error) error { return e }
+
+// mergedRules combines every tool family's PEP decisions.
+func mergedRules() map[contracts.ToolID]effectpath.Decision {
+	rules := memory.Rules()
+	for k, v := range obligation.Rules() {
+		rules[k] = v
+	}
+	return rules
+}
+
+// mergedTools combines every tool family's handlers.
+func mergedTools(memStore *memory.Store, r redact.Redactor, m *obligation.Manager) map[contracts.ToolID]effectpath.InProcFunc {
+	tools := memory.Tools(memStore, r)
+	for k, v := range obligation.Tools(m) {
+		tools[k] = v
+	}
+	return tools
 }
 
 // knownSecretRefs feeds the C1 known-ref redactor: every configured

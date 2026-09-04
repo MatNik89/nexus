@@ -22,6 +22,16 @@ type Criterion struct {
 	// user-acknowledged — both correlated to the SAME occurrence id
 	// (HARDQ B5: an ack for occurrence N never closes N+1).
 	DeliveredAndAcked *string // occurrence id
+	// FileContainsLine: a file at Path contains EXACTLY this line — the
+	// stable postcondition for one appended record (Phase-4 codex #6: a
+	// whole-file hash breaks when a later task appends legitimately).
+	FileContainsLine *FileLineCriterion
+}
+
+// FileLineCriterion pins one immutable marker line.
+type FileLineCriterion struct {
+	Path string
+	Line string
 }
 
 // FileHashCriterion pins a file's content.
@@ -49,6 +59,9 @@ func (c Criterion) validate() error {
 	if c.DeliveredAndAcked != nil && *c.DeliveredAndAcked == "" {
 		return fmt.Errorf("delivered-and-acked criterion requires a non-empty occurrence id")
 	}
+	if c.FileContainsLine != nil && (c.FileContainsLine.Path == "" || c.FileContainsLine.Line == "") {
+		return fmt.Errorf("file-line criterion requires a path and a non-empty line")
+	}
 	set := 0
 	if c.ExitCodeIs != nil {
 		set++
@@ -57,6 +70,9 @@ func (c Criterion) validate() error {
 		set++
 	}
 	if c.DeliveredAndAcked != nil {
+		set++
+	}
+	if c.FileContainsLine != nil {
 		set++
 	}
 	if set != 1 {
@@ -92,6 +108,14 @@ type Evidence struct {
 	FileHash *FileHashEvidence
 	Delivery *DeliveryEvidence
 	Ack      *AckEvidence
+	FileLine *FileLineEvidence
+}
+
+// FileLineEvidence reports whether the verifier FOUND the exact line.
+type FileLineEvidence struct {
+	Path    string
+	Line    string
+	Present bool
 }
 
 type ExitEvidence struct {
@@ -129,6 +153,9 @@ func (e Evidence) validate() error {
 	if e.FileHash != nil && !sha256Hex(e.FileHash.SHA256) {
 		return fmt.Errorf("file-hash evidence requires a 64-char hex sha256")
 	}
+	if e.FileLine != nil && (e.FileLine.Path == "" || e.FileLine.Line == "") {
+		return fmt.Errorf("file-line evidence requires a path and a non-empty line")
+	}
 	set := 0
 	if e.Exit != nil {
 		set++
@@ -140,6 +167,9 @@ func (e Evidence) validate() error {
 		set++
 	}
 	if e.Ack != nil {
+		set++
+	}
+	if e.FileLine != nil {
 		set++
 	}
 	if set != 1 {
@@ -238,6 +268,22 @@ func gradeOne(idx int, c Criterion, bundle []Evidence) CriterionResult {
 		}
 		if !found {
 			return fail("no file-hash evidence for the contracted path")
+		}
+		return CriterionResult{Index: idx, Pass: true}
+	case c.FileContainsLine != nil:
+		// ALL matching evidence must agree the line is PRESENT.
+		found := false
+		for _, e := range bundle {
+			if e.FileLine == nil || e.FileLine.Path != c.FileContainsLine.Path || e.FileLine.Line != c.FileContainsLine.Line {
+				continue
+			}
+			found = true
+			if !e.FileLine.Present {
+				return fail("the contracted line is absent from the file")
+			}
+		}
+		if !found {
+			return fail("no file-line evidence for the contracted path+line")
 		}
 		return CriterionResult{Index: idx, Pass: true}
 	case c.DeliveredAndAcked != nil:

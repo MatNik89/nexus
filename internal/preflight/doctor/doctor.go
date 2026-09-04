@@ -9,6 +9,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/MatNik89/nexus/internal/preflight/probe"
 )
@@ -112,6 +115,64 @@ func Run(e Env) []Check {
 		})
 	} else {
 		checks = append(checks, Check{Name: "provider-key", Capability: "conversation", Status: StatusOK, Detail: "set"})
+	}
+
+	// 6 (C8 observability): scheduler last_occurrence_fired counter — an
+	// informational mirror the daemon writes after every fire; absent
+	// before the first fire (that is not a failure).
+	counterPath := filepath.Join(e.DataDir, "system", "last_occurrence_fired")
+	if b, err := os.ReadFile(counterPath); err == nil {
+		// STRICT parse (Phase-4-r2 codex #11): the mirror must be a bare
+		// counter — anything else is corruption, not health.
+		v := strings.TrimSpace(string(b))
+		if _, perr := strconv.ParseUint(v, 10, 64); perr == nil {
+			checks = append(checks, Check{Name: "scheduler-fires", Capability: "obligations",
+				Status: StatusOK, Detail: "last_occurrence_fired=" + v})
+		} else {
+			checks = append(checks, Check{Name: "scheduler-fires", Capability: "obligations",
+				Status: StatusOff, Detail: "counter mirror is malformed",
+				Fix: "remove " + counterPath + "; the next sweep rewrites it from the journal projection"})
+		}
+	} else if os.IsNotExist(err) {
+		checks = append(checks, Check{Name: "scheduler-fires", Capability: "obligations",
+			Status: StatusOK, Detail: "no occurrences fired yet (counter file absent)"})
+	} else {
+		// EACCES/I/O is NOT "nothing fired" — it is broken observability.
+		checks = append(checks, Check{Name: "scheduler-fires", Capability: "obligations",
+			Status: StatusOff, Detail: "counter mirror unreadable: " + err.Error(),
+			Fix: "fix permissions on " + counterPath})
+	}
+
+	// 6b: scheduler health mirror — a non-empty file is a live failure.
+	healthPath := filepath.Join(e.DataDir, "system", "scheduler_health")
+	if hb, herr := os.ReadFile(healthPath); herr == nil {
+		if v := strings.TrimSpace(string(hb)); v != "" {
+			checks = append(checks, Check{Name: "scheduler-health", Capability: "obligations",
+				Status: StatusOff, Detail: "last sweep failed: " + v,
+				Fix: "inspect the daemon log; the next successful sweep clears this"})
+		} else {
+			checks = append(checks, Check{Name: "scheduler-health", Capability: "obligations",
+				Status: StatusOK, Detail: "no sweep failures recorded"})
+		}
+	} else if os.IsNotExist(herr) {
+		// A LIVE daemon (fresh heartbeat) with NO health mirror means the
+		// startup health write failed — that is broken observability, not
+		// a never-started daemon (Phase-4-r5 codex #4).
+		hbPath := filepath.Join(e.DataDir, "system", "heartbeat")
+		if info, hbErr := os.Stat(hbPath); hbErr == nil && time.Since(info.ModTime()) < time.Minute {
+			checks = append(checks, Check{Name: "scheduler-health", Capability: "obligations",
+				Status: StatusOff, Detail: "daemon is live but its health mirror is missing",
+				Fix: "inspect daemon stderr; the mirror write is failing"})
+		} else {
+			checks = append(checks, Check{Name: "scheduler-health", Capability: "obligations",
+				Status: StatusOK, Detail: "no health mirror yet (daemon not started)"})
+		}
+	} else {
+		// EACCES/EISDIR/I-O is broken observability, never health
+		// (Phase-4-r4 codex #7).
+		checks = append(checks, Check{Name: "scheduler-health", Capability: "obligations",
+			Status: StatusOff, Detail: "health mirror unreadable: " + herr.Error(),
+			Fix: "fix permissions on " + healthPath})
 	}
 
 	// 5. Telegram token → telegram capability.
