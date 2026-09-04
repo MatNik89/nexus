@@ -28,6 +28,7 @@ import (
 	"github.com/MatNik89/nexus/internal/channel/telegram"
 	"github.com/MatNik89/nexus/internal/foundation/config"
 	"github.com/MatNik89/nexus/internal/foundation/pathx"
+	"github.com/MatNik89/nexus/internal/kernel/closure"
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
 	"github.com/MatNik89/nexus/internal/kernel/journal"
 	"github.com/MatNik89/nexus/internal/obligation"
@@ -590,20 +591,37 @@ func TestTelegramProbeGate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := telegramProbeGate(context.Background(), live, config.Resolved{}); err != nil {
-		t.Fatalf("healthy channel refused: %v", err)
+	prLive := live.Probe(context.Background(), config.Resolved{})
+	snapLive, err := sealStartupSnapshot(config.Resolved{}, []closure.ProbeResult{
+		{Name: "store", Passed: true, ConfigHash: config.Resolved{}.ConfigHash()},
+		{Name: "provider", Passed: true, ConfigHash: config.Resolved{}.ConfigHash()},
+		prLive,
+	}, []string{"conversation", "profiles", "telegram"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snapLive.On("telegram") {
+		t.Fatalf("healthy channel sealed OFF: %s", snapLive.Status("telegram").Reason)
 	}
 	dead, err := telegram.New(telegram.Config{APIBase: "http://127.0.0.1:1", TokenEnv: "NEXUS_TG_PROBE_TOKEN",
 		Bindings: map[int64]string{42: "private"}, Profile: "private"}, core, h)
 	if err != nil {
 		t.Fatal(err)
 	}
-	gerr := telegramProbeGate(context.Background(), dead, config.Resolved{})
-	if gerr == nil {
-		t.Fatal("dead channel passed the probe gate")
+	prDead := dead.Probe(context.Background(), config.Resolved{})
+	snapDead, err := sealStartupSnapshot(config.Resolved{}, []closure.ProbeResult{
+		{Name: "store", Passed: true, ConfigHash: config.Resolved{}.ConfigHash()},
+		{Name: "provider", Passed: true, ConfigHash: config.Resolved{}.ConfigHash()},
+		prDead,
+	}, []string{"conversation", "profiles", "telegram"})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if strings.Contains(gerr.Error(), "123:tok") {
-		t.Fatalf("probe gate leaked the token: %v", gerr)
+	if snapDead.On("telegram") {
+		t.Fatal("dead channel sealed ON")
+	}
+	if strings.Contains(snapDead.Status("telegram").Reason, "123:tok") {
+		t.Fatalf("sealed reason leaked the token: %s", snapDead.Status("telegram").Reason)
 	}
 }
 
@@ -1163,5 +1181,55 @@ func TestReminderReceiptOnlyFromSent(t *testing.T) {
 	b.deliverPendingReminders(context.Background(), "chat-42")
 	if st, _ := b.obl.Status(context.Background(), "rem-rcpt"); st != obligation.StateDelivered {
 		t.Fatalf("proven SENT did not mint the receipt: %v", st)
+	}
+}
+
+// ACK-vs-receipt race (T27-r2 agy #1): a user acking IMMEDIATELY after
+// the message hit the wire — before any delivery-loop tick minted the
+// receipt — must succeed: the ack path settles the SENT-proven receipt
+// inline (same SENT gate, never fabricated).
+func TestAckSettlesSentReceiptInline(t *testing.T) {
+	b := hitlBundle(t, "TG_ACKRACE")
+	if err := b.obl.CreateReminder(context.Background(), "rem-race", "race reminder",
+		schedule.WallTime{Year: 2026, Month: 1, Day: 2, Hour: 9, Minute: 0, TZ: "Europe/Zagreb"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.sched.Sweep(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Enqueue + SEND, but NO delivery-loop receipt pass (the race window).
+	b.deliverPendingReminders(context.Background(), "chat-42") // enqueue only (status PENDING)
+	if err := b.chanCore.Flush(context.Background(), func(o channel.Outbound) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	// The user acks NOW.
+	reply, err := telegramHandler(b)(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 50,
+		Text: "ack occ-rem-race#1", Profile: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(reply, "Acknowledged occ-rem-race#1") {
+		t.Fatalf("SENT-proven ack rejected in the race window: %q", reply)
+	}
+	if st, _ := b.obl.Status(context.Background(), "rem-race"); st != obligation.StateAcked {
+		t.Fatalf("state %v, want ACKED", st)
+	}
+	// An ack with NO send at all still fails (no fabricated receipt).
+	if err := b.obl.CreateReminder(context.Background(), "rem-nosend", "never sent",
+		schedule.WallTime{Year: 2026, Month: 1, Day: 2, Hour: 10, Minute: 0, TZ: "Europe/Zagreb"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.sched.Sweep(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	reply2, err := telegramHandler(b)(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 51,
+		Text: "ack occ-rem-nosend#1", Profile: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(reply2, "Ack failed") {
+		t.Fatalf("unsent occurrence acked (fabricated evidence): %q", reply2)
 	}
 }

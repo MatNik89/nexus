@@ -784,6 +784,8 @@ func runDoctorP0() int {
 		add("reminders", profilesOK, "durable scheduler substrate ready")
 	}
 	// 4. telegram — token + strict bindings + LIVE getMe.
+	probeCore, probeCleanup := mustProbeCore(layout, resolved)
+	defer probeCleanup()
 	tgOK, tgWhy := false, ""
 	if tok := os.Getenv(resolved.Config.TelegramTokenEnv); tok == "" {
 		tgWhy = "no bot token in " + resolved.Config.TelegramTokenEnv
@@ -794,7 +796,7 @@ func runDoctorP0() int {
 	} else if adapter, aerr := telegram.New(telegram.Config{
 		APIBase: resolved.Config.TelegramAPIBase, TokenEnv: resolved.Config.TelegramTokenEnv,
 		Bindings: bindings, Profile: resolved.Config.DefaultProfile,
-	}, mustProbeCore(layout, resolved), func(context.Context, channel.Inbound) (string, error) { return "", nil }); aerr != nil {
+	}, probeCore, func(context.Context, channel.Inbound) (string, error) { return "", nil }); aerr != nil {
 		tgWhy = aerr.Error()
 	} else if pr := adapter.Probe(ctx, resolved); !pr.Passed {
 		tgWhy = pr.Detail
@@ -869,21 +871,25 @@ func verifyAcceptanceAttestation(layout pathx.Layout) (bool, string) {
 
 // mustProbeCore opens a throwaway channel core for the doctor's live
 // telegram probe (never the production journal).
-func mustProbeCore(layout pathx.Layout, resolved config.Resolved) *channel.Core {
+func mustProbeCore(layout pathx.Layout, resolved config.Resolved) (*channel.Core, func()) {
 	dir, err := os.MkdirTemp("", "nexus-doctor-")
 	if err != nil {
-		return nil
+		return nil, func() {}
 	}
+	cleanup := func() { os.RemoveAll(dir) }
 	j, err := journal.Open(filepath.Join(dir, "probe.db"), resolved.Config.DefaultProfile,
 		redact.None{}, channel.Events(), channel.NewProjection())
 	if err != nil {
-		return nil
+		cleanup()
+		return nil, func() {}
 	}
 	c, err := channel.New(j)
 	if err != nil {
-		return nil
+		j.Close()
+		cleanup()
+		return nil, func() {}
 	}
-	return c
+	return c, func() { j.Close(); cleanup() }
 }
 
 // deliverPendingReminders is ONE pass of the reminder delivery loop:
@@ -948,27 +954,6 @@ func telegramBindings(raw string) (map[int64]string, error) {
 		out[chat] = profile
 	}
 	return out, nil
-}
-
-// telegramProbeGate runs the LIVE channel probe and seals it into the
-// T11 closure snapshot (Phase-5 codex #10 / Phase-5-r2 codex #7): the
-// adapter serves only when the SEALED snapshot turns the telegram
-// capability ON under the current config hash — never on a loose local
-// check.
-func telegramProbeGate(ctx context.Context, adapter *telegram.Adapter, resolved config.Resolved) error {
-	pr := adapter.Probe(ctx, resolved)
-	snap, err := sealStartupSnapshot(resolved, []closure.ProbeResult{
-		{Name: "store", Passed: true, Detail: "journal open", ConfigHash: resolved.ConfigHash()},
-		{Name: "provider", Passed: true, Detail: "gated separately at startup", ConfigHash: resolved.ConfigHash()},
-		pr,
-	}, []string{"conversation", "profiles", "telegram"})
-	if err != nil {
-		return fmt.Errorf("closure seal: %w", err)
-	}
-	if st := snap.Status("telegram"); !st.On {
-		return fmt.Errorf("telegram capability OFF in the sealed snapshot: %s", st.Reason)
-	}
-	return nil
 }
 
 // sealStartupSnapshot builds the T11 sealed capability snapshot (T27:
@@ -1055,8 +1040,16 @@ func telegramHandler(b *daemonBundle) telegram.Handler {
 			return "Denied " + id + ".", nil
 		case strings.HasPrefix(lower, "ack "):
 			// Direct occurrence ack (B5: the ack correlates to the EXACT
-			// occurrence id shown in the delivery message).
+			// occurrence id shown in the delivery message). A user acking
+			// within the delivery loop's tick window races the receipt
+			// mint (T27-r2 agy #1) — the ack itself carries the proof the
+			// message arrived, so settle the SENT-proven receipt inline
+			// first (same SENT gate; never a fabricated receipt).
 			occ := strings.TrimSpace(text[len("ack "):])
+			if st, serr := b.chanCore.DeliveryStatus(ctx, deliveryIDFor(occ)); serr == nil && st == "SENT" {
+				b.obl.MarkDelivered(ctx, occ, obligation.DeliveryReceipt{
+					Producer: "telegram", ReceiptID: deliveryIDFor(occ)}) // idempotent; already-delivered is fine
+			}
 			if err := b.obl.MarkAcked(ctx, occ, obligation.AckGesture{Source: source}); err != nil {
 				return "Ack failed: " + err.Error(), nil
 			}
