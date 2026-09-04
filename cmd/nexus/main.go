@@ -163,10 +163,13 @@ func runDaemon() int {
 	// Telegram (channel:builtin): starts ONLY when the token env var is
 	// set AND at least one chat is bound — deny-default (B3).
 	if tok := os.Getenv(resolved.Config.TelegramTokenEnv); tok != "" {
-		bindings := telegramBindings()
-		if len(bindings) == 0 {
+		bindings, berr := telegramBindings(os.Getenv("NEXUS_TELEGRAM_BINDINGS"))
+		switch {
+		case berr != nil:
+			fmt.Fprintf(os.Stderr, "nexus daemon: %v — adapter stays OFF (fail closed)\n", berr)
+		case len(bindings) == 0:
 			fmt.Fprintln(os.Stderr, "nexus daemon: telegram token set but no chat bindings (NEXUS_TELEGRAM_BINDINGS=\"chatid=profile,...\") — adapter stays OFF (deny-default)")
-		} else {
+		default:
 			adapter, aerr := telegram.New(telegram.Config{
 				APIBase:  "https://api.telegram.org",
 				TokenEnv: resolved.Config.TelegramTokenEnv,
@@ -175,9 +178,11 @@ func runDaemon() int {
 			}, b.chanCore, telegramHandler(b))
 			if aerr != nil {
 				fmt.Fprintf(os.Stderr, "nexus daemon: telegram: %v\n", aerr)
+			} else if perr := telegramProbeGate(ctx, adapter, resolved); perr != nil {
+				fmt.Fprintf(os.Stderr, "nexus daemon: %v — adapter stays OFF (fail closed)\n", perr)
 			} else {
 				go adapter.Run(ctx, 2*time.Second)
-				fmt.Println("nexus daemon: telegram adapter running")
+				fmt.Println("nexus daemon: telegram adapter running (channel probe passed)")
 			}
 		}
 	}
@@ -204,6 +209,31 @@ type daemonBundle struct {
 	approvals *approval.Store
 	profile   contracts.ProfileID
 	cfg       config.Config
+	sysPath   *effectpath.EffectPath
+	authority *s7min.Authority
+}
+
+// resumeApproved executes the EXACT approved call through the sealed
+// system EffectPath (the durable approval is consumed inside the PEP) —
+// the T24 resume.
+func (b *daemonBundle) resumeApproved(ctx context.Context, challengeID string) (string, error) {
+	call, err := b.approvals.ApprovedCall(ctx, challengeID)
+	if err != nil {
+		return "", err
+	}
+	op := contracts.OperationID("resume-" + challengeID)
+	grant, err := b.authority.Issue(op, effectpath.ToolTarget(call))
+	if err != nil {
+		return "", err
+	}
+	out, err := b.sysPath.RunTool(ctx, call, grant)
+	if err != nil {
+		return "", err
+	}
+	if len(out.Output) > 0 && out.Output[0].Content != nil {
+		return *out.Output[0].Content, nil
+	}
+	return "done", nil
 }
 
 func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, error) {
@@ -302,6 +332,8 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 		j.Close()
 		return nil, err
 	}
+	sysPep.SetDurableApprovals(approvals)
+	sysPep.SetDurableApprovals(approvals)
 	sysPath, err := effectpath.NewEffectPath(sysPep, systemMW{},
 		effectpath.NewInProcessExecutor(allTools),
 		effectpath.NewSandboxedProcessExecutor(nil), authority)
@@ -330,17 +362,30 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 			return pl.WithTools(specs, profile)
 		},
 		Authority: authority, Profile: profile,
-		Rules:    mergedRules(),
-		Tools:    allTools,
-		Audit:    &journalAudit{j: j, profile: profile},
-		Redactor: redactor,
+		Rules:            mergedRules(),
+		Tools:            allTools,
+		Audit:            &journalAudit{j: j, profile: profile},
+		Redactor:         redactor,
+		DurableApprovals: approvals,
+		SuspenderFor: func(identity string) loop.Suspender {
+			source := "tg:" + identity
+			return func(ctx context.Context, turn contracts.TurnID, run contracts.RunID,
+				call contracts.ToolCall) (string, error) {
+				ch, err := approvals.Suspend(ctx, turn, run, call, source)
+				if err != nil {
+					return "", err
+				}
+				return ch.Summary, nil
+			}
+		},
 	})
 	if err != nil {
 		j.Close()
 		return nil, err
 	}
 	return &daemonBundle{d: d, j: j, sched: sched, obl: oblManager,
-		chanCore: chanCore, approvals: approvals, profile: profile, cfg: resolved.Config}, nil
+		chanCore: chanCore, approvals: approvals, profile: profile, cfg: resolved.Config,
+		sysPath: sysPath, authority: authority}, nil
 }
 
 // systemMW is the order-only S6.9 seam for the system EffectPath.
@@ -428,10 +473,12 @@ func runDoctor(args []string) int {
 	return 0
 }
 
-// telegramBindings parses NEXUS_TELEGRAM_BINDINGS ("chatid=profile,...").
-func telegramBindings() map[int64]string {
+// telegramBindings parses NEXUS_TELEGRAM_BINDINGS ("chatid=profile,...")
+// STRICTLY (Phase-5 codex #13): a malformed pair, unparsable chat id,
+// empty profile, or duplicate chat id is a loud error — never a silent
+// skip or last-write-wins remap. Both sides of '=' are trimmed.
+func telegramBindings(raw string) (map[int64]string, error) {
 	out := map[int64]string{}
-	raw := os.Getenv("NEXUS_TELEGRAM_BINDINGS")
 	for _, pair := range strings.Split(raw, ",") {
 		pair = strings.TrimSpace(pair)
 		if pair == "" {
@@ -439,15 +486,33 @@ func telegramBindings() map[int64]string {
 		}
 		i := strings.IndexByte(pair, '=')
 		if i <= 0 {
-			continue
+			return nil, fmt.Errorf("telegram bindings: malformed pair %q (want chatid=profile)", pair)
 		}
-		chat, err := strconv.ParseInt(pair[:i], 10, 64)
+		chat, err := strconv.ParseInt(strings.TrimSpace(pair[:i]), 10, 64)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("telegram bindings: chat id in %q is not a number", pair)
 		}
-		out[chat] = pair[i+1:]
+		profile := strings.TrimSpace(pair[i+1:])
+		if profile == "" {
+			return nil, fmt.Errorf("telegram bindings: empty profile in %q", pair)
+		}
+		if prev, dup := out[chat]; dup {
+			return nil, fmt.Errorf("telegram bindings: chat %d bound twice (%q and %q) — ambiguous", chat, prev, profile)
+		}
+		out[chat] = profile
 	}
-	return out
+	return out, nil
+}
+
+// telegramProbeGate runs the LIVE channel probe (T11) before the adapter
+// may serve (Phase-5 codex #10): revoked/invalid bot credentials keep
+// the channel OFF with a loud reason instead of a silently dead poller.
+func telegramProbeGate(ctx context.Context, adapter *telegram.Adapter, resolved config.Resolved) error {
+	pr := adapter.Probe(ctx, resolved)
+	if !pr.Passed {
+		return fmt.Errorf("telegram channel probe failed: %s", pr.Detail)
+	}
+	return nil
 }
 
 // telegramHandler routes an admitted Telegram message: "approve <id>" /
@@ -465,7 +530,12 @@ func telegramHandler(b *daemonBundle) telegram.Handler {
 			if err := b.approvals.Approve(ctx, id, source); err != nil {
 				return "Approval failed: " + err.Error(), nil
 			}
-			return "Approved " + id + ". The suspended action will resume.", nil
+			// RESUME (T24): execute the exact approved effect now.
+			result, rerr := b.resumeApproved(ctx, id)
+			if rerr != nil {
+				return "Approved " + id + " but the resume failed: " + rerr.Error(), nil
+			}
+			return "Approved " + id + ". Done: " + result, nil
 		case strings.HasPrefix(lower, "deny "):
 			id := strings.TrimSpace(text[len("deny "):])
 			if err := b.approvals.Deny(ctx, id, source); err != nil {
@@ -487,7 +557,9 @@ func telegramHandler(b *daemonBundle) telegram.Handler {
 			return out, nil
 		}
 		// Ordinary conversation: one turn through the daemon's session
-		// spine (ModeDefault — channel input can NEVER carry yolo).
+		// spine (ModeDefault — channel input can NEVER carry yolo). The
+		// suspender binds any approval challenge to THIS chat as the only
+		// legal decision source.
 		reply, err := b.d.RunChannelTurn(ctx, in.ChannelIdentity, text)
 		if err != nil {
 			return "", err

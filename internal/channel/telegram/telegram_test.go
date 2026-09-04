@@ -74,12 +74,12 @@ func (f *fakeBot) handler() http.HandlerFunc {
 
 func textUpdate(id int64, chat int64, text string) map[string]any {
 	return map[string]any{"update_id": id, "message": map[string]any{
-		"message_id": id, "chat": map[string]any{"id": chat}, "text": text}}
+		"message_id": id, "chat": map[string]any{"id": chat, "type": "private"}, "from": map[string]any{"id": chat}, "text": text}}
 }
 
 func photoUpdate(id int64, chat int64) map[string]any {
 	return map[string]any{"update_id": id, "message": map[string]any{
-		"message_id": id, "chat": map[string]any{"id": chat},
+		"message_id": id, "chat": map[string]any{"id": chat, "type": "private"}, "from": map[string]any{"id": chat},
 		"photo": []any{map[string]any{"file_id": "f1"}}}}
 }
 
@@ -256,3 +256,79 @@ func TestConstructionAndProbe(t *testing.T) {
 		t.Fatalf("probe: %+v", pr)
 	}
 }
+
+// Crash between admission and handler (Phase-5 codex #2 literal): a
+// redelivered NON-TERMINAL update RE-RUNS the handler — the message is
+// never silently dropped; a TERMINAL redelivery is skipped.
+func TestNonTerminalReplayRerunsHandler(t *testing.T) {
+	h := build(t, map[int64]string{42: "work"})
+	// Emulate the crash: admit directly (as a prior incarnation did),
+	// handler never ran, then the update is redelivered.
+	if _, err := h.core.Admit(ctxT(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 5,
+		Text: "crashed before handling", Profile: "work"}); err != nil {
+		t.Fatal(err)
+	}
+	h.bot.batches = [][]map[string]any{{textUpdate(5, 42, "crashed before handling")}}
+	if err := h.a.PollOnce(ctxT()); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.got) != 1 {
+		t.Fatalf("non-terminal replay did not re-run the handler: %d runs", len(h.got))
+	}
+	// Now TERMINAL: a second redelivery is skipped.
+	h.bot.batches = [][]map[string]any{{textUpdate(5, 42, "crashed before handling")}}
+	if err := h.a.PollOnce(ctxT()); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.got) != 1 {
+		t.Fatalf("terminal replay re-ran the handler: %d runs", len(h.got))
+	}
+}
+
+// Group chats are refused fail-closed (Phase-5 codex #5: every group
+// member would inherit the owner's USER trust).
+func TestGroupChatRefused(t *testing.T) {
+	h := build(t, map[int64]string{42: "work"})
+	h.bot.batches = [][]map[string]any{{map[string]any{"update_id": 1, "message": map[string]any{
+		"message_id": 1, "chat": map[string]any{"id": 42, "type": "group"},
+		"from": map[string]any{"id": 777}, "text": "group takeover"}}}}
+	if err := h.a.PollOnce(ctxT()); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.got) != 0 {
+		t.Fatal("group message reached the handler")
+	}
+	if err := h.a.FlushOutbox(ctxT()); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.bot.sent) != 1 || !strings.Contains(h.bot.sent[0], "private chat") {
+		t.Fatalf("typed group refusal missing: %v", h.bot.sent)
+	}
+}
+
+// The bot token NEVER leaks into errors (Phase-5 codex #9/kilo #2/agy #1):
+// a transport failure against a dead endpoint carries no token bytes.
+func TestTokenNeverInErrors(t *testing.T) {
+	h := build(t, map[int64]string{42: "work"})
+	dead, err := New(Config{
+		APIBase: "http://127.0.0.1:1", TokenEnv: "NEXUS_TEST_TG",
+		Bindings: map[int64]string{42: "work"}, Profile: "work",
+	}, h.core, h.a.handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	perr := dead.PollOnce(ctxT())
+	if perr == nil {
+		t.Fatal("dead endpoint succeeded")
+	}
+	if strings.Contains(perr.Error(), "123:token") {
+		t.Fatalf("token leaked into the error: %v", perr)
+	}
+	pr := dead.Probe(ctxT(), configResolved())
+	if pr.Passed || strings.Contains(pr.Detail, "123:token") {
+		t.Fatalf("token leaked into the probe detail: %+v", pr)
+	}
+}
+
+func configResolved() config.Resolved { return config.Resolved{} }

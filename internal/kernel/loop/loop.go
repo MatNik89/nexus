@@ -52,16 +52,26 @@ const (
 )
 
 // Loop drives one turn at a time. All collaborators are required.
+// Suspender commits the durable HITL suspension (T24, B6) and returns
+// the challenge summary the user sees.
+type Suspender func(ctx context.Context, turn contracts.TurnID, run contracts.RunID, call contracts.ToolCall) (string, error)
+
 type Loop struct {
-	planner  Planner
-	path     *effectpath.EffectPath
-	grants   *s7min.Authority
-	journal  *journal.Journal
-	redactor redact.Redactor
-	policy   Policy
-	maxIters int
-	breakerN int
+	planner   Planner
+	path      *effectpath.EffectPath
+	grants    *s7min.Authority
+	journal   *journal.Journal
+	redactor  redact.Redactor
+	policy    Policy
+	maxIters  int
+	breakerN  int
+	suspender Suspender
 }
+
+// SetSuspender wires the durable HITL owner: with it, an unapproved ASK
+// SUSPENDS the turn (TurnSuspended committed by the owner, loop exits,
+// the user gets the challenge) instead of failing it.
+func (l *Loop) SetSuspender(s Suspender) { l.suspender = s }
 
 func New(p Planner, path *effectpath.EffectPath, grants *s7min.Authority, j *journal.Journal,
 	r redact.Redactor, policy Policy, maxIters, breakerN int) (*Loop, error) {
@@ -278,9 +288,21 @@ func (l *Loop) RunTurn(ctx context.Context, turn contracts.TurnID, run contracts
 		}
 		if errors.Is(toolErr, effectpath.ErrNeedsApproval) {
 			// HITL gate: the USER must act — never packed as an
-			// observation the model could talk itself past. Durable
-			// TurnSuspended (HARDQ B6) lands with its owner task; the
-			// -min turn surfaces the gate and fails closed.
+			// observation the model could talk itself past. With the T24
+			// suspender wired, the owner commits TurnSuspended durably
+			// (B6), the loop EXITS, and the turn's outcome IS the
+			// challenge shown to the user; without it (interactive
+			// sessions) the gate surfaces as a failure.
+			if l.suspender != nil {
+				summary, serr := l.suspender(ctx, turn, run, call)
+				if serr != nil {
+					return failTurn(fmt.Errorf("loop: suspension failed: %w", errors.Join(toolErr, serr)))
+				}
+				if err := l.append(ctx, run, profile, turn, machine.EvTurnSucceeded, next(), nil); err != nil {
+					return "", err
+				}
+				return summary, nil
+			}
 			return failTurn(fmt.Errorf("loop: tool %s: %w", call.ToolID, toolErr))
 		}
 		if errors.Is(toolErr, effectpath.ErrEffectUnknown) {

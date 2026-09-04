@@ -23,6 +23,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sync/atomic"
@@ -35,11 +36,17 @@ import (
 // Event types (closed).
 const (
 	EvInboundAdmitted  = "channel.inbound_admitted"
+	EvInboundTerminal  = "channel.inbound_terminal"
 	EvOutboundEnqueued = "channel.outbound_enqueued"
 	EvOutboundSent     = "channel.outbound_sent"
 	EvOutboundUnknown  = "channel.outbound_unknown"
 	EvOutboundResolved = "channel.outbound_resolved"
 )
+
+// ErrAmbiguousSend marks a transport outcome where the request may have
+// been ACCEPTED remotely (the HTTP call was issued but its result is
+// unknown) — the row parks UNKNOWN, never a blind retry (B2).
+var ErrAmbiguousSend = errors.New("AMBIGUOUS_SEND")
 
 // State is the inbound lifecycle (RECEIVED exists only transiently inside
 // the admission transaction; durably a row is ADMITTED or TERMINAL).
@@ -97,6 +104,10 @@ type deliveryMark struct {
 	Proved     bool   `json:"proved,omitempty"`
 }
 
+type terminalPayload struct {
+	MessageID string `json:"message_id"`
+}
+
 // Events returns the closed payload validators.
 func Events() map[string]journal.PayloadValidator {
 	markV := func(raw json.RawMessage) error {
@@ -127,6 +138,16 @@ func Events() map[string]journal.PayloadValidator {
 			}
 			if p.DeliveryID == "" || p.AdapterID == "" || p.ChannelIdentity == "" || p.Text == "" {
 				return fmt.Errorf("channel: enqueue requires delivery id, adapter, identity and text")
+			}
+			return nil
+		},
+		EvInboundTerminal: func(raw json.RawMessage) error {
+			var p terminalPayload
+			if err := json.Unmarshal(raw, &p); err != nil {
+				return err
+			}
+			if p.MessageID == "" {
+				return fmt.Errorf("channel: terminal requires a message id")
 			}
 			return nil
 		},
@@ -201,6 +222,19 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 			p.MessageID, p.AdapterID, p.ChannelIdentity, p.UpdateID, p.Text,
 			string(StateAdmitted), int64(ev.JournalOffset)); err != nil {
 			return fmt.Errorf("channel: inbox insert: %w", err)
+		}
+	case EvInboundTerminal:
+		var p terminalPayload
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return err
+		}
+		res, err := tx.Exec(`UPDATE chan_inbox SET status=? WHERE message_id=? AND status=?`,
+			string(StateTerminal), p.MessageID, string(StateAdmitted))
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return fmt.Errorf("channel: terminal for an unknown or already-terminal message (fail closed)")
 		}
 	case EvOutboundEnqueued:
 		var p outboundPayload
@@ -389,40 +423,97 @@ func (c *Core) mark(ctx context.Context, eventType, deliveryID string) error {
 	return err
 }
 
-// Flush attempts delivery of every PENDING row through send:
-//   - send ERROR: the row STAYS pending (nothing was accepted; retrying
-//     later is safe) and the error surfaces;
-//   - send ACCEPT: the sent-mark appends; if THAT fails the remote HAS
-//     the message but our record does not — the row parks UNKNOWN
-//     (durably when possible) and reconciliation owns it (B2: never
-//     blind-retry over a non-transactional remote).
+// Flush delivers every PENDING row with UNKNOWN-FIRST honesty (Phase-5
+// codex #3/#4): the row is durably parked UNKNOWN BEFORE the wire is
+// touched, so a crash mid-send, an ambiguous transport result, or a
+// failed sent-mark ALL leave the row in reconciliation — a blind resend
+// is structurally impossible. Outcomes:
+//   - DEFINITE pre-wire failure (send returns a non-ambiguous error):
+//     the row resolves back to PENDING (nothing left the process; retry
+//     is safe) and the error surfaces;
+//   - accept: the SENT mark closes it; if THAT mark fails the row simply
+//     stays UNKNOWN (already durable) and the error surfaces;
+//   - ErrAmbiguousSend (the wire was touched, result unknown): the row
+//     stays UNKNOWN for reconciliation.
 func (c *Core) Flush(ctx context.Context, send func(Outbound) error) error {
 	pending, err := c.Pending(ctx)
 	if err != nil {
 		return err
 	}
 	for _, o := range pending {
-		if err := send(o); err != nil {
-			return fmt.Errorf("channel: delivery %s failed (stays pending): %w", o.DeliveryID, err)
+		// Durable in-flight parking BEFORE the wire.
+		if err := c.mark(ctx, EvOutboundUnknown, o.DeliveryID); err != nil {
+			return fmt.Errorf("channel: delivery %s could not be parked in-flight — not sending: %w", o.DeliveryID, err)
 		}
-		sentErr := error(nil)
-		if c.testFailSentMark {
-			sentErr = fmt.Errorf("injected sent-mark failure")
-		} else {
-			sentErr = c.mark(ctx, EvOutboundSent, o.DeliveryID)
-		}
-		if sentErr != nil {
-			// sent-but-unrecorded: try to park UNKNOWN durably; even if
-			// that also fails, surface loudly — the next Flush must NOT
-			// resend, so we park in-memory state via the UNKNOWN mark
-			// retry below.
-			if uerr := c.mark(ctx, EvOutboundUnknown, o.DeliveryID); uerr != nil {
-				return fmt.Errorf("channel: delivery %s accepted remotely but neither sent nor unknown mark is durable — STOP AND RECONCILE: %w", o.DeliveryID, uerr)
+		sendErr := send(o)
+		switch {
+		case sendErr == nil:
+			sentErr := error(nil)
+			if c.testFailSentMark {
+				sentErr = fmt.Errorf("injected sent-mark failure")
+			} else {
+				sentErr = c.markSentFromUnknown(ctx, o.DeliveryID)
 			}
-			return fmt.Errorf("channel: delivery %s accepted remotely but the sent-mark failed — parked UNKNOWN for reconciliation: %w", o.DeliveryID, sentErr)
+			if sentErr != nil {
+				// Already durably UNKNOWN: reconciliation owns it.
+				return fmt.Errorf("channel: delivery %s accepted but the sent-mark failed — stays UNKNOWN for reconciliation: %w", o.DeliveryID, sentErr)
+			}
+		case errors.Is(sendErr, ErrAmbiguousSend):
+			return fmt.Errorf("channel: delivery %s ambiguous — stays UNKNOWN for reconciliation: %w", o.DeliveryID, sendErr)
+		default:
+			// DEFINITE pre-wire failure: nothing left the process.
+			if rerr := c.Reconcile(ctx, o.DeliveryID, false); rerr != nil {
+				return fmt.Errorf("channel: delivery %s failed pre-wire and could not re-pend: %w", o.DeliveryID, errors.Join(sendErr, rerr))
+			}
+			return fmt.Errorf("channel: delivery %s failed (re-pended): %w", o.DeliveryID, sendErr)
 		}
 	}
 	return nil
+}
+
+// markSentFromUnknown closes an in-flight row as SENT.
+func (c *Core) markSentFromUnknown(ctx context.Context, deliveryID string) error {
+	return c.mark(ctx, EvOutboundSent, deliveryID)
+}
+
+// CompleteInbound is THE terminal-result+outbox recipe (B7): the inbound
+// message's TERMINAL outcome and its reply's outbox row commit in ONE
+// batch — no reply without its terminal, no terminal without its reply.
+// A crash between handler completion and this call redelivers the update
+// and the handler re-runs (at-least-once handling over exactly-once
+// admission — B2).
+func (c *Core) CompleteInbound(ctx context.Context, messageID, adapter, identity string, profile contracts.ProfileID, reply string) (string, error) {
+	if messageID == "" || adapter == "" || identity == "" || reply == "" {
+		return "", fmt.Errorf("channel: message id, adapter, identity and reply are required (fail closed)")
+	}
+	if profile != c.j.Profile() {
+		return "", fmt.Errorf("channel: profile does not match this journal's binding (fail closed, B3)")
+	}
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%d|%d|%d", adapter, identity, os.Getpid(), time.Now().UnixNano(), c.seq.Add(1))))
+	deliveryID := "dlv-" + hex.EncodeToString(sum[:12])
+	termP, err := c.params(EvInboundTerminal, terminalPayload{MessageID: messageID})
+	if err != nil {
+		return "", err
+	}
+	outP, err := c.params(EvOutboundEnqueued, outboundPayload{
+		DeliveryID: deliveryID, AdapterID: adapter, ChannelIdentity: identity, Text: reply})
+	if err != nil {
+		return "", err
+	}
+	if _, err := c.j.AppendBatch(ctx, []contracts.EnvelopeParams{termP, outP}); err != nil {
+		return "", err
+	}
+	return deliveryID, nil
+}
+
+// MarkInboundTerminal closes an inbound with NO reply (single event).
+func (c *Core) MarkInboundTerminal(ctx context.Context, messageID string) error {
+	p, err := c.params(EvInboundTerminal, terminalPayload{MessageID: messageID})
+	if err != nil {
+		return err
+	}
+	_, err = c.j.Append(ctx, p)
+	return err
 }
 
 // Reconcile resolves an UNKNOWN delivery with external proof: proved=true

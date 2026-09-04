@@ -67,7 +67,7 @@ func TestApproveAfterRestartCompletesOnce(t *testing.T) {
 	clock := clockid.NewFake(time.Now())
 	s, j := open(t, dir, clock, "work")
 	c := call("rm_file", "tc-1", `{"path":"/tmp/x"}`)
-	ch, err := s.Suspend(ctxT(), "turn-1", "run-1", c)
+	ch, err := s.Suspend(ctxT(), "turn-1", "run-1", c, "tg:chat-42")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +103,7 @@ func TestApprovalReplayRejected(t *testing.T) {
 	clock := clockid.NewFake(time.Now())
 	s, _ := open(t, t.TempDir(), clock, "work")
 	c := call("rm_file", "tc-1", `{"path":"/tmp/x"}`)
-	ch, err := s.Suspend(ctxT(), "turn-1", "run-1", c)
+	ch, err := s.Suspend(ctxT(), "turn-1", "run-1", c, "tg:chat-42")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +126,7 @@ func TestApprovalCannotAuthorizeModifiedEffect(t *testing.T) {
 	clock := clockid.NewFake(time.Now())
 	s, _ := open(t, t.TempDir(), clock, "work")
 	c := call("rm_file", "tc-1", `{"path":"/tmp/x"}`)
-	ch, err := s.Suspend(ctxT(), "turn-1", "run-1", c)
+	ch, err := s.Suspend(ctxT(), "turn-1", "run-1", c, "tg:chat-42")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +148,7 @@ func TestExpiredChallengeDead(t *testing.T) {
 	clock := clockid.NewFake(time.Now())
 	s, _ := open(t, t.TempDir(), clock, "work")
 	c := call("rm_file", "tc-1", `{"path":"/tmp/x"}`)
-	ch, err := s.Suspend(ctxT(), "turn-1", "run-1", c)
+	ch, err := s.Suspend(ctxT(), "turn-1", "run-1", c, "tg:chat-42")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +168,7 @@ func TestCrossProfileChallengeInvisible(t *testing.T) {
 	work, _ := open(t, dir, clock, "work")
 	private, _ := open(t, dir, clock, "private")
 	c := call("rm_file", "tc-1", `{"path":"/tmp/x"}`)
-	ch, err := work.Suspend(ctxT(), "turn-1", "run-1", c)
+	ch, err := work.Suspend(ctxT(), "turn-1", "run-1", c, "tg:chat-42")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,7 +189,7 @@ func TestDenyClosesChallenge(t *testing.T) {
 	clock := clockid.NewFake(time.Now())
 	s, _ := open(t, t.TempDir(), clock, "work")
 	c := call("rm_file", "tc-1", `{"path":"/tmp/x"}`)
-	ch, err := s.Suspend(ctxT(), "turn-1", "run-1", c)
+	ch, err := s.Suspend(ctxT(), "turn-1", "run-1", c, "tg:chat-42")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,11 +214,90 @@ func TestChallengeSummaryNamesEffect(t *testing.T) {
 	clock := clockid.NewFake(time.Now())
 	s, _ := open(t, t.TempDir(), clock, "work")
 	c := call("rm_file", "tc-9", `{"path":"/home/x/notes.txt"}`)
-	ch, err := s.Suspend(ctxT(), "turn-1", "run-1", c)
+	ch, err := s.Suspend(ctxT(), "turn-1", "run-1", c, "tg:chat-42")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(ch.Summary, "rm_file") || !strings.Contains(ch.Summary, "/home/x/notes.txt") {
 		t.Fatalf("summary does not name the effect: %q", ch.Summary)
+	}
+}
+
+// SOURCE BINDING (Phase-5 codex #6): only the ORIGINATING channel
+// identity may decide its challenge — a foreign chat's approve/deny is
+// refused and the challenge stays PENDING.
+func TestForeignSourceCannotDecide(t *testing.T) {
+	clock := clockid.NewFake(time.Now())
+	s, _ := open(t, t.TempDir(), clock, "work")
+	c := call("fs_delete", "tc-1", `{"path":"/tmp/x"}`)
+	ch, err := s.Suspend(ctxT(), "turn-1", "run-1", c, "tg:chat-42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Approve(ctxT(), ch.ChallengeID, "tg:chat-666"); err == nil {
+		t.Fatal("foreign chat approved the challenge")
+	}
+	if err := s.Deny(ctxT(), ch.ChallengeID, "tg:chat-666"); err == nil {
+		t.Fatal("foreign chat denied the challenge")
+	}
+	if err := s.ConsumeApproval(ctxT(), c); err == nil {
+		t.Fatal("foreign decision produced a consumable approval")
+	}
+	// The rightful owner still can.
+	if err := s.Approve(ctxT(), ch.ChallengeID, "tg:chat-42"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ConsumeApproval(ctxT(), c); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// EXPIRY AT CONSUME with the >= boundary (Phase-5 codex #7): an approval
+// granted in time but consumed at/after expiry is dead — the grant window
+// closes at the consume moment, not the approve moment.
+func TestApprovalExpiresAtConsume(t *testing.T) {
+	clock := clockid.NewFake(time.Now())
+	s, _ := open(t, t.TempDir(), clock, "work")
+	c := call("fs_delete", "tc-1", `{"path":"/tmp/x"}`)
+	ch, err := s.Suspend(ctxT(), "turn-1", "run-1", c, "tg:chat-42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Approve(ctxT(), ch.ChallengeID, "tg:chat-42"); err != nil {
+		t.Fatal(err)
+	}
+	// Advance EXACTLY to expiry: `now >= expires` must already refuse.
+	clock.Advance(DefaultChallengeTTL)
+	if err := s.ConsumeApproval(ctxT(), c); err == nil {
+		t.Fatal("approval consumed at the expiry boundary")
+	}
+}
+
+// SECRET REFUSAL (Phase-5 kilo #3): a challenge whose summary would
+// carry bytes the redactor rewrites is REFUSED before any journal write —
+// the approver channel never sees a known secret.
+func TestChallengeRefusesSecretExposure(t *testing.T) {
+	clock := clockid.NewFake(time.Now())
+	secret := "sk-live-abcdef123456"
+	j, err := journal.Open(filepath.Join(t.TempDir(), "work.db"), "work",
+		redact.NewKnownRefs(map[string]string{"api_key": secret}), Events(), NewProjection())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { j.Close() })
+	s, err := NewStore(j, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := call("web_post", "tc-1", `{"auth":"`+secret+`"}`)
+	if _, serr := s.Suspend(ctxT(), "turn-1", "run-1", c, "tg:chat-42"); serr == nil {
+		t.Fatal("challenge exposing a known secret was created")
+	}
+	if p, _ := s.Pending(ctxT()); len(p) != 0 {
+		t.Fatalf("refused challenge left state behind: %v", p)
+	}
+	// A clean call on the same store still works (the refusal is per-payload).
+	if _, serr := s.Suspend(ctxT(), "turn-2", "run-2", call("fs_delete", "tc-2", `{"path":"/tmp/x"}`), "tg:chat-42"); serr != nil {
+		t.Fatal(serr)
 	}
 }

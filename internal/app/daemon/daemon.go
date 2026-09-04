@@ -45,6 +45,12 @@ type Deps struct {
 	// surface (observations, UDS error frames) — same instance the
 	// journal uses.
 	Redactor redact.Redactor
+	// SuspenderFor + DurableApprovals wire the T24 HITL owner into
+	// CHANNEL turns (remote HITL): the factory binds each challenge to
+	// its originating channel identity as the ONLY legal decision source;
+	// interactive sessions keep surfacing NEEDS_APPROVAL directly.
+	SuspenderFor     func(channelIdentity string) loop.Suspender
+	DurableApprovals effectpath.DurableApprovals
 }
 
 // Daemon serves chat sessions over a UDS.
@@ -203,11 +209,16 @@ func (d *Daemon) handle(ctx context.Context, conn net.Conn) {
 
 // RunChannelTurn executes ONE conversation turn for CHANNEL input —
 // ALWAYS ModeDefault (a channel message can never enable yolo, HARDQ
-// F2); the turn is journaled like any session turn.
+// F2); an unapproved ASK suspends durably through the T24 owner and the
+// challenge summary is the reply; the turn is journaled like any
+// session turn. Provenance names the REAL source (Phase-5 codex #14).
 func (d *Daemon) RunChannelTurn(ctx context.Context, identity, text string) (string, error) {
 	pep, err := effectpath.NewPEP(d.deps.Rules, effectpath.NewApprovals(nil, 5*time.Minute), d.deps.Audit, effectpath.ModeDefault)
 	if err != nil {
 		return "", err
+	}
+	if d.deps.DurableApprovals != nil {
+		pep.SetDurableApprovals(d.deps.DurableApprovals)
 	}
 	path, err := effectpath.NewEffectPath(pep, orderOnlyMW{},
 		effectpath.NewInProcessExecutor(d.deps.Tools),
@@ -223,8 +234,12 @@ func (d *Daemon) RunChannelTurn(ctx context.Context, identity, text string) (str
 	if err != nil {
 		return "", err
 	}
+	if d.deps.SuspenderFor != nil {
+		l.SetSuspender(d.deps.SuspenderFor(identity))
+	}
 	n := d.session.Add(1)
-	block, err := userBlock(fmt.Sprintf("chan-%s-%d-%d", identity, d.nonce, n), text)
+	block, err := sourcedBlock(fmt.Sprintf("chan-%s-%d-%d", identity, d.nonce, n), text,
+		"nexus://telegram/"+identity, "telegram")
 	if err != nil {
 		return "", err
 	}
@@ -235,10 +250,16 @@ func (d *Daemon) RunChannelTurn(ctx context.Context, identity, text string) (str
 
 // userBlock wraps terminal input as a USER-trust context block.
 func userBlock(id, text string) (contracts.ContextBlock, error) {
+	return sourcedBlock(id, text, "nexus://repl", "repl")
+}
+
+// sourcedBlock carries HONEST provenance (Phase-5 codex #14: channel
+// input must never masquerade as terminal input).
+func sourcedBlock(id, text, sourceURI, producer string) (contracts.ContextBlock, error) {
 	sum := sha256Hex(text)
 	return contracts.NewContextBlock(contracts.ContextBlockParams{
 		BlockID: contracts.BlockID(id), Kind: "user_message", Content: &text,
-		ContentHash: sum, SourceURI: "nexus://repl", Producer: "repl",
+		ContentHash: sum, SourceURI: sourceURI, Producer: producer,
 		Trust: contracts.TrustUser, Sensitivity: contracts.Sensitivity(1),
 		Lineage: []string{}, ObservedAt: time.Now().UTC(),
 	})

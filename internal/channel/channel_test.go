@@ -192,7 +192,7 @@ func TestDeliveryHonesty(t *testing.T) {
 	if _, err := c.EnqueueReply(ctxT(), "telegram", "chat-42", "work", "hi"); err != nil {
 		t.Fatal(err)
 	}
-	// Transport error → still pending.
+	// DEFINITE transport error → re-pended for a safe retry.
 	fails := 0
 	err := c.Flush(ctxT(), func(o Outbound) error { fails++; return fmt.Errorf("network down") })
 	if err == nil {
@@ -312,4 +312,133 @@ func TestChannelStateSurvivesRestart(t *testing.T) {
 	}
 	_ = contracts.ProfileID("work")
 	_ = time.Now
+}
+
+// UNKNOWN-FIRST honesty (Phase-5 codex #3/#4): an AMBIGUOUS transport
+// result (wire touched, outcome unknown) parks the row UNKNOWN — never a
+// blind retry; and because the row is parked BEFORE the wire, even a
+// dual-mark failure or restart cannot resend it.
+func TestAmbiguousSendParksUnknownNeverResends(t *testing.T) {
+	dir := t.TempDir()
+	c, j := open(t, dir)
+	if _, err := c.EnqueueReply(ctxT(), "telegram", "chat-42", "work", "hi"); err != nil {
+		t.Fatal(err)
+	}
+	accepts := 0
+	err := c.Flush(ctxT(), func(o Outbound) error {
+		accepts++ // the wire WAS touched
+		return fmt.Errorf("connection reset: %w", ErrAmbiguousSend)
+	})
+	if err == nil {
+		t.Fatal("ambiguous send swallowed")
+	}
+	// UNKNOWN, not pending: a second flush sends NOTHING.
+	if err := c.Flush(ctxT(), func(o Outbound) error { accepts++; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if accepts != 1 {
+		t.Fatalf("ambiguous delivery retried blindly: accepts=%d", accepts)
+	}
+	// RESTART: still not resent (the parking is durable).
+	j.Close()
+	c2, _ := open(t, dir)
+	if err := c2.Flush(ctxT(), func(o Outbound) error { accepts++; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if accepts != 1 {
+		t.Fatalf("ambiguous delivery resent after restart: accepts=%d", accepts)
+	}
+	if u, _ := c2.Unreconciled(ctxT()); len(u) != 1 {
+		t.Fatalf("ambiguous row not awaiting reconciliation: %v", u)
+	}
+	// A DEFINITE pre-wire failure re-pends for a safe retry.
+	if _, err := c2.EnqueueReply(ctxT(), "telegram", "chat-42", "work", "second"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c2.Flush(ctxT(), func(o Outbound) error { return fmt.Errorf("definite pre-wire failure") }); err == nil {
+		t.Fatal("definite failure swallowed")
+	}
+	p, _ := c2.Pending(ctxT())
+	if len(p) != 1 {
+		t.Fatalf("definite failure did not re-pend: %v", p)
+	}
+}
+
+// Inbound TERMINAL lifecycle (Phase-5 codex #2): CompleteInbound is ONE
+// batch (terminal + reply); a message admitted but NOT terminal is
+// re-runnable; a terminal one is done.
+func TestInboundTerminalRecipe(t *testing.T) {
+	c, j := open(t, t.TempDir())
+	out, err := c.Admit(ctxT(), inbound(1, "hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := c.InboundStatus(ctxT(), out.MessageID); st != StateAdmitted {
+		t.Fatalf("state %v", st)
+	}
+	if _, err := c.CompleteInbound(ctxT(), out.MessageID, "telegram", "chat-42", "work", "the reply"); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := c.InboundStatus(ctxT(), out.MessageID); st != StateTerminal {
+		t.Fatalf("state %v, want TERMINAL", st)
+	}
+	if len(mustPending(t, c)) != 1 {
+		t.Fatal("reply not enqueued with the terminal")
+	}
+	// Double-complete aborts (the recipe is once-only).
+	if _, err := c.CompleteInbound(ctxT(), out.MessageID, "telegram", "chat-42", "work", "again"); err == nil {
+		t.Fatal("double terminal accepted")
+	}
+	// Replay events → terminal and reply BOTH exist (one batch).
+	terminals, enqueues := 0, 0
+	j.Replay(0, func(ev journal.Event) error {
+		switch ev.Envelope.EventType {
+		case EvInboundTerminal:
+			terminals++
+		case EvOutboundEnqueued:
+			enqueues++
+		}
+		return nil
+	})
+	if terminals != 1 || enqueues != 1 {
+		t.Fatalf("recipe events: terminals=%d enqueues=%d", terminals, enqueues)
+	}
+}
+
+// CONCURRENT admissions of one update (Phase-5 codex #11): exactly one
+// admission event; both callers converge on the same outcome.
+func TestConcurrentAdmissionRace(t *testing.T) {
+	c, j := open(t, t.TempDir())
+	type res struct {
+		out AdmitOutcome
+		err error
+	}
+	results := make(chan res, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			o, err := c.Admit(ctxT(), inbound(7, "race"))
+			results <- res{o, err}
+		}()
+	}
+	ids := map[string]bool{}
+	for i := 0; i < 2; i++ {
+		r := <-results
+		if r.err != nil {
+			t.Fatalf("concurrent admission errored: %v", r.err)
+		}
+		ids[r.out.MessageID] = true
+	}
+	if len(ids) != 1 {
+		t.Fatalf("concurrent admissions diverged: %v", ids)
+	}
+	count := 0
+	j.Replay(0, func(ev journal.Event) error {
+		if ev.Envelope.EventType == EvInboundAdmitted {
+			count++
+		}
+		return nil
+	})
+	if count != 1 {
+		t.Fatalf("%d admission events (want 1)", count)
+	}
 }

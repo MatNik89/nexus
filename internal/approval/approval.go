@@ -14,7 +14,7 @@ package approval
 
 import (
 	"context"
-	"crypto/sha256"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -25,6 +25,7 @@ import (
 
 	"github.com/MatNik89/nexus/internal/foundation/clockid"
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
+	"github.com/MatNik89/nexus/internal/kernel/effectpath"
 	"github.com/MatNik89/nexus/internal/kernel/journal"
 )
 
@@ -48,23 +49,13 @@ type Challenge struct {
 	Summary     string
 }
 
-// effectHash is the C4 exact-intent digest: every field that shapes the
-// effect, length-prefixed.
-func effectHash(c contracts.ToolCall) string {
-	h := sha256.New()
-	idem := ""
-	if c.IdempotencyKey != nil {
-		idem = *c.IdempotencyKey
-	}
-	for _, part := range [][]byte{
-		[]byte(c.ToolID), c.Arguments, []byte(c.ArgsSchemaHash),
-		{byte(c.Effect)}, {byte(c.ExecutionKind)}, []byte(idem), []byte(c.ProfileID),
-	} {
-		fmt.Fprintf(h, "%d:", len(part))
-		h.Write(part)
-	}
-	return hex.EncodeToString(h.Sum(nil))
-}
+// effectHash delegates to THE canonical exact-intent digest (Phase-5
+// kilo #4: two divergent hashes would silently self-invalidate approvals
+// once the durable store feeds the effect path). topknot ceiling (C4):
+// (device,inode) binding for destructive FS ops lands with the first
+// direct-FS destructive tool — P0's only exec surface is the sandboxed
+// T26 path; trigger: that tool's owner.
+func effectHash(c contracts.ToolCall) string { return effectpath.EffectHash(c) }
 
 // --- payloads (closed) ---
 
@@ -75,6 +66,11 @@ type suspendedPayload struct {
 	EffectHash  string `json:"effect_hash"`
 	Summary     string `json:"summary"`
 	ExpiresUnix int64  `json:"expires_unix"`
+	// ExpectedSource binds WHO may decide: the originating channel
+	// identity (Phase-5 codex #5 — a foreign chat can never approve).
+	ExpectedSource string `json:"expected_source"`
+	// Call is the canonical ToolCall JSON — resume re-executes EXACTLY it.
+	Call json.RawMessage `json:"call"`
 }
 
 type decisionPayload struct {
@@ -105,8 +101,9 @@ func Events() map[string]journal.PayloadValidator {
 			if err := json.Unmarshal(raw, &p); err != nil {
 				return err
 			}
-			if p.ChallengeID == "" || p.TurnID == "" || p.RunID == "" || p.EffectHash == "" || p.ExpiresUnix == 0 {
-				return fmt.Errorf("approval: suspension requires challenge, turn, run, effect hash and expiry")
+			if p.ChallengeID == "" || p.TurnID == "" || p.RunID == "" || p.EffectHash == "" ||
+				p.ExpiresUnix == 0 || p.ExpectedSource == "" || len(p.Call) == 0 {
+				return fmt.Errorf("approval: suspension requires challenge, turn, run, effect hash, expiry, expected source and the call")
 			}
 			return nil
 		},
@@ -142,6 +139,8 @@ func (Projection) Init(db *journal.ProjDB) error {
 			effect_hash TEXT NOT NULL,
 			summary TEXT NOT NULL,
 			expires_unix INTEGER NOT NULL,
+			expected_source TEXT NOT NULL,
+			call_json TEXT NOT NULL,
 			status TEXT NOT NULL, -- PENDING | APPROVED | DENIED | CONSUMED
 			decided_by TEXT NOT NULL DEFAULT '',
 			created INTEGER NOT NULL
@@ -164,10 +163,10 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 			return err
 		}
 		if _, err := tx.Exec(`INSERT INTO appr_challenges
-			(challenge_id, turn_id, run_id, effect_hash, summary, expires_unix, status, created)
-			VALUES(?,?,?,?,?,?,?,?)`,
+			(challenge_id, turn_id, run_id, effect_hash, summary, expires_unix, expected_source, call_json, status, created)
+			VALUES(?,?,?,?,?,?,?,?,?,?)`,
 			p.ChallengeID, p.TurnID, p.RunID, p.EffectHash, p.Summary, p.ExpiresUnix,
-			"PENDING", int64(ev.JournalOffset)); err != nil {
+			p.ExpectedSource, string(p.Call), "PENDING", int64(ev.JournalOffset)); err != nil {
 			return fmt.Errorf("approval: challenge insert: %w", err)
 		}
 	case EvApprovalReceived:
@@ -176,7 +175,7 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 			return err
 		}
 		res, err := tx.Exec(`UPDATE appr_challenges SET status='APPROVED', decided_by=?
-			WHERE challenge_id=? AND status='PENDING'`, p.Source, p.ChallengeID)
+			WHERE challenge_id=? AND status='PENDING' AND expected_source=?`, p.Source, p.ChallengeID, p.Source)
 		if err != nil {
 			return err
 		}
@@ -189,7 +188,7 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 			return err
 		}
 		res, err := tx.Exec(`UPDATE appr_challenges SET status='DENIED', decided_by=?
-			WHERE challenge_id=? AND status='PENDING'`, p.Source, p.ChallengeID)
+			WHERE challenge_id=? AND status='PENDING' AND expected_source=?`, p.Source, p.ChallengeID, p.Source)
 		if err != nil {
 			return err
 		}
@@ -246,10 +245,16 @@ func (s *Store) params(eventType string, payload any) (contracts.EnvelopeParams,
 
 // Suspend commits TurnSuspended + the exact-intent challenge in ONE
 // durable event; the caller (loop) EXITS afterwards (B6 — no in-memory
-// wait). The summary names the effect for the human approver.
-func (s *Store) Suspend(ctx context.Context, turn contracts.TurnID, run contracts.RunID, c contracts.ToolCall) (Challenge, error) {
-	if !turn.Valid() || !run.Valid() {
-		return Challenge{}, fmt.Errorf("approval: turn and run ids are required (fail closed)")
+// wait). expectedSource binds WHO may decide (the originating channel
+// identity — Phase-5 codex #5). The challenge id is RANDOM (codex #12:
+// a hash-prefix id coupled identity to intent and invited collision
+// DoS); consumption matches by the full effect hash. A payload the
+// journal redactor would rewrite is REFUSED — a secret in tool args
+// must never reach an approver's phone (codex #8).
+func (s *Store) Suspend(ctx context.Context, turn contracts.TurnID, run contracts.RunID,
+	c contracts.ToolCall, expectedSource string) (Challenge, error) {
+	if !turn.Valid() || !run.Valid() || expectedSource == "" {
+		return Challenge{}, fmt.Errorf("approval: turn, run and the expected decision source are required (fail closed)")
 	}
 	if err := c.Validate(); err != nil {
 		return Challenge{}, fmt.Errorf("approval: invalid call (fail closed): %w", err)
@@ -258,13 +263,34 @@ func (s *Store) Suspend(ctx context.Context, turn contracts.TurnID, run contract
 		return Challenge{}, fmt.Errorf("approval: call profile does not match this journal's binding (fail closed, B3)")
 	}
 	hash := effectHash(c)
-	id := "ch-" + hash[:16]
+	rb := make([]byte, 12)
+	if _, err := rand.Read(rb); err != nil {
+		return Challenge{}, err
+	}
+	id := "ch-" + hex.EncodeToString(rb)
+	callJSON, err := json.Marshal(c)
+	if err != nil {
+		return Challenge{}, err
+	}
 	summary := fmt.Sprintf("APPROVAL NEEDED [%s]: tool %s with args %s (profile %s). Reply approve %s or deny %s.",
 		id, c.ToolID, string(c.Arguments), c.ProfileID, id, id)
-	p, err := s.params(EvTurnSuspended, suspendedPayload{
+	payload := suspendedPayload{
 		ChallengeID: id, TurnID: string(turn), RunID: string(run),
 		EffectHash: hash, Summary: summary,
-		ExpiresUnix: s.clock.Now().Add(DefaultChallengeTTL).Unix()})
+		ExpiresUnix:    s.clock.Now().Add(DefaultChallengeTTL).Unix(),
+		ExpectedSource: expectedSource, Call: callJSON}
+	rawPayload, err := json.Marshal(payload)
+	if err != nil {
+		return Challenge{}, err
+	}
+	rewrites, err := s.j.RedactorRewrites(rawPayload)
+	if err != nil {
+		return Challenge{}, err
+	}
+	if rewrites {
+		return Challenge{}, fmt.Errorf("approval: the challenge would expose a known secret to the approver — refused (fail closed)")
+	}
+	p, err := s.params(EvTurnSuspended, payload)
 	if err != nil {
 		return Challenge{}, err
 	}
@@ -321,7 +347,7 @@ func (s *Store) decide(ctx context.Context, eventType, id, source string) error 
 	if status != "PENDING" {
 		return fmt.Errorf("approval: challenge already %s: %w", status, ErrApprovalReplay)
 	}
-	if s.clock.Now().Unix() > expires {
+	if s.clock.Now().Unix() >= expires {
 		return fmt.Errorf("approval: challenge expired (fail closed)")
 	}
 	p, err := s.params(eventType, decisionPayload{ChallengeID: id, Source: source})
@@ -344,16 +370,63 @@ func (s *Store) Deny(ctx context.Context, id, source string) error {
 }
 
 // ConsumeApproval burns the approval for THIS exact call (single-use,
-// exact-intent — the projection enforces both).
+// exact-intent, UNEXPIRED — codex #7: an approval must not stay
+// consumable forever). Lookup is by the FULL effect hash.
 func (s *Store) ConsumeApproval(ctx context.Context, c contracts.ToolCall) error {
 	hash := effectHash(c)
-	id := "ch-" + hash[:16]
+	rows, err := s.j.QueryProjection(ctx,
+		`SELECT challenge_id, expires_unix FROM appr_challenges WHERE effect_hash=? AND status='APPROVED'`, hash)
+	if err != nil {
+		return err
+	}
+	var id string
+	var expires int64
+	found := false
+	if rows.Next() {
+		found = true
+		if err := rows.Scan(&id, &expires); err != nil {
+			rows.Close()
+			return err
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("approval: no approved challenge matches this exact effect (fail closed)")
+	}
+	if s.clock.Now().Unix() >= expires {
+		return fmt.Errorf("approval: the approval expired before consumption (fail closed)")
+	}
 	p, err := s.params(EvApprovalConsumed, consumedPayload{ChallengeID: id, EffectHash: hash})
 	if err != nil {
 		return err
 	}
 	_, err = s.j.Append(ctx, p)
 	return err
+}
+
+// ApprovedCall returns the canonical ToolCall of an APPROVED challenge —
+// resume re-executes EXACTLY it.
+func (s *Store) ApprovedCall(ctx context.Context, id string) (contracts.ToolCall, error) {
+	rows, err := s.j.QueryProjection(ctx,
+		`SELECT call_json FROM appr_challenges WHERE challenge_id=? AND status='APPROVED'`, id)
+	if err != nil {
+		return contracts.ToolCall{}, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return contracts.ToolCall{}, fmt.Errorf("approval: no approved challenge %q (fail closed)", id)
+	}
+	var raw string
+	if err := rows.Scan(&raw); err != nil {
+		return contracts.ToolCall{}, err
+	}
+	var c contracts.ToolCall
+	if err := json.Unmarshal([]byte(raw), &c); err != nil {
+		return contracts.ToolCall{}, err
+	}
+	return c, nil
 }
 
 // SuspendedTurn rehydrates the suspended turn context for a challenge.

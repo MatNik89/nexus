@@ -15,6 +15,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -90,13 +91,26 @@ type tgUpdate struct {
 	Message  *struct {
 		MessageID int64 `json:"message_id"`
 		Chat      struct {
-			ID int64 `json:"id"`
+			ID   int64  `json:"id"`
+			Type string `json:"type"`
 		} `json:"chat"`
+		From *struct {
+			ID int64 `json:"id"`
+		} `json:"from"`
 		Text  string          `json:"text"`
 		Photo json.RawMessage `json:"photo"`
 		Voice json.RawMessage `json:"voice"`
 		Doc   json.RawMessage `json:"document"`
 	} `json:"message"`
+}
+
+// sanitize strips the bot token from any error text (Phase-5 codex #9 /
+// kilo #2 / agy #1: url.Error embeds the full bot<token> URL).
+func (a *Adapter) sanitize(err error) error {
+	if err == nil {
+		return nil
+	}
+	return errors.New(strings.ReplaceAll(err.Error(), a.token, "[REDACTED-TOKEN]"))
 }
 
 func (a *Adapter) call(ctx context.Context, method string, req any, out any) error {
@@ -112,10 +126,16 @@ func (a *Adapter) call(ctx context.Context, method string, req any, out any) err
 	httpReq.Header.Set("Content-Type", "application/json")
 	resp, err := a.client.Do(httpReq)
 	if err != nil {
-		return fmt.Errorf("telegram: transport: %w", err)
+		// The wire WAS touched: the remote may have accepted — ambiguous
+		// (Phase-5 codex #3), and the token never leaks (codex #9).
+		return fmt.Errorf("telegram: transport: %w: %w", channel.ErrAmbiguousSend, a.sanitize(err))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		if resp.StatusCode >= 500 {
+			// 5xx after a POST: the remote may have processed it.
+			return fmt.Errorf("telegram: %s HTTP %d: %w", method, resp.StatusCode, channel.ErrAmbiguousSend)
+		}
 		return fmt.Errorf("telegram: %s HTTP %d", method, resp.StatusCode)
 	}
 	var envelope struct {
@@ -123,7 +143,9 @@ func (a *Adapter) call(ctx context.Context, method string, req any, out any) err
 		Result json.RawMessage `json:"result"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
-		return fmt.Errorf("telegram: malformed %s reply: %w", method, err)
+		// 2xx but unreadable body: the remote ACCEPTED — ambiguous for
+		// effectful methods.
+		return fmt.Errorf("telegram: malformed %s reply: %w: %w", method, channel.ErrAmbiguousSend, a.sanitize(err))
 	}
 	if !envelope.OK {
 		return fmt.Errorf("telegram: %s not ok", method)
@@ -163,6 +185,14 @@ func (a *Adapter) processUpdate(ctx context.Context, u tgUpdate) error {
 	}
 	chat := u.Message.Chat.ID
 	identity := "chat-" + strconv.FormatInt(chat, 10)
+	// SINGLE-USER boundary (Phase-5 codex #5): only PRIVATE chats — in a
+	// group every member would inherit the owner's USER trust. Fail
+	// closed on anything else (and on a missing sender identity).
+	if u.Message.Chat.Type != "private" || u.Message.From == nil {
+		_, err := a.core.EnqueueReply(ctx, adapterID, identity, a.profile,
+			"NEXUS talks only in a private chat with its owner.")
+		return err
+	}
 	// DENY-DEFAULT profile binding (B3): an unbound chat — or one bound
 	// to a DIFFERENT profile than this adapter serves — is refused with a
 	// typed reply and NOTHING is admitted.
@@ -179,32 +209,41 @@ func (a *Adapter) processUpdate(ctx context.Context, u tgUpdate) error {
 			"I can handle only text messages for now (photos, voice and files are not supported yet).")
 		return err
 	}
-	outcome, err := a.core.Admit(ctx, channel.Inbound{
+	in := channel.Inbound{
 		AdapterID: adapterID, ChannelIdentity: identity,
 		UpdateID: u.UpdateID, Text: u.Message.Text, Profile: a.profile,
-	})
+	}
+	outcome, err := a.core.Admit(ctx, in)
 	if err != nil {
 		return err
 	}
 	if outcome.Replayed {
-		return nil // durable existing outcome: no double effect
+		// Crash recovery (Phase-5 codex #2): an admitted-but-NON-TERMINAL
+		// message was interrupted before its handler finished — RE-RUN it
+		// (at-least-once handling over exactly-once admission). A
+		// TERMINAL replay is done: skip.
+		st, serr := a.core.InboundStatus(ctx, outcome.MessageID)
+		if serr != nil {
+			return serr
+		}
+		if st == channel.StateTerminal {
+			return nil
+		}
 	}
-	reply, herr := a.handle(ctx, channel.Inbound{
-		AdapterID: adapterID, ChannelIdentity: identity,
-		UpdateID: u.UpdateID, Text: u.Message.Text, Profile: a.profile,
-	})
+	reply, herr := a.handle(ctx, in)
 	if herr != nil {
-		// The admission stays durable; the failure gets a typed reply.
-		_, err := a.core.EnqueueReply(ctx, adapterID, identity, a.profile,
+		// The admission stays durable; the failure gets a typed reply and
+		// the message closes TERMINAL with it (one recipe batch).
+		_, err := a.core.CompleteInbound(ctx, outcome.MessageID, adapterID, identity, a.profile,
 			"I could not process that message. Try again, or check the daemon log.")
 		return err
 	}
-	if reply != "" {
-		if _, err := a.core.EnqueueReply(ctx, adapterID, identity, a.profile, reply); err != nil {
-			return err
-		}
+	if reply == "" {
+		return a.core.MarkInboundTerminal(ctx, outcome.MessageID)
 	}
-	return nil
+	// THE terminal-result+outbox recipe: terminal + reply in one batch.
+	_, err = a.core.CompleteInbound(ctx, outcome.MessageID, adapterID, identity, a.profile, reply)
+	return err
 }
 
 // FlushOutbox delivers pending outbox rows through sendMessage (the T22
