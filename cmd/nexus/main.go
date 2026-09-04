@@ -14,6 +14,7 @@ import (
 
 	"github.com/MatNik89/nexus/internal/app/daemon"
 	"github.com/MatNik89/nexus/internal/app/repl"
+	"github.com/MatNik89/nexus/internal/foundation/clockid"
 	"github.com/MatNik89/nexus/internal/foundation/config"
 	"github.com/MatNik89/nexus/internal/foundation/pathx"
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
@@ -25,6 +26,7 @@ import (
 	"github.com/MatNik89/nexus/internal/llm/provider"
 	"github.com/MatNik89/nexus/internal/memory"
 	"github.com/MatNik89/nexus/internal/preflight/doctor"
+	"github.com/MatNik89/nexus/internal/schedule"
 	"github.com/MatNik89/nexus/internal/security/redact"
 )
 
@@ -106,7 +108,7 @@ func runDaemon() int {
 		fmt.Fprintf(os.Stderr, "nexus daemon: %v\n", err)
 		return 2
 	}
-	d, j, err := buildDaemon(layout, resolved)
+	d, j, sched, err := buildDaemon(layout, resolved)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "nexus daemon: %v\n", err)
 		return 2
@@ -116,6 +118,8 @@ func runDaemon() int {
 	defer cancel()
 	hb := daemon.NewHeartbeat(filepath.Join(layout.SystemDir(), "heartbeat"), 5*time.Second)
 	go hb.Run(ctx)
+	// Durable scheduler: startup sweep + periodic catch-up (T20).
+	go sched.Run(ctx, 30*time.Second, nil)
 	sock := socketPath(layout)
 	fmt.Printf("nexus daemon %s — profile %s, socket %s\n", version, resolved.Config.DefaultProfile, sock)
 	if err := d.Serve(ctx, sock); err != nil {
@@ -129,17 +133,17 @@ func runDaemon() int {
 // redactor, S7 authority, governed provider, streaming planner factory,
 // fail-closed audit) wired exactly as the daemon runs it — and testable
 // against a custom layout (Phase-2-r2 codex #13).
-func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemon.Daemon, *journal.Journal, error) {
+func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemon.Daemon, *journal.Journal, *schedule.Scheduler, error) {
 	profile := resolved.Config.DefaultProfile
 	profileDir, err := layout.ProfileDir(profile)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	for _, dir := range []string{profileDir, layout.SystemDir()} {
 		if err := pathx.EnsureDir(layout.Base, dir); err != nil {
 			// The base itself may not exist yet: create it 0700 first.
 			if os.MkdirAll(layout.Base, 0o700) != nil || pathx.EnsureDir(layout.Base, dir) != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 		}
 	}
@@ -150,26 +154,35 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemon.Daemon,
 	for n, v := range memory.Events() {
 		events[n] = v
 	}
+	for n, v := range schedule.Events() {
+		events[n] = v
+	}
 	journalPath, _ := layout.ProfileJournal(profile)
 	redactor := redact.NewKnownRefs(knownSecretRefs(resolved.Config))
 	// The ONE profile database: journal + memory projection together
 	// (Annex P0.3 — facts are journal events folded in the same
 	// transaction; no second SQLite file exists).
-	j, err := journal.Open(journalPath, profile, redactor, events, memory.NewProjection())
+	j, err := journal.Open(journalPath, profile, redactor, events, memory.NewProjection(), schedule.NewProjection())
 	if err != nil {
-		return nil, nil, fmt.Errorf("journal: %w", err)
+		return nil, nil, nil, fmt.Errorf("journal: %w", err)
 	}
 	authority := s7min.NewAuthority(nil, 5*time.Minute)
 	prov, err := provider.NewAPIKey(resolved.Config, authority)
 	if err != nil {
 		j.Close()
-		return nil, nil, fmt.Errorf("provider: %w (conversation is a P0 core capability — fix the config and restart)", err)
+		return nil, nil, nil, fmt.Errorf("provider: %w (conversation is a P0 core capability — fix the config and restart)", err)
 	}
 	memStore, err := memory.NewStore(j)
 	if err != nil {
 		j.Close()
-		return nil, nil, fmt.Errorf("memory: %w", err)
+		return nil, nil, nil, fmt.Errorf("memory: %w", err)
 	}
+	sched, err := schedule.New(j, clockid.System{})
+	if err != nil {
+		j.Close()
+		return nil, nil, nil, fmt.Errorf("schedule: %w", err)
+	}
+	sched.SetCounterFile(filepath.Join(layout.SystemDir(), "last_occurrence_fired"))
 	target := prov.Target() // the provider's OWN grant target — anything else never reaches the wire
 	d, err := daemon.New(daemon.Deps{
 		Journal: j,
@@ -193,9 +206,9 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemon.Daemon,
 	})
 	if err != nil {
 		j.Close()
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return d, j, nil
+	return d, j, sched, nil
 }
 
 // knownSecretRefs feeds the C1 known-ref redactor: every configured

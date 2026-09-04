@@ -101,12 +101,12 @@ type Journal struct {
 }
 
 type appendReq struct {
-	params contracts.EnvelopeParams
-	reply  chan appendReply
+	batch []contracts.EnvelopeParams
+	reply chan appendReply
 }
 
 type appendReply struct {
-	ev  Event
+	evs []Event
 	err error
 }
 
@@ -380,10 +380,11 @@ func (j *Journal) actor(lastOffset uint64, lastHash string) {
 		case <-j.done:
 			return
 		case req := <-j.reqs:
-			rep := j.appendOne(req.params, lastOffset+1, lastHash)
-			if rep.err == nil {
-				lastOffset = rep.ev.JournalOffset
-				lastHash = rep.ev.IntegrityHash
+			rep := j.appendBatch(req.batch, lastOffset+1, lastHash)
+			if rep.err == nil && len(rep.evs) > 0 {
+				last := rep.evs[len(rep.evs)-1]
+				lastOffset = last.JournalOffset
+				lastHash = last.IntegrityHash
 			}
 			if testPauseAfterCommit != nil && rep.err == nil {
 				testPauseAfterCommit()
@@ -422,60 +423,61 @@ func structuralFields(p contracts.EnvelopeParams) []string {
 	return out
 }
 
-func (j *Journal) appendOne(p contracts.EnvelopeParams, offset uint64, prevHash string) appendReply {
-	fail := func(err error) appendReply { return appendReply{err: err} }
+// prepare runs every PRE-transaction admission step for one envelope:
+// profile binding, closed event-type, structural-secret rejection,
+// semantic redaction + hash recompute, typed payload validation.
+func (j *Journal) prepare(p contracts.EnvelopeParams) (contracts.EnvelopeParams, error) {
 	if p.ProfileID != j.profile {
-		return fail(fmt.Errorf("journal append: envelope profile does not match the journal's bound profile (fail closed, B3)"))
+		return p, fmt.Errorf("journal append: envelope profile does not match the journal's bound profile (fail closed, B3)")
 	}
 	// Closed event-type admission + typed payload validation BEFORE
 	// persistence (r2 codex #7).
 	validator, ok := j.events[p.EventType]
 	if !ok {
-		return fail(fmt.Errorf("journal append: unknown event type (fail closed; closed set has %d entries)", len(j.events)))
+		return p, fmt.Errorf("journal append: unknown event type (fail closed; closed set has %d entries)", len(j.events))
 	}
 	// Known secrets in STRUCTURAL fields are rejected, not mutated
 	// (r2 codex #2): stored and returned identity stay one and the same.
 	// Touches is part of the required Redactor contract (r3 codex #2).
 	for _, f := range structuralFields(p) {
 		if j.redact.Touches(f) {
-			return fail(fmt.Errorf("journal append: a known secret occurs in a structural field (rejected fail-closed)"))
+			return p, fmt.Errorf("journal append: a known secret occurs in a structural field (rejected fail-closed)")
 		}
 	}
 	// Redact the payload SEMANTICALLY, then recompute its hash so integrity
 	// describes the stored bytes (r1 kilo #2).
 	redacted, rerr := j.redact.Redact([]byte(p.Payload))
 	if rerr != nil {
-		return fail(fmt.Errorf("journal append: %w", rerr))
+		return p, fmt.Errorf("journal append: %w", rerr)
 	}
 	p.Payload = json.RawMessage(redacted)
 	sum := sha256.Sum256(p.Payload)
 	p.PayloadHash = hex.EncodeToString(sum[:])
 	if validator != nil {
 		if err := validator(p.Payload); err != nil {
-			return fail(fmt.Errorf("journal append: payload invalid for event type: %w", err))
+			return p, fmt.Errorf("journal append: payload invalid for event type: %w", err)
 		}
 	}
+	return p, nil
+}
 
-	tx, err := j.db.Begin()
-	if err != nil {
-		return fail(fmt.Errorf("journal append begin: %w", err))
-	}
-	defer tx.Rollback()
-
+// insertInTx sequences, chains and persists ONE prepared envelope inside
+// the caller's transaction, folding sync projections with it.
+func (j *Journal) insertInTx(tx *sql.Tx, p contracts.EnvelopeParams, offset uint64, prevHash string) (Event, error) {
 	var runSeq uint64
 	row := tx.QueryRow(`SELECT COALESCE(MAX(sequence),0) FROM events WHERE run_id = ?`, string(p.RunID))
 	if err := row.Scan(&runSeq); err != nil {
-		return fail(fmt.Errorf("journal append (run sequence): %w", err))
+		return Event{}, fmt.Errorf("journal append (run sequence): %w", err)
 	}
 	p.Sequence = runSeq + 1
 
 	env, err := contracts.NewEnvelope(p) // single validation owner (P0.1)
 	if err != nil {
-		return fail(err)
+		return Event{}, err
 	}
 	raw, err := json.Marshal(env)
 	if err != nil {
-		return fail(fmt.Errorf("journal encode: %w", err))
+		return Event{}, fmt.Errorf("journal encode: %w", err)
 	}
 	integrity := chainHash(chainInput(offset, string(env.EventID), string(env.RunID),
 		env.Sequence, redactionPolicyVersion, prevHash, nil, raw))
@@ -487,17 +489,52 @@ func (j *Journal) appendOne(p contracts.EnvelopeParams, offset uint64, prevHash 
 		int64(offset), string(env.EventID), string(env.RunID), int64(env.Sequence),
 		string(raw), redactionPolicyVersion, prevHash, integrity,
 	); err != nil {
-		return fail(fmt.Errorf("journal append: %w", err))
+		return Event{}, fmt.Errorf("journal append: %w", err)
 	}
 	// Core-state projections fold IN THIS transaction (B7): event and
 	// derived state commit together or not at all.
-	pendingEv := Event{
+	ev := Event{
 		JournalOffset: offset, Envelope: env,
 		RedactionPolicyVersion: redactionPolicyVersion,
 		IntegrityPrevHash:      prevHash, IntegrityHash: integrity,
 	}
-	if err := j.applySyncProjections(tx, pendingEv); err != nil {
-		return fail(fmt.Errorf("journal append: %w", err))
+	if err := j.applySyncProjections(tx, ev); err != nil {
+		return Event{}, fmt.Errorf("journal append: %w", err)
+	}
+	return ev, nil
+}
+
+// appendBatch persists a whole batch in ONE transaction — the concrete
+// HARDQ B7 recipe primitive (occurrence+run-admission, inbox-admission+
+// journal, terminal-result+outbox): every event in the batch is durable,
+// or none is.
+func (j *Journal) appendBatch(batch []contracts.EnvelopeParams, firstOffset uint64, prevHash string) appendReply {
+	fail := func(err error) appendReply { return appendReply{err: err} }
+	if len(batch) == 0 {
+		return fail(fmt.Errorf("journal append: empty batch (fail closed)"))
+	}
+	prepared := make([]contracts.EnvelopeParams, 0, len(batch))
+	for _, p := range batch {
+		pp, err := j.prepare(p)
+		if err != nil {
+			return fail(err)
+		}
+		prepared = append(prepared, pp)
+	}
+	tx, err := j.db.Begin()
+	if err != nil {
+		return fail(fmt.Errorf("journal append begin: %w", err))
+	}
+	defer tx.Rollback()
+	evs := make([]Event, 0, len(prepared))
+	offset, hash := firstOffset, prevHash
+	for _, p := range prepared {
+		ev, err := j.insertInTx(tx, p, offset, hash)
+		if err != nil {
+			return fail(err)
+		}
+		evs = append(evs, ev)
+		offset, hash = ev.JournalOffset+1, ev.IntegrityHash
 	}
 	if testFailCommit != nil {
 		if err := testFailCommit(); err != nil {
@@ -507,26 +544,32 @@ func (j *Journal) appendOne(p contracts.EnvelopeParams, offset uint64, prevHash 
 	if err := tx.Commit(); err != nil {
 		return fail(fmt.Errorf("journal commit: %w", err))
 	}
-	return appendReply{ev: Event{
-		JournalOffset: offset, Envelope: env,
-		RedactionPolicyVersion: redactionPolicyVersion,
-		IntegrityPrevHash:      prevHash, IntegrityHash: integrity,
-	}}
+	return appendReply{evs: evs}
 }
 
 // Append validates, redacts, sequences and durably persists one event. ctx
 // gates ADMISSION only: after the actor accepts, the outcome is definitive.
 func (j *Journal) Append(ctx context.Context, p contracts.EnvelopeParams) (Event, error) {
-	req := appendReq{params: p, reply: make(chan appendReply, 1)}
+	evs, err := j.AppendBatch(ctx, []contracts.EnvelopeParams{p})
+	if err != nil {
+		return Event{}, err
+	}
+	return evs[0], nil
+}
+
+// AppendBatch persists ALL the given events in ONE serialized transaction
+// (HARDQ B7 recipes): all durable or none. ctx gates admission only.
+func (j *Journal) AppendBatch(ctx context.Context, batch []contracts.EnvelopeParams) ([]Event, error) {
+	req := appendReq{batch: batch, reply: make(chan appendReply, 1)}
 	select {
 	case j.reqs <- req:
 	case <-j.done:
-		return Event{}, fmt.Errorf("journal is closed")
+		return nil, fmt.Errorf("journal is closed")
 	case <-ctx.Done():
-		return Event{}, ctx.Err()
+		return nil, ctx.Err()
 	}
 	rep := <-req.reply
-	return rep.ev, rep.err
+	return rep.evs, rep.err
 }
 
 // Replay folds every event with journal_offset > from, in order, VERIFYING

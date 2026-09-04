@@ -59,7 +59,7 @@ func TestCompositionRootServesConversation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	d, j, err := buildDaemon(layout, resolved)
+	d, j, _, err := buildDaemon(layout, resolved)
 	if err != nil {
 		t.Fatalf("production composition root failed: %v", err)
 	}
@@ -129,7 +129,7 @@ func TestMemoryToolSpineSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	runSession := func(input string) string {
-		d, j, err := buildDaemon(layout, resolved)
+		d, j, _, err := buildDaemon(layout, resolved)
 		if err != nil {
 			t.Fatalf("composition root: %v", err)
 		}

@@ -233,7 +233,7 @@ accepted fact recallable after restart, only in its profile.
 
 ## Phase 4 — scheduler + obligations
 
-**[ ] T20 — 3.6-min durable scheduler + occurrence counter.**
+**[x] T20 — 3.6-min durable scheduler + occurrence counter.**
 Persisted occurrence (UTC + IANA + `dst=ONCE_FIRST` + `missed_run=COALESCE`), stable
 occurrence ID, T05 clock seams, single-process overlap rule; startup + wake (D-Bus
 PrepareForSleep where available) catch-up sweep — `EvaluateDue` range query, overdue fires

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/MatNik89/nexus/internal/preflight/probe"
 )
@@ -112,6 +113,18 @@ func Run(e Env) []Check {
 		})
 	} else {
 		checks = append(checks, Check{Name: "provider-key", Capability: "conversation", Status: StatusOK, Detail: "set"})
+	}
+
+	// 6 (C8 observability): scheduler last_occurrence_fired counter — an
+	// informational mirror the daemon writes after every fire; absent
+	// before the first fire (that is not a failure).
+	counterPath := filepath.Join(e.DataDir, "system", "last_occurrence_fired")
+	if b, err := os.ReadFile(counterPath); err == nil {
+		checks = append(checks, Check{Name: "scheduler-fires", Capability: "obligations",
+			Status: StatusOK, Detail: "last_occurrence_fired=" + strings.TrimSpace(string(b))})
+	} else {
+		checks = append(checks, Check{Name: "scheduler-fires", Capability: "obligations",
+			Status: StatusOK, Detail: "no occurrences fired yet (counter file absent)"})
 	}
 
 	// 5. Telegram token → telegram capability.
