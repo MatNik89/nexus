@@ -208,6 +208,8 @@ CLI clients → zero surfaced `SQLITE_BUSY`; heartbeat stops → detectable with
 
 ## Phase 3 — memory + profiles
 
+**DONE 2026-09-04** — merged to main; deep review 5 rounds (codex/kilo/agy), 15 findings folded, final 3× PASS zero findings.
+
 **[x] T18 — Profiles: physical isolation + admission stamping.**
 Per-profile SQLite file + `system.db` (zero profile payloads); non-null `ProfileID` at
 admission, immutable through the chain; no post-admission mutable global lookup.
