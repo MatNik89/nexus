@@ -502,9 +502,14 @@ func TestRecoveryFailsClosedOnCorruptJournal(t *testing.T) {
 	if _, err := db.Exec(`UPDATE events SET integrity_hash='deadbeef' WHERE event_id='ev-tail-1'`); err != nil {
 		t.Fatal(err)
 	}
-	// Redelivery: recovery must refuse — the corrupt stream is not
-	// evidence; the caller gets the duplicate-turn error instead.
-	if _, err := d.RunChannelTurn(context.Background(), "chat-42", 7, "hello"); err == nil {
+	// Redelivery: recovery must refuse — AND the decisive integrity
+	// failure must surface, not the duplicate-event symptom (Phase-5-r5
+	// codex #1).
+	_, rerr := d.RunChannelTurn(context.Background(), "chat-42", 7, "hello")
+	if rerr == nil {
 		t.Fatal("recovered a final from a journal that fails integrity verification")
+	}
+	if !strings.Contains(rerr.Error(), "chain broken") {
+		t.Fatalf("replay integrity error was not propagated: %v", rerr)
 	}
 }

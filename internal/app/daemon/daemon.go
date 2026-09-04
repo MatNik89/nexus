@@ -234,7 +234,14 @@ func (d *Daemon) RunChannelTurn(ctx context.Context, identity string, updateID i
 		// codex #3): the redelivered update re-enters the same turn and
 		// collides on its event ids — recover the DURABLE final from the
 		// journal instead of reporting a false failure.
-		if recovered, ok := d.completedTurnFinal(turn); ok {
+		recovered, ok, rerr := d.completedTurnFinal(turn)
+		if rerr != nil {
+			// The DECISIVE failure is the broken canonical stream — never
+			// mask it behind the duplicate-event symptom (Phase-5-r5
+			// codex #1).
+			return "", fmt.Errorf("daemon: completed-turn recovery refused: %w", rerr)
+		}
+		if ok {
 			return recovered, nil
 		}
 		return "", err
@@ -246,7 +253,7 @@ func (d *Daemon) RunChannelTurn(ctx context.Context, identity string, updateID i
 // turn from its journaled turn.succeeded payload.
 // topknot ceiling: full-journal replay per recovery lookup — a turn-state
 // projection is the upgrade when replay latency is measurable (P1).
-func (d *Daemon) completedTurnFinal(turn contracts.TurnID) (string, bool) {
+func (d *Daemon) completedTurnFinal(turn contracts.TurnID) (string, bool, error) {
 	final, found := "", false
 	err := d.deps.Journal.Replay(0, func(ev journal.Event) error {
 		if ev.Envelope.EventType == "turn.succeeded" && ev.Envelope.TurnID != nil && *ev.Envelope.TurnID == turn {
@@ -262,10 +269,11 @@ func (d *Daemon) completedTurnFinal(turn contracts.TurnID) (string, bool) {
 	if err != nil {
 		// FAIL CLOSED (Phase-5-r4 codex #3): a final observed during a
 		// replay that later fails integrity verification is not evidence —
-		// never serve a recovered outcome from a corrupt canonical stream.
-		return "", false
+		// and the integrity error itself is the diagnosis, propagated,
+		// never swallowed (Phase-5-r5 codex #1).
+		return "", false, err
 	}
-	return final, found
+	return final, found, nil
 }
 
 // ResumeChannelTurn rehydrates a SUSPENDED channel turn after its
