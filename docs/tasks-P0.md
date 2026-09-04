@@ -264,7 +264,7 @@ RED: ACK for occurrence N does not close N+1; MarkDone without evidence → reje
 
 ## Phase 5 — Telegram (channel:builtin)
 
-**[x] T22 — Durable channel ingress/egress (transport-neutral B2 core).**
+**[x] T22 (9606515..169f7ae) — Durable channel ingress/egress (transport-neutral B2 core).**
 Durable inbox keyed `(adapter_id, channel_identity, update_id)`
 `RECEIVED→ADMITTED→TERMINAL` — normalized message persisted BEFORE offset advance, replay
 returns existing outcome; transactional outbox + stable delivery ID; at-least-once remote
@@ -281,7 +281,7 @@ neither (no inbound row without its journal event; no terminal result without it
 row, and vice versa); visibility — committed recipe rows readable in the next
 same-process read.
 
-**[x] T23 — Telegram built-in adapter.**
+**[x] T23 (63f2314..169f7ae) — Telegram built-in adapter.**
 Long-poll on T22 core; per-chat profile binding deny-default (unbound chat → typed "which
 profile?" refusal); non-text → typed fail-closed reply (C2); registers as `channel:builtin`
 (P1.6 as amended — NO extensions closure); registers live channel probe into T11 snapshot.
@@ -290,7 +290,7 @@ Acceptance: phone→NEXUS→phone round trip on the real bot.
 RED: unbound chat refused; BlockImage/BlockAudio → typed reply, loop alive; replayed
 update_id returns existing outcome (no double effect).
 
-**[x] T24 — Remote HITL (durable) + cross-profile integration REDs.**
+**[x] T24 (f63143c..169f7ae) — Remote HITL (durable) + cross-profile integration REDs.**
 `ApprovalChallenge` exact-intent (canonical tool+args+target+ProfileID; `(device,inode)`
 for destructive FS — C4), expiring, single-use; `DecisionAsk` → commit `TurnSuspended`,
 loop exits; approval appends `ApprovalReceived`, resume rehydrates from journal.
@@ -305,6 +305,17 @@ not park (ASK auto-allows, journaled) and a Telegram message can neither enable 
 piggyback on it to authorize a DENY-classified effect. (The yolo-with-REAL-sandbox
 integration RED — hostile suite unchanged under yolo — lives in T27, where the real
 backend exists; r4 codex #5.)
+
+**Phase 5 convergence (2026-09-04, merged 169f7ae):** deep+security review, 6 rounds
+(codex/kilo/agy): r1 3×FAIL (33 findings: HITL unwired, inbox no terminal, blind
+ambiguous resend, group trust escalation, token leak, unsourced approvals, expiry gaps)
+→ r2 fold (UNKNOWN-first outbox, private-only, source-bound expiring approvals) → r3
+(turn SUSPENDED state, deadline refresh, deterministic turn ids, projection expiry,
+poison-head, sealed channel probe) → r4 (context rehydration, tagged resume cycles,
+recovered finals, E9 retry reconcile) → r5 (atomic retry batch, legacy-context
+degradation, fail-closed corrupt-journal recovery) → r6 3×PASS (integrity-error
+propagation). Every fold point carries a causal RED; guard ablations verified RED per
+round. Reviews: docs/REVIEW-PHASE5*.md.
 
 ## Phase 6 — sandboxed exec (gated by T02)
 
