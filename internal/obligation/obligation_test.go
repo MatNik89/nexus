@@ -71,16 +71,15 @@ func build(t *testing.T) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reg, err := NewRegistry(map[string]Handler{
-		"file_note": FileNoteHandler(dir),
+	reg, err := NewRegistry(map[string]Kind{
+		"file_note": {Handler: FileNoteHandler(dir), ValidateParams: ValidateFileNoteParams},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	SetNotesDir(dir)
 	auth := s7min.NewAuthority(nil, time.Minute)
 	lazy := &LazyRunner{}
-	m, err := NewManager(j, sched, reg, clock, lazy, auth)
+	m, err := NewManager(j, sched, reg, clock, lazy, auth, dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,10 +127,10 @@ func TestReminderLifecycleEndToEnd(t *testing.T) {
 	if st, _ := h.m.Status(ctxT(), "rem-1"); st != StateDeliveryPending {
 		t.Fatalf("state after due %v, want DELIVERY_PENDING", st)
 	}
-	if err := h.m.MarkDelivered(ctxT(), f.OccurrenceID); err != nil {
+	if err := h.m.MarkDelivered(ctxT(), f.OccurrenceID, DeliveryReceipt{Producer: "test-channel", ReceiptID: "rcpt-1"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.m.MarkAcked(ctxT(), f.OccurrenceID); err != nil {
+	if err := h.m.MarkAcked(ctxT(), f.OccurrenceID, AckGesture{Source: "test-gesture"}); err != nil {
 		t.Fatal(err)
 	}
 	st, err := h.m.Status(ctxT(), "rem-1")
@@ -147,14 +146,14 @@ func TestAckForWrongOccurrenceNeverCloses(t *testing.T) {
 		t.Fatal(err)
 	}
 	f := fireDue(t, h)
-	if err := h.m.MarkDelivered(ctxT(), f.OccurrenceID); err != nil {
+	if err := h.m.MarkDelivered(ctxT(), f.OccurrenceID, DeliveryReceipt{Producer: "test-channel", ReceiptID: "rcpt-1"}); err != nil {
 		t.Fatal(err)
 	}
 	// An ack for a DIFFERENT occurrence id is refused outright.
-	if err := h.m.MarkAcked(ctxT(), "occ-rem-1#2"); err == nil {
+	if err := h.m.MarkAcked(ctxT(), "occ-rem-1#2", AckGesture{Source: "g"}); err == nil {
 		t.Fatal("ack for a foreign occurrence accepted")
 	}
-	if err := h.m.MarkAcked(ctxT(), "occ-other#1"); err == nil {
+	if err := h.m.MarkAcked(ctxT(), "occ-other#1", AckGesture{Source: "g"}); err == nil {
 		t.Fatal("ack for an unknown occurrence accepted")
 	}
 	if st, _ := h.m.Status(ctxT(), "rem-1"); st != StateDelivered {
@@ -169,19 +168,19 @@ func TestIllegalTransitionsAbort(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Delivered before due: illegal.
-	if err := h.m.MarkDelivered(ctxT(), "occ-rem-1#1"); err == nil {
+	if err := h.m.MarkDelivered(ctxT(), "occ-rem-1#1", DeliveryReceipt{Producer: "test-channel", ReceiptID: "rcpt-x"}); err == nil {
 		t.Fatal("DELIVERED before DUE accepted")
 	}
 	// Acked before delivered: illegal.
 	fireDue(t, h)
-	if err := h.m.MarkAcked(ctxT(), "occ-rem-1#1"); err == nil {
+	if err := h.m.MarkAcked(ctxT(), "occ-rem-1#1", AckGesture{Source: "g"}); err == nil {
 		t.Fatal("ACKED before DELIVERED accepted")
 	}
 	// Expire from DELIVERY_PENDING is legal; ack after expiry is not.
 	if err := h.m.MarkExpired(ctxT(), "occ-rem-1#1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.m.MarkDelivered(ctxT(), "occ-rem-1#1"); err == nil {
+	if err := h.m.MarkDelivered(ctxT(), "occ-rem-1#1", DeliveryReceipt{Producer: "test-channel", ReceiptID: "rcpt-x"}); err == nil {
 		t.Fatal("delivery after expiry accepted")
 	}
 	if st, _ := h.m.Status(ctxT(), "rem-1"); st != StateExpired {
@@ -224,7 +223,7 @@ func TestFileNoteTaskVerifiedPostcondition(t *testing.T) {
 
 // An empty handler registry is impossible; unknown task kinds fail closed.
 func TestRegistryAndKindValidation(t *testing.T) {
-	if _, err := NewRegistry(map[string]Handler{}); err == nil {
+	if _, err := NewRegistry(map[string]Kind{}); err == nil {
 		t.Fatal("empty handler registry accepted")
 	}
 	h := build(t)
@@ -243,7 +242,7 @@ func TestLifecycleSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	f := fireDue(t, h)
-	if err := h.m.MarkDelivered(ctxT(), f.OccurrenceID); err != nil {
+	if err := h.m.MarkDelivered(ctxT(), f.OccurrenceID, DeliveryReceipt{Producer: "test-channel", ReceiptID: "rcpt-1"}); err != nil {
 		t.Fatal(err)
 	}
 	h.m.Journal().Close()
@@ -260,16 +259,16 @@ func TestLifecycleSurvivesRestart(t *testing.T) {
 	}
 	defer j.Close()
 	sched, _ := schedule.New(j, h.clock)
-	reg, _ := NewRegistry(map[string]Handler{"file_note": FileNoteHandler(h.dir)})
+	reg, _ := NewRegistry(map[string]Kind{"file_note": {Handler: FileNoteHandler(h.dir), ValidateParams: ValidateFileNoteParams}})
 	auth2 := s7min.NewAuthority(nil, time.Minute)
-	m2, err := NewManager(j, sched, reg, h.clock, &LazyRunner{}, auth2)
+	m2, err := NewManager(j, sched, reg, h.clock, &LazyRunner{}, auth2, h.dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if st, _ := m2.Status(ctxT(), "rem-1"); st != StateDelivered {
 		t.Fatalf("state lost across restart: %v", st)
 	}
-	if err := m2.MarkAcked(ctxT(), f.OccurrenceID); err != nil {
+	if err := m2.MarkAcked(ctxT(), f.OccurrenceID, AckGesture{Source: "g2"}); err != nil {
 		t.Fatalf("ack after restart refused: %v", err)
 	}
 }
@@ -301,7 +300,7 @@ func TestAckGradesPersistedDeliveryReceipt(t *testing.T) {
 	}
 	f := fireDue(t, h)
 	deliveredClock := h.clock.Now()
-	if err := h.m.MarkDelivered(ctxT(), f.OccurrenceID); err != nil {
+	if err := h.m.MarkDelivered(ctxT(), f.OccurrenceID, DeliveryReceipt{Producer: "test-channel", ReceiptID: "rcpt-1"}); err != nil {
 		t.Fatal(err)
 	}
 	at, err := h.m.DeliveredAt(ctxT(), f.OccurrenceID)
@@ -309,7 +308,7 @@ func TestAckGradesPersistedDeliveryReceipt(t *testing.T) {
 		t.Fatalf("persisted delivery instant %v != durable event time %v (%v)", at, deliveredClock, err)
 	}
 	h.clock.Advance(time.Minute)
-	if err := h.m.MarkAcked(ctxT(), f.OccurrenceID); err != nil {
+	if err := h.m.MarkAcked(ctxT(), f.OccurrenceID, AckGesture{Source: "test-gesture"}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -382,6 +381,92 @@ func TestTaskIntentAndReconcileNeverDuplicates(t *testing.T) {
 func jsonUnmarshalT(t *testing.T, raw []byte, v any) {
 	t.Helper()
 	if err := jsonUnmarshal(raw, v); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The projection ENFORCES the execution protocol (Phase-4-r2 codex
+// #5/#18): a second concurrent claim loses the CAS; an attestation
+// without (or not matching) the claim is forged; DONE without an
+// attested marker is forged; an attestation never overwrites.
+func TestProjectionEnforcesExecutionProtocol(t *testing.T) {
+	h := build(t)
+	if err := h.m.CreateTask(ctxT(), "task-p", "file_note", `{"note":"protocol"}`); err != nil {
+		t.Fatal(err)
+	}
+	// Forged attestation with NO claim: aborted.
+	ep, _ := h.m.params(EvTaskExecuted, executedPayload{ID: "task-p", OperationID: "op-forged",
+		ExpectedPath: "/x", MarkerLine: "[task-p] fake"})
+	if _, err := h.m.j.Append(ctxT(), ep); err == nil {
+		t.Fatal("attestation without a claim accepted")
+	}
+	// Forged DONE with no attestation: aborted.
+	dp, _ := h.m.params(EvTaskDone, donePayload{ID: "task-p"})
+	if _, err := h.m.j.Append(ctxT(), dp); err == nil {
+		t.Fatal("done without an attested execution accepted")
+	}
+	// Claim once; a SECOND claim loses the CAS.
+	i1, _ := h.m.params(EvTaskIntent, intentPayload{ID: "task-p", OperationID: "op-one"})
+	if _, err := h.m.j.Append(ctxT(), i1); err != nil {
+		t.Fatal(err)
+	}
+	i2, _ := h.m.params(EvTaskIntent, intentPayload{ID: "task-p", OperationID: "op-two"})
+	if _, err := h.m.j.Append(ctxT(), i2); err == nil {
+		t.Fatal("second concurrent claim accepted (CAS violated)")
+	}
+	// Attestation under the WRONG operation: aborted.
+	ew, _ := h.m.params(EvTaskExecuted, executedPayload{ID: "task-p", OperationID: "op-two",
+		ExpectedPath: "/x", MarkerLine: "[task-p] wrong"})
+	if _, err := h.m.j.Append(ctxT(), ew); err == nil {
+		t.Fatal("attestation under an unclaimed operation accepted")
+	}
+	// Correct attestation lands ONCE; a re-attestation aborts.
+	eok, _ := h.m.params(EvTaskExecuted, executedPayload{ID: "task-p", OperationID: "op-one",
+		ExpectedPath: "/x", MarkerLine: "[task-p] real"})
+	if _, err := h.m.j.Append(ctxT(), eok); err != nil {
+		t.Fatal(err)
+	}
+	eagain, _ := h.m.params(EvTaskExecuted, executedPayload{ID: "task-p", OperationID: "op-one",
+		ExpectedPath: "/y", MarkerLine: "[task-p] overwrite"})
+	if _, err := h.m.j.Append(ctxT(), eagain); err == nil {
+		t.Fatal("attestation overwrite accepted")
+	}
+}
+
+// Kind schema + marker safety at admission (Phase-4-r2 codex #13/#17/#19).
+func TestTaskAdmissionSealedAndSafe(t *testing.T) {
+	h := build(t)
+	if err := h.m.CreateTask(ctxT(), "t-bad", "file_note", `not-json`); err == nil {
+		t.Fatal("malformed file_note params accepted")
+	}
+	if err := h.m.CreateTask(ctxT(), "t-multi", "file_note", `{"note":"a\nb"}`); err == nil {
+		t.Fatal("multi-line note accepted")
+	}
+	for _, badID := range []string{"a] b", "a b", "a\nb", "", strings.Repeat("x", 65)} {
+		if err := h.m.CreateTask(ctxT(), badID, "file_note", `{"note":"x"}`); err == nil {
+			t.Fatalf("ambiguous task id %q accepted (marker aliasing)", badID)
+		}
+	}
+}
+
+// Delivery requires the CHANNEL's receipt; ack requires the USER gesture;
+// grading consumes the persisted producer (Phase-4-r2 codex #2).
+func TestDeliveryReceiptAndGestureRequired(t *testing.T) {
+	h := build(t)
+	if err := h.m.CreateReminder(ctxT(), "rem-1", "receipted", wall); err != nil {
+		t.Fatal(err)
+	}
+	f := fireDue(t, h)
+	if err := h.m.MarkDelivered(ctxT(), f.OccurrenceID, DeliveryReceipt{}); err == nil {
+		t.Fatal("delivery without a receipt identity accepted")
+	}
+	if err := h.m.MarkDelivered(ctxT(), f.OccurrenceID, DeliveryReceipt{Producer: "telegram", ReceiptID: "msg-42"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.m.MarkAcked(ctxT(), f.OccurrenceID, AckGesture{}); err == nil {
+		t.Fatal("ack without a gesture source accepted")
+	}
+	if err := h.m.MarkAcked(ctxT(), f.OccurrenceID, AckGesture{Source: "tool:tc-9"}); err != nil {
 		t.Fatal(err)
 	}
 }

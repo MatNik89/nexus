@@ -93,7 +93,9 @@ func Tools(m *Manager) map[contracts.ToolID]effectpath.InProcFunc {
 			if err := json.Unmarshal(c.Arguments, &args); err != nil || args.OccurrenceID == "" {
 				return contracts.ToolResult{}, fmt.Errorf("reminder_ack: an occurrence_id is required (fail closed)")
 			}
-			if err := m.MarkAcked(ctx, args.OccurrenceID); err != nil {
+			// The user gesture IS this authenticated tool call (same-UID
+			// UDS session): its call id identifies the ack source.
+			if err := m.MarkAcked(ctx, args.OccurrenceID, AckGesture{Source: "tool:" + string(c.ToolCallID)}); err != nil {
 				return contracts.ToolResult{}, err
 			}
 			return oblResult(c, "acknowledged "+args.OccurrenceID, true)

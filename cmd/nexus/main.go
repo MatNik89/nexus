@@ -120,12 +120,12 @@ func runDaemon() int {
 	defer cancel()
 	hb := daemon.NewHeartbeat(filepath.Join(layout.SystemDir(), "heartbeat"), 5*time.Second)
 	go hb.Run(ctx)
-	// Durable scheduler: startup sweep + periodic catch-up (T20); every
-	// fire moves its obligation to DELIVERY_PENDING (T21 — the delivery
-	// channel consumes it in T22).
-	go b.sched.Run(ctx, 30*time.Second, func(f schedule.Fired) {
-		b.obl.MarkDue(context.Background(), f)
-	})
+	// Durable scheduler: startup sweep + periodic catch-up (T20). The
+	// FireDecorator already moved each fired obligation to
+	// DELIVERY_PENDING inside the fire batch — no post-fire callback
+	// exists to fail (Phase-4-r2 codex #21); the T22 channel consumes
+	// DELIVERY_PENDING. Sweep failures surface via sched.Health().
+	go b.sched.Run(ctx, 30*time.Second, nil)
 	sock := socketPath(layout)
 	fmt.Printf("nexus daemon %s — profile %s, socket %s\n", version, resolved.Config.DefaultProfile, sock)
 	if err := b.d.Serve(ctx, sock); err != nil {
@@ -200,16 +200,15 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 		return nil, fmt.Errorf("schedule: %w", err)
 	}
 	sched.SetCounterFile(filepath.Join(layout.SystemDir(), "last_occurrence_fired"))
-	registry, err := obligation.NewRegistry(map[string]obligation.Handler{
-		"file_note": obligation.FileNoteHandler(profileDir),
+	registry, err := obligation.NewRegistry(map[string]obligation.Kind{
+		"file_note": {Handler: obligation.FileNoteHandler(profileDir), ValidateParams: obligation.ValidateFileNoteParams},
 	})
 	if err != nil {
 		j.Close()
 		return nil, err
 	}
-	obligation.SetNotesDir(profileDir)
 	lazyRunner := &obligation.LazyRunner{}
-	oblManager, err := obligation.NewManager(j, sched, registry, clockid.System{}, lazyRunner, authority)
+	oblManager, err := obligation.NewManager(j, sched, registry, clockid.System{}, lazyRunner, authority, profileDir)
 	if err != nil {
 		j.Close()
 		return nil, err

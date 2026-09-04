@@ -10,6 +10,9 @@ package schedule
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -411,5 +414,119 @@ func TestConcurrentSweepsFireOnce(t *testing.T) {
 	})
 	if occ != 1 {
 		t.Fatalf("%d durable occurrences (want 1)", occ)
+	}
+}
+
+// v1 UPCAST (Phase-4-r2 codex #20): a canonical schedule.created WITHOUT
+// due_utc (previous revision) rebuilds with the instant derived from its
+// wall payload — never an epoch-overdue immediate fire.
+func TestV1ScheduleEventUpcastsNotEpochFires(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "journal.db")
+	clock := clockid.NewFake(utc(2026, 9, 4, 10, 0))
+	// Permissive open (nil validator) lets us author the OLD event shape.
+	permissive := map[string]journal.PayloadValidator{EvScheduleCreated: nil}
+	j, err := journal.Open(path, "work", redact.None{}, permissive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := contracts.EnvelopeParams{
+		SchemaID: "nexus.event", SchemaVersion: 1, EventID: "ev-v1-1",
+		EventType: EvScheduleCreated, RunID: "run-schedule", EmittedAt: clock.Now(),
+		ActorType: contracts.ActorSystem, ActorID: "scheduler", PrincipalID: "nexus",
+		WorkspaceID: "local", ProfileID: "work", AttemptNo: 1,
+		Payload:     []byte(`{"id":"rem-v1","body":"old shape","wall":{"year":2026,"month":9,"day":4,"hour":14,"minute":0,"tz":"Europe/Zagreb"}}`),
+		PayloadHash: "recomputed",
+	}
+	if _, err := j.Append(ctxT(), p); err != nil {
+		t.Fatal(err)
+	}
+	j.Close()
+	s2 := reopenSched(t, path, clock)
+	// 10:00 UTC now; wall 14:00 CEST = 12:00 UTC — NOT epoch-due.
+	if fired, _ := s2.Sweep(ctxT()); len(fired) != 0 {
+		t.Fatalf("v1 event fired as epoch-overdue: %v", fired)
+	}
+	clock.Advance(2*time.Hour + time.Minute)
+	fired, err := s2.Sweep(ctxT())
+	if err != nil || len(fired) != 1 {
+		t.Fatalf("upcast v1 schedule did not fire at its wall time: %v %v", fired, err)
+	}
+}
+
+// SIGKILL fuzz through Scheduler.Sweep (Phase-4-r2 codex #14): a child
+// process is killed at a random instant mid-sweep; afterwards the chain
+// verifies and every fired occurrence has its FULL batch (run admission)
+// — never a fired occurrence without its admitted run.
+func TestSweepCrashConsistencyUnderSigkill(t *testing.T) {
+	if os.Getenv("SCHED_CRASH_CHILD") == "1" {
+		crashChildMain()
+		return
+	}
+	for i := 0; i < 4; i++ {
+		dir := t.TempDir()
+		cmd := exec.Command(os.Args[0], "-test.run", "TestSweepCrashConsistencyUnderSigkill")
+		cmd.Env = append(os.Environ(), "SCHED_CRASH_CHILD=1", "SCHED_CRASH_DIR="+dir)
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(time.Duration(20+i*15) * time.Millisecond)
+		cmd.Process.Kill()
+		cmd.Wait()
+		// Verify the survivor journal: chain intact, recipe atomic.
+		events := Events()
+		for _, n := range machine.EventTypes() {
+			events[n] = nil
+		}
+		j, err := journal.Open(filepath.Join(dir, "journal.db"), "work", redact.None{}, events, NewProjection())
+		if err != nil {
+			t.Fatalf("iteration %d: reopen after SIGKILL: %v", i, err)
+		}
+		occ := map[string]bool{}
+		admitted := map[string]bool{}
+		if err := j.Replay(0, func(ev journal.Event) error {
+			if ev.Envelope.EventType == EvOccurrenceFired {
+				occ[string(ev.Envelope.RunID)] = true
+			}
+			if ev.Envelope.EventType == machine.EvRunAdmitted {
+				admitted[string(ev.Envelope.RunID)] = true
+			}
+			return nil
+		}); err != nil {
+			j.Close()
+			t.Fatalf("iteration %d: replay: %v", i, err)
+		}
+		for run := range occ {
+			if !admitted[run] {
+				j.Close()
+				t.Fatalf("iteration %d: fired occurrence %s without its admitted run (recipe broken)", i, run)
+			}
+		}
+		j.Close()
+	}
+}
+
+// crashChildMain runs sweeps in a tight loop until the parent kills it.
+func crashChildMain() {
+	dir := os.Getenv("SCHED_CRASH_DIR")
+	events := Events()
+	for _, n := range machine.EventTypes() {
+		events[n] = nil
+	}
+	j, err := journal.Open(filepath.Join(dir, "journal.db"), "work", redact.None{}, events, NewProjection())
+	if err != nil {
+		os.Exit(1)
+	}
+	clock := clockid.NewFake(utc(2026, 9, 4, 10, 0))
+	s, err := New(j, clock)
+	if err != nil {
+		os.Exit(1)
+	}
+	for i := 0; ; i++ {
+		id := fmt.Sprintf("rem-crash-%d", i)
+		s.CreateReminder(context.Background(), id, "crash fuzz", WallTime{
+			Year: 2026, Month: 9, Day: 4, Hour: 11, Minute: 0, TZ: "Europe/Zagreb"})
+		clock.Advance(2 * time.Hour)
+		s.Sweep(context.Background())
 	}
 }

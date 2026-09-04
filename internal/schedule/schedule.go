@@ -24,6 +24,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/MatNik89/nexus/internal/foundation/atomicwrite"
@@ -207,6 +208,17 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 		if err != nil {
 			return err
 		}
+		if p.DueUTC == 0 {
+			// v1 UPCAST (Phase-4-r2 codex #20): an old canonical event
+			// carries only the wall intent — derive the instant
+			// deterministically from the payload instead of firing at
+			// epoch. (Current tzdata; recorded as the upcast rule.)
+			due, derr := p.Wall.dueUTC()
+			if derr != nil {
+				return fmt.Errorf("schedule: v1 upcast: %w", derr)
+			}
+			p.DueUTC = due.UnixNano()
+		}
 		if _, err := tx.Exec(`INSERT INTO sched_schedules(id, body, wall, due_utc, fired, created) VALUES(?,?,?,?,0,?)`,
 			p.ID, p.Body, string(wall), p.DueUTC, int64(ev.JournalOffset)); err != nil {
 			return fmt.Errorf("schedule: create: %w", err) // dup id = PK violation → append aborted
@@ -249,6 +261,7 @@ type Scheduler struct {
 	counterFile   string
 	sweepInterval time.Duration
 	decorator     FireDecorator
+	lastErr       atomic.Value
 	mu            sync.Mutex
 	seq           uint64
 }
@@ -404,20 +417,26 @@ func (s *Scheduler) Sweep(ctx context.Context) ([]Fired, error) {
 		}
 		fired = append(fired, f)
 	}
-	s.mirrorCounter(ctx)
+	if merr := s.mirrorCounter(ctx); merr != nil {
+		// The fires are durable; the OBSERVABILITY mirror is not — surface
+		// it (the caller records it in health; the next sweep retries).
+		return fired, fmt.Errorf("schedule: counter mirror: %w", merr)
+	}
 	return fired, nil
 }
 
 // mirrorCounter reconciles the C8 observability file from the
 // AUTHORITATIVE projection on every sweep (codex #11: a crash between
 // batch and mirror must self-heal on the next tick).
-func (s *Scheduler) mirrorCounter(ctx context.Context) {
+func (s *Scheduler) mirrorCounter(ctx context.Context) error {
 	if s.counterFile == "" {
-		return
+		return nil
 	}
-	if n, err := s.LastOccurrenceFired(ctx); err == nil {
-		atomicwrite.Write(s.counterFile, []byte(fmt.Sprintf("%d\n", n)), 0o600)
+	n, err := s.LastOccurrenceFired(ctx)
+	if err != nil {
+		return err
 	}
+	return atomicwrite.Write(s.counterFile, []byte(fmt.Sprintf("%d\n", n)), 0o600)
 }
 
 // LastOccurrenceFired reports the C8 positive-liveness counter.
@@ -440,15 +459,14 @@ func (s *Scheduler) LastOccurrenceFired(ctx context.Context) (uint64, error) {
 }
 
 // Run drives the periodic sweep until ctx ends (startup sweep included).
+// The SAME interval value ticks the loop and classifies OVERDUE (Phase-4-
+// r2 codex #10: one owned number, never two). Sweep failures are retained
+// for health observation, never silently dropped (codex #11/#21).
 func (s *Scheduler) Run(ctx context.Context, interval time.Duration, onFire func(Fired)) {
-	if interval <= 0 {
-		interval = 30 * time.Second
-	}
+	s.SetSweepInterval(interval)
 	sweep := func() {
 		fired, err := s.Sweep(ctx)
-		if err != nil {
-			return // next tick retries; journal state is authoritative
-		}
+		s.lastErr.Store(errBox{err})
 		for _, f := range fired {
 			if onFire != nil {
 				onFire(f)
@@ -456,7 +474,7 @@ func (s *Scheduler) Run(ctx context.Context, interval time.Duration, onFire func
 		}
 	}
 	sweep()
-	t := time.NewTicker(interval)
+	t := time.NewTicker(s.sweepInterval)
 	defer t.Stop()
 	for {
 		select {
@@ -466,4 +484,14 @@ func (s *Scheduler) Run(ctx context.Context, interval time.Duration, onFire func
 			sweep()
 		}
 	}
+}
+
+type errBox struct{ err error }
+
+// Health reports the most recent sweep error (nil = healthy).
+func (s *Scheduler) Health() error {
+	if v, ok := s.lastErr.Load().(errBox); ok {
+		return v.err
+	}
+	return nil
 }

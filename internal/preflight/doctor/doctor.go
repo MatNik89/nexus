@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/MatNik89/nexus/internal/preflight/probe"
@@ -120,11 +121,25 @@ func Run(e Env) []Check {
 	// before the first fire (that is not a failure).
 	counterPath := filepath.Join(e.DataDir, "system", "last_occurrence_fired")
 	if b, err := os.ReadFile(counterPath); err == nil {
-		checks = append(checks, Check{Name: "scheduler-fires", Capability: "obligations",
-			Status: StatusOK, Detail: "last_occurrence_fired=" + strings.TrimSpace(string(b))})
-	} else {
+		// STRICT parse (Phase-4-r2 codex #11): the mirror must be a bare
+		// counter — anything else is corruption, not health.
+		v := strings.TrimSpace(string(b))
+		if _, perr := strconv.ParseUint(v, 10, 64); perr == nil {
+			checks = append(checks, Check{Name: "scheduler-fires", Capability: "obligations",
+				Status: StatusOK, Detail: "last_occurrence_fired=" + v})
+		} else {
+			checks = append(checks, Check{Name: "scheduler-fires", Capability: "obligations",
+				Status: StatusOff, Detail: "counter mirror is malformed",
+				Fix: "remove " + counterPath + "; the next sweep rewrites it from the journal projection"})
+		}
+	} else if os.IsNotExist(err) {
 		checks = append(checks, Check{Name: "scheduler-fires", Capability: "obligations",
 			Status: StatusOK, Detail: "no occurrences fired yet (counter file absent)"})
+	} else {
+		// EACCES/I/O is NOT "nothing fired" — it is broken observability.
+		checks = append(checks, Check{Name: "scheduler-fires", Capability: "obligations",
+			Status: StatusOff, Detail: "counter mirror unreadable: " + err.Error(),
+			Fix: "fix permissions on " + counterPath})
 	}
 
 	// 5. Telegram token → telegram capability.

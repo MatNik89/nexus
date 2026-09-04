@@ -231,10 +231,21 @@ func TestReminderSpineAcrossRestart(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 		}
 		if sweep {
-			// The startup catch-up sweep, exactly as runDaemon runs it —
-			// the decorated batch fires the overdue occurrence.
-			if _, err := b.sched.Sweep(context.Background()); err != nil {
-				t.Fatalf("startup sweep: %v", err)
+			// The PRODUCTION scheduler goroutine (startup sweep + tick),
+			// exactly as runDaemon runs it — the decorated batch fires
+			// the overdue occurrence.
+			sctx, scancel := context.WithCancel(context.Background())
+			go b.sched.Run(sctx, 50*time.Millisecond, nil)
+			deadline := time.Now().Add(3 * time.Second)
+			for time.Now().Before(deadline) {
+				if st, err := b.obl.Status(context.Background(), "rem-spine"); err == nil && st == obligation.StateDeliveryPending {
+					break
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+			scancel()
+			if herr := b.sched.Health(); herr != nil {
+				t.Fatalf("scheduler health after production run: %v", herr)
 			}
 		}
 		var out strings.Builder
@@ -265,7 +276,7 @@ func TestReminderSpineAcrossRestart(t *testing.T) {
 		b2.j.Close()
 		t.Fatalf("fired obligation not DELIVERY_PENDING after restart: %v %v", st, err)
 	}
-	if err := b2.obl.MarkDelivered(context.Background(), "occ-rem-spine#1"); err != nil {
+	if err := b2.obl.MarkDelivered(context.Background(), "occ-rem-spine#1", obligation.DeliveryReceipt{Producer: "test-channel", ReceiptID: "rcpt-spine"}); err != nil {
 		b2.j.Close()
 		t.Fatal(err)
 	}
