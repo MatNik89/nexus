@@ -649,8 +649,12 @@ type Manager struct {
 	auth     *s7min.Authority
 	notesDir string // IMMUTABLE profile-bound reconcile root (B3 — no globals)
 	gate     *DoneGate
-	inflight sync.Map
-	seq      atomic.Uint64
+	// testPostArmFail injects a deterministic append failure AFTER the
+	// gate is armed (test-only; production never sets it) — the disarm
+	// path's causal detector.
+	testPostArmFail func() error
+	inflight        sync.Map
+	seq             atomic.Uint64
 }
 
 func NewManager(j *journal.Journal, s *schedule.Scheduler, r *Registry, c clockid.Clock,
@@ -1035,6 +1039,12 @@ func (m *Manager) MarkTaskDone(ctx context.Context, id string) error {
 	nonce, err := m.gate.arm(id, markerLine)
 	if err != nil {
 		return err
+	}
+	if m.testPostArmFail != nil {
+		if ferr := m.testPostArmFail(); ferr != nil {
+			m.gate.disarm(nonce)
+			return ferr
+		}
 	}
 	p, err := m.params(EvTaskDone, donePayload{ID: id, MarkerLine: markerLine, Verifier: "postcondition-verifier", Nonce: nonce})
 	if err != nil {

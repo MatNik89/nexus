@@ -608,14 +608,22 @@ func TestReplayedDoneDisclosesNoCapability(t *testing.T) {
 	if err := h.m.MarkTaskDone(ctxT(), "task-a"); err != nil {
 		t.Fatal(err)
 	}
-	// Adversary replays the WHOLE canonical stream hunting a bearer.
+	// Adversary replays the WHOLE canonical stream and HARVESTS the used
+	// nonce (it IS serialized — the claim is that it is inert, not
+	// hidden; Phase-4-r7 codex #4).
+	harvested := ""
 	if err := h.m.j.Replay(0, func(ev journal.Event) error {
-		if strings.Contains(string(ev.Envelope.Payload), "cap") {
-			t.Fatalf("canonical bytes carry a capability field: %s", ev.Envelope.Payload)
+		if ev.Envelope.EventType == EvTaskDone {
+			var p donePayload
+			jsonUnmarshal(ev.Envelope.Payload, &p)
+			harvested = p.Nonce
 		}
 		return nil
 	}); err != nil {
 		t.Fatal(err)
+	}
+	if harvested == "" {
+		t.Fatal("oracle vacuous: no persisted nonce harvested")
 	}
 	// Forge task B's full chain with everything replay COULD offer.
 	if err := h.m.CreateTask(ctxT(), "task-b", "file_note", `{"note":"victim"}`); err != nil {
@@ -630,10 +638,11 @@ func TestReplayedDoneDisclosesNoCapability(t *testing.T) {
 	if _, err := h.m.j.Append(ctxT(), e); err != nil {
 		t.Fatal(err)
 	}
+	// The HARVESTED nonce is inert for task B — and for a re-done of A.
 	d, _ := h.m.params(EvTaskDone, donePayload{ID: "task-b",
-		MarkerLine: "[task-b] victim", Verifier: "postcondition-verifier"})
+		MarkerLine: "[task-b] victim", Verifier: "postcondition-verifier", Nonce: harvested})
 	if _, err := h.m.j.Append(ctxT(), d); err == nil {
-		t.Fatal("post-replay forged DONE accepted (bearer leaked or gate not single-use)")
+		t.Fatal("post-replay forged DONE accepted (harvested nonce reusable)")
 	}
 	if st, _ := h.m.Status(ctxT(), "task-b"); st == StateDone {
 		t.Fatal("victim task closed without verification")
