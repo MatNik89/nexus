@@ -162,14 +162,16 @@ func TestBackendShebangRejected(t *testing.T) {
 	if err := os.WriteFile(script, []byte("#!/bin/sh\necho pwned\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// The closure pin resolves the target at COMPILE time now — a
-	// shebang/script is refused before any policy exists (and Launch
-	// would refuse it again).
-	pol, err := b.Compile(ctxT(), Spec{Target: script, WorkDir: wdir(t)}, rep)
+	// The closure pin resolves the target at COMPILE time — a
+	// shebang/script is refused BEFORE any policy exists (Phase-6-r4
+	// codex #1: accepting a launch-time refusal instead made this
+	// detector false-green under a compile-guard ablation).
+	_, err := b.Compile(ctxT(), Spec{Target: script, WorkDir: wdir(t)}, rep)
 	if err == nil {
-		if _, lerr := b.Launch(ctxT(), pol); lerr == nil {
-			t.Fatal("shebang script launched (must be rejected BEFORE any sandbox)")
-		}
+		t.Fatal("shebang script compiled into a policy (must be rejected at Compile)")
+	}
+	if !strings.Contains(err.Error(), "not a native ELF") && !strings.Contains(err.Error(), "closure") {
+		t.Fatalf("refused for an unexpected reason: %v", err)
 	}
 }
 
