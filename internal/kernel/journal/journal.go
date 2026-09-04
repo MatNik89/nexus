@@ -537,11 +537,16 @@ func (j *Journal) appendBatch(batch []contracts.EnvelopeParams, firstOffset uint
 		}
 		evs = append(evs, ev)
 		offset, hash = ev.JournalOffset+1, ev.IntegrityHash
-		// Crash-consistency seam (test builds only): SIGKILL between
-		// recipe members — the transaction must leave NOTHING durable.
-		if len(evs) == 1 && len(prepared) > 1 && testing.Testing() &&
-			os.Getenv("NEXUS_TEST_KILL_MID_BATCH") == "1" {
-			syscall.Kill(os.Getpid(), syscall.SIGKILL)
+		// Crash-consistency seam (test builds only): SIGKILL after the
+		// first insert, before commit — the transaction must leave
+		// NOTHING durable. "1" fires only inside multi-member batches
+		// (between recipe members); "single" also fires inside
+		// single-event transactions (the channel recipes).
+		if len(evs) == 1 && testing.Testing() {
+			mode := os.Getenv("NEXUS_TEST_KILL_MID_BATCH")
+			if (mode == "1" && len(prepared) > 1) || mode == "single" {
+				syscall.Kill(os.Getpid(), syscall.SIGKILL)
+			}
 		}
 	}
 	if testFailCommit != nil {

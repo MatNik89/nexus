@@ -118,11 +118,18 @@ func NewApprovals(now func() time.Time, ttl time.Duration) *Approvals {
 	return &Approvals{now: now, ttl: ttl, grants: map[string]time.Time{}}
 }
 
-func effectHash(c contracts.ToolCall) string {
+// EffectHash is THE canonical exact-intent digest (C4): one definition
+// for in-memory approvals AND the durable HITL store (Phase-5 kilo #4 —
+// two hashes would silently self-invalidate approvals across the seam).
+func EffectHash(c contracts.ToolCall) string {
 	h := sha256.New()
+	idem := ""
+	if c.IdempotencyKey != nil {
+		idem = *c.IdempotencyKey
+	}
 	for _, part := range [][]byte{
 		[]byte(c.ToolID), c.Arguments, []byte(c.ArgsSchemaHash),
-		{byte(c.Effect)}, {byte(c.ExecutionKind)}, []byte(c.ProfileID),
+		{byte(c.Effect)}, {byte(c.ExecutionKind)}, []byte(idem), []byte(c.ProfileID),
 	} {
 		// Length-prefix every part: no concatenation ambiguity.
 		fmt.Fprintf(h, "%d:", len(part))
@@ -130,6 +137,8 @@ func effectHash(c contracts.ToolCall) string {
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }
+
+func effectHash(c contracts.ToolCall) string { return EffectHash(c) }
 
 // Approve registers the user's approval of THIS exact call.
 func (a *Approvals) Approve(c contracts.ToolCall) {
@@ -151,14 +160,25 @@ func (a *Approvals) consumeExact(c contracts.ToolCall) bool {
 	return a.now().Before(exp)
 }
 
+// DurableApprovals is the T24 seam: a journal-backed exact-intent
+// approval consumed once (the HITL store implements it).
+type DurableApprovals interface {
+	ConsumeApproval(ctx context.Context, c contracts.ToolCall) error
+}
+
 // PEP is the S6.0 policy enforcement point: a closed per-tool rule table,
 // default-DENY for everything it does not know.
 type PEP struct {
 	rules     map[contracts.ToolID]Decision
 	approvals *Approvals
+	durable   DurableApprovals
 	audit     AuditSink
 	mode      PolicyMode
 }
+
+// SetDurableApprovals wires the T24 store: the ASK branch consults it
+// AFTER the in-memory exact-intent store (both are single-use).
+func (p *PEP) SetDurableApprovals(d DurableApprovals) { p.durable = d }
 
 func NewPEP(rules map[contracts.ToolID]Decision, approvals *Approvals, audit AuditSink, mode PolicyMode) (*PEP, error) {
 	if approvals == nil || audit == nil {
@@ -353,7 +373,14 @@ func (p *EffectPath) RunTool(ctx context.Context, call contracts.ToolCall, grant
 					fmt.Errorf("effectpath: yolo audit not durable — confirmation bypass refused (fail closed): %w", aerr))
 			}
 		} else if !p.pep.approvals.consumeExact(call) {
-			return contracts.ToolResult{}, fmt.Errorf("effectpath: tool %q: %w", call.ToolID, ErrNeedsApproval)
+			// Durable (T24) approvals: an ApprovalReceived committed for
+			// EXACTLY this effect admits it once.
+			if p.pep.durable == nil {
+				return contracts.ToolResult{}, fmt.Errorf("effectpath: tool %q: %w", call.ToolID, ErrNeedsApproval)
+			}
+			if derr := p.pep.durable.ConsumeApproval(ctx, call); derr != nil {
+				return contracts.ToolResult{}, fmt.Errorf("effectpath: tool %q: %w (durable: %v)", call.ToolID, ErrNeedsApproval, derr)
+			}
 		}
 	case DecisionDeny:
 		return contracts.ToolResult{}, fmt.Errorf("effectpath: tool %q: %w", call.ToolID, ErrDenied)

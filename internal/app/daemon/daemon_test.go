@@ -11,6 +11,7 @@ package daemon
 import (
 	"bufio"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -380,5 +381,135 @@ func TestFullSpineDeterministicTransport(t *testing.T) {
 	st, _, err := machine.TurnTable().Fold(contracts.TurnInvalid, turnEvents, nil)
 	if err != nil || st != contracts.TurnSucceeded {
 		t.Fatalf("full-spine turn folds to %v (%v)", st, err)
+	}
+}
+
+// blockCapturingPlanner records the context blocks it is planned with.
+type blockCapturingPlanner struct {
+	mu     sync.Mutex
+	blocks [][]contracts.ContextBlock
+}
+
+func (p *blockCapturingPlanner) Plan(ctx context.Context, blocks []contracts.ContextBlock) (loop.Action, error) {
+	p.mu.Lock()
+	cp := append([]contracts.ContextBlock{}, blocks...)
+	p.blocks = append(p.blocks, cp)
+	p.mu.Unlock()
+	final := "ok"
+	return loop.Action{Final: &final}, nil
+}
+
+// HONEST channel provenance detector (Phase-5-r2 codex #9: the round-1
+// fix had no red-capable test): a channel turn's user block must name the
+// REAL source — restoring REPL provenance turns this RED.
+func TestChannelTurnCarriesChannelProvenance(t *testing.T) {
+	p := &blockCapturingPlanner{}
+	d, _, _ := testDaemon(t, p, nil)
+	if _, err := d.RunChannelTurn(context.Background(), "chat-42", 7, "hello"); err != nil {
+		t.Fatal(err)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.blocks) == 0 || len(p.blocks[0]) == 0 {
+		t.Fatal("planner saw no blocks")
+	}
+	b := p.blocks[0][0]
+	if b.SourceURI != "nexus://telegram/chat-42" || b.Producer != "telegram" {
+		t.Fatalf("channel input masquerades as %q/%q (want nexus://telegram/chat-42 / telegram)", b.SourceURI, b.Producer)
+	}
+}
+
+// DETERMINISTIC channel turn ids (Phase-5-r2 codex #1): the SAME
+// redelivered update re-enters the SAME turn — the journal's unique event
+// ids refuse a second run instead of duplicating effects under fresh
+// identities; a DIFFERENT update still runs.
+func TestRedeliveredUpdateCannotRerunCompletedTurn(t *testing.T) {
+	p := &blockCapturingPlanner{}
+	d, _, _ := testDaemon(t, p, nil)
+	if _, err := d.RunChannelTurn(context.Background(), "chat-42", 7, "hello"); err != nil {
+		t.Fatal(err)
+	}
+	// Redelivery of update 7: the completed turn must NOT run again —
+	// and the DURABLE original final is recovered instead of an error
+	// (Phase-5-r3 codex #3: a crash between turn completion and channel
+	// delivery must not turn a success into a false failure).
+	recovered, err := d.RunChannelTurn(context.Background(), "chat-42", 7, "hello")
+	if err != nil {
+		t.Fatalf("redelivery of a completed turn errored instead of recovering the final: %v", err)
+	}
+	if recovered != "ok" {
+		t.Fatalf("recovered final %q, want the original %q", recovered, "ok")
+	}
+	p.mu.Lock()
+	runs := len(p.blocks)
+	p.mu.Unlock()
+	if runs != 1 {
+		t.Fatalf("completed turn planned twice: %d", runs)
+	}
+	// A different update id is a fresh turn.
+	if _, err := d.RunChannelTurn(context.Background(), "chat-42", 8, "next"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Completed-turn recovery FAILS CLOSED on a corrupt journal (Phase-5-r4
+// codex #3): a final observed during a replay whose integrity chain later
+// breaks is never served as a recovered outcome.
+func TestRecoveryFailsClosedOnCorruptJournal(t *testing.T) {
+	p := &blockCapturingPlanner{}
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "journal.db")
+	ev := map[string]journal.PayloadValidator{}
+	for _, n := range machine.EventTypes() {
+		ev[n] = nil
+	}
+	j, err := journal.Open(dbPath, "work", redact.None{}, ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { j.Close() })
+	d, err := New(Deps{
+		Journal:        j,
+		PlannerFactory: func(deliver func(string) error) (loop.Planner, error) { return p, nil },
+		Authority:      s7min.NewAuthority(nil, time.Minute),
+		Profile:        "work",
+		Rules:          map[contracts.ToolID]effectpath.Decision{},
+		Tools:          map[contracts.ToolID]effectpath.InProcFunc{},
+		Audit:          &capturingAudit{}, Redactor: redact.None{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.RunChannelTurn(context.Background(), "chat-42", 7, "hello"); err != nil {
+		t.Fatal(err)
+	}
+	// Append one more event AFTER the completed turn, then corrupt it —
+	// the chain now breaks after the final was observed.
+	if _, err := j.Append(context.Background(), contracts.EnvelopeParams{
+		SchemaID: "nexus.event", SchemaVersion: 1,
+		EventID: "ev-tail-1", EventType: machine.EvRunCreated, RunID: "run-tail",
+		EmittedAt: time.Now().UTC(), ActorType: contracts.ActorSystem, ActorID: "test",
+		PrincipalID: "nexus", WorkspaceID: "local", ProfileID: "work", AttemptNo: 1,
+		Payload: []byte(`{"x":1}`), PayloadHash: "recomputed",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`UPDATE events SET integrity_hash='deadbeef' WHERE event_id='ev-tail-1'`); err != nil {
+		t.Fatal(err)
+	}
+	// Redelivery: recovery must refuse — AND the decisive integrity
+	// failure must surface, not the duplicate-event symptom (Phase-5-r5
+	// codex #1).
+	_, rerr := d.RunChannelTurn(context.Background(), "chat-42", 7, "hello")
+	if rerr == nil {
+		t.Fatal("recovered a final from a journal that fails integrity verification")
+	}
+	if !strings.Contains(rerr.Error(), "chain broken") {
+		t.Fatalf("replay integrity error was not propagated: %v", rerr)
 	}
 }

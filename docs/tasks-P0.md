@@ -264,7 +264,7 @@ RED: ACK for occurrence N does not close N+1; MarkDone without evidence → reje
 
 ## Phase 5 — Telegram (channel:builtin)
 
-**[ ] T22 — Durable channel ingress/egress (transport-neutral B2 core).**
+**[x] T22 — Durable channel ingress/egress (transport-neutral B2 core).**
 Durable inbox keyed `(adapter_id, channel_identity, update_id)`
 `RECEIVED→ADMITTED→TERMINAL` — normalized message persisted BEFORE offset advance, replay
 returns existing outcome; transactional outbox + stable delivery ID; at-least-once remote
@@ -281,7 +281,7 @@ neither (no inbound row without its journal event; no terminal result without it
 row, and vice versa); visibility — committed recipe rows readable in the next
 same-process read.
 
-**[ ] T23 — Telegram built-in adapter.**
+**[x] T23 — Telegram built-in adapter.**
 Long-poll on T22 core; per-chat profile binding deny-default (unbound chat → typed "which
 profile?" refusal); non-text → typed fail-closed reply (C2); registers as `channel:builtin`
 (P1.6 as amended — NO extensions closure); registers live channel probe into T11 snapshot.
@@ -290,7 +290,7 @@ Acceptance: phone→NEXUS→phone round trip on the real bot.
 RED: unbound chat refused; BlockImage/BlockAudio → typed reply, loop alive; replayed
 update_id returns existing outcome (no double effect).
 
-**[ ] T24 — Remote HITL (durable) + cross-profile integration REDs.**
+**[x] T24 — Remote HITL (durable) + cross-profile integration REDs.**
 `ApprovalChallenge` exact-intent (canonical tool+args+target+ProfileID; `(device,inode)`
 for destructive FS — C4), expiring, single-use; `DecisionAsk` → commit `TurnSuspended`,
 loop exits; approval appends `ApprovalReceived`, resume rehydrates from journal.

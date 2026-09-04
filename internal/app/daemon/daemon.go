@@ -45,6 +45,12 @@ type Deps struct {
 	// surface (observations, UDS error frames) — same instance the
 	// journal uses.
 	Redactor redact.Redactor
+	// SuspenderFor + DurableApprovals wire the T24 HITL owner into
+	// CHANNEL turns (remote HITL): the factory binds each challenge to
+	// its originating channel identity as the ONLY legal decision source;
+	// interactive sessions keep surfacing NEEDS_APPROVAL directly.
+	SuspenderFor     func(channelIdentity string) loop.Suspender
+	DurableApprovals effectpath.DurableApprovals
 }
 
 // Daemon serves chat sessions over a UDS.
@@ -201,12 +207,128 @@ func (d *Daemon) handle(ctx context.Context, conn net.Conn) {
 	}
 }
 
+// RunChannelTurn executes ONE conversation turn for CHANNEL input —
+// ALWAYS ModeDefault (a channel message can never enable yolo, HARDQ
+// F2); an unapproved ASK suspends durably through the T24 owner and the
+// challenge summary is the reply; the turn is journaled like any
+// session turn. Provenance names the REAL source (Phase-5 codex #14).
+func (d *Daemon) RunChannelTurn(ctx context.Context, identity string, updateID int64, text string) (string, error) {
+	l, err := d.channelLoop(identity)
+	if err != nil {
+		return "", err
+	}
+	// DETERMINISTIC per-message ids (Phase-5-r2 codex #1): a redelivered
+	// update re-enters the SAME turn — the journal's unique event ids then
+	// refuse a second execution of an already-run turn instead of
+	// duplicating its effects under fresh identities.
+	turn := contracts.TurnID(fmt.Sprintf("turn-chan-%s-%d", identity, updateID))
+	run := contracts.RunID(fmt.Sprintf("run-chan-%s-%d", identity, updateID))
+	block, err := sourcedBlock(fmt.Sprintf("chan-%s-%d", identity, updateID), text,
+		"nexus://telegram/"+identity, "telegram")
+	if err != nil {
+		return "", err
+	}
+	final, err := l.RunTurn(ctx, turn, run, d.deps.Profile, []contracts.ContextBlock{block})
+	if err != nil {
+		// Crash between turn completion and channel delivery (Phase-5-r3
+		// codex #3): the redelivered update re-enters the same turn and
+		// collides on its event ids — recover the DURABLE final from the
+		// journal instead of reporting a false failure.
+		recovered, ok, rerr := d.completedTurnFinal(turn)
+		if rerr != nil {
+			// The DECISIVE failure is the broken canonical stream — never
+			// mask it behind the duplicate-event symptom (Phase-5-r5
+			// codex #1).
+			return "", fmt.Errorf("daemon: completed-turn recovery refused: %w", rerr)
+		}
+		if ok {
+			return recovered, nil
+		}
+		return "", err
+	}
+	return final, nil
+}
+
+// completedTurnFinal recovers the redacted final of an already-succeeded
+// turn from its journaled turn.succeeded payload.
+// topknot ceiling: full-journal replay per recovery lookup — a turn-state
+// projection is the upgrade when replay latency is measurable (P1).
+func (d *Daemon) completedTurnFinal(turn contracts.TurnID) (string, bool, error) {
+	final, found := "", false
+	err := d.deps.Journal.Replay(0, func(ev journal.Event) error {
+		if ev.Envelope.EventType == "turn.succeeded" && ev.Envelope.TurnID != nil && *ev.Envelope.TurnID == turn {
+			var p struct {
+				Final string `json:"final"`
+			}
+			if json.Unmarshal(ev.Envelope.Payload, &p) == nil && p.Final != "" {
+				final, found = p.Final, true
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		// FAIL CLOSED (Phase-5-r4 codex #3): a final observed during a
+		// replay that later fails integrity verification is not evidence —
+		// and the integrity error itself is the diagnosis, propagated,
+		// never swallowed (Phase-5-r5 codex #1).
+		return "", false, err
+	}
+	return final, found, nil
+}
+
+// ResumeChannelTurn rehydrates a SUSPENDED channel turn after its
+// approval (B6, Phase-5-r2 codex #2): the loop re-enters the ORIGINAL
+// turn with the approved tool's observation and continues to a real final.
+func (d *Daemon) ResumeChannelTurn(ctx context.Context, identity string, turn contracts.TurnID,
+	run contracts.RunID, tag string, blocks []contracts.ContextBlock) (string, error) {
+	l, err := d.channelLoop(identity)
+	if err != nil {
+		return "", err
+	}
+	return l.ResumeTurn(ctx, turn, run, d.deps.Profile, tag, blocks)
+}
+
+// channelLoop builds the per-turn channel loop (ModeDefault ALWAYS — F2).
+func (d *Daemon) channelLoop(identity string) (*loop.Loop, error) {
+	pep, err := effectpath.NewPEP(d.deps.Rules, effectpath.NewApprovals(nil, 5*time.Minute), d.deps.Audit, effectpath.ModeDefault)
+	if err != nil {
+		return nil, err
+	}
+	if d.deps.DurableApprovals != nil {
+		pep.SetDurableApprovals(d.deps.DurableApprovals)
+	}
+	path, err := effectpath.NewEffectPath(pep, orderOnlyMW{},
+		effectpath.NewInProcessExecutor(d.deps.Tools),
+		effectpath.NewSandboxedProcessExecutor(noSandbox{}), d.deps.Authority)
+	if err != nil {
+		return nil, err
+	}
+	planner, err := d.deps.PlannerFactory(func(string) error { return nil })
+	if err != nil {
+		return nil, err
+	}
+	l, err := loop.New(planner, path, d.deps.Authority, d.deps.Journal, d.deps.Redactor, loop.PolicyInteractive, 16, 3)
+	if err != nil {
+		return nil, err
+	}
+	if d.deps.SuspenderFor != nil {
+		l.SetSuspender(d.deps.SuspenderFor(identity))
+	}
+	return l, nil
+}
+
 // userBlock wraps terminal input as a USER-trust context block.
 func userBlock(id, text string) (contracts.ContextBlock, error) {
+	return sourcedBlock(id, text, "nexus://repl", "repl")
+}
+
+// sourcedBlock carries HONEST provenance (Phase-5 codex #14: channel
+// input must never masquerade as terminal input).
+func sourcedBlock(id, text, sourceURI, producer string) (contracts.ContextBlock, error) {
 	sum := sha256Hex(text)
 	return contracts.NewContextBlock(contracts.ContextBlockParams{
 		BlockID: contracts.BlockID(id), Kind: "user_message", Content: &text,
-		ContentHash: sum, SourceURI: "nexus://repl", Producer: "repl",
+		ContentHash: sum, SourceURI: sourceURI, Producer: producer,
 		Trust: contracts.TrustUser, Sensitivity: contracts.Sensitivity(1),
 		Lineage: []string{}, ObservedAt: time.Now().UTC(),
 	})

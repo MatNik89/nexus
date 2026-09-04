@@ -52,16 +52,29 @@ const (
 )
 
 // Loop drives one turn at a time. All collaborators are required.
+// Suspender commits the durable HITL suspension (T24, B6) and returns
+// the challenge summary the user sees.
+type Suspender func(ctx context.Context, turn contracts.TurnID, run contracts.RunID, call contracts.ToolCall, blocks []contracts.ContextBlock) (string, error)
+
 type Loop struct {
-	planner  Planner
-	path     *effectpath.EffectPath
-	grants   *s7min.Authority
-	journal  *journal.Journal
-	redactor redact.Redactor
-	policy   Policy
-	maxIters int
-	breakerN int
+	planner   Planner
+	path      *effectpath.EffectPath
+	grants    *s7min.Authority
+	journal   *journal.Journal
+	redactor  redact.Redactor
+	policy    Policy
+	maxIters  int
+	breakerN  int
+	suspender Suspender
+	// resumeTag namespaces event ids per resume cycle (Phase-5-r3 codex
+	// #2): empty for the first incarnation.
+	resumeTag string
 }
+
+// SetSuspender wires the durable HITL owner: with it, an unapproved ASK
+// SUSPENDS the turn (TurnSuspended committed by the owner, loop exits,
+// the user gets the challenge) instead of failing it.
+func (l *Loop) SetSuspender(s Suspender) { l.suspender = s }
 
 func New(p Planner, path *effectpath.EffectPath, grants *s7min.Authority, j *journal.Journal,
 	r redact.Redactor, policy Policy, maxIters, breakerN int) (*Loop, error) {
@@ -83,14 +96,28 @@ func New(p Planner, path *effectpath.EffectPath, grants *s7min.Authority, j *jou
 // an undifferentiated attempt stream folds illegally past the first call).
 func (l *Loop) append(ctx context.Context, run contracts.RunID, profile contracts.ProfileID,
 	turn contracts.TurnID, eventType string, seq int, toolCall *contracts.ToolCallID) error {
+	return l.appendPayload(ctx, run, profile, turn, eventType, seq, toolCall,
+		json.RawMessage(fmt.Sprintf(`{"turn_id":%q}`, turn)))
+}
+
+// appendPayload journals one lifecycle event with an explicit payload.
+// Resume incarnations carry l.resumeTag in the event id so a turn that
+// suspends and resumes MORE than once can never collide with an earlier
+// cycle's ids (Phase-5-r3 codex #2).
+func (l *Loop) appendPayload(ctx context.Context, run contracts.RunID, profile contracts.ProfileID,
+	turn contracts.TurnID, eventType string, seq int, toolCall *contracts.ToolCallID, payload json.RawMessage) error {
+	id := fmt.Sprintf("ev-%s-%s-%d", turn, eventType, seq)
+	if l.resumeTag != "" {
+		id = fmt.Sprintf("ev-%s-r%s-%s-%d", turn, l.resumeTag, eventType, seq)
+	}
 	_, err := l.journal.Append(ctx, contracts.EnvelopeParams{
 		SchemaID: "nexus.event", SchemaVersion: 1,
-		EventID:   contracts.EventID(fmt.Sprintf("ev-%s-%s-%d", turn, eventType, seq)),
+		EventID:   contracts.EventID(id),
 		EventType: eventType, RunID: run, TurnID: &turn, ToolCallID: toolCall,
 		EmittedAt: time.Now().UTC(),
 		ActorType: contracts.ActorSystem, ActorID: "loop", PrincipalID: "nexus",
 		WorkspaceID: "local", ProfileID: profile, AttemptNo: 1,
-		Payload: json.RawMessage(fmt.Sprintf(`{"turn_id":%q}`, turn)), PayloadHash: "recomputed",
+		Payload: payload, PayloadHash: "recomputed",
 	})
 	if err != nil {
 		return fmt.Errorf("loop: journal %s: %w", eventType, err)
@@ -184,6 +211,31 @@ func (l *Loop) RunTurn(ctx context.Context, turn contracts.TurnID, run contracts
 	if err := l.append(ctx, run, profile, turn, machine.EvTurnStarted, next(), nil); err != nil {
 		return "", err
 	}
+	return l.iterate(ctx, turn, run, profile, initial, next)
+}
+
+// ResumeTurn re-enters a SUSPENDED turn after its approval decision (B6
+// rehydration, Phase-5-r2 codex #2): turn.resumed is journaled, then the
+// planner continues from the supplied blocks (the approved tool's
+// observation) to a real final. Event seq starts high so resume event ids
+// can never collide with the original incarnation's.
+func (l *Loop) ResumeTurn(ctx context.Context, turn contracts.TurnID, run contracts.RunID,
+	profile contracts.ProfileID, tag string, blocks []contracts.ContextBlock) (string, error) {
+	if !turn.Valid() || !run.Valid() || !profile.Valid() || tag == "" {
+		return "", fmt.Errorf("loop: turn, run, profile and a unique resume tag are required (fail closed)")
+	}
+	l.resumeTag = tag
+	seq := 0
+	next := func() int { seq++; return seq }
+	if err := l.append(ctx, run, profile, turn, machine.EvTurnResumed, next(), nil); err != nil {
+		return "", err
+	}
+	return l.iterate(ctx, turn, run, profile, blocks, next)
+}
+
+// iterate is the shared plan→act→observe core (turn already RUNNING).
+func (l *Loop) iterate(ctx context.Context, turn contracts.TurnID, run contracts.RunID,
+	profile contracts.ProfileID, initial []contracts.ContextBlock, next func() int) (string, error) {
 	failTurn := func(cause error) (string, error) {
 		if jerr := l.append(ctx, run, profile, turn, machine.EvTurnFailed, next(), nil); jerr != nil {
 			return "", fmt.Errorf("%w (and journal: %v)", cause, jerr)
@@ -204,7 +256,15 @@ func (l *Loop) RunTurn(ctx context.Context, turn contracts.TurnID, run contracts
 		}
 		switch {
 		case action.Final != nil && action.Call == nil:
-			if err := l.append(ctx, run, profile, turn, machine.EvTurnSucceeded, next(), nil); err != nil {
+			// The final rides the succeeded event (REDACTED) so a crash
+			// between turn completion and channel delivery can recover the
+			// real outcome on replay (Phase-5-r3 codex #3).
+			finalPayload, perr := json.Marshal(map[string]string{
+				"turn_id": string(turn), "final": RedactText(l.redactor, *action.Final)})
+			if perr != nil {
+				return failTurn(fmt.Errorf("loop: final payload: %w", perr))
+			}
+			if err := l.appendPayload(ctx, run, profile, turn, machine.EvTurnSucceeded, next(), nil, finalPayload); err != nil {
 				return "", err
 			}
 			return *action.Final, nil
@@ -278,9 +338,24 @@ func (l *Loop) RunTurn(ctx context.Context, turn contracts.TurnID, run contracts
 		}
 		if errors.Is(toolErr, effectpath.ErrNeedsApproval) {
 			// HITL gate: the USER must act — never packed as an
-			// observation the model could talk itself past. Durable
-			// TurnSuspended (HARDQ B6) lands with its owner task; the
-			// -min turn surfaces the gate and fails closed.
+			// observation the model could talk itself past. With the T24
+			// suspender wired, the owner commits TurnSuspended durably
+			// (B6), the loop EXITS, and the turn's outcome IS the
+			// challenge shown to the user; without it (interactive
+			// sessions) the gate surfaces as a failure.
+			if l.suspender != nil {
+				summary, serr := l.suspender(ctx, turn, run, call, blocks)
+				if serr != nil {
+					return failTurn(fmt.Errorf("loop: suspension failed: %w", errors.Join(toolErr, serr)))
+				}
+				// The turn is SUSPENDED — recording it SUCCEEDED would
+				// lie to recovery while the effect still awaits approval
+				// (Phase-5-r2 codex #4). ResumeTurn re-enters it.
+				if err := l.append(ctx, run, profile, turn, machine.EvTurnSuspended, next(), nil); err != nil {
+					return "", err
+				}
+				return summary, nil
+			}
 			return failTurn(fmt.Errorf("loop: tool %s: %w", call.ToolID, toolErr))
 		}
 		if errors.Is(toolErr, effectpath.ErrEffectUnknown) {
@@ -290,7 +365,7 @@ func (l *Loop) RunTurn(ctx context.Context, turn contracts.TurnID, run contracts
 		}
 		if toolErr != nil {
 			// Failure is an OBSERVATION; the turn continues.
-			obs, oerr := errorObservation(l.redactor, call, seq, toolErr)
+			obs, oerr := errorObservation(l.redactor, call, next(), toolErr)
 			if oerr != nil {
 				return failTurn(fmt.Errorf("loop: observation: %w", oerr))
 			}
