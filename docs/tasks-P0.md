@@ -281,7 +281,7 @@ neither (no inbound row without its journal event; no terminal result without it
 row, and vice versa); visibility — committed recipe rows readable in the next
 same-process read.
 
-**[ ] T23 — Telegram built-in adapter.**
+**[x] T23 — Telegram built-in adapter.**
 Long-poll on T22 core; per-chat profile binding deny-default (unbound chat → typed "which
 profile?" refusal); non-text → typed fail-closed reply (C2); registers as `channel:builtin`
 (P1.6 as amended — NO extensions closure); registers live channel probe into T11 snapshot.
