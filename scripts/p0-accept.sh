@@ -14,11 +14,17 @@ DIGEST="$(sha256sum "$BIN" | cut -d' ' -f1)"
 echo "acceptance: grading binary sha256=$DIGEST"
 cd "$ROOT"
 NEXUS_ACCEPT_BIN="$BIN" CGO_ENABLED=0 go test -count=1 -timeout 900s ./internal/acceptance
+# The attestation is SIGNED (T27-r2 codex #2: a plain JSON is forgeable
+# by any process that can write the config dir). NEXUS_RELEASE_KEY names
+# the owner ssh key; doctor verifies against <config>/nexus/allowed_signers.
+KEY="${NEXUS_RELEASE_KEY:?set NEXUS_RELEASE_KEY to the owner ssh private key}"
 OUT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nexus/system"
 mkdir -p "$OUT_DIR"
 cat > "$OUT_DIR/acceptance.json" <<JSON
 {"binary_sha256":"$DIGEST","suite":"internal/acceptance","passed":true,"host":"$(uname -srm)","time":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
 JSON
+rm -f "$OUT_DIR/acceptance.json.sig"
+ssh-keygen -Y sign -f "$KEY" -n nexus-acceptance "$OUT_DIR/acceptance.json"
 # Install the EXACT graded binary so the running nexus matches the digest.
 echo "acceptance PASS — attestation written: $OUT_DIR/acceptance.json"
 echo "install the graded binary (its sha256 must match at doctor time), e.g.:"

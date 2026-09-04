@@ -696,10 +696,38 @@ func writeAttestationDigest(t *testing.T, w *world, digest string) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	attPath := filepath.Join(dir, "acceptance.json")
 	att := fmt.Sprintf(`{"binary_sha256":%q,"suite":"internal/acceptance","passed":true,"host":"test","time":"2026-09-05T00:00:00Z"}`, digest)
-	if err := os.WriteFile(filepath.Join(dir, "acceptance.json"), []byte(att), 0o600); err != nil {
+	if err := os.WriteFile(attPath, []byte(att), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// SIGN it as the owner (T27-r2 codex #2): unsigned JSON is not
+	// evidence; the world carries its own owner key + allowed_signers.
+	key := w.ownerKey(t)
+	os.Remove(attPath + ".sig")
+	if out, err := exec.Command("ssh-keygen", "-Y", "sign", "-f", key, "-n", "nexus-acceptance", attPath).CombinedOutput(); err != nil {
+		t.Fatalf("attestation sign: %v\n%s", err, out)
+	}
+}
+
+// ownerKey lazily creates the world's owner ssh key + allowed_signers.
+func (w *world) ownerKey(t *testing.T) string {
+	t.Helper()
+	key := filepath.Join(w.base, "owner_key")
+	if _, err := os.Stat(key); err == nil {
+		return key
+	}
+	if out, err := exec.Command("ssh-keygen", "-t", "ed25519", "-N", "", "-C", "owner", "-f", key).CombinedOutput(); err != nil {
+		t.Fatalf("owner keygen: %v\n%s", err, out)
+	}
+	pub, err := os.ReadFile(key + ".pub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(w.base, "nexus", "allowed_signers"), []byte("owner "+string(pub)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return key
 }
 
 func ctxT() context.Context { return context.Background() }
@@ -783,6 +811,14 @@ func TestDoctorP0GrantLive(t *testing.T) {
 	if code != 0 || !strings.Contains(out, "P0-capable") {
 		t.Fatalf("live world not granted P0-capable (exit %d):\n%s", code, out)
 	}
+	// A FORGED (unsigned) attestation withdraws the grant even with a
+	// correct digest (codex-r2 #2).
+	os.Remove(filepath.Join(w.base, "nexus", "system", "acceptance.json.sig"))
+	outForged, codeForged := run(w.env())
+	if codeForged == 0 || strings.Contains(outForged, "P0-capable") {
+		t.Fatalf("unsigned attestation granted (exit %d):\n%s", codeForged, outForged)
+	}
+	writeAttestation(t, w, nexusBin(t))
 	// A TAMPERED digest withdraws the grant.
 	writeAttestationDigest(t, w, "deadbeef")
 	outBad, codeBad := run(w.env())

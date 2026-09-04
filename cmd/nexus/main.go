@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -131,6 +132,62 @@ func runDaemon() int {
 	defer b.j.Close()
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	var chanProbe *closure.ProbeResult
+	var tgAdapter *telegram.Adapter
+	// Telegram (channel:builtin): starts ONLY when the token env var is
+	// set AND at least one chat is bound — deny-default (B3).
+	if tok := os.Getenv(resolved.Config.TelegramTokenEnv); tok != "" {
+		bindings, berr := telegramBindings(os.Getenv("NEXUS_TELEGRAM_BINDINGS"))
+		switch {
+		case berr != nil:
+			fmt.Fprintf(os.Stderr, "nexus daemon: %v — adapter stays OFF (fail closed)\n", berr)
+		case len(bindings) == 0:
+			fmt.Fprintln(os.Stderr, "nexus daemon: telegram token set but no chat bindings (NEXUS_TELEGRAM_BINDINGS=\"chatid=profile,...\") — adapter stays OFF (deny-default)")
+		default:
+			adapter, aerr := telegram.New(telegram.Config{
+				APIBase:  resolved.Config.TelegramAPIBase,
+				TokenEnv: resolved.Config.TelegramTokenEnv,
+				Bindings: bindings,
+				Profile:  b.profile,
+			}, b.chanCore, telegramHandler(b))
+			if aerr != nil {
+				fmt.Fprintf(os.Stderr, "nexus daemon: telegram: %v\n", aerr)
+			} else {
+				pr := adapter.Probe(ctx, resolved)
+				chanProbe = &pr
+				tgAdapter = adapter // start decision belongs to the SEALED snapshot
+				if !pr.Passed {
+					fmt.Fprintf(os.Stderr, "nexus daemon: telegram channel probe failed: %s\n", pr.Detail)
+				}
+			}
+		}
+	}
+	// FINAL sealed capability snapshot (T11/T27 codex #1): sealed BEFORE
+	// any consumer starts, and ENFORCED — conversation OFF refuses to
+	// serve at all (fail closed), telegram starts only when its sealed
+	// capability is ON; nothing dispatches to an OFF capability.
+	probes, requested := b.liveProbes(ctx, resolved, b.prov, b.sandboxOK, chanProbe)
+	snap, serr := sealStartupSnapshot(resolved, probes, requested)
+	if serr != nil {
+		fmt.Fprintf(os.Stderr, "nexus daemon: capability seal: %v\n", serr)
+		return 1
+	}
+	for _, st := range snap.List() {
+		state := "ON"
+		if !st.On {
+			state = "OFF (" + st.Reason + ")"
+		}
+		fmt.Printf("nexus daemon: capability %-12s %s\n", st.Name, state)
+	}
+	if !snap.On("conversation") {
+		fmt.Fprintf(os.Stderr, "nexus daemon: conversation capability OFF (%s) — refusing to serve (fail closed)\n",
+			snap.Status("conversation").Reason)
+		return 1
+	}
+	// EVERYTHING effectful below this line runs ONLY under a sealed,
+	// conversation-ON snapshot (T27-r2 codex #1: the sweep, scheduler,
+	// approved-resume scan and delivery loop must never advance state a
+	// sealed-OFF startup would refuse).
 	hb := daemon.NewHeartbeat(filepath.Join(layout.SystemDir(), "heartbeat"), 5*time.Second)
 	go hb.Run(ctx)
 	// Durable scheduler: SYNCHRONOUS startup sweep first — its outcome is
@@ -208,58 +265,6 @@ func runDaemon() int {
 				}
 			}
 		}()
-	}
-	var chanProbe *closure.ProbeResult
-	var tgAdapter *telegram.Adapter
-	// Telegram (channel:builtin): starts ONLY when the token env var is
-	// set AND at least one chat is bound — deny-default (B3).
-	if tok := os.Getenv(resolved.Config.TelegramTokenEnv); tok != "" {
-		bindings, berr := telegramBindings(os.Getenv("NEXUS_TELEGRAM_BINDINGS"))
-		switch {
-		case berr != nil:
-			fmt.Fprintf(os.Stderr, "nexus daemon: %v — adapter stays OFF (fail closed)\n", berr)
-		case len(bindings) == 0:
-			fmt.Fprintln(os.Stderr, "nexus daemon: telegram token set but no chat bindings (NEXUS_TELEGRAM_BINDINGS=\"chatid=profile,...\") — adapter stays OFF (deny-default)")
-		default:
-			adapter, aerr := telegram.New(telegram.Config{
-				APIBase:  resolved.Config.TelegramAPIBase,
-				TokenEnv: resolved.Config.TelegramTokenEnv,
-				Bindings: bindings,
-				Profile:  b.profile,
-			}, b.chanCore, telegramHandler(b))
-			if aerr != nil {
-				fmt.Fprintf(os.Stderr, "nexus daemon: telegram: %v\n", aerr)
-			} else {
-				pr := adapter.Probe(ctx, resolved)
-				chanProbe = &pr
-				tgAdapter = adapter // start decision belongs to the SEALED snapshot
-				if !pr.Passed {
-					fmt.Fprintf(os.Stderr, "nexus daemon: telegram channel probe failed: %s\n", pr.Detail)
-				}
-			}
-		}
-	}
-	// FINAL sealed capability snapshot (T11/T27 codex #1): sealed BEFORE
-	// any consumer starts, and ENFORCED — conversation OFF refuses to
-	// serve at all (fail closed), telegram starts only when its sealed
-	// capability is ON; nothing dispatches to an OFF capability.
-	probes, requested := b.liveProbes(ctx, resolved, b.prov, b.sandboxOK, chanProbe)
-	snap, serr := sealStartupSnapshot(resolved, probes, requested)
-	if serr != nil {
-		fmt.Fprintf(os.Stderr, "nexus daemon: capability seal: %v\n", serr)
-		return 1
-	}
-	for _, st := range snap.List() {
-		state := "ON"
-		if !st.On {
-			state = "OFF (" + st.Reason + ")"
-		}
-		fmt.Printf("nexus daemon: capability %-12s %s\n", st.Name, state)
-	}
-	if !snap.On("conversation") {
-		fmt.Fprintf(os.Stderr, "nexus daemon: conversation capability OFF (%s) — refusing to serve (fail closed)\n",
-			snap.Status("conversation").Reason)
-		return 1
 	}
 	if tgAdapter != nil {
 		if snap.On("telegram") {
@@ -866,7 +871,31 @@ func verifyAcceptanceAttestation(layout pathx.Layout) (bool, string) {
 	if hex.EncodeToString(h.Sum(nil)) != att.BinarySHA256 {
 		return false, "this binary is NOT the one the acceptance suite graded (digest mismatch, fail closed)"
 	}
-	return true, "acceptance suite passed against this exact binary (" + att.Time + ")"
+	// PROVENANCE (T27-r2 codex #2): the attestation must carry the
+	// owner's signature — an unsigned JSON in a user-writable directory
+	// is not evidence. Verified against <config>/nexus/allowed_signers
+	// in the nexus-acceptance namespace.
+	attPath := filepath.Join(layout.SystemDir(), "acceptance.json")
+	sigPath := attPath + ".sig"
+	signers := filepath.Join(layout.Base, "allowed_signers")
+	if _, err := os.Stat(sigPath); err != nil {
+		return false, "acceptance attestation is UNSIGNED — run scripts/p0-accept.sh with NEXUS_RELEASE_KEY"
+	}
+	if _, err := os.Stat(signers); err != nil {
+		return false, "no allowed_signers file at " + signers + " (install the owner public key)"
+	}
+	attFile, err := os.Open(attPath)
+	if err != nil {
+		return false, err.Error()
+	}
+	defer attFile.Close()
+	cmd := exec.Command("ssh-keygen", "-Y", "verify", "-f", signers, "-I", "owner",
+		"-n", "nexus-acceptance", "-s", sigPath)
+	cmd.Stdin = attFile
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return false, "attestation signature verification FAILED: " + strings.TrimSpace(string(out))
+	}
+	return true, "signed acceptance pass for this exact binary (" + att.Time + ")"
 }
 
 // mustProbeCore opens a throwaway channel core for the doctor's live
@@ -943,6 +972,12 @@ func telegramBindings(raw string) (map[int64]string, error) {
 		chat, err := strconv.ParseInt(strings.TrimSpace(pair[:i]), 10, 64)
 		if err != nil {
 			return nil, fmt.Errorf("telegram bindings: chat id in %q is not a number", pair)
+		}
+		if chat <= 0 {
+			// Telegram PRIVATE chats have positive ids; negative ids are
+			// groups/supergroups — a reminder routed there would leak to
+			// every member (T27-r2 codex #3, single-user boundary).
+			return nil, fmt.Errorf("telegram bindings: chat id %d is not a private chat (groups are refused, fail closed)", chat)
 		}
 		profile := strings.TrimSpace(pair[i+1:])
 		if profile == "" {
