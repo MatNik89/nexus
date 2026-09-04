@@ -14,6 +14,7 @@ package sandbox
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -23,6 +24,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/MatNik89/nexus/internal/preflight/probe"
@@ -50,10 +52,11 @@ type ProbeReport struct {
 // CompiledPolicy is a SEALED launch plan: constructed only by Compile
 // (unexported fields — no caller can forge or loosen one).
 type CompiledPolicy struct {
-	spec       Spec
-	probeHash  string
-	targetHash string
-	policyHash string
+	spec        Spec
+	probeHash   string
+	targetHash  string
+	closurePins map[string]string
+	policyHash  string
 }
 
 // PolicyHash is the policy's identity digest (target, argv, workdir,
@@ -132,6 +135,24 @@ func (b *Bwrap) Probe(ctx context.Context) (ProbeReport, error) {
 	if err != nil {
 		return ProbeReport{}, fmt.Errorf("SANDBOX_CAPABILITY_UNAVAILABLE: %w", err)
 	}
+	// TRUST ROOT (Phase-6-r2 codex #1): a finite black-box canary cannot
+	// authenticate an ADAPTIVE malicious backend, so the backend binary
+	// must live on a root-owned, non-user-writable path BEFORE any
+	// behavioral check — a fake dropped into a user-writable PATH entry
+	// never becomes the trust anchor. Symlinks are resolved first.
+	canonPath, err := filepath.EvalSymlinks(av.BwrapPath)
+	if err != nil {
+		return ProbeReport{}, fmt.Errorf("SANDBOX_CAPABILITY_UNAVAILABLE: backend path: %w", err)
+	}
+	st, err := os.Stat(canonPath)
+	if err != nil {
+		return ProbeReport{}, fmt.Errorf("SANDBOX_CAPABILITY_UNAVAILABLE: backend stat: %w", err)
+	}
+	sys, ok := st.Sys().(*syscall.Stat_t)
+	if !ok || sys.Uid != 0 || st.Mode().Perm()&0o022 != 0 {
+		return ProbeReport{}, fmt.Errorf("SANDBOX_CAPABILITY_UNAVAILABLE: backend %s is not a root-owned, non-writable executable — refusing to trust it", canonPath)
+	}
+	av.BwrapPath = canonPath
 	// IDENTITY: the probe binds the bwrap BINARY CONTENT, not just its
 	// pathname and self-reported version (Phase-6 codex #2: a fake that
 	// prints a version string must not become the trust anchor).
@@ -142,7 +163,9 @@ func (b *Bwrap) Probe(ctx context.Context) (ProbeReport, error) {
 	// ENFORCEMENT: one live negative control THROUGH this exact backend —
 	// a host directory outside the closure must be INVISIBLE inside. An
 	// unconfined fake passes the version check but fails this.
-	canaryDir, err := os.MkdirTemp("", "nexus-probe-canary-")
+	// Random, unmarked canary path: an adaptive fake cannot pattern-match
+	// the probe invocation (defense in depth under the trust root).
+	canaryDir, err := os.MkdirTemp("", randomHex(8))
 	if err != nil {
 		return ProbeReport{}, err
 	}
@@ -194,13 +217,36 @@ func (b *Bwrap) Compile(ctx context.Context, spec Spec, report ProbeReport) (Com
 	if err != nil {
 		return CompiledPolicy{}, fmt.Errorf("sandbox: cannot pin the launch target (fail closed): %w", err)
 	}
+	// Pin the ENTIRE runtime closure — loader and every library — not
+	// just the main ELF (Phase-6-r2 codex #2: a $ORIGIN library swapped
+	// after Compile executed and attested under the old policy).
+	pins, err := probe.ResolveClosureHashes(spec.Target)
+	if err != nil {
+		return CompiledPolicy{}, fmt.Errorf("sandbox: cannot pin the runtime closure (fail closed): %w", err)
+	}
 	return CompiledPolicy{
-		spec:       spec,
-		probeHash:  report.ProbeHash,
-		targetHash: targetHash,
-		policyHash: digest("policy", spec.Target, targetHash, strings.Join(spec.Args, "\x00"),
+		spec:        spec,
+		probeHash:   report.ProbeHash,
+		targetHash:  targetHash,
+		closurePins: pins,
+		policyHash: digest("policy", spec.Target, targetHash, closureDigest(pins),
+			strings.Join(spec.Args, "\x00"),
 			spec.WorkDir, spec.Timeout.String(), report.ProbeHash),
 	}, nil
+}
+
+// closureDigest folds a closure pin map into one deterministic digest.
+func closureDigest(pins map[string]string) string {
+	keys := make([]string, 0, len(pins))
+	for k := range pins {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	h := sha256.New()
+	for _, k := range keys {
+		fmt.Fprintf(h, "%d:%s%d:%s", len(k), k, len(pins[k]), pins[k])
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // hashFile is the bounded sha256 of a file's bytes.
@@ -259,11 +305,22 @@ func (b *Bwrap) Launch(ctx context.Context, policy CompiledPolicy) (*Process, er
 	if err != nil {
 		return nil, err
 	}
-	// The memfd-pinned target must be EXACTLY the compile-time content —
-	// a path swapped between Compile and Launch is refused (codex #3).
-	if got := h.ClosureHashes()["/nexus-target"]; got != policy.targetHash {
+	// EVERY memfd-pinned closure member must be EXACTLY the compile-time
+	// content — target, loader and libraries alike (codex #3 + r2 #2).
+	launched := h.ClosureHashes()
+	if got := launched["/nexus-target"]; got != policy.targetHash {
 		h.Close()
 		return nil, fmt.Errorf("sandbox: launch target bytes changed since Compile — refused (fail closed)")
+	}
+	if len(launched) != len(policy.closurePins) {
+		h.Close()
+		return nil, fmt.Errorf("sandbox: runtime closure shape changed since Compile — refused (fail closed)")
+	}
+	for dest, want := range policy.closurePins {
+		if launched[dest] != want {
+			h.Close()
+			return nil, fmt.Errorf("sandbox: closure member %s changed since Compile — refused (fail closed)", dest)
+		}
 	}
 	out := &boundedBuffer{limit: 1 << 20}
 	if err := h.SetOutput(out, out); err != nil {
@@ -313,6 +370,15 @@ func (b *Bwrap) Attest(ctx context.Context, p *Process, policy CompiledPolicy) (
 		ProbeHash:     policy.probeHash,
 		AttestedAt:    time.Now().UTC(),
 	}, nil
+}
+
+// randomHex returns n random bytes hex-encoded (canary naming).
+func randomHex(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "nexus-canary"
+	}
+	return hex.EncodeToString(b)
 }
 
 // digest is a length-prefixed sha256 over parts.
