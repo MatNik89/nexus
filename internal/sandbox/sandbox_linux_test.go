@@ -162,12 +162,14 @@ func TestBackendShebangRejected(t *testing.T) {
 	if err := os.WriteFile(script, []byte("#!/bin/sh\necho pwned\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// The closure pin resolves the target at COMPILE time now — a
+	// shebang/script is refused before any policy exists (and Launch
+	// would refuse it again).
 	pol, err := b.Compile(ctxT(), Spec{Target: script, WorkDir: wdir(t)}, rep)
-	if err != nil {
-		t.Fatalf("compile shape-checks only: %v", err)
-	}
-	if _, err := b.Launch(ctxT(), pol); err == nil {
-		t.Fatal("shebang script launched (must be rejected BEFORE any sandbox)")
+	if err == nil {
+		if _, lerr := b.Launch(ctxT(), pol); lerr == nil {
+			t.Fatal("shebang script launched (must be rejected BEFORE any sandbox)")
+		}
 	}
 }
 
@@ -267,8 +269,15 @@ func TestFakeBwrapRejected(t *testing.T) {
 	}
 	t.Setenv("PATH", dir)
 	b := NewBwrap()
-	if _, err := b.Probe(ctxT()); err == nil {
+	_, err := b.Probe(ctxT())
+	if err == nil {
 		t.Fatal("version-only fake bwrap passed the probe")
+	}
+	// The TRUST ROOT is what refuses it (Phase-6-r2 codex #1): a
+	// user-writable fake never reaches the behavioral canary, so an
+	// ADAPTIVE fake has nothing to spoof.
+	if !strings.Contains(err.Error(), "root-owned") {
+		t.Fatalf("fake rejected for the wrong reason (trust root not causal): %v", err)
 	}
 }
 

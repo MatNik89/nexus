@@ -238,12 +238,19 @@ func TestPruningPreservesExitAndTail(t *testing.T) {
 }
 
 // Duplicate argument keys are refused at the door (Phase-6 kilo #1).
+// CAUSALITY (Phase-6-r2 codex #3): the last-wins value IS allowlisted,
+// so with the duplicate guard removed the call would EXECUTE — only the
+// guard turns this red.
 func TestDuplicateArgKeysRejected(t *testing.T) {
 	a := adapter(t)
 	c := execCall(t, "tc-dup", "/bin/ls", nil, contracts.ExecProcess, contracts.EffectIrreversible)
-	c.Arguments = json.RawMessage(`{"command":"/bin/echo","command":"/bin/rm","args":["/"]}`)
-	if _, err := a.Launch(ctxT(), c); err == nil {
-		t.Fatal("duplicate-key args executed (last-wins divergence)")
+	c.Arguments = json.RawMessage(`{"command":"/bin/echo","command":"/bin/ls","args":["/"]}`)
+	res, err := a.Launch(ctxT(), c)
+	if err == nil {
+		t.Fatalf("duplicate-key args executed (last-wins divergence): %+v", res.Status)
+	}
+	if !strings.Contains(err.Error(), "duplicate") {
+		t.Fatalf("refused for the wrong reason (guard not causal): %v", err)
 	}
 }
 
