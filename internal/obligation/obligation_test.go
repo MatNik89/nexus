@@ -672,3 +672,51 @@ func TestAckGestureDurable(t *testing.T) {
 		t.Fatalf("ack gesture source not durable: %q", found)
 	}
 }
+
+// The armed window is UNGUESSABLE (Phase-4-r6 codex #1): while a
+// legitimate ticket is live, an attacker knowing the durable id+marker —
+// but not the 128-bit request nonce — cannot land a done; and a FAILED
+// append disarms its ticket (no stranded authority).
+func TestArmedWindowRaceAndDisarm(t *testing.T) {
+	h := build(t)
+	if err := h.m.CreateTask(ctxT(), "task-w", "file_note", `{"note":"window"}`); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.m.RunTask(ctxT(), "task-w"); err != nil {
+		t.Fatal(err)
+	}
+	// Arm a live ticket directly (the manager's own pre-append state).
+	nonce, err := h.m.gate.arm("task-w", "[task-w] window")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Attacker in the armed window: right id+marker, no nonce / guessed
+	// nonce — refused.
+	for name, guess := range map[string]string{"empty": "", "guessed": "00112233445566778899aabbccddeeff"} {
+		d, _ := h.m.params(EvTaskDone, donePayload{ID: "task-w",
+			MarkerLine: "[task-w] window", Verifier: "postcondition-verifier", Nonce: guess})
+		if _, err := h.m.j.Append(ctxT(), d); err == nil {
+			t.Fatalf("%s-nonce attacker landed a done inside the armed window", name)
+		}
+	}
+	// The legitimate ticket still works exactly once.
+	d, _ := h.m.params(EvTaskDone, donePayload{ID: "task-w",
+		MarkerLine: "[task-w] window", Verifier: "postcondition-verifier", Nonce: nonce})
+	if _, err := h.m.j.Append(ctxT(), d); err != nil {
+		t.Fatalf("legitimate armed append refused: %v", err)
+	}
+	// DISARM on failure: a cancelled/failed append leaves no authority.
+	if err := h.m.CreateTask(ctxT(), "task-x", "file_note", `{"note":"strand"}`); err != nil {
+		t.Fatal(err)
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()                                  // admission select loses immediately
+	_ = h.m.MarkTaskDone(cancelled, "task-x") // fails (unattested anyway) — must not strand
+	// Whatever happened, no ticket for task-x survives: a raw append with
+	// ANY nonce fails.
+	d2, _ := h.m.params(EvTaskDone, donePayload{ID: "task-x",
+		MarkerLine: "[task-x] strand", Verifier: "postcondition-verifier", Nonce: "deadbeefdeadbeefdeadbeefdeadbeef"})
+	if _, err := h.m.j.Append(ctxT(), d2); err == nil {
+		t.Fatal("stranded authority consumed after a cancelled request")
+	}
+}

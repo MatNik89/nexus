@@ -19,6 +19,8 @@ package obligation
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -128,11 +130,14 @@ type donePayload struct {
 	ID string `json:"id"`
 	// MarkerLine + Verifier bind DONE to the verified artifact and the
 	// independent verifier identity (checker != worker; Phase-4-r3 codex
-	// #10). The admission CAPABILITY is out-of-band (DoneGate) and NEVER
-	// serialized into canonical bytes (Phase-4-r5 codex #1: a persisted
-	// bearer would leak through Replay).
+	// #10). Nonce identifies THIS append request: the out-of-band DoneGate
+	// ticket is keyed by it, so an attacker racing the armed window would
+	// have to guess 128 random bits — knowing the durable id+marker is
+	// worthless (Phase-4-r6 codex #1). A replayed nonce is inert: the
+	// ticket was consumed by its own append and restarts empty the gate.
 	MarkerLine string `json:"marker_line"`
 	Verifier   string `json:"verifier"`
+	Nonce      string `json:"nonce"`
 }
 
 // DoneGate is the OUT-OF-BAND admission capability for task_done: the
@@ -144,25 +149,44 @@ type donePayload struct {
 // DONE events untouched.
 type DoneGate struct {
 	mu      sync.Mutex
-	tickets map[string]bool // taskID + "|" + marker → armed
+	tickets map[string]ticket // nonce → the exact (id, marker) it authorizes
 }
 
-func NewDoneGate() *DoneGate { return &DoneGate{tickets: map[string]bool{}} }
+type ticket struct{ id, marker string }
 
-func (g *DoneGate) arm(id, marker string) {
+func NewDoneGate() *DoneGate { return &DoneGate{tickets: map[string]ticket{}} }
+
+// arm mints an unguessable per-REQUEST nonce for one (id, marker) append.
+func (g *DoneGate) arm(id, marker string) (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	nonce := hex.EncodeToString(b)
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.tickets[id+"|"+marker] = true
+	g.tickets[nonce] = ticket{id: id, marker: marker}
+	return nonce, nil
 }
 
-func (g *DoneGate) consume(id, marker string) bool {
+// disarm revokes an unconsumed ticket (append failed/cancelled — the
+// authority must not strand, Phase-4-r6 codex #1).
+func (g *DoneGate) disarm(nonce string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	k := id + "|" + marker
-	if !g.tickets[k] {
+	delete(g.tickets, nonce)
+}
+
+// consume burns the nonce and verifies it authorizes EXACTLY this
+// (id, marker) pair.
+func (g *DoneGate) consume(nonce, id, marker string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	tk, ok := g.tickets[nonce]
+	if !ok || tk.id != id || tk.marker != marker {
 		return false
 	}
-	delete(g.tickets, k) // single-use
+	delete(g.tickets, nonce) // single-use
 	return true
 }
 
@@ -258,7 +282,7 @@ func Events(reg *Registry, gate *DoneGate) map[string]journal.PayloadValidator {
 			if p.ID == "" || p.MarkerLine == "" || p.Verifier == "" || p.Verifier == "file_note-handler" {
 				return fmt.Errorf("obligation: done requires the verified marker and an independent verifier identity")
 			}
-			if gate == nil || !gate.consume(p.ID, p.MarkerLine) {
+			if gate == nil || p.Nonce == "" || !gate.consume(p.Nonce, p.ID, p.MarkerLine) {
 				return fmt.Errorf("obligation: done without the verifying manager's armed admission ticket (fail closed)")
 			}
 			return nil
@@ -1006,14 +1030,22 @@ func (m *Manager) MarkTaskDone(ctx context.Context, id string) error {
 	if !verdict.Pass {
 		return fmt.Errorf("obligation: done refused — the postcondition does not verify (the task's marker line is absent)")
 	}
-	// ARM the single-use out-of-band ticket immediately before the append.
-	m.gate.arm(id, markerLine)
-	p, err := m.params(EvTaskDone, donePayload{ID: id, MarkerLine: markerLine, Verifier: "postcondition-verifier"})
+	// ARM the single-use per-request ticket immediately before the append;
+	// a failed or cancelled append DISARMS it (no stranded authority).
+	nonce, err := m.gate.arm(id, markerLine)
 	if err != nil {
 		return err
 	}
-	_, err = m.j.Append(ctx, p)
-	return err
+	p, err := m.params(EvTaskDone, donePayload{ID: id, MarkerLine: markerLine, Verifier: "postcondition-verifier", Nonce: nonce})
+	if err != nil {
+		m.gate.disarm(nonce)
+		return err
+	}
+	if _, err := m.j.Append(ctx, p); err != nil {
+		m.gate.disarm(nonce)
+		return err
+	}
+	return nil
 }
 
 // --- reads (guarded projection queries) ---
