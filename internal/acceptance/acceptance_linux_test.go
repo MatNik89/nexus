@@ -707,3 +707,36 @@ func TestReleaseSignatureTamperDetected(t *testing.T) {
 		t.Fatal("tampered binary passed signature verification")
 	}
 }
+
+// doctor --p0 grants P0-capable ONLY from live criteria (T27): with a
+// live provider, fake Bot API and bwrap, all six go LIVE; removing the
+// bot token turns exactly the telegram criterion OFF and the grant away.
+func TestDoctorP0GrantLive(t *testing.T) {
+	requireBwrap(t)
+	w := newWorld(t, nil)
+	w.withTelegram(t)
+	run := func(env []string) (string, int) {
+		cmd := exec.Command(nexusBin(t), "doctor", "--p0")
+		cmd.Env = env
+		out, _ := cmd.CombinedOutput()
+		return string(out), cmd.ProcessState.ExitCode()
+	}
+	out, code := run(w.env())
+	if code != 0 || !strings.Contains(out, "P0-capable") {
+		t.Fatalf("live world not granted P0-capable (exit %d):\n%s", code, out)
+	}
+	// SENSITIVITY: drop the bot token → telegram OFF, grant withdrawn.
+	var envNoTok []string
+	for _, e := range w.env() {
+		if !strings.HasPrefix(e, "NEXUS_ACCEPT_TG=") {
+			envNoTok = append(envNoTok, e)
+		}
+	}
+	out2, code2 := run(envNoTok)
+	if code2 == 0 || strings.Contains(out2, "P0-capable") {
+		t.Fatalf("grant survived a dead channel (exit %d):\n%s", code2, out2)
+	}
+	if !strings.Contains(out2, "OFF  telegram") {
+		t.Fatalf("wrong criterion went off:\n%s", out2)
+	}
+}

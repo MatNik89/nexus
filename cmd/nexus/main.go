@@ -720,7 +720,40 @@ func runDoctorP0() int {
 			add("profiles", false, jerr.Error())
 			break
 		}
-		j, jerr := journal.Open(jp, prof, redact.None{}, map[string]journal.PayloadValidator{})
+		profDir, _ := layout.ProfileDir(prof)
+		if merr := os.MkdirAll(profDir, 0o700); merr != nil {
+			profilesOK = false
+			add("profiles", false, merr.Error())
+			break
+		}
+		reg, rerr := obligation.NewRegistry(map[string]obligation.Kind{
+			"file_note": {Handler: obligation.FileNoteHandler(profDir), ValidateParams: obligation.ValidateFileNoteParams},
+		})
+		if rerr != nil {
+			profilesOK = false
+			add("profiles", false, rerr.Error())
+			break
+		}
+		events := map[string]journal.PayloadValidator{evPolicyYolo: nil}
+		for _, n := range machine.EventTypes() {
+			events[n] = nil
+		}
+		for n, v := range memory.Events() {
+			events[n] = v
+		}
+		for n, v := range schedule.Events() {
+			events[n] = v
+		}
+		for n, v := range obligation.Events(reg, obligation.NewDoneGate()) {
+			events[n] = v
+		}
+		for n, v := range channel.Events() {
+			events[n] = v
+		}
+		for n, v := range approval.Events() {
+			events[n] = v
+		}
+		j, jerr := journal.Open(jp, prof, redact.None{}, events)
 		if jerr != nil {
 			profilesOK = false
 			add("profiles", false, string(prof)+": "+jerr.Error())
