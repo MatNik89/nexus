@@ -878,3 +878,60 @@ func TestSealedOffCapabilityNeverServes(t *testing.T) {
 		t.Fatalf("daemon served a conversation although the sealed snapshot marked it OFF: %q", out)
 	}
 }
+
+// SEAL-BEFORE-CONSUMERS (T27-r3 codex #1): a startup whose provider
+// probe fails must not run ANY effectful consumer — with an overdue
+// reminder waiting and a channel wired, the refused incarnation delivers
+// NOTHING; a later healthy incarnation still can (nothing was lost or
+// falsely advanced past delivery).
+func TestSealedOffStartupRunsNoConsumers(t *testing.T) {
+	w := newWorld(t, nil)
+	bot := w.withTelegram(t)
+	w.script = func(last string) string {
+		if strings.Contains(last, "obs-") {
+			return "reminder placed"
+		}
+		if strings.Contains(last, "remind me") {
+			return `{"action":"tool","tool_id":"reminder_set","arguments":{"id":"rem-seal","body":"sealed reminder","year":2026,"month":1,"day":2,"hour":9,"minute":0,"tz":"Europe/Zagreb"}}`
+		}
+		return "echo: " + last
+	}
+	stop, _ := w.daemon()
+	if out, err := w.chat("remind me", true); err != nil || !strings.Contains(out, "reminder placed") {
+		t.Fatalf("set failed: %v %q", err, out)
+	}
+	stop()
+	// Incarnation 2: the provider fails EVERYTHING → sealed OFF → the
+	// daemon must refuse and run NO consumer (no delivery may appear).
+	deadProv := w.provider
+	w.provider = nil
+	broken := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		http.Error(rw, "down", http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(broken.Close)
+	w.rewriteConfig(t, func(cfg map[string]any) { cfg["provider_base_url"] = broken.URL })
+	// egress allow must include the broken host for the probe to even try
+	w.rewriteConfig(t, func(cfg map[string]any) {
+		cfg["egress_allow"] = []any{strings.TrimPrefix(broken.URL, "http://"), strings.TrimPrefix(deadProv.URL, "http://")}
+	})
+	stop2, _ := w.daemon()
+	time.Sleep(4 * time.Second)
+	stop2()
+	bot.mu.Lock()
+	for _, sent := range bot.sent {
+		if strings.Contains(sent, "sealed reminder") {
+			bot.mu.Unlock()
+			t.Fatalf("sealed-OFF startup ran the delivery consumer: %q", sent)
+		}
+	}
+	bot.mu.Unlock()
+	// Incarnation 3: healthy again — the reminder arrives now.
+	w.rewriteConfig(t, func(cfg map[string]any) { cfg["provider_base_url"] = deadProv.URL })
+	w.rewriteConfig(t, func(cfg map[string]any) {
+		cfg["egress_allow"] = []any{strings.TrimPrefix(deadProv.URL, "http://")}
+	})
+	w.provider = deadProv
+	stop3, _ := w.daemon()
+	defer stop3()
+	bot.waitSent(t, "sealed reminder", 25*time.Second)
+}

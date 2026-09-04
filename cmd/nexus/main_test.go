@@ -565,7 +565,7 @@ func TestTelegramBindingsStrict(t *testing.T) {
 	if good[42] != "private" || good[7] != "work" || len(good) != 2 {
 		t.Fatalf("trimmed parse broken: %v", good)
 	}
-	for _, bad := range []string{"42=private,42=work", "garbage", "x=private", "42=", "=private"} {
+	for _, bad := range []string{"42=private,42=work", "garbage", "x=private", "42=", "=private", "-100123=private", "0=private"} {
 		if _, err := telegramBindings(bad); err == nil {
 			t.Fatalf("malformed bindings %q accepted silently", bad)
 		}
