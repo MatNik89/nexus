@@ -8,12 +8,17 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/MatNik89/nexus/internal/app/daemon"
 	"github.com/MatNik89/nexus/internal/app/repl"
+	"github.com/MatNik89/nexus/internal/approval"
+	"github.com/MatNik89/nexus/internal/channel"
+	"github.com/MatNik89/nexus/internal/channel/telegram"
 	"github.com/MatNik89/nexus/internal/foundation/atomicwrite"
 	"github.com/MatNik89/nexus/internal/foundation/clockid"
 	"github.com/MatNik89/nexus/internal/foundation/config"
@@ -155,6 +160,27 @@ func runDaemon() int {
 			}
 		}
 	}()
+	// Telegram (channel:builtin): starts ONLY when the token env var is
+	// set AND at least one chat is bound — deny-default (B3).
+	if tok := os.Getenv(resolved.Config.TelegramTokenEnv); tok != "" {
+		bindings := telegramBindings()
+		if len(bindings) == 0 {
+			fmt.Fprintln(os.Stderr, "nexus daemon: telegram token set but no chat bindings (NEXUS_TELEGRAM_BINDINGS=\"chatid=profile,...\") — adapter stays OFF (deny-default)")
+		} else {
+			adapter, aerr := telegram.New(telegram.Config{
+				APIBase:  "https://api.telegram.org",
+				TokenEnv: resolved.Config.TelegramTokenEnv,
+				Bindings: bindings,
+				Profile:  b.profile,
+			}, b.chanCore, telegramHandler(b))
+			if aerr != nil {
+				fmt.Fprintf(os.Stderr, "nexus daemon: telegram: %v\n", aerr)
+			} else {
+				go adapter.Run(ctx, 2*time.Second)
+				fmt.Println("nexus daemon: telegram adapter running")
+			}
+		}
+	}
 	sock := socketPath(layout)
 	fmt.Printf("nexus daemon %s — profile %s, socket %s\n", version, resolved.Config.DefaultProfile, sock)
 	if err := b.d.Serve(ctx, sock); err != nil {
@@ -170,10 +196,14 @@ func runDaemon() int {
 // against a custom layout (Phase-2-r2 codex #13).
 // daemonBundle is everything the composition root wires together.
 type daemonBundle struct {
-	d     *daemon.Daemon
-	j     *journal.Journal
-	sched *schedule.Scheduler
-	obl   *obligation.Manager
+	d         *daemon.Daemon
+	j         *journal.Journal
+	sched     *schedule.Scheduler
+	obl       *obligation.Manager
+	chanCore  *channel.Core
+	approvals *approval.Store
+	profile   contracts.ProfileID
+	cfg       config.Config
 }
 
 func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, error) {
@@ -210,13 +240,19 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 	for n, v := range obligation.Events(registry, doneGate) {
 		events[n] = v
 	}
+	for n, v := range channel.Events() {
+		events[n] = v
+	}
+	for n, v := range approval.Events() {
+		events[n] = v
+	}
 
 	journalPath, _ := layout.ProfileJournal(profile)
 	redactor := redact.NewKnownRefs(knownSecretRefs(resolved.Config))
 	// The ONE profile database: journal + memory projection together
 	// (Annex P0.3 — facts are journal events folded in the same
 	// transaction; no second SQLite file exists).
-	j, err := journal.Open(journalPath, profile, redactor, events, memory.NewProjection(), schedule.NewProjection(), obligation.NewProjection())
+	j, err := journal.Open(journalPath, profile, redactor, events, memory.NewProjection(), schedule.NewProjection(), obligation.NewProjection(), channel.NewProjection(), approval.NewProjection())
 	if err != nil {
 		return nil, fmt.Errorf("journal: %w", err)
 	}
@@ -237,6 +273,16 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 		return nil, fmt.Errorf("schedule: %w", err)
 	}
 	sched.SetCounterFile(filepath.Join(layout.SystemDir(), "last_occurrence_fired"))
+	chanCore, err := channel.New(j)
+	if err != nil {
+		j.Close()
+		return nil, err
+	}
+	approvals, err := approval.NewStore(j, clockid.System{})
+	if err != nil {
+		j.Close()
+		return nil, err
+	}
 	lazyRunner := &obligation.LazyRunner{}
 	oblManager, err := obligation.NewManager(j, sched, registry, clockid.System{}, lazyRunner, authority, profileDir, doneGate)
 	if err != nil {
@@ -293,7 +339,8 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 		j.Close()
 		return nil, err
 	}
-	return &daemonBundle{d: d, j: j, sched: sched, obl: oblManager}, nil
+	return &daemonBundle{d: d, j: j, sched: sched, obl: oblManager,
+		chanCore: chanCore, approvals: approvals, profile: profile, cfg: resolved.Config}, nil
 }
 
 // systemMW is the order-only S6.9 seam for the system EffectPath.
@@ -379,4 +426,72 @@ func runDoctor(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+// telegramBindings parses NEXUS_TELEGRAM_BINDINGS ("chatid=profile,...").
+func telegramBindings() map[int64]string {
+	out := map[int64]string{}
+	raw := os.Getenv("NEXUS_TELEGRAM_BINDINGS")
+	for _, pair := range strings.Split(raw, ",") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		i := strings.IndexByte(pair, '=')
+		if i <= 0 {
+			continue
+		}
+		chat, err := strconv.ParseInt(pair[:i], 10, 64)
+		if err != nil {
+			continue
+		}
+		out[chat] = pair[i+1:]
+	}
+	return out
+}
+
+// telegramHandler routes an admitted Telegram message: "approve <id>" /
+// "deny <id>" hit the durable HITL store; anything else is a normal
+// conversation turn through the same production planner spine
+// (ModeDefault ALWAYS — a channel message can never enable yolo, F2).
+func telegramHandler(b *daemonBundle) telegram.Handler {
+	return func(ctx context.Context, in channel.Inbound) (string, error) {
+		text := strings.TrimSpace(in.Text)
+		lower := strings.ToLower(text)
+		source := "tg:" + in.ChannelIdentity
+		switch {
+		case strings.HasPrefix(lower, "approve "):
+			id := strings.TrimSpace(text[len("approve "):])
+			if err := b.approvals.Approve(ctx, id, source); err != nil {
+				return "Approval failed: " + err.Error(), nil
+			}
+			return "Approved " + id + ". The suspended action will resume.", nil
+		case strings.HasPrefix(lower, "deny "):
+			id := strings.TrimSpace(text[len("deny "):])
+			if err := b.approvals.Deny(ctx, id, source); err != nil {
+				return "Denial failed: " + err.Error(), nil
+			}
+			return "Denied " + id + ".", nil
+		case lower == "pending":
+			pending, err := b.approvals.Pending(ctx)
+			if err != nil {
+				return "", err
+			}
+			if len(pending) == 0 {
+				return "No pending approvals.", nil
+			}
+			out := ""
+			for _, ch := range pending {
+				out += ch.Summary + "\n"
+			}
+			return out, nil
+		}
+		// Ordinary conversation: one turn through the daemon's session
+		// spine (ModeDefault — channel input can NEVER carry yolo).
+		reply, err := b.d.RunChannelTurn(ctx, in.ChannelIdentity, text)
+		if err != nil {
+			return "", err
+		}
+		return reply, nil
+	}
 }

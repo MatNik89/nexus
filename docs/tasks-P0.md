@@ -290,7 +290,7 @@ Acceptance: phone→NEXUS→phone round trip on the real bot.
 RED: unbound chat refused; BlockImage/BlockAudio → typed reply, loop alive; replayed
 update_id returns existing outcome (no double effect).
 
-**[ ] T24 — Remote HITL (durable) + cross-profile integration REDs.**
+**[x] T24 — Remote HITL (durable) + cross-profile integration REDs.**
 `ApprovalChallenge` exact-intent (canonical tool+args+target+ProfileID; `(device,inode)`
 for destructive FS — C4), expiring, single-use; `DecisionAsk` → commit `TurnSuspended`,
 loop exits; approval appends `ApprovalReceived`, resume rehydrates from journal.

@@ -201,6 +201,38 @@ func (d *Daemon) handle(ctx context.Context, conn net.Conn) {
 	}
 }
 
+// RunChannelTurn executes ONE conversation turn for CHANNEL input —
+// ALWAYS ModeDefault (a channel message can never enable yolo, HARDQ
+// F2); the turn is journaled like any session turn.
+func (d *Daemon) RunChannelTurn(ctx context.Context, identity, text string) (string, error) {
+	pep, err := effectpath.NewPEP(d.deps.Rules, effectpath.NewApprovals(nil, 5*time.Minute), d.deps.Audit, effectpath.ModeDefault)
+	if err != nil {
+		return "", err
+	}
+	path, err := effectpath.NewEffectPath(pep, orderOnlyMW{},
+		effectpath.NewInProcessExecutor(d.deps.Tools),
+		effectpath.NewSandboxedProcessExecutor(noSandbox{}), d.deps.Authority)
+	if err != nil {
+		return "", err
+	}
+	planner, err := d.deps.PlannerFactory(func(string) error { return nil })
+	if err != nil {
+		return "", err
+	}
+	l, err := loop.New(planner, path, d.deps.Authority, d.deps.Journal, d.deps.Redactor, loop.PolicyInteractive, 16, 3)
+	if err != nil {
+		return "", err
+	}
+	n := d.session.Add(1)
+	block, err := userBlock(fmt.Sprintf("chan-%s-%d-%d", identity, d.nonce, n), text)
+	if err != nil {
+		return "", err
+	}
+	turn := contracts.TurnID(fmt.Sprintf("turn-chan-%d-%d", d.nonce, n))
+	run := contracts.RunID(fmt.Sprintf("run-chan-%d-%d", d.nonce, n))
+	return l.RunTurn(ctx, turn, run, d.deps.Profile, []contracts.ContextBlock{block})
+}
+
 // userBlock wraps terminal input as a USER-trust context block.
 func userBlock(id, text string) (contracts.ContextBlock, error) {
 	sum := sha256Hex(text)
