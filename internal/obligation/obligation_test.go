@@ -766,6 +766,17 @@ func TestLiveNonceTupleBinding(t *testing.T) {
 	if _, err := h.m.j.Append(ctxT(), dWrongID); err == nil {
 		t.Fatal("live nonce authorized a DIFFERENT task")
 	}
+	// The ID half in ISOLATION (Phase-4-r10 codex #3): wrong id with the
+	// ORIGINAL authorized marker — the marker comparison alone must not
+	// mask a deleted id comparison. The append fails either way (the
+	// projection also rejects the marker mismatch for t2), so the CAUSAL
+	// observable is the ticket: with the id comparison deleted this
+	// attempt BURNS it and the exact tuple below can no longer land.
+	dWrongIDOnly, _ := h.m.params(EvTaskDone, donePayload{ID: "task-t2",
+		MarkerLine: "[task-t1] tuple", Verifier: "postcondition-verifier", Nonce: nonce})
+	if _, err := h.m.j.Append(ctxT(), dWrongIDOnly); err == nil {
+		t.Fatal("live nonce authorized a different task carrying the original marker")
+	}
 	// The real live nonce with a WRONG marker.
 	dWrongMarker, _ := h.m.params(EvTaskDone, donePayload{ID: "task-t1",
 		MarkerLine: "[task-t1] forged-marker", Verifier: "postcondition-verifier", Nonce: nonce})

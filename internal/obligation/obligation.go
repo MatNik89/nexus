@@ -1037,27 +1037,34 @@ func (m *Manager) MarkTaskDone(ctx context.Context, id string) error {
 	if !verdict.Pass {
 		return fmt.Errorf("obligation: done refused — the postcondition does not verify (the task's marker line is absent)")
 	}
-	// ARM the single-use per-request ticket immediately before the append;
-	// a failed or cancelled append DISARMS it (no stranded authority).
+	// ARM the single-use per-request ticket immediately before the append.
+	// ONE deferred cleanup owner disarms on EVERY failure path — hook,
+	// params, append — so no branch can strand authority (Phase-4-r10
+	// codex #2: per-branch disarm calls left the append-error branch
+	// uncovered by the detector).
 	nonce, err := m.gate.arm(id, markerLine)
 	if err != nil {
 		return err
 	}
+	committed := false
+	defer func() {
+		if !committed {
+			m.gate.disarm(nonce)
+		}
+	}()
 	if m.testPostArmFail != nil {
 		if ferr := m.testPostArmFail(); ferr != nil {
-			m.gate.disarm(nonce)
 			return ferr
 		}
 	}
 	p, err := m.params(EvTaskDone, donePayload{ID: id, MarkerLine: markerLine, Verifier: "postcondition-verifier", Nonce: nonce})
 	if err != nil {
-		m.gate.disarm(nonce)
 		return err
 	}
 	if _, err := m.j.Append(ctx, p); err != nil {
-		m.gate.disarm(nonce)
 		return err
 	}
+	committed = true
 	return nil
 }
 
