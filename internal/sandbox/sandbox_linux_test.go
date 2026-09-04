@@ -345,3 +345,30 @@ func TestCancelledContextNeverLaunches(t *testing.T) {
 		t.Fatal("cancel did not kill the tree promptly")
 	}
 }
+
+// FULL-CLOSURE pin verified at Launch (Phase-6-r2 codex #2): ANY closure
+// member whose bytes differ from the compile-time pin is refused — not
+// just the main target. White-box: the policy is mutated in-package to
+// simulate a dependency swapped between Compile and Launch (the
+// black-box $ORIGIN variant was proven by the external review probe).
+func TestLaunchRefusesSwappedClosureMember(t *testing.T) {
+	b, rep := backend(t)
+	pol, err := b.Compile(ctxT(), Spec{Target: "/bin/ls", Args: []string{"/"}, WorkDir: wdir(t)}, rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pol.closurePins) < 2 {
+		t.Fatalf("dynamic /bin/ls should pin target+loader+libs, got %d members", len(pol.closurePins))
+	}
+	// Pick a NON-target member (loader or a library) and corrupt its pin
+	// — equivalent to the on-disk bytes changing after Compile.
+	for dest := range pol.closurePins {
+		if dest != "/nexus-target" {
+			pol.closurePins[dest] = "deadbeef"
+			break
+		}
+	}
+	if _, err := b.Launch(ctxT(), pol); err == nil {
+		t.Fatal("closure member with non-compile-time bytes launched")
+	}
+}
