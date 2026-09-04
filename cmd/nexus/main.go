@@ -22,6 +22,7 @@ import (
 	"github.com/MatNik89/nexus/internal/approval"
 	"github.com/MatNik89/nexus/internal/channel"
 	"github.com/MatNik89/nexus/internal/channel/telegram"
+	"github.com/MatNik89/nexus/internal/exectool"
 	"github.com/MatNik89/nexus/internal/foundation/atomicwrite"
 	"github.com/MatNik89/nexus/internal/foundation/clockid"
 	"github.com/MatNik89/nexus/internal/foundation/config"
@@ -38,6 +39,7 @@ import (
 	"github.com/MatNik89/nexus/internal/memory"
 	"github.com/MatNik89/nexus/internal/obligation"
 	"github.com/MatNik89/nexus/internal/preflight/doctor"
+	"github.com/MatNik89/nexus/internal/sandbox"
 	"github.com/MatNik89/nexus/internal/schedule"
 	"github.com/MatNik89/nexus/internal/security/redact"
 )
@@ -417,6 +419,20 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 	// task runs) goes through the SAME sealed path as sessions —
 	// ModeDefault, merged sealed tools/rules.
 	allTools := mergedTools(memStore, redactor, oblManager)
+	// REAL sandbox (T25/T26): probe bwrap; a passing probe binds the exec
+	// tool, a failing one leaves every ExecProcess call fail-closed and
+	// the exec capability OFF (deny-default).
+	var execAdapter *exectool.Adapter
+	sbBackend := sandbox.NewBwrap()
+	if rep, perr := sbBackend.Probe(context.Background()); perr == nil {
+		if ad, aerr := exectool.New(sbBackend, rep); aerr == nil {
+			execAdapter = ad
+		}
+	}
+	var execDoor effectpath.SandboxBackend
+	if execAdapter != nil {
+		execDoor = execAdapter
+	}
 	sysPep, err := effectpath.NewPEP(mergedRules(), effectpath.NewApprovals(nil, 5*time.Minute),
 		&journalAudit{j: j, profile: profile}, effectpath.ModeDefault)
 	if err != nil {
@@ -426,7 +442,7 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 	sysPep.SetDurableApprovals(approvals)
 	sysPath, err := effectpath.NewEffectPath(sysPep, systemMW{},
 		effectpath.NewInProcessExecutor(allTools),
-		effectpath.NewSandboxedProcessExecutor(nil), authority)
+		effectpath.NewSandboxedProcessExecutor(execDoor), authority)
 	if err != nil {
 		j.Close()
 		return nil, err
@@ -449,6 +465,13 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 			for k, v := range obligation.Specs() {
 				specs[k] = v
 			}
+			if execAdapter != nil {
+				// The planner offers exec ONLY behind a passing sandbox
+				// probe (deny-default).
+				for k, v := range exectool.Spec() {
+					specs[k] = v
+				}
+			}
 			return pl.WithTools(specs, profile)
 		},
 		Authority: authority, Profile: profile,
@@ -457,6 +480,7 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 		Audit:            &journalAudit{j: j, profile: profile},
 		Redactor:         redactor,
 		DurableApprovals: approvals,
+		Sandbox:          execDoor,
 		SuspenderFor: func(identity string) loop.Suspender {
 			source := "tg:" + identity
 			return func(ctx context.Context, turn contracts.TurnID, run contracts.RunID,
@@ -491,6 +515,11 @@ func (systemMW) OnError(ctx context.Context, e error) error { return e }
 func mergedRules() map[contracts.ToolID]effectpath.Decision {
 	rules := memory.Rules()
 	for k, v := range obligation.Rules() {
+		rules[k] = v
+	}
+	// exec is ALWAYS ASK — the rule exists even when no sandbox is bound
+	// (the process door then refuses fail-closed regardless of policy).
+	for k, v := range exectool.Rules() {
 		rules[k] = v
 	}
 	return rules

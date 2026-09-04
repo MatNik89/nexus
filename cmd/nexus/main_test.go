@@ -29,6 +29,7 @@ import (
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
 	"github.com/MatNik89/nexus/internal/kernel/journal"
 	"github.com/MatNik89/nexus/internal/obligation"
+	"github.com/MatNik89/nexus/internal/sandbox"
 	"github.com/MatNik89/nexus/internal/security/redact"
 )
 
@@ -1011,5 +1012,68 @@ func TestConsumedUnfinishedReconciles(t *testing.T) {
 		Text: "retry " + ch.ChallengeID, Profile: "private"})
 	if !strings.Contains(again, "Nothing to retry") {
 		t.Fatalf("consumed challenge retryable twice: %q", again)
+	}
+}
+
+// T26 acceptance literal: a MODEL-REQUESTED command runs SANDBOXED end
+// to end through the production spine — channel turn → ASK suspend →
+// approve → resume executes through the REAL bwrap backend; the reply
+// carries the exit status. Skipped only where bwrap is absent.
+func TestExecSpineEndToEndSandboxed(t *testing.T) {
+	if _, err := sandbox.NewBwrap().Probe(context.Background()); err != nil {
+		t.Skipf("bwrap unavailable: %v", err)
+	}
+	step := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		step++
+		reply := `{"action":"tool","tool_id":"exec","arguments":{"command":"/bin/ls","args":["/"]}}`
+		if step > 1 {
+			var req struct {
+				Messages []struct{ Role, Content string } `json:"messages"`
+			}
+			json.NewDecoder(r.Body).Decode(&req)
+			last := req.Messages[len(req.Messages)-1].Content
+			reply = "ran it: " + last[:min(80, len(last))]
+		}
+		b, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{
+			"message": map[string]string{"role": "assistant", "content": reply}}}})
+		w.Write(b)
+	}))
+	t.Cleanup(srv.Close)
+	host := strings.TrimPrefix(srv.URL, "http://")
+	t.Setenv("NEXUS_TG_EXEC_KEY", "sk-x")
+	base := filepath.Join(t.TempDir(), "nexus")
+	os.MkdirAll(base, 0o700)
+	cfgJSON := fmt.Sprintf(`{"provider_base_url":%q,"provider_key_env":"NEXUS_TG_EXEC_KEY",
+		"provider_model":"m","egress_allow":[%q],"default_profile":"private"}`, srv.URL, host)
+	os.WriteFile(filepath.Join(base, "config.json"), []byte(cfgJSON), 0o600)
+	resolved, err := config.Resolve(filepath.Join(base, "config.json"), "", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := buildDaemon(pathx.Layout{Base: base}, resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.j.Close()
+	h := telegramHandler(b)
+	reply, err := h(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 1,
+		Text: "list the root directory", Profile: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(reply, "APPROVAL NEEDED") {
+		t.Fatalf("exec did not hit the ASK gate from the channel: %q", reply)
+	}
+	id := challengeIDFrom(t, reply)
+	final, err := h(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 2,
+		Text: "approve " + id, Profile: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(final, "Approved "+id) || !strings.Contains(final, "ran it") {
+		t.Fatalf("approved exec did not resume through the spine: %q", final)
 	}
 }

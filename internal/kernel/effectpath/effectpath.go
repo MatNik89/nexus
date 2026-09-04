@@ -11,9 +11,11 @@
 package effectpath
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -128,7 +130,7 @@ func EffectHash(c contracts.ToolCall) string {
 		idem = *c.IdempotencyKey
 	}
 	for _, part := range [][]byte{
-		[]byte(c.ToolID), c.Arguments, []byte(c.ArgsSchemaHash),
+		[]byte(c.ToolID), canonicalJSON(c.Arguments), []byte(c.ArgsSchemaHash),
 		{byte(c.Effect)}, {byte(c.ExecutionKind)}, []byte(idem), []byte(c.ProfileID),
 	} {
 		// Length-prefix every part: no concatenation ambiguity.
@@ -136,6 +138,27 @@ func EffectHash(c contracts.ToolCall) string {
 		h.Write(part)
 	}
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// canonicalJSON re-encodes a JSON document with DETERMINISTIC object-key
+// order (Go maps marshal sorted). The journal redactor rebuilds payloads
+// through maps, so the byte order of stored arguments can differ from
+// the mint-time order — the hash must bind the CANONICAL form or a
+// journal round trip silently invalidates its own approval (Phase-6:
+// found by the exec spine e2e; C4 intent is unchanged, JSON object key
+// order carries no meaning). Unparsable input hashes as raw bytes.
+func canonicalJSON(raw []byte) []byte {
+	var v interface{}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(&v); err != nil {
+		return raw
+	}
+	out, err := json.Marshal(v)
+	if err != nil {
+		return raw
+	}
+	return out
 }
 
 func effectHash(c contracts.ToolCall) string { return EffectHash(c) }
