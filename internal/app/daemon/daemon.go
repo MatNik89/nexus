@@ -212,10 +212,42 @@ func (d *Daemon) handle(ctx context.Context, conn net.Conn) {
 // F2); an unapproved ASK suspends durably through the T24 owner and the
 // challenge summary is the reply; the turn is journaled like any
 // session turn. Provenance names the REAL source (Phase-5 codex #14).
-func (d *Daemon) RunChannelTurn(ctx context.Context, identity, text string) (string, error) {
-	pep, err := effectpath.NewPEP(d.deps.Rules, effectpath.NewApprovals(nil, 5*time.Minute), d.deps.Audit, effectpath.ModeDefault)
+func (d *Daemon) RunChannelTurn(ctx context.Context, identity string, updateID int64, text string) (string, error) {
+	l, err := d.channelLoop(identity)
 	if err != nil {
 		return "", err
+	}
+	// DETERMINISTIC per-message ids (Phase-5-r2 codex #1): a redelivered
+	// update re-enters the SAME turn — the journal's unique event ids then
+	// refuse a second execution of an already-run turn instead of
+	// duplicating its effects under fresh identities.
+	turn := contracts.TurnID(fmt.Sprintf("turn-chan-%s-%d", identity, updateID))
+	run := contracts.RunID(fmt.Sprintf("run-chan-%s-%d", identity, updateID))
+	block, err := sourcedBlock(fmt.Sprintf("chan-%s-%d", identity, updateID), text,
+		"nexus://telegram/"+identity, "telegram")
+	if err != nil {
+		return "", err
+	}
+	return l.RunTurn(ctx, turn, run, d.deps.Profile, []contracts.ContextBlock{block})
+}
+
+// ResumeChannelTurn rehydrates a SUSPENDED channel turn after its
+// approval (B6, Phase-5-r2 codex #2): the loop re-enters the ORIGINAL
+// turn with the approved tool's observation and continues to a real final.
+func (d *Daemon) ResumeChannelTurn(ctx context.Context, identity string, turn contracts.TurnID,
+	run contracts.RunID, blocks []contracts.ContextBlock) (string, error) {
+	l, err := d.channelLoop(identity)
+	if err != nil {
+		return "", err
+	}
+	return l.ResumeTurn(ctx, turn, run, d.deps.Profile, blocks)
+}
+
+// channelLoop builds the per-turn channel loop (ModeDefault ALWAYS — F2).
+func (d *Daemon) channelLoop(identity string) (*loop.Loop, error) {
+	pep, err := effectpath.NewPEP(d.deps.Rules, effectpath.NewApprovals(nil, 5*time.Minute), d.deps.Audit, effectpath.ModeDefault)
+	if err != nil {
+		return nil, err
 	}
 	if d.deps.DurableApprovals != nil {
 		pep.SetDurableApprovals(d.deps.DurableApprovals)
@@ -224,28 +256,20 @@ func (d *Daemon) RunChannelTurn(ctx context.Context, identity, text string) (str
 		effectpath.NewInProcessExecutor(d.deps.Tools),
 		effectpath.NewSandboxedProcessExecutor(noSandbox{}), d.deps.Authority)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	planner, err := d.deps.PlannerFactory(func(string) error { return nil })
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	l, err := loop.New(planner, path, d.deps.Authority, d.deps.Journal, d.deps.Redactor, loop.PolicyInteractive, 16, 3)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if d.deps.SuspenderFor != nil {
 		l.SetSuspender(d.deps.SuspenderFor(identity))
 	}
-	n := d.session.Add(1)
-	block, err := sourcedBlock(fmt.Sprintf("chan-%s-%d-%d", identity, d.nonce, n), text,
-		"nexus://telegram/"+identity, "telegram")
-	if err != nil {
-		return "", err
-	}
-	turn := contracts.TurnID(fmt.Sprintf("turn-chan-%d-%d", d.nonce, n))
-	run := contracts.RunID(fmt.Sprintf("run-chan-%d-%d", d.nonce, n))
-	return l.RunTurn(ctx, turn, run, d.deps.Profile, []contracts.ContextBlock{block})
+	return l, nil
 }
 
 // userBlock wraps terminal input as a USER-trust context block.

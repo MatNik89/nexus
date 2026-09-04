@@ -295,6 +295,9 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 type Core struct {
 	j   *journal.Journal
 	seq atomic.Uint64
+	// testPostCheckHook parks Admit between its dedup check and its
+	// append (race-detector seam, Phase-5-r2 codex #9); nil in production.
+	testPostCheckHook func()
 	// testFailSentMark simulates a daemon death between transport accept
 	// and the sent-mark append (the sent-but-unrecorded window).
 	testFailSentMark bool
@@ -345,6 +348,12 @@ func (c *Core) Admit(ctx context.Context, in Inbound) (AdmitOutcome, error) {
 	// Fast path: the durable dedup row already exists → existing outcome.
 	if st, err := c.InboundStatus(ctx, id); err == nil && st != "" {
 		return AdmitOutcome{MessageID: id, Replayed: true}, nil
+	}
+	if c.testPostCheckHook != nil {
+		// Test seam (Phase-5-r2 codex #9): parks racers HERE, between the
+		// dedup check and the append, so the race detector deterministically
+		// exercises the UNIQUE-index backstop. Never set in production.
+		c.testPostCheckHook()
 	}
 	p, err := c.params(EvInboundAdmitted, inboundPayload{
 		MessageID: id, AdapterID: in.AdapterID, ChannelIdentity: in.ChannelIdentity,
@@ -440,6 +449,10 @@ func (c *Core) Flush(ctx context.Context, send func(Outbound) error) error {
 	if err != nil {
 		return err
 	}
+	// One poisoned head must not starve every later delivery (Phase-5-r2
+	// codex #6): failures are collected and the loop CONTINUES; only a
+	// journal-mark failure aborts (the durable substrate itself is broken).
+	var failures []error
 	for _, o := range pending {
 		// Durable in-flight parking BEFORE the wire.
 		if err := c.mark(ctx, EvOutboundUnknown, o.DeliveryID); err != nil {
@@ -459,16 +472,16 @@ func (c *Core) Flush(ctx context.Context, send func(Outbound) error) error {
 				return fmt.Errorf("channel: delivery %s accepted but the sent-mark failed — stays UNKNOWN for reconciliation: %w", o.DeliveryID, sentErr)
 			}
 		case errors.Is(sendErr, ErrAmbiguousSend):
-			return fmt.Errorf("channel: delivery %s ambiguous — stays UNKNOWN for reconciliation: %w", o.DeliveryID, sendErr)
+			failures = append(failures, fmt.Errorf("channel: delivery %s ambiguous — stays UNKNOWN for reconciliation: %w", o.DeliveryID, sendErr))
 		default:
 			// DEFINITE pre-wire failure: nothing left the process.
 			if rerr := c.Reconcile(ctx, o.DeliveryID, false); rerr != nil {
 				return fmt.Errorf("channel: delivery %s failed pre-wire and could not re-pend: %w", o.DeliveryID, errors.Join(sendErr, rerr))
 			}
-			return fmt.Errorf("channel: delivery %s failed (re-pended): %w", o.DeliveryID, sendErr)
+			failures = append(failures, fmt.Errorf("channel: delivery %s failed (re-pended): %w", o.DeliveryID, sendErr))
 		}
 	}
-	return nil
+	return errors.Join(failures...)
 }
 
 // markSentFromUnknown closes an in-flight row as SENT.

@@ -3,7 +3,10 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -23,6 +26,7 @@ import (
 	"github.com/MatNik89/nexus/internal/foundation/clockid"
 	"github.com/MatNik89/nexus/internal/foundation/config"
 	"github.com/MatNik89/nexus/internal/foundation/pathx"
+	"github.com/MatNik89/nexus/internal/kernel/closure"
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
 	"github.com/MatNik89/nexus/internal/kernel/effectpath"
 	"github.com/MatNik89/nexus/internal/kernel/journal"
@@ -160,6 +164,12 @@ func runDaemon() int {
 			}
 		}
 	}()
+	// Startup resume scan (Phase-5-r2 codex #2): an approval whose
+	// receipt committed but whose resume was lost to a crash completes
+	// NOW — the action is never stranded. The reply rides the outbox.
+	if serr := b.resumeApprovedPending(ctx); serr != nil {
+		fmt.Fprintf(os.Stderr, "nexus daemon: approved-resume scan: %v\n", serr)
+	}
 	// Telegram (channel:builtin): starts ONLY when the token env var is
 	// set AND at least one chat is bound — deny-default (B3).
 	if tok := os.Getenv(resolved.Config.TelegramTokenEnv); tok != "" {
@@ -213,14 +223,21 @@ type daemonBundle struct {
 	authority *s7min.Authority
 }
 
-// resumeApproved executes the EXACT approved call through the sealed
-// system EffectPath (the durable approval is consumed inside the PEP) —
-// the T24 resume.
-func (b *daemonBundle) resumeApproved(ctx context.Context, challengeID string) (string, error) {
-	call, err := b.approvals.ApprovedCall(ctx, challengeID)
+// resumeApproved is the T24 resume: it executes the EXACT approved call
+// through the sealed system EffectPath (the durable approval is consumed
+// inside the PEP), then REHYDRATES the original suspended turn (B6,
+// Phase-5-r2 codex #2/#4) — the loop re-enters it with the tool's
+// observation and continues to a real final. The transport deadline is
+// refreshed before execution (Phase-5-r2 codex #3 / kilo #1: the frozen
+// 2-minute planner deadline would refuse every delayed remote approval;
+// the deadline is deliberately NOT part of the C4 EffectHash, so the
+// refresh cannot alter the approved intent).
+func (b *daemonBundle) resumeApproved(ctx context.Context, identity, challengeID string) (string, error) {
+	turn, run, call, err := b.approvals.SuspendedCall(ctx, challengeID, "tg:"+identity)
 	if err != nil {
 		return "", err
 	}
+	call.Deadline = time.Now().Add(2 * time.Minute)
 	op := contracts.OperationID("resume-" + challengeID)
 	grant, err := b.authority.Issue(op, effectpath.ToolTarget(call))
 	if err != nil {
@@ -230,10 +247,61 @@ func (b *daemonBundle) resumeApproved(ctx context.Context, challengeID string) (
 	if err != nil {
 		return "", err
 	}
+	result := "done"
 	if len(out.Output) > 0 && out.Output[0].Content != nil {
-		return *out.Output[0].Content, nil
+		result = *out.Output[0].Content
 	}
-	return "done", nil
+	// Continuation: the approved tool's outcome re-enters the ORIGINAL
+	// turn as an observation and the planner produces the final reply.
+	obs, err := resumeObservation(call, result)
+	if err != nil {
+		return "", err
+	}
+	final, err := b.d.ResumeChannelTurn(ctx, identity, turn, run, []contracts.ContextBlock{obs})
+	if err != nil {
+		// The effect DID run and the approval is consumed — report the
+		// tool result honestly even when the continuation fails.
+		return result, nil
+	}
+	return final, nil
+}
+
+// resumeApprovedPending completes every approval whose receipt committed
+// but whose resume was lost to a crash (Phase-5-r2 codex #2) — run at
+// startup; each outcome rides the outbox back to its originating chat.
+func (b *daemonBundle) resumeApprovedPending(ctx context.Context) error {
+	approvedList, err := b.approvals.Approved(ctx)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, ac := range approvedList {
+		identity := strings.TrimPrefix(ac.ExpectedSource, "tg:")
+		result, rerr := b.resumeApproved(ctx, identity, ac.ChallengeID)
+		text := "Approved " + ac.ChallengeID + ". " + result
+		if rerr != nil {
+			errs = append(errs, fmt.Errorf("resume %s: %w", ac.ChallengeID, rerr))
+			text = "Your approval " + ac.ChallengeID + " could not be resumed: " + rerr.Error()
+		}
+		if _, qerr := b.chanCore.EnqueueReply(ctx, "telegram", identity, b.profile, text); qerr != nil {
+			errs = append(errs, fmt.Errorf("resume reply %s: %w", ac.ChallengeID, qerr))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// resumeObservation packs the approved tool's result for the resumed turn.
+func resumeObservation(call contracts.ToolCall, result string) (contracts.ContextBlock, error) {
+	content := fmt.Sprintf("The user approved the suspended action. Tool %s executed with result: %s. Reply to the user.",
+		call.ToolID, result)
+	sum := sha256.Sum256([]byte(content))
+	return contracts.NewContextBlock(contracts.ContextBlockParams{
+		BlockID: contracts.BlockID("obs-resume-" + string(call.ToolCallID)),
+		Kind:    "tool_result", Content: &content, ContentHash: hex.EncodeToString(sum[:]),
+		SourceURI: "nexus://approval/resume", Producer: "tool",
+		Trust: contracts.TrustToolTrusted, Sensitivity: contracts.SensitivityInternal,
+		Lineage: []string{string(call.ToolCallID)}, ObservedAt: time.Now().UTC(),
+	})
 }
 
 func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, error) {
@@ -332,7 +400,6 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 		j.Close()
 		return nil, err
 	}
-	sysPep.SetDurableApprovals(approvals)
 	sysPep.SetDurableApprovals(approvals)
 	sysPath, err := effectpath.NewEffectPath(sysPep, systemMW{},
 		effectpath.NewInProcessExecutor(allTools),
@@ -504,15 +571,40 @@ func telegramBindings(raw string) (map[int64]string, error) {
 	return out, nil
 }
 
-// telegramProbeGate runs the LIVE channel probe (T11) before the adapter
-// may serve (Phase-5 codex #10): revoked/invalid bot credentials keep
-// the channel OFF with a loud reason instead of a silently dead poller.
+// telegramProbeGate runs the LIVE channel probe and seals it into the
+// T11 closure snapshot (Phase-5 codex #10 / Phase-5-r2 codex #7): the
+// adapter serves only when the SEALED snapshot turns the telegram
+// capability ON under the current config hash — never on a loose local
+// check.
 func telegramProbeGate(ctx context.Context, adapter *telegram.Adapter, resolved config.Resolved) error {
 	pr := adapter.Probe(ctx, resolved)
-	if !pr.Passed {
-		return fmt.Errorf("telegram channel probe failed: %s", pr.Detail)
+	snap, err := sealStartupSnapshot(resolved, &pr)
+	if err != nil {
+		return fmt.Errorf("closure seal: %w", err)
+	}
+	if st := snap.Status("telegram"); !st.On {
+		return fmt.Errorf("telegram capability OFF in the sealed snapshot: %s", st.Reason)
 	}
 	return nil
+}
+
+// sealStartupSnapshot builds the T11 sealed capability snapshot from the
+// probes the daemon can actually measure at startup.
+// topknot ceiling: the provider and store probes are STATIC attestations
+// (config resolved, journal open) — a live provider round trip is the
+// upgrade trigger when a cheap provider health endpoint lands (P1).
+func sealStartupSnapshot(resolved config.Resolved, channelProbe *closure.ProbeResult) (*closure.Snapshot, error) {
+	hash := resolved.ConfigHash()
+	probes := []closure.ProbeResult{
+		{Name: "provider", Passed: true, Detail: "static: config resolved, key env bound", ConfigHash: hash},
+		{Name: "store", Passed: true, Detail: "journal open", ConfigHash: hash},
+	}
+	requested := []string{"conversation", "memory", "obligations", "profiles"}
+	if channelProbe != nil {
+		probes = append(probes, *channelProbe)
+		requested = append(requested, "telegram")
+	}
+	return closure.Seal(closure.P0Capabilities(), requested, probes, resolved)
 }
 
 // telegramHandler routes an admitted Telegram message: "approve <id>" /
@@ -528,14 +620,21 @@ func telegramHandler(b *daemonBundle) telegram.Handler {
 		case strings.HasPrefix(lower, "approve "):
 			id := strings.TrimSpace(text[len("approve "):])
 			if err := b.approvals.Approve(ctx, id, source); err != nil {
-				return "Approval failed: " + err.Error(), nil
+				// Crash-window recovery (Phase-5-r2 codex #2): if the
+				// receipt already committed for THIS source but the resume
+				// never ran, a replayed approve completes it instead of
+				// stranding the action. A foreign source still fails here
+				// because SuspendedCall is source-bound.
+				if _, _, _, aerr := b.approvals.SuspendedCall(ctx, id, source); aerr != nil {
+					return "Approval failed: " + err.Error(), nil
+				}
 			}
 			// RESUME (T24): execute the exact approved effect now.
-			result, rerr := b.resumeApproved(ctx, id)
+			result, rerr := b.resumeApproved(ctx, in.ChannelIdentity, id)
 			if rerr != nil {
 				return "Approved " + id + " but the resume failed: " + rerr.Error(), nil
 			}
-			return "Approved " + id + ". Done: " + result, nil
+			return "Approved " + id + ". " + result, nil
 		case strings.HasPrefix(lower, "deny "):
 			id := strings.TrimSpace(text[len("deny "):])
 			if err := b.approvals.Deny(ctx, id, source); err != nil {
@@ -560,7 +659,7 @@ func telegramHandler(b *daemonBundle) telegram.Handler {
 		// spine (ModeDefault — channel input can NEVER carry yolo). The
 		// suspender binds any approval challenge to THIS chat as the only
 		// legal decision source.
-		reply, err := b.d.RunChannelTurn(ctx, in.ChannelIdentity, text)
+		reply, err := b.d.RunChannelTurn(ctx, in.ChannelIdentity, in.UpdateID, text)
 		if err != nil {
 			return "", err
 		}

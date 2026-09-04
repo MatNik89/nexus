@@ -214,8 +214,8 @@ func TestEventTypesCoverAllTables(t *testing.T) {
 		}
 		names[n] = true
 	}
-	if len(names) != 25 {
-		t.Fatalf("want 25 distinct event types, got %d", len(names))
+	if len(names) != 27 {
+		t.Fatalf("want 27 distinct event types, got %d", len(names))
 	}
 }
 

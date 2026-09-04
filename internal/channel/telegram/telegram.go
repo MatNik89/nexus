@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -104,6 +105,19 @@ type tgUpdate struct {
 	} `json:"message"`
 }
 
+// isPreWire reports whether a client.Do error happened before anything
+// could reach the remote: dial-phase socket errors and DNS resolution
+// failures. Everything else (reset/EOF/timeout after write) stays
+// ambiguous — the remote may have accepted the request.
+func isPreWire(err error) bool {
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+	var opErr *net.OpError
+	return errors.As(err, &opErr) && opErr.Op == "dial"
+}
+
 // sanitize strips the bot token from any error text (Phase-5 codex #9 /
 // kilo #2 / agy #1: url.Error embeds the full bot<token> URL).
 func (a *Adapter) sanitize(err error) error {
@@ -121,13 +135,20 @@ func (a *Adapter) call(ctx context.Context, method string, req any, out any) err
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		a.base+"/bot"+a.token+"/"+method, bytes.NewReader(body))
 	if err != nil {
-		return err
+		// Request construction can embed the full bot URL in parser
+		// errors (Phase-5-r2 codex #8).
+		return a.sanitize(err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	resp, err := a.client.Do(httpReq)
 	if err != nil {
-		// The wire WAS touched: the remote may have accepted — ambiguous
-		// (Phase-5 codex #3), and the token never leaks (codex #9).
+		// Classify (Phase-5-r2 kilo #2): a dial/DNS-phase failure is
+		// DEFINITE — nothing left the process, a retry is safe. Only a
+		// failure after the request may have been sent is ambiguous
+		// (Phase-5 codex #3). The token never leaks (codex #9).
+		if isPreWire(err) {
+			return fmt.Errorf("telegram: connect: %w", a.sanitize(err))
+		}
 		return fmt.Errorf("telegram: transport: %w: %w", channel.ErrAmbiguousSend, a.sanitize(err))
 	}
 	defer resp.Body.Close()

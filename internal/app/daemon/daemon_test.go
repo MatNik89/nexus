@@ -382,3 +382,64 @@ func TestFullSpineDeterministicTransport(t *testing.T) {
 		t.Fatalf("full-spine turn folds to %v (%v)", st, err)
 	}
 }
+
+// blockCapturingPlanner records the context blocks it is planned with.
+type blockCapturingPlanner struct {
+	mu     sync.Mutex
+	blocks [][]contracts.ContextBlock
+}
+
+func (p *blockCapturingPlanner) Plan(ctx context.Context, blocks []contracts.ContextBlock) (loop.Action, error) {
+	p.mu.Lock()
+	cp := append([]contracts.ContextBlock{}, blocks...)
+	p.blocks = append(p.blocks, cp)
+	p.mu.Unlock()
+	final := "ok"
+	return loop.Action{Final: &final}, nil
+}
+
+// HONEST channel provenance detector (Phase-5-r2 codex #9: the round-1
+// fix had no red-capable test): a channel turn's user block must name the
+// REAL source — restoring REPL provenance turns this RED.
+func TestChannelTurnCarriesChannelProvenance(t *testing.T) {
+	p := &blockCapturingPlanner{}
+	d, _, _ := testDaemon(t, p, nil)
+	if _, err := d.RunChannelTurn(context.Background(), "chat-42", 7, "hello"); err != nil {
+		t.Fatal(err)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.blocks) == 0 || len(p.blocks[0]) == 0 {
+		t.Fatal("planner saw no blocks")
+	}
+	b := p.blocks[0][0]
+	if b.SourceURI != "nexus://telegram/chat-42" || b.Producer != "telegram" {
+		t.Fatalf("channel input masquerades as %q/%q (want nexus://telegram/chat-42 / telegram)", b.SourceURI, b.Producer)
+	}
+}
+
+// DETERMINISTIC channel turn ids (Phase-5-r2 codex #1): the SAME
+// redelivered update re-enters the SAME turn — the journal's unique event
+// ids refuse a second run instead of duplicating effects under fresh
+// identities; a DIFFERENT update still runs.
+func TestRedeliveredUpdateCannotRerunCompletedTurn(t *testing.T) {
+	p := &blockCapturingPlanner{}
+	d, _, _ := testDaemon(t, p, nil)
+	if _, err := d.RunChannelTurn(context.Background(), "chat-42", 7, "hello"); err != nil {
+		t.Fatal(err)
+	}
+	// Redelivery of update 7: the completed turn must NOT run again.
+	if _, err := d.RunChannelTurn(context.Background(), "chat-42", 7, "hello"); err == nil {
+		t.Fatal("redelivered update re-ran a completed turn")
+	}
+	p.mu.Lock()
+	runs := len(p.blocks)
+	p.mu.Unlock()
+	if runs != 1 {
+		t.Fatalf("completed turn planned twice: %d", runs)
+	}
+	// A different update id is a fresh turn.
+	if _, err := d.RunChannelTurn(context.Background(), "chat-42", 8, "next"); err != nil {
+		t.Fatal(err)
+	}
+}

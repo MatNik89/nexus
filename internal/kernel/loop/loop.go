@@ -194,6 +194,30 @@ func (l *Loop) RunTurn(ctx context.Context, turn contracts.TurnID, run contracts
 	if err := l.append(ctx, run, profile, turn, machine.EvTurnStarted, next(), nil); err != nil {
 		return "", err
 	}
+	return l.iterate(ctx, turn, run, profile, initial, next)
+}
+
+// ResumeTurn re-enters a SUSPENDED turn after its approval decision (B6
+// rehydration, Phase-5-r2 codex #2): turn.resumed is journaled, then the
+// planner continues from the supplied blocks (the approved tool's
+// observation) to a real final. Event seq starts high so resume event ids
+// can never collide with the original incarnation's.
+func (l *Loop) ResumeTurn(ctx context.Context, turn contracts.TurnID, run contracts.RunID,
+	profile contracts.ProfileID, blocks []contracts.ContextBlock) (string, error) {
+	if !turn.Valid() || !run.Valid() || !profile.Valid() {
+		return "", fmt.Errorf("loop: turn, run and profile ids are required (fail closed)")
+	}
+	seq := 1000
+	next := func() int { seq++; return seq }
+	if err := l.append(ctx, run, profile, turn, machine.EvTurnResumed, next(), nil); err != nil {
+		return "", err
+	}
+	return l.iterate(ctx, turn, run, profile, blocks, next)
+}
+
+// iterate is the shared plan→act→observe core (turn already RUNNING).
+func (l *Loop) iterate(ctx context.Context, turn contracts.TurnID, run contracts.RunID,
+	profile contracts.ProfileID, initial []contracts.ContextBlock, next func() int) (string, error) {
 	failTurn := func(cause error) (string, error) {
 		if jerr := l.append(ctx, run, profile, turn, machine.EvTurnFailed, next(), nil); jerr != nil {
 			return "", fmt.Errorf("%w (and journal: %v)", cause, jerr)
@@ -298,7 +322,10 @@ func (l *Loop) RunTurn(ctx context.Context, turn contracts.TurnID, run contracts
 				if serr != nil {
 					return failTurn(fmt.Errorf("loop: suspension failed: %w", errors.Join(toolErr, serr)))
 				}
-				if err := l.append(ctx, run, profile, turn, machine.EvTurnSucceeded, next(), nil); err != nil {
+				// The turn is SUSPENDED — recording it SUCCEEDED would
+				// lie to recovery while the effect still awaits approval
+				// (Phase-5-r2 codex #4). ResumeTurn re-enters it.
+				if err := l.append(ctx, run, profile, turn, machine.EvTurnSuspended, next(), nil); err != nil {
 					return "", err
 				}
 				return summary, nil
@@ -312,7 +339,7 @@ func (l *Loop) RunTurn(ctx context.Context, turn contracts.TurnID, run contracts
 		}
 		if toolErr != nil {
 			// Failure is an OBSERVATION; the turn continues.
-			obs, oerr := errorObservation(l.redactor, call, seq, toolErr)
+			obs, oerr := errorObservation(l.redactor, call, next(), toolErr)
 			if oerr != nil {
 				return failTurn(fmt.Errorf("loop: observation: %w", oerr))
 			}

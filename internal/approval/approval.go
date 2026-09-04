@@ -174,13 +174,17 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return err
 		}
+		// Expiry is enforced HERE, in the same transaction as the append,
+		// against the EVENT-OWNED decision time — a pre-check race can no
+		// longer commit a decision past expiry (Phase-5-r2 codex #5).
 		res, err := tx.Exec(`UPDATE appr_challenges SET status='APPROVED', decided_by=?
-			WHERE challenge_id=? AND status='PENDING' AND expected_source=?`, p.Source, p.ChallengeID, p.Source)
+			WHERE challenge_id=? AND status='PENDING' AND expected_source=? AND expires_unix > ?`,
+			p.Source, p.ChallengeID, p.Source, ev.Envelope.EmittedAt.Unix())
 		if err != nil {
 			return err
 		}
 		if n, _ := res.RowsAffected(); n != 1 {
-			return fmt.Errorf("approval: challenge is not PENDING (unknown, decided, or replayed): %w", ErrApprovalReplay)
+			return fmt.Errorf("approval: challenge is not PENDING (unknown, decided, expired, or replayed): %w", ErrApprovalReplay)
 		}
 	case EvApprovalDenied:
 		var p decisionPayload
@@ -188,7 +192,8 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 			return err
 		}
 		res, err := tx.Exec(`UPDATE appr_challenges SET status='DENIED', decided_by=?
-			WHERE challenge_id=? AND status='PENDING' AND expected_source=?`, p.Source, p.ChallengeID, p.Source)
+			WHERE challenge_id=? AND status='PENDING' AND expected_source=? AND expires_unix > ?`,
+			p.Source, p.ChallengeID, p.Source, ev.Envelope.EmittedAt.Unix())
 		if err != nil {
 			return err
 		}
@@ -203,7 +208,8 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 		// Single-use, exact-intent: consumption requires APPROVED and the
 		// MATCHING effect hash — a tampered call aborts here.
 		res, err := tx.Exec(`UPDATE appr_challenges SET status='CONSUMED'
-			WHERE challenge_id=? AND status='APPROVED' AND effect_hash=?`, p.ChallengeID, p.EffectHash)
+			WHERE challenge_id=? AND status='APPROVED' AND effect_hash=? AND expires_unix > ?`,
+			p.ChallengeID, p.EffectHash, ev.Envelope.EmittedAt.Unix())
 		if err != nil {
 			return err
 		}
@@ -445,4 +451,55 @@ func (s *Store) SuspendedTurn(ctx context.Context, id string) (contracts.TurnID,
 		return "", "", false, err
 	}
 	return contracts.TurnID(turn), contracts.RunID(run), true, rows.Err()
+}
+
+// ApprovedChallenge is one APPROVED-but-unconsumed challenge (startup
+// resume scan, Phase-5-r2 codex #2: a crash between the approval receipt
+// and the resume must not strand the action).
+type ApprovedChallenge struct {
+	ChallengeID    string
+	ExpectedSource string
+}
+
+// Approved lists APPROVED, unconsumed, unexpired challenges.
+func (s *Store) Approved(ctx context.Context) ([]ApprovedChallenge, error) {
+	rows, err := s.j.QueryProjection(ctx,
+		`SELECT challenge_id, expected_source FROM appr_challenges WHERE status='APPROVED' AND expires_unix > ? ORDER BY created`,
+		s.clock.Now().Unix())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ApprovedChallenge
+	for rows.Next() {
+		var c ApprovedChallenge
+		if err := rows.Scan(&c.ChallengeID, &c.ExpectedSource); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// SuspendedCall returns the suspended turn/run ids AND canonical call of
+// an APPROVED challenge — resume rehydrates the ORIGINAL turn (B6).
+func (s *Store) SuspendedCall(ctx context.Context, id, source string) (contracts.TurnID, contracts.RunID, contracts.ToolCall, error) {
+	rows, err := s.j.QueryProjection(ctx,
+		`SELECT turn_id, run_id, call_json FROM appr_challenges WHERE challenge_id=? AND status='APPROVED' AND expected_source=?`, id, source)
+	if err != nil {
+		return "", "", contracts.ToolCall{}, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return "", "", contracts.ToolCall{}, fmt.Errorf("approval: no approved challenge %q (fail closed)", id)
+	}
+	var turn, run, raw string
+	if err := rows.Scan(&turn, &run, &raw); err != nil {
+		return "", "", contracts.ToolCall{}, err
+	}
+	var c contracts.ToolCall
+	if err := json.Unmarshal([]byte(raw), &c); err != nil {
+		return "", "", contracts.ToolCall{}, err
+	}
+	return contracts.TurnID(turn), contracts.RunID(run), c, nil
 }

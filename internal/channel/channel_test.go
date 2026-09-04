@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -409,6 +410,17 @@ func TestInboundTerminalRecipe(t *testing.T) {
 // admission event; both callers converge on the same outcome.
 func TestConcurrentAdmissionRace(t *testing.T) {
 	c, j := open(t, t.TempDir())
+	// Deterministic losing interleaving: BOTH racers pass the dedup check
+	// before EITHER appends — only the journal-side UNIQUE backstop can
+	// keep admission exactly-once now (removing it turns this RED).
+	var arrived sync.WaitGroup
+	arrived.Add(2)
+	release := make(chan struct{})
+	c.testPostCheckHook = func() {
+		arrived.Done()
+		<-release
+	}
+	go func() { arrived.Wait(); close(release) }()
 	type res struct {
 		out AdmitOutcome
 		err error
@@ -440,5 +452,36 @@ func TestConcurrentAdmissionRace(t *testing.T) {
 	})
 	if count != 1 {
 		t.Fatalf("%d admission events (want 1)", count)
+	}
+}
+
+// POISON HEAD (Phase-5-r2 codex #6): one permanently failing delivery
+// must not starve every later row — the flush continues past a definite
+// failure and still reports it.
+func TestPoisonHeadDoesNotStarve(t *testing.T) {
+	c, _ := open(t, t.TempDir())
+	if _, err := c.EnqueueReply(ctxT(), "telegram", "chat-poison", "work", "always fails"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.EnqueueReply(ctxT(), "telegram", "chat-42", "work", "must deliver"); err != nil {
+		t.Fatal(err)
+	}
+	good := 0
+	err := c.Flush(ctxT(), func(o Outbound) error {
+		if o.ChannelIdentity == "chat-poison" {
+			return fmt.Errorf("chat rejected permanently")
+		}
+		good++
+		return nil
+	})
+	if err == nil {
+		t.Fatal("poison failure swallowed")
+	}
+	if good != 1 {
+		t.Fatalf("poison head starved the later delivery: good=%d", good)
+	}
+	// The poison row is re-pended (definite failure), not lost.
+	if p, _ := c.Pending(ctxT()); len(p) != 1 || p[0].ChannelIdentity != "chat-poison" {
+		t.Fatalf("poison row not re-pended: %v", p)
 	}
 }

@@ -332,3 +332,48 @@ func TestTokenNeverInErrors(t *testing.T) {
 }
 
 func configResolved() config.Resolved { return config.Resolved{} }
+
+// PRE-WIRE classification (Phase-5-r2 kilo #2): a dial-phase failure
+// (connection refused — nothing left the process) re-pends the row for a
+// safe retry instead of parking it UNKNOWN forever.
+func TestPreWireFailureRepends(t *testing.T) {
+	h := build(t, map[int64]string{42: "work"})
+	dead, err := New(Config{
+		APIBase: "http://127.0.0.1:1", TokenEnv: "NEXUS_TEST_TG",
+		Bindings: map[int64]string{42: "work"}, Profile: "work",
+	}, h.core, h.a.handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.core.EnqueueReply(ctxT(), "telegram", "chat-42", "work", "hello"); err != nil {
+		t.Fatal(err)
+	}
+	if err := dead.FlushOutbox(ctxT()); err == nil {
+		t.Fatal("dead endpoint flush succeeded")
+	}
+	pending, _ := h.core.Pending(ctxT())
+	unknown, _ := h.core.Unreconciled(ctxT())
+	if len(pending) != 1 || len(unknown) != 0 {
+		t.Fatalf("connection-refused misclassified: pending=%d unknown=%d (want 1/0)", len(pending), len(unknown))
+	}
+}
+
+// Request-construction errors are sanitized too (Phase-5-r2 codex #8):
+// an invalid URL escape renders Go's parser error WITH the full bot URL.
+func TestRequestConstructionSanitized(t *testing.T) {
+	h := build(t, map[int64]string{42: "work"})
+	bad, err := New(Config{
+		APIBase: "http://x/%zz", TokenEnv: "NEXUS_TEST_TG",
+		Bindings: map[int64]string{42: "work"}, Profile: "work",
+	}, h.core, h.a.handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	perr := bad.PollOnce(ctxT())
+	if perr == nil {
+		t.Fatal("invalid URL accepted")
+	}
+	if strings.Contains(perr.Error(), "123:token") {
+		t.Fatalf("token leaked from request construction: %v", perr)
+	}
+}

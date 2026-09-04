@@ -508,8 +508,10 @@ func TestChannelAskSuspendsThenApproveResumes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(ok, "Approved "+id) || !strings.Contains(ok, "Done:") {
-		t.Fatalf("approve did not resume the effect: %q", ok)
+	// The resume REHYDRATES the original turn: the reply is the
+	// planner's continuation final, not a raw tool dump (B6).
+	if !strings.Contains(ok, "Approved "+id) || !strings.Contains(ok, "saved it") {
+		t.Fatalf("approve did not resume the suspended turn: %q", ok)
 	}
 	// 4. The approval is SINGLE-USE: approving again resumes nothing.
 	again, err := h(context.Background(), channel.Inbound{
@@ -518,7 +520,7 @@ func TestChannelAskSuspendsThenApproveResumes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(again, "Done:") {
+	if strings.Contains(again, "saved it") {
 		t.Fatalf("approval replayed into a second execution: %q", again)
 	}
 }
@@ -598,5 +600,206 @@ func TestTelegramProbeGate(t *testing.T) {
 	}
 	if strings.Contains(gerr.Error(), "123:tok") {
 		t.Fatalf("probe gate leaked the token: %v", gerr)
+	}
+}
+
+// hitlBundle builds a daemon over a deterministic 2-step provider (tool
+// call, then final) for the round-2 HITL crash/deadline REDs.
+func hitlBundle(t *testing.T, name string) *daemonBundle {
+	t.Helper()
+	step := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		step++
+		reply := `{"action":"tool","tool_id":"memory_remember","arguments":{"content":"fact"}}`
+		if step > 1 {
+			reply = "saved it"
+		}
+		b, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{
+			"message": map[string]string{"role": "assistant", "content": reply}}}})
+		w.Write(b)
+	}))
+	t.Cleanup(srv.Close)
+	host := strings.TrimPrefix(srv.URL, "http://")
+	key := "NEXUS_" + name + "_KEY"
+	t.Setenv(key, "sk-x")
+	base := filepath.Join(t.TempDir(), "nexus")
+	os.MkdirAll(base, 0o700)
+	cfgJSON := fmt.Sprintf(`{"provider_base_url":%q,"provider_key_env":%q,
+		"provider_model":"m","egress_allow":[%q],"default_profile":"private"}`, srv.URL, key, host)
+	os.WriteFile(filepath.Join(base, "config.json"), []byte(cfgJSON), 0o600)
+	resolved, err := config.Resolve(filepath.Join(base, "config.json"), "", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := buildDaemon(pathx.Layout{Base: base}, resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b.j.Close() })
+	return b
+}
+
+func shortDeadlineCall(t *testing.T, d time.Duration) contracts.ToolCall {
+	t.Helper()
+	idem := "ik-dl"
+	args, _ := json.Marshal(map[string]string{"content": "delayed fact"})
+	c, err := contracts.NewToolCall(contracts.ToolCallParams{
+		ToolCallID: "tc-dl", ToolID: "memory_remember", Arguments: args,
+		ArgsSchemaHash: "h1", Effect: contracts.EffectReversible,
+		ExecutionKind: contracts.ExecInProcess, Deadline: time.Now().Add(d),
+		AttemptNo: 1, IdempotencyKey: &idem, ProfileID: "private",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+// DELAYED approval (Phase-5-r2 codex #3 / kilo #1): an approval arriving
+// AFTER the original transport deadline but within the challenge TTL must
+// still resume — the deadline is refreshed at resume (it is deliberately
+// not part of the C4 hash).
+func TestDelayedApprovalResumes(t *testing.T) {
+	b := hitlBundle(t, "TG_DELAY")
+	c := shortDeadlineCall(t, 50*time.Millisecond)
+	ch, err := b.approvals.Suspend(context.Background(), "turn-dl", "run-dl", c, "tg:chat-42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(120 * time.Millisecond) // the frozen deadline is now past
+	reply, err := telegramHandler(b)(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 1,
+		Text: "approve " + ch.ChallengeID, Profile: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(reply, "CALL_DEADLINE_EXCEEDED") || strings.Contains(reply, "resume failed") {
+		t.Fatalf("delayed approval self-invalidated: %q", reply)
+	}
+	if !strings.Contains(reply, "Approved "+ch.ChallengeID) {
+		t.Fatalf("delayed approval did not resume: %q", reply)
+	}
+}
+
+// CRASH between the approval receipt and the resume (Phase-5-r2 codex
+// #2): a replayed approve command COMPLETES the stranded action instead
+// of dead-ending on APPROVAL_REPLAY; and the startup scan does the same
+// without any redelivery.
+func TestApproveReplayAfterCrashResumes(t *testing.T) {
+	b := hitlBundle(t, "TG_CRASH")
+	c := shortDeadlineCall(t, time.Hour)
+	ch, err := b.approvals.Suspend(context.Background(), "turn-cr", "run-cr", c, "tg:chat-42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The receipt commits; the resume is "lost to a crash" (never runs).
+	if err := b.approvals.Approve(context.Background(), ch.ChallengeID, "tg:chat-42"); err != nil {
+		t.Fatal(err)
+	}
+	// Redelivered approve command: Approve replays, resume must complete.
+	reply, err := telegramHandler(b)(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 2,
+		Text: "approve " + ch.ChallengeID, Profile: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(reply, "Approval failed") {
+		t.Fatalf("replayed approve stranded the action: %q", reply)
+	}
+	if !strings.Contains(reply, "Approved "+ch.ChallengeID) {
+		t.Fatalf("replayed approve did not resume: %q", reply)
+	}
+	// A FOREIGN chat's replayed approve still fails (source binding).
+	c2 := shortDeadlineCall(t, time.Hour)
+	c2b, _ := json.Marshal(map[string]string{"content": "second"})
+	_ = c2b
+	ch2, err := b.approvals.Suspend(context.Background(), "turn-cr2", "run-cr2", c2, "tg:chat-42")
+	if err == nil {
+		if err := b.approvals.Approve(context.Background(), ch2.ChallengeID, "tg:chat-42"); err != nil {
+			t.Fatal(err)
+		}
+		foreign, err := telegramHandler(b)(context.Background(), channel.Inbound{
+			AdapterID: "telegram", ChannelIdentity: "chat-666", UpdateID: 3,
+			Text: "approve " + ch2.ChallengeID, Profile: "private"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(foreign, "Approval failed") {
+			t.Fatalf("foreign chat resumed a stranded approval: %q", foreign)
+		}
+	}
+}
+
+// STARTUP scan (Phase-5-r2 codex #2): an APPROVED-unconsumed challenge is
+// resumed at daemon startup and the outcome rides the outbox.
+func TestStartupScanResumesApproved(t *testing.T) {
+	b := hitlBundle(t, "TG_SCAN")
+	c := shortDeadlineCall(t, time.Hour)
+	ch, err := b.approvals.Suspend(context.Background(), "turn-sc", "run-sc", c, "tg:chat-42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.approvals.Approve(context.Background(), ch.ChallengeID, "tg:chat-42"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.resumeApprovedPending(context.Background()); err != nil {
+		t.Fatalf("startup scan failed: %v", err)
+	}
+	pending, err := b.chanCore.Pending(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, p := range pending {
+		if p.ChannelIdentity == "chat-42" && strings.Contains(p.Text, "Approved "+ch.ChallengeID) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("startup resume outcome not enqueued: %v", pending)
+	}
+	// The approval was CONSUMED: a second scan resumes nothing.
+	if list, _ := b.approvals.Approved(context.Background()); len(list) != 0 {
+		t.Fatalf("scan left the approval un-consumed: %v", list)
+	}
+}
+
+// SUSPENDED is not SUCCEEDED (Phase-5-r2 codex #4): a channel turn whose
+// ASK suspends is journaled turn.suspended — recovery never sees a
+// completed turn while its effect still awaits approval; the approve
+// resumes it (turn.resumed) to a REAL turn.succeeded.
+func TestSuspendedTurnHonestState(t *testing.T) {
+	b := hitlBundle(t, "TG_STATE")
+	h := telegramHandler(b)
+	reply, err := h(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 11,
+		Text: "remember the fact", Profile: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := challengeIDFrom(t, reply)
+	turnID := "turn-chan-chat-42-11"
+	count := func(eventType string) int {
+		n := 0
+		b.j.Replay(0, func(ev journal.Event) error {
+			if ev.Envelope.EventType == eventType && ev.Envelope.TurnID != nil && string(*ev.Envelope.TurnID) == turnID {
+				n++
+			}
+			return nil
+		})
+		return n
+	}
+	if count("turn.suspended") != 1 || count("turn.succeeded") != 0 {
+		t.Fatalf("suspended turn state dishonest: suspended=%d succeeded=%d",
+			count("turn.suspended"), count("turn.succeeded"))
+	}
+	if _, err := h(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 12,
+		Text: "approve " + id, Profile: "private"}); err != nil {
+		t.Fatal(err)
+	}
+	if count("turn.resumed") != 1 || count("turn.succeeded") != 1 {
+		t.Fatalf("resume did not complete the ORIGINAL turn: resumed=%d succeeded=%d",
+			count("turn.resumed"), count("turn.succeeded"))
 	}
 }

@@ -157,6 +157,10 @@ const (
 	EvTurnSucceeded = "turn.succeeded"
 	EvTurnFailed    = "turn.failed"
 	EvTurnCancelled = "turn.cancelled"
+	// Durable HITL (B6, Phase-5-r2 codex #4): a suspended turn is
+	// SUSPENDED — never falsely SUCCEEDED; resume re-enters RUNNING.
+	EvTurnSuspended = "turn.suspended"
+	EvTurnResumed   = "turn.resumed"
 )
 
 // TurnTable returns the canonical turn-state table.
@@ -168,6 +172,8 @@ func TurnTable() *Table[contracts.TurnState] {
 		{EvTurnFailed, contracts.TurnRunning, contracts.TurnFailed},
 		{EvTurnCancelled, contracts.TurnCreated, contracts.TurnCancelled},
 		{EvTurnCancelled, contracts.TurnRunning, contracts.TurnCancelled},
+		{EvTurnSuspended, contracts.TurnRunning, contracts.TurnSuspendedState},
+		{EvTurnResumed, contracts.TurnSuspendedState, contracts.TurnRunning},
 	})
 	if err != nil {
 		panic(err)
@@ -219,6 +225,7 @@ func EventTypes() []string {
 		EvRunCreated, EvRunAdmitted, EvRunStarted, EvRunSucceeded, EvRunFailed,
 		EvRunCancelled, EvRunLost, EvRunReconciled, EvRunReconciledFailed, EvRunManual,
 		EvTurnCreated, EvTurnStarted, EvTurnSucceeded, EvTurnFailed, EvTurnCancelled,
+		EvTurnSuspended, EvTurnResumed,
 		EvAttemptPlanned, EvAttemptAuthorized, EvAttemptStarted, EvAttemptSucceeded,
 		EvAttemptFailed, EvAttemptCancelled, EvAttemptLost, EvAttemptReconciledOK,
 		EvAttemptReconciledFailed, EvAttemptManual,

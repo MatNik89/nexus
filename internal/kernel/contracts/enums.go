@@ -201,11 +201,16 @@ const (
 	TurnSucceeded
 	TurnFailed
 	TurnCancelled
+	// TurnSuspendedState: the turn committed a durable HITL suspension
+	// (B6) and waits for the owner's decision — appended LAST to keep
+	// existing serialized state bytes stable (Phase-5-r2 codex #4).
+	TurnSuspendedState
 )
 
 var turnStateNames = map[TurnState]string{
 	TurnCreated: "CREATED", TurnRunning: "RUNNING",
 	TurnSucceeded: "SUCCEEDED", TurnFailed: "FAILED", TurnCancelled: "CANCELLED",
+	TurnSuspendedState: "SUSPENDED",
 }
 
 type AttemptState uint8

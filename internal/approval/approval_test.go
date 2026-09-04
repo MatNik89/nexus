@@ -301,3 +301,53 @@ func TestChallengeRefusesSecretExposure(t *testing.T) {
 		t.Fatal(serr)
 	}
 }
+
+// PROJECTION-ENFORCED expiry (Phase-5-r2 codex #5 / kilo #5): a decision
+// event whose EVENT-OWNED time is past expiry is refused inside the
+// append transaction itself — the API precheck race cannot commit it.
+func TestProjectionRefusesExpiredDecision(t *testing.T) {
+	clock := clockid.NewFake(time.Now())
+	s, j := open(t, t.TempDir(), clock, "work")
+	c := call("fs_delete", "tc-1", `{"path":"/tmp/x"}`)
+	ch, err := s.Suspend(ctxT(), "turn-1", "run-1", c, "tg:chat-42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Bypass the API precheck: append the receipt DIRECTLY with an
+	// emitted-at past expiry (the race's losing interleaving).
+	payload, _ := json.Marshal(map[string]string{"challenge_id": ch.ChallengeID, "source": "tg:chat-42"})
+	_, aerr := j.Append(ctxT(), contracts.EnvelopeParams{
+		SchemaID: "nexus.event", SchemaVersion: 1,
+		EventID: "ev-race-1", EventType: EvApprovalReceived, RunID: "run-1",
+		EmittedAt: clock.Now().Add(DefaultChallengeTTL + time.Minute),
+		ActorType: contracts.ActorSystem, ActorID: "test", PrincipalID: "nexus",
+		WorkspaceID: "local", ProfileID: "work", AttemptNo: 1,
+		Payload: payload, PayloadHash: "recomputed",
+	})
+	if aerr == nil {
+		t.Fatal("projection committed a decision emitted past expiry")
+	}
+	if st, _, _, _ := s.challengeRow(ctxT(), ch.ChallengeID); st != "PENDING" {
+		t.Fatalf("challenge left PENDING state on a refused decision: %s", st)
+	}
+}
+
+// UNPREDICTABLE challenge ids (Phase-5-r2 codex #12-detector): two
+// challenges over the SAME exact effect must get DIFFERENT ids — the old
+// hash-prefix scheme would collide here.
+func TestChallengeIDsUnpredictable(t *testing.T) {
+	clock := clockid.NewFake(time.Now())
+	s, _ := open(t, t.TempDir(), clock, "work")
+	c := call("fs_delete", "tc-1", `{"path":"/tmp/x"}`)
+	ch1, err := s.Suspend(ctxT(), "turn-1", "run-1", c, "tg:chat-42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch2, err := s.Suspend(ctxT(), "turn-2", "run-2", c, "tg:chat-42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ch1.ChallengeID == ch2.ChallengeID {
+		t.Fatalf("challenge ids derived from the effect hash: %s == %s", ch1.ChallengeID, ch2.ChallengeID)
+	}
+}
