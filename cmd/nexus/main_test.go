@@ -1439,19 +1439,35 @@ func TestMachineIDCheckScriptMirrorsDoctor(t *testing.T) {
 	dir := t.TempDir()
 	mk := func(name, content string, perm os.FileMode) string {
 		p := filepath.Join(dir, name)
-		if err := os.WriteFile(p, []byte(content), perm); err != nil {
+		if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// Explicit chmod: WriteFile's mode is umask-clipped and would
+		// silently drop the world-write bits this test depends on.
+		if err := os.Chmod(p, perm); err != nil {
 			t.Fatal(err)
 		}
 		return p
 	}
+	runReason := func(path string) (string, error) {
+		out, err := exec.Command(script, path).CombinedOutput()
+		return string(out), err
+	}
 	run := func(path string) error {
-		return exec.Command(script, path).Run()
+		_, err := runReason(path)
+		return err
 	}
 	valid := "0123456789abcdef0123456789abcdef\n"
-	// World-writable modes the old glob MISSED must refuse.
+	// World-writable modes the old glob MISSED must refuse FOR THE PERM
+	// REASON (the perm check runs before ownership, so this assertion is
+	// causal for the perm test even on a non-root run).
 	for _, perm := range []os.FileMode{0o602, 0o642, 0o646, 0o622} {
-		if err := run(mk(fmt.Sprintf("ww-%o", perm), valid, perm)); err == nil {
+		reason, err := runReason(mk(fmt.Sprintf("ww-%o", perm), valid, perm))
+		if err == nil {
 			t.Fatalf("world-writable mode %o accepted by the script", perm)
+		}
+		if !strings.Contains(reason, "writable") {
+			t.Fatalf("mode %o refused for the wrong reason (perm check not causal): %q", perm, reason)
 		}
 	}
 	// Embedded whitespace must refuse (no interior-whitespace deletion).
