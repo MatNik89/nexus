@@ -42,6 +42,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -110,7 +111,7 @@ func p95Int64(xs []int64) int64 {
 
 // soakVerdict applies S1-S4 (latencies passed separately: they belong
 // to messages, not process samples).
-func soakVerdict(samples []soakSample, latFirst, latLast []int64, warmup int) error {
+func soakVerdict(samples []soakSample, latFirst, latLast []int64, warmup, expectedIncarnations int) error {
 	if len(samples) < warmup+9 {
 		return fmt.Errorf("too few samples (%d) for a verdict (vacuous)", len(samples))
 	}
@@ -121,10 +122,14 @@ func soakVerdict(samples []soakSample, latFirst, latLast []int64, warmup int) er
 	for _, s := range work {
 		byInc[s.incarnation] = append(byInc[s.incarnation], s)
 	}
-	for inc, ss := range byInc {
-		if len(ss) < 6 {
-			continue // too short to judge; the other incarnation carries it
+	// EVERY planned incarnation must be judgeable (prep4-r2 codex #1: a
+	// short second incarnation must never exempt its samples).
+	for inc := 1; inc <= expectedIncarnations; inc++ {
+		if len(byInc[inc]) < 6 {
+			return fmt.Errorf("S1/S2 incarnation %d has only %d samples — cannot be judged (fail closed)", inc, len(byInc[inc]))
 		}
+	}
+	for inc, ss := range byInc {
 		third := len(ss) / 3
 		var rssF, rssAll []int
 		for _, s := range ss[:third] {
@@ -233,13 +238,61 @@ func TestSoakSurvival(t *testing.T) {
 	cmd, cold1 := start()
 	pid, incarnation := cmd.Process.Pid, 1
 
-	// OPEN-LOOP producer state: fixed arrival rate; replies correlated
-	// asynchronously; a message unanswered >60s is an immediate failure.
+	// OPEN-LOOP producer: a DEDICATED goroutine pushes at a fixed 2s
+	// rate, independent of correlation, sampling and reminder work
+	// (prep4-r2 codex #2 — the offered rate must not sag under load).
+	// Latencies carry the message sequence and are sorted by it before
+	// the temporal thirds are cut (map-iteration order is not time).
+	type sentRec struct {
+		seq int
+		t0  time.Time
+	}
+	type latRec struct {
+		seq int
+		ms  int64
+	}
 	pushedIDs := map[int64]bool{}
-	sentAt := map[string]time.Time{} // marker -> push time (unanswered)
-	var latencies []int64            // completed roundtrips, in order
-	var samples []soakSample
+	sentAt := map[string]sentRec{}
+	var mu sync.Mutex
+	var latencies []latRec
 	msg := 0
+	prodStop := make(chan struct{})
+	prodDone := make(chan struct{})
+	go func() {
+		defer close(prodDone)
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-prodStop:
+				return
+			case <-ticker.C:
+				mu.Lock()
+				msg++
+				marker := fmt.Sprintf("soak-msg-%06d", msg)
+				id := bot.pushID(marker)
+				pushedIDs[id] = true
+				sentAt[marker] = sentRec{seq: msg, t0: time.Now()}
+				mu.Unlock()
+			}
+		}
+	}()
+	collect := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		for m, rec := range sentAt {
+			if bot.countSent("reply-for "+m) >= 1 {
+				latencies = append(latencies, latRec{seq: rec.seq, ms: time.Since(rec.t0).Milliseconds()})
+				delete(sentAt, m)
+				continue
+			}
+			if time.Since(rec.t0) > 60*time.Second {
+				t.Fatalf("soak: %s unanswered for >60s (backlog explosion)", m)
+			}
+		}
+		return len(sentAt)
+	}
+	var samples []soakSample
 	tick := 0
 	deadline := time.Now().Add(total)
 	half := time.Now().Add(total / 2)
@@ -247,22 +300,7 @@ func TestSoakSurvival(t *testing.T) {
 	var cold2 time.Duration
 	for time.Now().Before(deadline) {
 		tick++
-		msg++
-		marker := fmt.Sprintf("soak-msg-%06d", msg)
-		id := bot.pushID(marker)
-		pushedIDs[id] = true
-		sentAt[marker] = time.Now()
-		// Asynchronous correlation pass: collect every answered marker.
-		for m, t0 := range sentAt {
-			if bot.countSent("reply-for "+m) >= 1 {
-				latencies = append(latencies, time.Since(t0).Milliseconds())
-				delete(sentAt, m)
-				continue
-			}
-			if time.Since(t0) > 60*time.Second {
-				t.Fatalf("soak: %s unanswered for >60s (backlog explosion, tick %d)", m, tick)
-			}
-		}
+		backlog := collect()
 		if tick%10 == 0 {
 			if out, cerr := w.chat("soak remind", true); cerr != nil || !strings.Contains(out, "placed") {
 				t.Fatalf("soak: reminder chat failed at tick %d: %v %q", tick, cerr, out)
@@ -272,7 +310,7 @@ func TestSoakSurvival(t *testing.T) {
 		dbB, _ := fileSizeChecked(journalPath)
 		samples = append(samples, soakSample{
 			at: time.Now(), incarnation: incarnation, rssKB: readRSSKB(pid), fds: countFDs(pid),
-			walB: walB, walValid: walOK, dbB: dbB, backlog: len(sentAt),
+			walB: walB, walValid: walOK, dbB: dbB, backlog: backlog,
 		})
 		if !restarted && time.Now().After(half) {
 			restarted = true
@@ -295,19 +333,21 @@ func TestSoakSurvival(t *testing.T) {
 		}
 		time.Sleep(2 * time.Second)
 	}
+	close(prodStop)
+	<-prodDone
 	// Let the tail answer, then graceful stop.
 	tailDeadline := time.Now().Add(45 * time.Second)
-	for time.Now().Before(tailDeadline) && len(sentAt) > 0 {
-		for m, t0 := range sentAt {
-			if bot.countSent("reply-for "+m) >= 1 {
-				latencies = append(latencies, time.Since(t0).Milliseconds())
-				delete(sentAt, m)
-			}
+	for time.Now().Before(tailDeadline) {
+		if collect() == 0 {
+			break
 		}
 		time.Sleep(300 * time.Millisecond)
 	}
-	if len(sentAt) > 0 {
-		t.Fatalf("soak: %d messages never answered at shutdown", len(sentAt))
+	mu.Lock()
+	left := len(sentAt)
+	mu.Unlock()
+	if left > 0 {
+		t.Fatalf("soak: %d messages never answered at shutdown", left)
 	}
 	cmd.Process.Signal(os.Interrupt)
 	done := make(chan struct{})
@@ -345,11 +385,19 @@ func TestSoakSurvival(t *testing.T) {
 	if !w.inboxExactlyTerminal(t, "private", pushedIDs) {
 		t.Fatal("S6 inbox not exact-set TERMINAL after soak")
 	}
+	sort.Slice(latencies, func(i, j int) bool { return latencies[i].seq < latencies[j].seq })
 	third := len(latencies) / 3
 	if third == 0 {
 		t.Fatalf("soak vacuous: %d latencies", len(latencies))
 	}
-	if verr := soakVerdict(samples, latencies[:third], latencies[len(latencies)-third:], 3); verr != nil {
+	msFrom := func(rs []latRec) []int64 {
+		out := make([]int64, len(rs))
+		for i, r := range rs {
+			out[i] = r.ms
+		}
+		return out
+	}
+	if verr := soakVerdict(samples, msFrom(latencies[:third]), msFrom(latencies[len(latencies)-third:]), 3, 2); verr != nil {
 		t.Fatalf("soak verdict: %v", verr)
 	}
 	lastS := samples[len(samples)-1]
@@ -382,7 +430,7 @@ func TestSoakVerdictSensitivity(t *testing.T) {
 		return out
 	}
 	healthy := append(mk(1, 15), mk(2, 15)...)
-	if err := soakVerdict(healthy, lat(100, 10), lat(120, 10), 3); err != nil {
+	if err := soakVerdict(healthy, lat(100, 10), lat(120, 10), 3, 2); err != nil {
 		t.Fatalf("healthy series rejected: %v", err)
 	}
 	// S1 endpoint growth within one incarnation.
@@ -390,25 +438,25 @@ func TestSoakVerdictSensitivity(t *testing.T) {
 	for i := 10; i < 15; i++ {
 		leak[i].rssKB = 90000
 	}
-	if err := soakVerdict(leak, lat(100, 10), lat(120, 10), 3); err == nil || !strings.Contains(err.Error(), "S1") {
+	if err := soakVerdict(leak, lat(100, 10), lat(120, 10), 3, 2); err == nil || !strings.Contains(err.Error(), "S1") {
 		t.Fatalf("in-incarnation RSS growth not caught: %v", err)
 	}
 	// S1 PRE-RESTART PEAK laundered by the restart (reviewer probe).
 	peak := append(mk(1, 15), mk(2, 15)...)
 	peak[12].rssKB = 95000 // spike inside incarnation 1 only
-	if err := soakVerdict(peak, lat(100, 10), lat(120, 10), 3); err == nil || !strings.Contains(err.Error(), "S1") {
+	if err := soakVerdict(peak, lat(100, 10), lat(120, 10), 3, 2); err == nil || !strings.Contains(err.Error(), "S1") {
 		t.Fatalf("pre-restart RSS peak not caught: %v", err)
 	}
 	// S2 FD spike inside the FIRST incarnation (reviewer probe).
 	fds := append(mk(1, 15), mk(2, 15)...)
 	fds[12].fds = 60
-	if err := soakVerdict(fds, lat(100, 10), lat(120, 10), 3); err == nil || !strings.Contains(err.Error(), "S2") {
+	if err := soakVerdict(fds, lat(100, 10), lat(120, 10), 3, 2); err == nil || !strings.Contains(err.Error(), "S2") {
 		t.Fatalf("pre-restart FD spike not caught: %v", err)
 	}
 	// S3 MID-RUN WAL spike (reviewer probe: end-sample-only was blind).
 	wal := append(mk(1, 15), mk(2, 15)...)
 	wal[8].walB = 20 << 20
-	if err := soakVerdict(wal, lat(100, 10), lat(120, 10), 3); err == nil || !strings.Contains(err.Error(), "S3") {
+	if err := soakVerdict(wal, lat(100, 10), lat(120, 10), 3, 2); err == nil || !strings.Contains(err.Error(), "S3") {
 		t.Fatalf("mid-run WAL spike not caught: %v", err)
 	}
 	// S3 invalid WAL samples are NEVER healthy zeros (reviewer probe).
@@ -416,19 +464,27 @@ func TestSoakVerdictSensitivity(t *testing.T) {
 	for i := range walBad {
 		walBad[i].walValid = false
 	}
-	if err := soakVerdict(walBad, lat(100, 10), lat(120, 10), 3); err == nil || !strings.Contains(err.Error(), "S3") {
+	if err := soakVerdict(walBad, lat(100, 10), lat(120, 10), 3, 2); err == nil || !strings.Contains(err.Error(), "S3") {
 		t.Fatalf("invalid WAL samples not caught: %v", err)
 	}
 	// S4 sparse latencies FAIL (reviewer probe: silent skip before).
-	if err := soakVerdict(healthy, lat(100, 2), lat(120, 2), 3); err == nil || !strings.Contains(err.Error(), "S4") {
+	if err := soakVerdict(healthy, lat(100, 2), lat(120, 2), 3, 2); err == nil || !strings.Contains(err.Error(), "S4") {
 		t.Fatalf("sparse latencies not caught: %v", err)
 	}
 	// S4 degradation.
-	if err := soakVerdict(healthy, lat(100, 10), lat(900, 10), 3); err == nil || !strings.Contains(err.Error(), "S4") {
+	if err := soakVerdict(healthy, lat(100, 10), lat(900, 10), 3, 2); err == nil || !strings.Contains(err.Error(), "S4") {
 		t.Fatalf("latency degradation not caught: %v", err)
 	}
+	// SHORT second incarnation with insane values must FAIL, not be
+	// exempted (prep4-r2 codex #1 probe).
+	short := append(mk(1, 24), soakSample{incarnation: 2, rssKB: 200000, fds: 100, walB: 1 << 20, walValid: true},
+		soakSample{incarnation: 2, rssKB: 200000, fds: 100, walB: 1 << 20, walValid: true},
+		soakSample{incarnation: 2, rssKB: 200000, fds: 100, walB: 1 << 20, walValid: true})
+	if err := soakVerdict(short, lat(100, 10), lat(120, 10), 3, 2); err == nil || !strings.Contains(err.Error(), "cannot be judged") {
+		t.Fatalf("short insane incarnation not caught: %v", err)
+	}
 	// Vacuous short series.
-	if err := soakVerdict(mk(1, 5), lat(100, 10), lat(100, 10), 3); err == nil {
+	if err := soakVerdict(mk(1, 5), lat(100, 10), lat(100, 10), 3, 1); err == nil {
 		t.Fatal("vacuous short series accepted")
 	}
 }
