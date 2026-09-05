@@ -694,14 +694,39 @@ func writeAttestation(t *testing.T, w *world, bin string) {
 	writeAttestationDigest(t, w, hex.EncodeToString(h.Sum(nil)))
 }
 
+// writeAttestationHost writes a signed attestation claiming a given host.
+func writeAttestationHost(t *testing.T, w *world, bin, host string) {
+	t.Helper()
+	f, err := os.Open(bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		t.Fatal(err)
+	}
+	writeAttestationFull(t, w, hex.EncodeToString(h.Sum(nil)), host)
+}
+
 func writeAttestationDigest(t *testing.T, w *world, digest string) {
+	t.Helper()
+	host, err := exec.Command("uname", "-srm").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeAttestationFull(t, w, digest, strings.TrimSpace(string(host)))
+}
+
+func writeAttestationFull(t *testing.T, w *world, digest, host string) {
 	t.Helper()
 	dir := filepath.Join(w.base, "nexus", "system")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	attPath := filepath.Join(dir, "acceptance.json")
-	att := fmt.Sprintf(`{"binary_sha256":%q,"suite":"internal/acceptance","passed":true,"host":"test","time":"2026-09-05T00:00:00Z"}`, digest)
+	att := fmt.Sprintf(`{"binary_sha256":%q,"suite":"internal/acceptance","passed":true,"host":%q,"time":"2026-09-05T00:00:00Z"}`,
+		digest, host)
 	if err := os.WriteFile(attPath, []byte(att), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -928,6 +953,14 @@ func TestDoctorP0GrantLive(t *testing.T) {
 	outRogue, codeRogue := run(w.env())
 	if codeRogue == 0 || strings.Contains(outRogue, "P0-capable") {
 		t.Fatalf("rogue-signed attestation granted (exit %d):\n%s", codeRogue, outRogue)
+	}
+	writeAttestation(t, w, w.pinnedDoctorBin(t))
+	// A DIFFERENT-HOST attestation withdraws the grant (P0-prep #2:
+	// copying binary+attestation to another machine transfers nothing).
+	writeAttestationHost(t, w, w.pinnedDoctorBin(t), "Linux 0.0.0-other x86_64")
+	outHost, codeHost := run(w.env())
+	if codeHost == 0 || strings.Contains(outHost, "P0-capable") {
+		t.Fatalf("foreign-host attestation granted (exit %d):\n%s", codeHost, outHost)
 	}
 	writeAttestation(t, w, w.pinnedDoctorBin(t))
 	// A TAMPERED digest withdraws the grant.

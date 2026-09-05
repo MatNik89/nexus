@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -858,6 +859,7 @@ func verifyAcceptanceAttestation(layout pathx.Layout) (bool, string) {
 		BinarySHA256 string `json:"binary_sha256"`
 		Suite        string `json:"suite"`
 		Passed       bool   `json:"passed"`
+		Host         string `json:"host"`
 		Time         string `json:"time"`
 	}
 	if json.Unmarshal(raw, &att) != nil || !att.Passed || att.Suite != "internal/acceptance" || att.BinarySHA256 == "" {
@@ -878,6 +880,12 @@ func verifyAcceptanceAttestation(layout pathx.Layout) (bool, string) {
 	}
 	if hex.EncodeToString(h.Sum(nil)) != att.BinarySHA256 {
 		return false, "this binary is NOT the one the acceptance suite graded (digest mismatch, fail closed)"
+	}
+	// HOST binding (P0-prep #2): the attestation is valid only on the
+	// host that ran the acceptance suite — copying the pair to another
+	// machine does not transfer the grant.
+	if att.Host != runtimeHostID() {
+		return false, "acceptance attestation was produced on a DIFFERENT host (fail closed) — run scripts/p0-accept.sh here"
 	}
 	// PROVENANCE (T27-r2 codex #2, hardened per r3 codex #1): the
 	// attestation must carry the owner's signature, the trust anchor
@@ -940,6 +948,26 @@ func verifyAcceptanceAttestation(layout pathx.Layout) (bool, string) {
 		return false, "attestation signature verification FAILED: " + strings.TrimSpace(string(out))
 	}
 	return true, "signed acceptance pass for this exact binary (" + att.Time + ")"
+}
+
+// runtimeHostID formats the running kernel identity exactly as
+// `uname -srm` does (the attestation's host field).
+func runtimeHostID() string {
+	var u syscall.Utsname
+	if err := syscall.Uname(&u); err != nil {
+		return "unknown"
+	}
+	conv := func(f [65]int8) string {
+		b := make([]byte, 0, 65)
+		for _, c := range f {
+			if c == 0 {
+				break
+			}
+			b = append(b, byte(c))
+		}
+		return string(b)
+	}
+	return conv(u.Sysname) + " " + conv(u.Release) + " " + conv(u.Machine)
 }
 
 // mustProbeCore opens a throwaway channel core for the doctor's live
@@ -1070,6 +1098,13 @@ func (b *daemonBundle) liveProbes(ctx context.Context, resolved config.Resolved,
 	return probes, requested
 }
 
+// Command-id shapes (P0-prep #3): commands fire only on exact ids.
+var (
+	challengeIDRe  = regexp.MustCompile(`^ch-[0-9a-f]{24}$`)
+	occurrenceIDRe = regexp.MustCompile(`^occ-[A-Za-z0-9_.-]+#[0-9]+$`)
+	deliveryIDRe   = regexp.MustCompile(`^dlv-[0-9a-f]{24}$`)
+)
+
 // telegramHandler routes an admitted Telegram message: "approve <id>" /
 // "deny <id>" hit the durable HITL store; anything else is a normal
 // conversation turn through the same production planner spine
@@ -1079,8 +1114,11 @@ func telegramHandler(b *daemonBundle) telegram.Handler {
 		text := strings.TrimSpace(in.Text)
 		lower := strings.ToLower(text)
 		source := "tg:" + in.ChannelIdentity
+		// Command words route ONLY with an exact well-formed id — an
+		// ordinary sentence starting with "approve"/"ack"/... is
+		// CONVERSATION, never a swallowed command error (P0-prep #3).
 		switch {
-		case strings.HasPrefix(lower, "approve "):
+		case strings.HasPrefix(lower, "approve ") && challengeIDRe.MatchString(strings.TrimSpace(text[len("approve "):])):
 			id := strings.TrimSpace(text[len("approve "):])
 			if err := b.approvals.Approve(ctx, id, source); err != nil {
 				// Crash-window recovery (Phase-5-r2 codex #2): if the
@@ -1098,7 +1136,7 @@ func telegramHandler(b *daemonBundle) telegram.Handler {
 				return "Approved " + id + " but the resume failed: " + rerr.Error(), nil
 			}
 			return "Approved " + id + ". " + result, nil
-		case strings.HasPrefix(lower, "retry "):
+		case strings.HasPrefix(lower, "retry ") && challengeIDRe.MatchString(strings.TrimSpace(text[len("retry "):])):
 			// E9 reconcile for a CONSUMED-but-unfinished resume: the user
 			// confirms by re-approving a FRESH challenge over the same
 			// exact intent — never a blind auto-retry (Phase-5-r3 kilo #1).
@@ -1111,13 +1149,13 @@ func telegramHandler(b *daemonBundle) telegram.Handler {
 				return "Nothing to retry for " + id + ": " + rerr.Error(), nil
 			}
 			return ch.Summary, nil
-		case strings.HasPrefix(lower, "deny "):
+		case strings.HasPrefix(lower, "deny ") && challengeIDRe.MatchString(strings.TrimSpace(text[len("deny "):])):
 			id := strings.TrimSpace(text[len("deny "):])
 			if err := b.approvals.Deny(ctx, id, source); err != nil {
 				return "Denial failed: " + err.Error(), nil
 			}
 			return "Denied " + id + ".", nil
-		case strings.HasPrefix(lower, "ack "):
+		case strings.HasPrefix(lower, "ack ") && occurrenceIDRe.MatchString(strings.TrimSpace(text[len("ack "):])):
 			// Direct occurrence ack (B5: the ack correlates to the EXACT
 			// occurrence id shown in the delivery message). A user acking
 			// within the delivery loop's tick window races the receipt
@@ -1133,6 +1171,35 @@ func telegramHandler(b *daemonBundle) telegram.Handler {
 				return "Ack failed: " + err.Error(), nil
 			}
 			return "Acknowledged " + occ + ".", nil
+		case lower == "outbox":
+			// UNKNOWN rows await HUMAN reconciliation (E9/B2): list them
+			// so the owner can decide (P0-prep #1 — a wire failure no
+			// longer dies silently).
+			rows, err := b.chanCore.Unreconciled(ctx)
+			if err != nil {
+				return "", err
+			}
+			if len(rows) == 0 {
+				return "Outbox clean: no deliveries awaiting reconciliation.", nil
+			}
+			out := "Deliveries with UNKNOWN outcome (may or may not have arrived):\n"
+			for _, r := range rows {
+				txt := r.Text
+				if len(txt) > 80 {
+					txt = txt[:80] + "…"
+				}
+				out += r.DeliveryID + ": " + txt + "\n"
+			}
+			out += "Reply redeliver <dlv-id> to resend one (it MAY arrive twice)."
+			return out, nil
+		case strings.HasPrefix(lower, "redeliver ") && deliveryIDRe.MatchString(strings.TrimSpace(text[len("redeliver "):])):
+			// HUMAN-confirmed E9 reconciliation: the owner accepts the
+			// duplicate risk explicitly — never an automatic retry.
+			id := strings.TrimSpace(text[len("redeliver "):])
+			if err := b.chanCore.Reconcile(ctx, id, false); err != nil {
+				return "Redeliver failed: " + err.Error(), nil
+			}
+			return "Re-queued " + id + " — it will go out on the next flush (and may arrive twice).", nil
 		case lower == "pending":
 			pending, err := b.approvals.Pending(ctx)
 			if err != nil {

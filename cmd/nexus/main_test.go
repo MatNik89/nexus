@@ -1233,3 +1233,86 @@ func TestAckSettlesSentReceiptInline(t *testing.T) {
 		t.Fatalf("unsent occurrence acked (fabricated evidence): %q", reply2)
 	}
 }
+
+// P0-prep #3: command words followed by ORDINARY TEXT are conversation —
+// never a swallowed command error; exact ids still command.
+func TestCommandWordsNeedExactIDs(t *testing.T) {
+	b := hitlBundle(t, "TG_CMDFMT")
+	h := telegramHandler(b)
+	for i, msg := range []string{
+		"approve my vacation plan", "deny the request politely",
+		"ack that you understood me", "retry the download again",
+		"redeliver the package tomorrow",
+	} {
+		reply, err := h(context.Background(), channel.Inbound{
+			AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: int64(100 + i),
+			Text: msg, Profile: "private"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(reply, "failed") || strings.Contains(reply, "Nothing to retry") {
+			t.Fatalf("ordinary sentence %q swallowed as a command: %q", msg, reply)
+		}
+	}
+	// Exact ids still route to commands (a malformed one falls through,
+	// a well-formed unknown one reaches the store and reports failure).
+	reply, err := h(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 200,
+		Text: "approve ch-000000000000000000000000", Profile: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(reply, "Approval failed") {
+		t.Fatalf("well-formed id did not route to the command: %q", reply)
+	}
+}
+
+// P0-prep #1: an UNKNOWN delivery is listable and HUMAN-redeliverable —
+// redeliver re-pends it, flush sends it, and it leaves the UNKNOWN list.
+func TestOutboxRedeliverCommand(t *testing.T) {
+	b := hitlBundle(t, "TG_REDELIVER")
+	if _, err := b.chanCore.EnqueueReply(context.Background(), "telegram", "chat-42", "private", "lost message"); err != nil {
+		t.Fatal(err)
+	}
+	b.chanCore.Flush(context.Background(), func(o channel.Outbound) error {
+		return fmt.Errorf("wire wobble: %w", channel.ErrAmbiguousSend)
+	})
+	h := telegramHandler(b)
+	listing, err := h(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 1,
+		Text: "outbox", Profile: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(listing, "lost message") || !strings.Contains(listing, "dlv-") {
+		t.Fatalf("outbox listing missing the UNKNOWN row: %q", listing)
+	}
+	id := listing[strings.Index(listing, "dlv-"):]
+	id = id[:strings.IndexByte(id, ':')]
+	reply, err := h(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 2,
+		Text: "redeliver " + id, Profile: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(reply, "Re-queued") {
+		t.Fatalf("redeliver refused: %q", reply)
+	}
+	sent := 0
+	if err := b.chanCore.Flush(context.Background(), func(o channel.Outbound) error { sent++; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if sent != 1 {
+		t.Fatalf("re-queued delivery did not send: %d", sent)
+	}
+	if u, _ := b.chanCore.Unreconciled(context.Background()); len(u) != 0 {
+		t.Fatalf("row still UNKNOWN after redeliver+flush: %v", u)
+	}
+	// An empty outbox reports clean.
+	clean, _ := h(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 3,
+		Text: "outbox", Profile: "private"})
+	if !strings.Contains(clean, "clean") {
+		t.Fatalf("clean outbox not reported: %q", clean)
+	}
+}
