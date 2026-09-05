@@ -1,27 +1,37 @@
 //go:build linux
 
-// Soak harness (pre-P1 prep #4): run the REAL daemon binary for a long
-// wall-clock stretch under steady traffic and watch the properties no
-// short test can see — memory growth, FD leaks, WAL discipline, journal
-// growth, reply-latency degradation, and cold-start time on a grown
-// journal. One planned mid-soak restart exercises full replay at size.
+// Soak harness (pre-P1 prep #4, hardened per the prep4 review): run the
+// REAL daemon binary for a long wall-clock stretch under OPEN-LOOP
+// traffic (fixed arrival rate, replies correlated asynchronously — a
+// slowdown builds observable backlog instead of silently lowering the
+// offered load) and machine-check the long-run signals:
 //
-// Gated: SKIPPED unless NEXUS_SOAK_MINUTES is set (reviewers run short
-// values, e.g. 2-5; the real 24-48h run uses 1440-2880 via nohup).
-//
-// Signals (each with a hard threshold, machine-checked):
-//
-//	S1 RSS: median of the last third <= 1.5x median of the first third
-//	   (after warmup) — a steady leak fails;
-//	S2 FDs: final count <= baseline + 10;
-//	S3 WAL: final size <= 8 MiB (auto-checkpoint must keep it bounded);
+//	S1 RSS budget PER INCARNATION: within each incarnation, the median
+//	   of its last third <= 1.5x the median of its first third AND its
+//	   peak <= 1.6x its baseline median. This is a window-scoped growth
+//	   budget, not a universal leak proof (a sub-budget slow leak needs
+//	   a longer run — stated, not hidden).
+//	S2 FD budget PER INCARNATION: peak <= incarnation baseline + 10.
+//	S3 WAL: MAX VALID sample over the whole run <= 8 MiB; a failed WAL
+//	   stat is an INVALID sample (never a healthy zero) and more than
+//	   10% invalid samples fails the run.
 //	S4 latency: p95 of the last third <= 3x p95 of the first third;
-//	S5 mid-soak restart on the grown journal completes readiness within
-//	   60s and the SECOND cold start is recorded for the report;
-//	S6 end-state: production journal replay clean + exact-set inbox
-//	   TERMINAL + every reply row SENT (reusing the chaos checkers).
+//	   too few valid samples is a FAILURE, not a skip (note: for small
+//	   N the p95 index degenerates to the maximum — acceptable here).
+//	S5 planned mid-soak restart: cold start on the grown journal <= 60s.
+//	S6 end-state HARD: drain timeout fails; zero non-SENT outbox rows
+//	   asserted independently; production journal replay clean;
+//	   exact-set TERMINAL inbox. Backlog: any message unanswered for
+//	   >60s fails immediately (no coordinated omission).
 //
-// The metrics collector is proven RED-capable by a synthetic series test.
+// SCOPE (explicit): traffic = telegram conversation replies + periodic
+// reminder creation via yolo chat. Memory write/recall and durable
+// ASK/HITL suspension are NOT part of this soak — they are covered by
+// the T27 acceptance and the chaos harness; this harness measures
+// long-run resource and delivery discipline.
+//
+// Gated: SKIPPED unless NEXUS_SOAK_MINUTES is set.
+// The verdict is proven RED-capable on synthetic series.
 package acceptance
 
 import (
@@ -37,12 +47,14 @@ import (
 )
 
 type soakSample struct {
-	at      time.Time
-	rssKB   int
-	fds     int
-	walB    int64
-	dbB     int64
-	replyMS int64
+	at          time.Time
+	incarnation int
+	rssKB       int
+	fds         int
+	walB        int64
+	walValid    bool
+	dbB         int64
+	backlog     int
 }
 
 func readRSSKB(pid int) int {
@@ -70,12 +82,12 @@ func countFDs(pid int) int {
 	return len(ents)
 }
 
-func fileSize(p string) int64 {
+func fileSizeChecked(p string) (int64, bool) {
 	st, err := os.Stat(p)
 	if err != nil {
-		return 0
+		return 0, false
 	}
-	return st.Size()
+	return st.Size(), true
 }
 
 func medianInt(xs []int) int {
@@ -96,52 +108,86 @@ func p95Int64(xs []int64) int64 {
 	return s[(len(s)*95)/100]
 }
 
-// soakVerdict applies S1-S4 to a sample series (separated so its own
-// sensitivity is testable without hours of wall clock).
-func soakVerdict(samples []soakSample, warmup int) error {
+// soakVerdict applies S1-S4 (latencies passed separately: they belong
+// to messages, not process samples).
+func soakVerdict(samples []soakSample, latFirst, latLast []int64, warmup int) error {
 	if len(samples) < warmup+9 {
 		return fmt.Errorf("too few samples (%d) for a verdict (vacuous)", len(samples))
 	}
 	work := samples[warmup:]
-	third := len(work) / 3
-	first, last := work[:third], work[len(work)-third:]
-	var rssF, rssL []int
-	var latF, latL []int64
-	for _, s := range first {
-		rssF = append(rssF, s.rssKB)
-		if s.replyMS > 0 {
-			latF = append(latF, s.replyMS)
+	// S1+S2 PER INCARNATION (prep4 codex/agy: a restart must not launder
+	// a leak; the pre-restart peak counts).
+	byInc := map[int][]soakSample{}
+	for _, s := range work {
+		byInc[s.incarnation] = append(byInc[s.incarnation], s)
+	}
+	for inc, ss := range byInc {
+		if len(ss) < 6 {
+			continue // too short to judge; the other incarnation carries it
+		}
+		third := len(ss) / 3
+		var rssF, rssAll []int
+		for _, s := range ss[:third] {
+			rssF = append(rssF, s.rssKB)
+		}
+		var rssL []int
+		for _, s := range ss[len(ss)-third:] {
+			rssL = append(rssL, s.rssKB)
+		}
+		peakRSS, baseFD, peakFD := 0, ss[0].fds, 0
+		for _, s := range ss {
+			rssAll = append(rssAll, s.rssKB)
+			if s.rssKB > peakRSS {
+				peakRSS = s.rssKB
+			}
+			if s.fds > peakFD {
+				peakFD = s.fds
+			}
+		}
+		mF, mL := medianInt(rssF), medianInt(rssL)
+		if mF <= 0 || mL <= 0 {
+			return fmt.Errorf("S1 inc%d RSS sampling broken (medians %d/%d)", inc, mF, mL)
+		}
+		if mL*2 > mF*3 {
+			return fmt.Errorf("S1 inc%d RSS median grew %dKB -> %dKB (>1.5x budget)", inc, mF, mL)
+		}
+		if peakRSS*5 > mF*8 { // peak > 1.6x baseline median
+			return fmt.Errorf("S1 inc%d RSS peak %dKB vs baseline %dKB (>1.6x budget)", inc, peakRSS, mF)
+		}
+		if baseFD <= 0 || peakFD <= 0 {
+			return fmt.Errorf("S2 inc%d FD sampling broken (%d/%d)", inc, baseFD, peakFD)
+		}
+		if peakFD > baseFD+10 {
+			return fmt.Errorf("S2 inc%d FD peak %d vs baseline %d (leak)", inc, peakFD, baseFD)
 		}
 	}
-	for _, s := range last {
-		rssL = append(rssL, s.rssKB)
-		if s.replyMS > 0 {
-			latL = append(latL, s.replyMS)
+	// S3: MAX valid WAL over the run; invalid samples bounded.
+	invalid, maxWal := 0, int64(0)
+	for _, s := range work {
+		if !s.walValid {
+			invalid++
+			continue
+		}
+		if s.walB > maxWal {
+			maxWal = s.walB
 		}
 	}
-	mF, mL := medianInt(rssF), medianInt(rssL)
-	if mF <= 0 || mL <= 0 {
-		return fmt.Errorf("RSS sampling broken (medians %d/%d)", mF, mL)
+	if invalid*10 > len(work) {
+		return fmt.Errorf("S3 %d/%d WAL samples invalid (measurement broken)", invalid, len(work))
 	}
-	if mL*2 > mF*3 { // mL > 1.5*mF without floats
-		return fmt.Errorf("S1 RSS grew %dKB -> %dKB (leak signal, >1.5x)", mF, mL)
+	if maxWal > 8<<20 {
+		return fmt.Errorf("S3 WAL peaked at %d bytes (checkpoint broken)", maxWal)
 	}
-	fd0, fdN := first[0].fds, last[len(last)-1].fds
-	if fd0 <= 0 || fdN <= 0 {
-		return fmt.Errorf("FD sampling broken (%d/%d)", fd0, fdN)
+	// S4: sparse latencies are a FAILURE (prep4 agy).
+	if len(latFirst) < 3 || len(latLast) < 3 {
+		return fmt.Errorf("S4 too few latency samples (%d/%d) — collection broken", len(latFirst), len(latLast))
 	}
-	if fdN > fd0+10 {
-		return fmt.Errorf("S2 FDs grew %d -> %d (leak)", fd0, fdN)
+	pF, pL := p95Int64(latFirst), p95Int64(latLast)
+	if pF <= 0 {
+		return fmt.Errorf("S4 latency sampling broken (p95 first=%d)", pF)
 	}
-	walN := last[len(last)-1].walB
-	if walN > 8<<20 {
-		return fmt.Errorf("S3 WAL unbounded: %d bytes at the end (checkpoint broken)", walN)
-	}
-	if len(latF) >= 3 && len(latL) >= 3 {
-		pF, pL := p95Int64(latF), p95Int64(latL)
-		if pF > 0 && pL > 3*pF {
-			return fmt.Errorf("S4 latency degraded: p95 %dms -> %dms (>3x)", pF, pL)
-		}
+	if pL > 3*pF {
+		return fmt.Errorf("S4 latency degraded: p95 %dms -> %dms (>3x)", pF, pL)
 	}
 	return nil
 }
@@ -181,52 +227,53 @@ func TestSoakSurvival(t *testing.T) {
 
 	start := func() (*exec.Cmd, time.Duration) {
 		t0 := time.Now()
-		cmd := w.killableDaemon(t) // dial-verified readiness
+		cmd := w.killableDaemon(t)
 		return cmd, time.Since(t0)
 	}
 	cmd, cold1 := start()
-	pid := cmd.Process.Pid
+	pid, incarnation := cmd.Process.Pid, 1
 
+	// OPEN-LOOP producer state: fixed arrival rate; replies correlated
+	// asynchronously; a message unanswered >60s is an immediate failure.
 	pushedIDs := map[int64]bool{}
+	sentAt := map[string]time.Time{} // marker -> push time (unanswered)
+	var latencies []int64            // completed roundtrips, in order
 	var samples []soakSample
 	msg := 0
-	reminderEvery := 10 // every 10th tick sets a reminder through chat
+	tick := 0
 	deadline := time.Now().Add(total)
 	half := time.Now().Add(total / 2)
 	restarted := false
 	var cold2 time.Duration
-	tick := 0
 	for time.Now().Before(deadline) {
 		tick++
 		msg++
 		marker := fmt.Sprintf("soak-msg-%06d", msg)
-		sentAt := time.Now()
 		id := bot.pushID(marker)
 		pushedIDs[id] = true
-		// latency = push -> reply arrives at the bot
-		lat := int64(-1)
-		latDeadline := time.Now().Add(30 * time.Second)
-		for time.Now().Before(latDeadline) {
-			if bot.countSent("reply-for "+marker) >= 1 {
-				lat = time.Since(sentAt).Milliseconds()
-				break
+		sentAt[marker] = time.Now()
+		// Asynchronous correlation pass: collect every answered marker.
+		for m, t0 := range sentAt {
+			if bot.countSent("reply-for "+m) >= 1 {
+				latencies = append(latencies, time.Since(t0).Milliseconds())
+				delete(sentAt, m)
+				continue
 			}
-			time.Sleep(150 * time.Millisecond)
+			if time.Since(t0) > 60*time.Second {
+				t.Fatalf("soak: %s unanswered for >60s (backlog explosion, tick %d)", m, tick)
+			}
 		}
-		if lat < 0 {
-			t.Fatalf("soak: reply for %s never arrived within 30s (tick %d)", marker, tick)
-		}
-		if tick%reminderEvery == 0 {
+		if tick%10 == 0 {
 			if out, cerr := w.chat("soak remind", true); cerr != nil || !strings.Contains(out, "placed") {
 				t.Fatalf("soak: reminder chat failed at tick %d: %v %q", tick, cerr, out)
 			}
 		}
+		walB, walOK := fileSizeChecked(walPath)
+		dbB, _ := fileSizeChecked(journalPath)
 		samples = append(samples, soakSample{
-			at: time.Now(), rssKB: readRSSKB(pid), fds: countFDs(pid),
-			walB: fileSize(walPath), dbB: fileSize(journalPath), replyMS: lat,
+			at: time.Now(), incarnation: incarnation, rssKB: readRSSKB(pid), fds: countFDs(pid),
+			walB: walB, walValid: walOK, dbB: dbB, backlog: len(sentAt),
 		})
-		// S5: one planned restart at half-time — full replay on the grown
-		// journal, cold-start bounded.
 		if !restarted && time.Now().After(half) {
 			restarted = true
 			cmd.Process.Signal(os.Interrupt)
@@ -240,7 +287,7 @@ func TestSoakSurvival(t *testing.T) {
 			}
 			var d time.Duration
 			cmd, d = start()
-			pid = cmd.Process.Pid
+			pid, incarnation = cmd.Process.Pid, 2
 			cold2 = d
 			if cold2 > 60*time.Second {
 				t.Fatalf("S5 cold start on the grown journal took %v (>60s)", cold2)
@@ -248,7 +295,20 @@ func TestSoakSurvival(t *testing.T) {
 		}
 		time.Sleep(2 * time.Second)
 	}
-	// graceful stop, then S6 end-state checks (reuse the chaos checkers).
+	// Let the tail answer, then graceful stop.
+	tailDeadline := time.Now().Add(45 * time.Second)
+	for time.Now().Before(tailDeadline) && len(sentAt) > 0 {
+		for m, t0 := range sentAt {
+			if bot.countSent("reply-for "+m) >= 1 {
+				latencies = append(latencies, time.Since(t0).Milliseconds())
+				delete(sentAt, m)
+			}
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	if len(sentAt) > 0 {
+		t.Fatalf("soak: %d messages never answered at shutdown", len(sentAt))
+	}
 	cmd.Process.Signal(os.Interrupt)
 	done := make(chan struct{})
 	go func() { cmd.Wait(); close(done) }()
@@ -258,68 +318,117 @@ func TestSoakSurvival(t *testing.T) {
 		cmd.Process.Kill()
 		<-done
 	}
-	// drain leftovers with one calm incarnation
+	// S6 HARD: drain with an explicit timeout FAILURE + independent
+	// non-SENT assertion (prep4 codex #1).
 	stopF, _ := w.daemon()
-	drainDeadline := time.Now().Add(60 * time.Second)
+	drained := false
+	drainDeadline := time.Now().Add(90 * time.Second)
 	for time.Now().Before(drainDeadline) {
 		notSent, e1 := w.pollQuery("private", `SELECT COUNT(*) FROM chan_outbox WHERE status NOT IN ('SENT')`)
 		if e1 == nil && notSent == 0 && w.inboxExactlyTerminal(t, "private", pushedIDs) {
+			drained = true
 			break
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
 	stopF()
+	if !drained {
+		t.Fatal("S6 drain deadline expired (outbox or inbox never converged)")
+	}
+	notSent, e1 := w.pollQuery("private", `SELECT COUNT(*) FROM chan_outbox WHERE status NOT IN ('SENT')`)
+	if e1 != nil || notSent != 0 {
+		t.Fatalf("S6 %d non-SENT outbox rows after the drain (err=%v)", notSent, e1)
+	}
 	if err := verifyJournalProduction(w, "private"); err != nil {
 		t.Fatalf("S6 journal replay after soak: %v", err)
 	}
 	if !w.inboxExactlyTerminal(t, "private", pushedIDs) {
 		t.Fatal("S6 inbox not exact-set TERMINAL after soak")
 	}
-	if verr := soakVerdict(samples, 3); verr != nil {
+	third := len(latencies) / 3
+	if third == 0 {
+		t.Fatalf("soak vacuous: %d latencies", len(latencies))
+	}
+	if verr := soakVerdict(samples, latencies[:third], latencies[len(latencies)-third:], 3); verr != nil {
 		t.Fatalf("soak verdict: %v", verr)
 	}
 	lastS := samples[len(samples)-1]
-	t.Logf("soak: %v, %d msgs, %d reminders, cold1=%v cold2=%v, RSS %dKB, FDs %d, WAL %dB, journal %dB",
-		total, msg, seq, cold1, cold2, lastS.rssKB, lastS.fds, lastS.walB, lastS.dbB)
+	maxBacklog := 0
+	for _, s := range samples {
+		if s.backlog > maxBacklog {
+			maxBacklog = s.backlog
+		}
+	}
+	t.Logf("soak: %v, %d msgs, %d reminders, cold1=%v cold2=%v, RSS %dKB, FDs %d, WAL %dB, journal %dB, maxBacklog=%d",
+		total, msg, seq, cold1, cold2, lastS.rssKB, lastS.fds, lastS.walB, lastS.dbB, maxBacklog)
 }
 
-// The soak verdict itself must be RED-capable on synthetic series.
+// The soak verdict must be RED-capable — including the reviewer-proven
+// blind spots: pre-restart peaks, mid-run WAL spikes, invalid WAL
+// samples, and sparse latencies.
 func TestSoakVerdictSensitivity(t *testing.T) {
-	base := func() []soakSample {
+	mk := func(inc, n int) []soakSample {
 		var s []soakSample
-		for i := 0; i < 30; i++ {
-			s = append(s, soakSample{rssKB: 50000, fds: 20, walB: 1 << 20, replyMS: 100})
+		for i := 0; i < n; i++ {
+			s = append(s, soakSample{incarnation: inc, rssKB: 50000, fds: 20, walB: 1 << 20, walValid: true})
 		}
 		return s
 	}
-	if err := soakVerdict(base(), 3); err != nil {
+	lat := func(v int64, n int) []int64 {
+		out := make([]int64, n)
+		for i := range out {
+			out[i] = v
+		}
+		return out
+	}
+	healthy := append(mk(1, 15), mk(2, 15)...)
+	if err := soakVerdict(healthy, lat(100, 10), lat(120, 10), 3); err != nil {
 		t.Fatalf("healthy series rejected: %v", err)
 	}
-	leak := base()
-	for i := 20; i < 30; i++ {
-		leak[i].rssKB = 90000 // >1.5x
+	// S1 endpoint growth within one incarnation.
+	leak := append(mk(1, 15), mk(2, 15)...)
+	for i := 10; i < 15; i++ {
+		leak[i].rssKB = 90000
 	}
-	if err := soakVerdict(leak, 3); err == nil || !strings.Contains(err.Error(), "S1") {
-		t.Fatalf("RSS leak not caught: %v", err)
+	if err := soakVerdict(leak, lat(100, 10), lat(120, 10), 3); err == nil || !strings.Contains(err.Error(), "S1") {
+		t.Fatalf("in-incarnation RSS growth not caught: %v", err)
 	}
-	fds := base()
-	fds[29].fds = 60
-	if err := soakVerdict(fds, 3); err == nil || !strings.Contains(err.Error(), "S2") {
-		t.Fatalf("FD leak not caught: %v", err)
+	// S1 PRE-RESTART PEAK laundered by the restart (reviewer probe).
+	peak := append(mk(1, 15), mk(2, 15)...)
+	peak[12].rssKB = 95000 // spike inside incarnation 1 only
+	if err := soakVerdict(peak, lat(100, 10), lat(120, 10), 3); err == nil || !strings.Contains(err.Error(), "S1") {
+		t.Fatalf("pre-restart RSS peak not caught: %v", err)
 	}
-	wal := base()
-	wal[29].walB = 20 << 20
-	if err := soakVerdict(wal, 3); err == nil || !strings.Contains(err.Error(), "S3") {
-		t.Fatalf("WAL growth not caught: %v", err)
+	// S2 FD spike inside the FIRST incarnation (reviewer probe).
+	fds := append(mk(1, 15), mk(2, 15)...)
+	fds[12].fds = 60
+	if err := soakVerdict(fds, lat(100, 10), lat(120, 10), 3); err == nil || !strings.Contains(err.Error(), "S2") {
+		t.Fatalf("pre-restart FD spike not caught: %v", err)
 	}
-	slow := base()
-	for i := 20; i < 30; i++ {
-		slow[i].replyMS = 900 // >3x p95
+	// S3 MID-RUN WAL spike (reviewer probe: end-sample-only was blind).
+	wal := append(mk(1, 15), mk(2, 15)...)
+	wal[8].walB = 20 << 20
+	if err := soakVerdict(wal, lat(100, 10), lat(120, 10), 3); err == nil || !strings.Contains(err.Error(), "S3") {
+		t.Fatalf("mid-run WAL spike not caught: %v", err)
 	}
-	if err := soakVerdict(slow, 3); err == nil || !strings.Contains(err.Error(), "S4") {
+	// S3 invalid WAL samples are NEVER healthy zeros (reviewer probe).
+	walBad := append(mk(1, 15), mk(2, 15)...)
+	for i := range walBad {
+		walBad[i].walValid = false
+	}
+	if err := soakVerdict(walBad, lat(100, 10), lat(120, 10), 3); err == nil || !strings.Contains(err.Error(), "S3") {
+		t.Fatalf("invalid WAL samples not caught: %v", err)
+	}
+	// S4 sparse latencies FAIL (reviewer probe: silent skip before).
+	if err := soakVerdict(healthy, lat(100, 2), lat(120, 2), 3); err == nil || !strings.Contains(err.Error(), "S4") {
+		t.Fatalf("sparse latencies not caught: %v", err)
+	}
+	// S4 degradation.
+	if err := soakVerdict(healthy, lat(100, 10), lat(900, 10), 3); err == nil || !strings.Contains(err.Error(), "S4") {
 		t.Fatalf("latency degradation not caught: %v", err)
 	}
-	if err := soakVerdict(base()[:5], 3); err == nil {
+	// Vacuous short series.
+	if err := soakVerdict(mk(1, 5), lat(100, 10), lat(100, 10), 3); err == nil {
 		t.Fatal("vacuous short series accepted")
 	}
 }
