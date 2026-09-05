@@ -352,7 +352,7 @@ Reviews: docs/REVIEW-PHASE6*.md.
 
 ## Phase 7 — P0 closure
 
-**[x] T27 (3c9895a..HEAD) — P0 acceptance run + release attestation + `P0-capable` grant.**
+**[x] T27 (3c9895a..d33d3e5) — P0 acceptance run + release attestation + `P0-capable` grant.**
 Scripted end-to-end checks for ALL SIX PRD §6 criteria + full hostile suite + minimal
 release signing (binary signed; built-in Telegram adapter integrity attested by that
 signature — HARDQ A1's second half) + doctor upgraded to grant `P0-capable` from live
@@ -369,6 +369,21 @@ removed or stale-hashed → its capability OFF in the snapshot and no dispatch t
 unchanged under `--yolo` (yolo never weakens containment).
 
 ---
+
+**Phase 7 / T27 convergence (2026-09-05, merged to main) — P0 COMPLETE:** full-P0
+adversarial review, 5 rounds (codex/kilo/agy): r1 codex 3H+2M+1L (log-only seal,
+enqueue-as-receipt, doctor self-certification, api-base token lane, shared build path)
++ kilo 1M+4L → folds (enforced pre-consumer seal, SENT-proven stable-id delivery
+receipts, signed binary-pinned attestation, loopback-only api base, private harness
+dir, causal no-channel sensitivity) → r2 agy ack-race + codex pre-seal consumers /
+forgeable attestation / group-id routing → folds (inline SENT-settle ack, seal FIRST
+in runDaemon, ldflags-pinned trust anchor + fixed root-owned verifier, positive-only
+chat ids) → r4/r5 single-read byte binding for signers+attestation+signature (TOCTOU
+class) → codex PASS, kilo PASS, agy PASS. All six PRD §6 criteria proven end-to-end
+against the real binary; per-criterion sensitivity switches verified; hostile suite
+unchanged under --yolo; P0-capable grant bound to the signed, binary-pinned
+acceptance attestation. NOTE: codex output-filter interference required fresh-thread
+neutral-framing dispatches; all evidence machine-read. Reviews: docs/REVIEW-T27*.md.
 
 Deferred ledger (do NOT build in P0): full S7 (P2) · full S5 shadow-git/worktree (P3) ·
 **MEMORY_FORGET + DATA_PURGE (both P2.1 — their normative owner; P0 correction =
