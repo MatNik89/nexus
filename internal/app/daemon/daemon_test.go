@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/MatNik89/nexus/internal/app/repl"
+	"github.com/MatNik89/nexus/internal/approval"
 	"github.com/MatNik89/nexus/internal/foundation/config"
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
 	"github.com/MatNik89/nexus/internal/kernel/effectpath"
@@ -81,6 +82,9 @@ func testDaemon(t *testing.T, planner loop.Planner, audit effectpath.AuditSink) 
 	ev := map[string]journal.PayloadValidator{}
 	for _, n := range machine.EventTypes() {
 		ev[n] = nil
+	}
+	for n, v := range approval.Events() {
+		ev[n] = v
 	}
 	j, err := journal.Open(filepath.Join(dir, "journal.db"), "work", redact.None{}, ev)
 	if err != nil {
@@ -511,5 +515,67 @@ func TestRecoveryFailsClosedOnCorruptJournal(t *testing.T) {
 	}
 	if !strings.Contains(rerr.Error(), "chain broken") {
 		t.Fatalf("replay integrity error was not propagated: %v", rerr)
+	}
+}
+
+// SUSPENDED-turn redelivery recovers the CHALLENGE SUMMARY (phase5-r4
+// kilo LOW): a crash between the suspension and the channel terminal
+// must replay the challenge, not a generic failure; a resumed turn's
+// success still wins.
+func TestRedeliveredSuspendedTurnRecoversChallenge(t *testing.T) {
+	p := &blockCapturingPlanner{}
+	d, _, j := testDaemon(t, p, nil)
+	// Simulate the durable suspension for a deterministic channel turn.
+	payload, _ := json.Marshal(map[string]any{"expires_unix": 9999999999, "call": json.RawMessage("{}"), "context": json.RawMessage("[]"),
+		"challenge_id": "ch-recovery", "turn_id": "turn-chan-chat-42-7", "run_id": "run-chan-chat-42-7",
+		"effect_hash": "h", "summary": "APPROVAL NEEDED [ch-recovery]: tool x", "expected_source": "tg:chat-42"})
+	ev := map[string]journal.PayloadValidator{}
+	_ = ev
+	if _, err := j.Append(context.Background(), contracts.EnvelopeParams{
+		SchemaID: "nexus.event", SchemaVersion: 1,
+		EventID: "ev-susp-rec", EventType: "approval.turn_suspended", RunID: "run-chan-chat-42-7",
+		EmittedAt: time.Now().UTC(), ActorType: contracts.ActorSystem, ActorID: "test",
+		PrincipalID: "nexus", WorkspaceID: "local", ProfileID: "work", AttemptNo: 1,
+		Payload: payload, PayloadHash: "recomputed",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Occupy the turn ids so redelivery collides (as a real crash does).
+	if _, err := d.RunChannelTurn(context.Background(), "chat-42", 7, "do it"); err != nil {
+		t.Fatal(err)
+	}
+	// Force the collision path: a second delivery of update 7 must NOT
+	// error — with the turn suspended it returns the challenge summary…
+	// except this turn actually SUCCEEDED (echo planner), so the success
+	// final wins. Now simulate the suspended-only turn 8.
+	payload8, _ := json.Marshal(map[string]any{"expires_unix": 9999999999, "call": json.RawMessage("{}"), "context": json.RawMessage("[]"),
+		"challenge_id": "ch-only", "turn_id": "turn-chan-chat-42-8", "run_id": "run-chan-chat-42-8",
+		"effect_hash": "h", "summary": "APPROVAL NEEDED [ch-only]: tool y", "expected_source": "tg:chat-42"})
+	if _, err := j.Append(context.Background(), contracts.EnvelopeParams{
+		SchemaID: "nexus.event", SchemaVersion: 1,
+		EventID: "ev-susp-only", EventType: "approval.turn_suspended", RunID: "run-chan-chat-42-8",
+		EmittedAt: time.Now().UTC(), ActorType: contracts.ActorSystem, ActorID: "test",
+		PrincipalID: "nexus", WorkspaceID: "local", ProfileID: "work", AttemptNo: 1,
+		Payload: payload8, PayloadHash: "recomputed",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Pre-occupy turn 8's created event (the crash left it mid-turn).
+	if _, err := j.Append(context.Background(), contracts.EnvelopeParams{
+		SchemaID: "nexus.event", SchemaVersion: 1,
+		EventID: "ev-turn-chan-chat-42-8-turn.created-1", EventType: "turn.created",
+		RunID: "run-chan-chat-42-8", EmittedAt: time.Now().UTC(),
+		ActorType: contracts.ActorSystem, ActorID: "loop", PrincipalID: "nexus",
+		WorkspaceID: "local", ProfileID: "work", AttemptNo: 1,
+		Payload: []byte(`{"turn_id":"turn-chan-chat-42-8"}`), PayloadHash: "recomputed",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	out, err := d.RunChannelTurn(context.Background(), "chat-42", 8, "do it again")
+	if err != nil {
+		t.Fatalf("suspended-turn redelivery errored instead of recovering the challenge: %v", err)
+	}
+	if !strings.Contains(out, "APPROVAL NEEDED [ch-only]") {
+		t.Fatalf("recovered %q, want the challenge summary", out)
 	}
 }

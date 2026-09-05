@@ -1488,6 +1488,18 @@ func TestMachineIDCheckScriptMirrorsDoctor(t *testing.T) {
 			t.Fatalf("%s refused for the wrong reason (content check not causal): %q", name, reason)
 		}
 	}
+	// A WHITESPACE-PADDED id passes content (mirrors Go TrimSpace) and
+	// falls through to ownership — the r5 slurp no-op refused it as
+	// malformed, diverging from the verifier (prep-low fix).
+	if os.Geteuid() != 0 {
+		reason, err := runReason(mk("padded", " "+strings.TrimSuffix(valid, "\n")+" \n", 0o644))
+		if err == nil {
+			t.Fatal("padded id on a user-owned file accepted")
+		}
+		if !strings.Contains(reason, "not root-owned") {
+			t.Fatalf("padded id refused as content (script diverges from Go): %q", reason)
+		}
+	}
 	// A symlink must refuse FOR THE SYMLINK REASON (first check).
 	target := mk("real", valid, 0o644)
 	link := filepath.Join(dir, "link")

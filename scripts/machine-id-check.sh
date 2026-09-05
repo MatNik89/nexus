@@ -20,7 +20,10 @@ NONUL_LEN="$(tr -d '\000' < "$F" | wc -c)"
 # WHOLE file, outer-whitespace-trimmed only (mirrors Go TrimSpace) —
 # trailing bytes after the id line are NOT ignored (r4 codex #1).
 CONTENT="$(cat "$F"; printf x)"; CONTENT="${CONTENT%x}"
-MID="$(printf '%s' "$CONTENT" | sed -e ':a' -e 'N;$!ba' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+# Per-line trim (the slurp idiom is a no-op on single-line input —
+# prep1-r5 kilo/agy): multi-line content still refuses via the length
+# guard because interior newlines survive.
+MID="$(printf '%s' "$CONTENT" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
 [ "${#MID}" -eq 32 ] || { echo "$F content malformed (fail closed)" >&2; exit 2; }
 case "$MID" in
   *[!0-9a-f]*) echo "$F content malformed (fail closed)" >&2; exit 2;;

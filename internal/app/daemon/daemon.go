@@ -259,12 +259,27 @@ func (d *Daemon) RunChannelTurn(ctx context.Context, identity string, updateID i
 func (d *Daemon) completedTurnFinal(turn contracts.TurnID) (string, bool, error) {
 	final, found := "", false
 	err := d.deps.Journal.Replay(0, func(ev journal.Event) error {
-		if ev.Envelope.EventType == "turn.succeeded" && ev.Envelope.TurnID != nil && *ev.Envelope.TurnID == turn {
-			var p struct {
-				Final string `json:"final"`
+		switch ev.Envelope.EventType {
+		case "turn.succeeded":
+			if ev.Envelope.TurnID != nil && *ev.Envelope.TurnID == turn {
+				var p struct {
+					Final string `json:"final"`
+				}
+				if json.Unmarshal(ev.Envelope.Payload, &p) == nil && p.Final != "" {
+					final, found = p.Final, true
+				}
 			}
-			if json.Unmarshal(ev.Envelope.Payload, &p) == nil && p.Final != "" {
-				final, found = p.Final, true
+		case "approval.turn_suspended":
+			// SUSPENDED analog of the success recovery (phase5-r4 kilo
+			// LOW): a crash between the suspension and the channel
+			// terminal must replay the CHALLENGE SUMMARY, not a generic
+			// failure. A later turn.succeeded (resume) overrides this.
+			var p struct {
+				TurnID  string `json:"turn_id"`
+				Summary string `json:"summary"`
+			}
+			if json.Unmarshal(ev.Envelope.Payload, &p) == nil && p.TurnID == string(turn) && p.Summary != "" {
+				final, found = p.Summary, true
 			}
 		}
 		return nil
