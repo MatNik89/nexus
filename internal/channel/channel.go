@@ -102,6 +102,13 @@ type outboundPayload struct {
 type deliveryMark struct {
 	DeliveryID string `json:"delivery_id"`
 	Proved     bool   `json:"proved,omitempty"`
+	// Adapter+Identity (optional, together) BIND the reconciliation to
+	// the delivery's FULL destination — a same-profile sibling chat or a
+	// different adapter cannot re-pend another destination's delivery
+	// (P0-prep r1 codex #2 + r2 codex #2). Source records WHO confirmed.
+	Adapter  string `json:"adapter,omitempty"`
+	Identity string `json:"identity,omitempty"`
+	Source   string `json:"source,omitempty"`
 }
 
 type terminalPayload struct {
@@ -280,7 +287,18 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 		if !p.Proved {
 			to = "PENDING" // proof of LOSS: safe to retry
 		}
-		res, err := tx.Exec(`UPDATE chan_outbox SET status=? WHERE delivery_id=? AND status='UNKNOWN'`, to, p.DeliveryID)
+		q := `UPDATE chan_outbox SET status=? WHERE delivery_id=? AND status='UNKNOWN'`
+		args := []interface{}{to, p.DeliveryID}
+		if p.Identity != "" || p.Adapter != "" {
+			// Atomic FULL-destination guard in the SAME statement: both
+			// columns or none (a half guard is refused).
+			if p.Identity == "" || p.Adapter == "" {
+				return fmt.Errorf("channel: destination guard requires BOTH adapter and identity (fail closed)")
+			}
+			q += ` AND adapter_id=? AND channel_identity=?`
+			args = append(args, p.Adapter, p.Identity)
+		}
+		res, err := tx.Exec(q, args...)
 		if err != nil {
 			return err
 		}
@@ -568,12 +586,40 @@ func (c *Core) MarkInboundTerminal(ctx context.Context, messageID string) error 
 // (the remote shows the message) → SENT; proved=false (the remote proves
 // loss) → back to PENDING for a safe retry.
 func (c *Core) Reconcile(ctx context.Context, deliveryID string, proved bool) error {
-	p, err := c.params(EvOutboundResolved, deliveryMark{DeliveryID: deliveryID, Proved: proved})
+	return c.ReconcileFor(ctx, deliveryID, proved, "", "", "")
+}
+
+// ReconcileFor reconciles WITH a destination binding: the transition
+// commits only if the row's channel identity matches (empty identity =
+// unbound internal call). The confirming source is persisted.
+func (c *Core) ReconcileFor(ctx context.Context, deliveryID string, proved bool, adapter, identity, source string) error {
+	p, err := c.params(EvOutboundResolved, deliveryMark{DeliveryID: deliveryID, Proved: proved,
+		Adapter: adapter, Identity: identity, Source: source})
 	if err != nil {
 		return err
 	}
 	_, err = c.j.Append(ctx, p)
 	return err
+}
+
+// UnreconciledFor lists UNKNOWN deliveries FOR ONE destination chat.
+func (c *Core) UnreconciledFor(ctx context.Context, adapter, identity string) ([]Outbound, error) {
+	rows, err := c.j.QueryProjection(ctx,
+		`SELECT delivery_id, adapter_id, channel_identity, text FROM chan_outbox
+		 WHERE status='UNKNOWN' AND adapter_id=? AND channel_identity=? ORDER BY created`, adapter, identity)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Outbound
+	for rows.Next() {
+		var o Outbound
+		if err := rows.Scan(&o.DeliveryID, &o.AdapterID, &o.ChannelIdentity, &o.Text); err != nil {
+			return nil, err
+		}
+		out = append(out, o)
+	}
+	return out, rows.Err()
 }
 
 // InboundStatus reports the durable inbound state ("" for unknown ids).

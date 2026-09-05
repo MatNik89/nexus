@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -1231,5 +1232,291 @@ func TestAckSettlesSentReceiptInline(t *testing.T) {
 	}
 	if !strings.Contains(reply2, "Ack failed") {
 		t.Fatalf("unsent occurrence acked (fabricated evidence): %q", reply2)
+	}
+}
+
+// P0-prep #3: command words followed by ORDINARY TEXT are conversation —
+// never a swallowed command error; exact ids still command.
+func TestCommandWordsNeedExactIDs(t *testing.T) {
+	b := hitlBundle(t, "TG_CMDFMT")
+	h := telegramHandler(b)
+	for i, msg := range []string{
+		"approve my vacation plan", "deny the request politely",
+		"ack that you understood me", "retry the download again",
+		"redeliver the package tomorrow",
+	} {
+		reply, err := h(context.Background(), channel.Inbound{
+			AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: int64(100 + i),
+			Text: msg, Profile: "private"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(reply, "failed") || strings.Contains(reply, "Nothing to retry") {
+			t.Fatalf("ordinary sentence %q swallowed as a command: %q", msg, reply)
+		}
+	}
+	// Exact ids still route to commands (a malformed one falls through,
+	// a well-formed unknown one reaches the store and reports failure).
+	reply, err := h(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 200,
+		Text: "approve ch-000000000000000000000000", Profile: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(reply, "Approval failed") {
+		t.Fatalf("well-formed id did not route to the command: %q", reply)
+	}
+}
+
+// P0-prep #1: an UNKNOWN delivery is listable and HUMAN-redeliverable —
+// redeliver re-pends it, flush sends it, and it leaves the UNKNOWN list.
+func TestOutboxRedeliverCommand(t *testing.T) {
+	b := hitlBundle(t, "TG_REDELIVER")
+	if _, err := b.chanCore.EnqueueReply(context.Background(), "telegram", "chat-42", "private", "lost message"); err != nil {
+		t.Fatal(err)
+	}
+	b.chanCore.Flush(context.Background(), func(o channel.Outbound) error {
+		return fmt.Errorf("wire wobble: %w", channel.ErrAmbiguousSend)
+	})
+	h := telegramHandler(b)
+	listing, err := h(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 1,
+		Text: "outbox", Profile: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(listing, "lost message") || !strings.Contains(listing, "dlv-") {
+		t.Fatalf("outbox listing missing the UNKNOWN row: %q", listing)
+	}
+	id := listing[strings.Index(listing, "dlv-"):]
+	id = id[:strings.IndexByte(id, ':')]
+	reply, err := h(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 2,
+		Text: "redeliver " + id, Profile: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(reply, "Re-queued") {
+		t.Fatalf("redeliver refused: %q", reply)
+	}
+	sent := 0
+	if err := b.chanCore.Flush(context.Background(), func(o channel.Outbound) error { sent++; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if sent != 1 {
+		t.Fatalf("re-queued delivery did not send: %d", sent)
+	}
+	if u, _ := b.chanCore.Unreconciled(context.Background()); len(u) != 0 {
+		t.Fatalf("row still UNKNOWN after redeliver+flush: %v", u)
+	}
+	// An empty outbox reports clean.
+	clean, _ := h(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 3,
+		Text: "outbox", Profile: "private"})
+	if !strings.Contains(clean, "clean") {
+		t.Fatalf("clean outbox not reported: %q", clean)
+	}
+}
+
+// P0-prep-r1 codex #2: a SIBLING chat on the same profile can neither
+// SEE nor REDELIVER another chat's UNKNOWN delivery.
+func TestOutboxIsDestinationBound(t *testing.T) {
+	b := hitlBundle(t, "TG_OUTBOUND")
+	if _, err := b.chanCore.EnqueueReply(context.Background(), "telegram", "chat-42", "private", "for chat 42 only"); err != nil {
+		t.Fatal(err)
+	}
+	b.chanCore.Flush(context.Background(), func(o channel.Outbound) error {
+		return fmt.Errorf("wobble: %w", channel.ErrAmbiguousSend)
+	})
+	h := telegramHandler(b)
+	// The sibling chat sees a CLEAN outbox.
+	foreignList, err := h(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-666", UpdateID: 1,
+		Text: "outbox", Profile: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(foreignList, "for chat 42 only") || strings.Contains(foreignList, "dlv-") {
+		t.Fatalf("sibling chat saw another chat's delivery: %q", foreignList)
+	}
+	// Find the real id via the OWNER chat, then the sibling tries it.
+	ownerList, err := h(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 2,
+		Text: "outbox", Profile: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := ownerList[strings.Index(ownerList, "dlv-"):]
+	id = id[:strings.IndexByte(id, ':')]
+	foreignRedeliver, err := h(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-666", UpdateID: 3,
+		Text: "redeliver " + id, Profile: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(foreignRedeliver, "Redeliver failed") {
+		t.Fatalf("sibling chat re-pended another chat's delivery: %q", foreignRedeliver)
+	}
+	// The row is STILL UNKNOWN (untouched), and the owner still can.
+	if u, _ := b.chanCore.UnreconciledFor(context.Background(), "telegram", "chat-42"); len(u) != 1 {
+		t.Fatalf("foreign attempt mutated the row: %v", u)
+	}
+	ownerRedeliver, err := h(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 4,
+		Text: "redeliver " + id, Profile: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(ownerRedeliver, "Re-queued") {
+		t.Fatalf("owner redeliver broken: %q", ownerRedeliver)
+	}
+	// CROSS-ADAPTER collision (P0-prep-r2 codex #2): an UNKNOWN row on a
+	// DIFFERENT adapter with the SAME chat identity is untouchable via
+	// the telegram command — the guard binds BOTH columns atomically.
+	if _, err := b.chanCore.EnqueueReply(context.Background(), "other-adapter", "chat-42", "private", "other adapter row"); err != nil {
+		t.Fatal(err)
+	}
+	b.chanCore.Flush(context.Background(), func(o channel.Outbound) error {
+		return fmt.Errorf("wobble: %w", channel.ErrAmbiguousSend)
+	})
+	others, _ := b.chanCore.UnreconciledFor(context.Background(), "other-adapter", "chat-42")
+	if len(others) != 1 {
+		t.Fatalf("fixture: %v", others)
+	}
+	crossReply, err := h(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 5,
+		Text: "redeliver " + others[0].DeliveryID, Profile: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(crossReply, "Redeliver failed") {
+		t.Fatalf("telegram command re-pended a foreign-adapter delivery: %q", crossReply)
+	}
+	if u, _ := b.chanCore.UnreconciledFor(context.Background(), "other-adapter", "chat-42"); len(u) != 1 {
+		t.Fatalf("foreign-adapter row mutated: %v", u)
+	}
+}
+
+// P0-prep-r2 codex #1: the machine identity must be VALID and the file
+// TRUSTWORTHY — templates, zeros, malformed content and user-writable
+// files all fail closed.
+func TestMachineIDValidation(t *testing.T) {
+	for _, bad := range []string{"", "uninitialized", "00000000000000000000000000000000",
+		"ABCDEF00000000000000000000000001", "abc", strings.Repeat("a", 33)} {
+		if err := validateMachineID(bad); err == nil {
+			t.Fatalf("invalid machine id %q accepted", bad)
+		}
+	}
+	if err := validateMachineID("0123456789abcdef0123456789abcdef"); err != nil {
+		t.Fatalf("valid machine id rejected: %v", err)
+	}
+	// A user-owned identity file is NOT a trust root (meaningless when
+	// the suite itself runs as root — then the fixture IS root-owned).
+	if os.Geteuid() != 0 {
+		f := filepath.Join(t.TempDir(), "machine-id")
+		if err := os.WriteFile(f, []byte("0123456789abcdef0123456789abcdef\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := machineIDSHAAt(f); err == nil {
+			t.Fatal("user-owned identity file accepted as a trust root")
+		}
+	}
+	// The REAL /etc/machine-id (root-owned) passes on this host.
+	if _, err := os.Stat("/etc/machine-id"); err == nil {
+		if _, err := machineIDSHA(); err != nil {
+			t.Fatalf("real machine-id refused: %v", err)
+		}
+	}
+}
+
+// P0-prep-r3 codex: the SHELL checker mirrors the Go verifier — modes
+// with a world-write bit, symlinks, and embedded whitespace all refuse.
+func TestMachineIDCheckScriptMirrorsDoctor(t *testing.T) {
+	script, err := filepath.Abs("../../scripts/machine-id-check.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	mk := func(name, content string, perm os.FileMode) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// Explicit chmod: WriteFile's mode is umask-clipped and would
+		// silently drop the world-write bits this test depends on.
+		if err := os.Chmod(p, perm); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	runReason := func(path string) (string, error) {
+		out, err := exec.Command(script, path).CombinedOutput()
+		return string(out), err
+	}
+
+	valid := "0123456789abcdef0123456789abcdef\n"
+	// World-writable modes the old glob MISSED must refuse FOR THE PERM
+	// REASON (the perm check runs before ownership, so this assertion is
+	// causal for the perm test even on a non-root run).
+	for _, perm := range []os.FileMode{0o602, 0o642, 0o646, 0o622} {
+		reason, err := runReason(mk(fmt.Sprintf("ww-%o", perm), valid, perm))
+		if err == nil {
+			t.Fatalf("world-writable mode %o accepted by the script", perm)
+		}
+		if !strings.Contains(reason, "writable") {
+			t.Fatalf("mode %o refused for the wrong reason (perm check not causal): %q", perm, reason)
+		}
+	}
+	// Content guards run BEFORE ownership, so these are causal without
+	// root — each asserts ITS refusal reason (r4 codex #2).
+	for name, content := range map[string]string{
+		"spaced":  "0123456789abcdef 123456789abcdef\n",
+		"garbage": valid + "trailing garbage\n",
+		"twoline": valid + valid,
+		// pure hex, wrong length: only the LENGTH guard catches this
+		// (charset alone would pass) — keeps that guard causal.
+		"shorthex": "0123456789abcdef\n",
+		// NUL-spliced: shell substitution would silently drop the NUL
+		// and normalize to valid 32-hex while Go refuses (r5 codex).
+		"nulsplice": "0123456789abcdef\x000123456789abcdef\n",
+	} {
+		reason, err := runReason(mk(name, content, 0o644))
+		if err == nil {
+			t.Fatalf("%s content accepted by the script", name)
+		}
+		if !strings.Contains(reason, "malformed") {
+			t.Fatalf("%s refused for the wrong reason (content check not causal): %q", name, reason)
+		}
+	}
+	// A symlink must refuse FOR THE SYMLINK REASON (first check).
+	target := mk("real", valid, 0o644)
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if reason, err := runReason(link); err == nil {
+		t.Fatal("symlinked identity file accepted by the script")
+	} else if !strings.Contains(reason, "symlink") {
+		t.Fatalf("symlink refused for the wrong reason: %q", reason)
+	}
+	// The ownership check itself: user-owned valid file refuses (unless
+	// the suite runs as root); the REAL /etc/machine-id passes.
+	if os.Geteuid() != 0 {
+		reason, err := runReason(mk("owned", valid, 0o644))
+		if err == nil {
+			t.Fatal("user-owned file accepted by the script")
+		}
+		if !strings.Contains(reason, "not root-owned") {
+			t.Fatalf("ownership refused for the wrong reason: %q", reason)
+		}
+	}
+	if _, err := os.Stat("/etc/machine-id"); err == nil {
+		out, err := exec.Command(script, "/etc/machine-id").Output()
+		if err != nil {
+			t.Fatalf("real machine-id refused by the script: %v", err)
+		}
+		if len(strings.TrimSpace(string(out))) != 32 {
+			t.Fatalf("script output shape: %q", out)
+		}
 	}
 }

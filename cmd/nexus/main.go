@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -858,6 +859,8 @@ func verifyAcceptanceAttestation(layout pathx.Layout) (bool, string) {
 		BinarySHA256 string `json:"binary_sha256"`
 		Suite        string `json:"suite"`
 		Passed       bool   `json:"passed"`
+		Host         string `json:"host"`
+		MachineID    string `json:"machine_id_sha256"`
 		Time         string `json:"time"`
 	}
 	if json.Unmarshal(raw, &att) != nil || !att.Passed || att.Suite != "internal/acceptance" || att.BinarySHA256 == "" {
@@ -878,6 +881,26 @@ func verifyAcceptanceAttestation(layout pathx.Layout) (bool, string) {
 	}
 	if hex.EncodeToString(h.Sum(nil)) != att.BinarySHA256 {
 		return false, "this binary is NOT the one the acceptance suite graded (digest mismatch, fail closed)"
+	}
+	// HOST binding (P0-prep #2): the attestation is valid only on the
+	// host that ran the acceptance suite — copying the pair to another
+	// machine does not transfer the grant.
+	host, herr := runtimeHostID()
+	if herr != nil {
+		return false, "cannot read the host identity (fail closed): " + herr.Error()
+	}
+	if att.Host != host {
+		return false, "acceptance attestation was produced on a DIFFERENT host (fail closed) — run scripts/p0-accept.sh here"
+	}
+	// MACHINE binding (P0-prep-r1 codex #1): the kernel tuple is not
+	// unique — the attestation also carries sha256(/etc/machine-id),
+	// stable and root-owned per machine.
+	mid, merr := machineIDSHA()
+	if merr != nil {
+		return false, "cannot read /etc/machine-id (fail closed): " + merr.Error()
+	}
+	if att.MachineID != mid {
+		return false, "acceptance attestation was produced on a DIFFERENT machine (machine-id mismatch, fail closed)"
 	}
 	// PROVENANCE (T27-r2 codex #2, hardened per r3 codex #1): the
 	// attestation must carry the owner's signature, the trust anchor
@@ -940,6 +963,77 @@ func verifyAcceptanceAttestation(layout pathx.Layout) (bool, string) {
 		return false, "attestation signature verification FAILED: " + strings.TrimSpace(string(out))
 	}
 	return true, "signed acceptance pass for this exact binary (" + att.Time + ")"
+}
+
+// runtimeHostID formats the running kernel identity exactly as
+// `uname -srm` does (the attestation's host field).
+func runtimeHostID() (string, error) {
+	var u syscall.Utsname
+	if err := syscall.Uname(&u); err != nil {
+		return "", err
+	}
+	conv := func(f [65]int8) string {
+		b := make([]byte, 0, 65)
+		for _, c := range f {
+			if c == 0 {
+				break
+			}
+			b = append(b, byte(c))
+		}
+		return string(b)
+	}
+	return conv(u.Sysname) + " " + conv(u.Release) + " " + conv(u.Machine), nil
+}
+
+// machineIDSHA is the sha256 of the machine's stable identity file.
+// The file must be TRUSTWORTHY (regular, root-owned, not group/world
+// writable) and VALID (exactly one nonzero 32-lowercase-hex id) — a
+// template, empty, or user-writable identity would let two machines
+// share a binding or a local writer choose one (P0-prep-r2 codex #1).
+func machineIDSHA() (string, error) { return machineIDSHAAt("/etc/machine-id") }
+
+func machineIDSHAAt(path string) (string, error) {
+	st, err := os.Lstat(path)
+	if err != nil {
+		return "", err
+	}
+	if !st.Mode().IsRegular() {
+		return "", fmt.Errorf("%s is not a regular file (fail closed)", path)
+	}
+	sys, ok := st.Sys().(*syscall.Stat_t)
+	if !ok || sys.Uid != 0 || st.Mode().Perm()&0o022 != 0 {
+		return "", fmt.Errorf("%s is not a root-owned, non-writable identity file (fail closed)", path)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	id := strings.TrimSpace(string(raw))
+	if err := validateMachineID(id); err != nil {
+		return "", fmt.Errorf("%s: %w", path, err)
+	}
+	sum := sha256.Sum256([]byte(id))
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// validateMachineID enforces the systemd machine-id shape.
+func validateMachineID(id string) error {
+	if len(id) != 32 {
+		return fmt.Errorf("machine id must be exactly 32 hex chars (fail closed)")
+	}
+	nonzero := false
+	for _, c := range id {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return fmt.Errorf("machine id must be lowercase hex (fail closed)")
+		}
+		if c != '0' {
+			nonzero = true
+		}
+	}
+	if !nonzero {
+		return fmt.Errorf("machine id is all zeros (uninitialized, fail closed)")
+	}
+	return nil
 }
 
 // mustProbeCore opens a throwaway channel core for the doctor's live
@@ -1070,6 +1164,13 @@ func (b *daemonBundle) liveProbes(ctx context.Context, resolved config.Resolved,
 	return probes, requested
 }
 
+// Command-id shapes (P0-prep #3): commands fire only on exact ids.
+var (
+	challengeIDRe  = regexp.MustCompile(`^ch-[0-9a-f]{24}$`)
+	occurrenceIDRe = regexp.MustCompile(`^occ-[A-Za-z0-9_.-]+#[0-9]+$`)
+	deliveryIDRe   = regexp.MustCompile(`^dlv-[0-9a-f]{24}$`)
+)
+
 // telegramHandler routes an admitted Telegram message: "approve <id>" /
 // "deny <id>" hit the durable HITL store; anything else is a normal
 // conversation turn through the same production planner spine
@@ -1079,8 +1180,11 @@ func telegramHandler(b *daemonBundle) telegram.Handler {
 		text := strings.TrimSpace(in.Text)
 		lower := strings.ToLower(text)
 		source := "tg:" + in.ChannelIdentity
+		// Command words route ONLY with an exact well-formed id — an
+		// ordinary sentence starting with "approve"/"ack"/... is
+		// CONVERSATION, never a swallowed command error (P0-prep #3).
 		switch {
-		case strings.HasPrefix(lower, "approve "):
+		case strings.HasPrefix(lower, "approve ") && challengeIDRe.MatchString(strings.TrimSpace(text[len("approve "):])):
 			id := strings.TrimSpace(text[len("approve "):])
 			if err := b.approvals.Approve(ctx, id, source); err != nil {
 				// Crash-window recovery (Phase-5-r2 codex #2): if the
@@ -1098,7 +1202,7 @@ func telegramHandler(b *daemonBundle) telegram.Handler {
 				return "Approved " + id + " but the resume failed: " + rerr.Error(), nil
 			}
 			return "Approved " + id + ". " + result, nil
-		case strings.HasPrefix(lower, "retry "):
+		case strings.HasPrefix(lower, "retry ") && challengeIDRe.MatchString(strings.TrimSpace(text[len("retry "):])):
 			// E9 reconcile for a CONSUMED-but-unfinished resume: the user
 			// confirms by re-approving a FRESH challenge over the same
 			// exact intent — never a blind auto-retry (Phase-5-r3 kilo #1).
@@ -1111,13 +1215,13 @@ func telegramHandler(b *daemonBundle) telegram.Handler {
 				return "Nothing to retry for " + id + ": " + rerr.Error(), nil
 			}
 			return ch.Summary, nil
-		case strings.HasPrefix(lower, "deny "):
+		case strings.HasPrefix(lower, "deny ") && challengeIDRe.MatchString(strings.TrimSpace(text[len("deny "):])):
 			id := strings.TrimSpace(text[len("deny "):])
 			if err := b.approvals.Deny(ctx, id, source); err != nil {
 				return "Denial failed: " + err.Error(), nil
 			}
 			return "Denied " + id + ".", nil
-		case strings.HasPrefix(lower, "ack "):
+		case strings.HasPrefix(lower, "ack ") && occurrenceIDRe.MatchString(strings.TrimSpace(text[len("ack "):])):
 			// Direct occurrence ack (B5: the ack correlates to the EXACT
 			// occurrence id shown in the delivery message). A user acking
 			// within the delivery loop's tick window races the receipt
@@ -1133,6 +1237,37 @@ func telegramHandler(b *daemonBundle) telegram.Handler {
 				return "Ack failed: " + err.Error(), nil
 			}
 			return "Acknowledged " + occ + ".", nil
+		case lower == "outbox":
+			// UNKNOWN rows await HUMAN reconciliation (E9/B2): list them
+			// so the owner can decide (P0-prep #1 — a wire failure no
+			// longer dies silently).
+			rows, err := b.chanCore.UnreconciledFor(ctx, "telegram", in.ChannelIdentity)
+			if err != nil {
+				return "", err
+			}
+			if len(rows) == 0 {
+				return "Outbox clean: no deliveries awaiting reconciliation.", nil
+			}
+			out := "Deliveries with UNKNOWN outcome (may or may not have arrived):\n"
+			for _, r := range rows {
+				txt := r.Text
+				if len(txt) > 80 {
+					txt = txt[:80] + "…"
+				}
+				out += r.DeliveryID + ": " + txt + "\n"
+			}
+			out += "Reply redeliver <dlv-id> to resend one (it MAY arrive twice)."
+			return out, nil
+		case strings.HasPrefix(lower, "redeliver ") && deliveryIDRe.MatchString(strings.TrimSpace(text[len("redeliver "):])):
+			// HUMAN-confirmed E9 reconciliation: the owner accepts the
+			// duplicate risk explicitly — never an automatic retry.
+			id := strings.TrimSpace(text[len("redeliver "):])
+			// Destination-bound: only THIS chat's deliveries (codex #2);
+			// the guard is atomic inside the projection transition.
+			if err := b.chanCore.ReconcileFor(ctx, id, false, "telegram", in.ChannelIdentity, source); err != nil {
+				return "Redeliver failed: " + err.Error(), nil
+			}
+			return "Re-queued " + id + " — it will go out on the next flush (and may arrive twice).", nil
 		case lower == "pending":
 			pending, err := b.approvals.Pending(ctx)
 			if err != nil {
