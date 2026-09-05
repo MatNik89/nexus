@@ -85,6 +85,10 @@ type world struct {
 	bot       *fakeBot
 	extraEnv  []string
 	pinnedBin string
+	// providerDelay stretches every provider turn (chaos harness: widens
+	// the admitted-but-not-terminal window so random kills provably land
+	// in flight).
+	providerDelay time.Duration
 }
 
 func newWorld(t *testing.T, execAllow []string) *world {
@@ -98,6 +102,9 @@ func newWorld(t *testing.T, execAllow []string) *world {
 		last := ""
 		if len(req.Messages) > 0 {
 			last = req.Messages[len(req.Messages)-1].Content
+		}
+		if w.providerDelay > 0 {
+			time.Sleep(w.providerDelay)
 		}
 		reply := "echo: " + last
 		if strings.Contains(last, "ping") && len(last) < 40 {
@@ -200,9 +207,24 @@ func newFakeBot(t *testing.T) *fakeBot {
 		case strings.HasSuffix(r.URL.Path, "/getMe"):
 			rw.Write([]byte(`{"ok":true,"result":{"is_bot":true}}`))
 		case strings.HasSuffix(r.URL.Path, "/getUpdates"):
+			// OFFSET-FAITHFUL like the real Bot API (prep3 reviews): an
+			// update stays pending until the client's offset passes it —
+			// a crash after fetch REDELIVERS instead of losing the batch.
+			var req struct {
+				Offset int64 `json:"offset"`
+			}
+			json.NewDecoder(r.Body).Decode(&req)
 			b.mu.Lock()
-			batch := b.updates
-			b.updates = nil
+			kept := b.updates[:0]
+			var batch []map[string]any
+			for _, u := range b.updates {
+				id, _ := u["update_id"].(int64)
+				if id >= req.Offset {
+					kept = append(kept, u)
+					batch = append(batch, u)
+				}
+			}
+			b.updates = kept
 			b.mu.Unlock()
 			out, _ := json.Marshal(map[string]any{"ok": true, "result": batch})
 			rw.Write(out)
