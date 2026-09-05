@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -1409,18 +1410,77 @@ func TestMachineIDValidation(t *testing.T) {
 	if err := validateMachineID("0123456789abcdef0123456789abcdef"); err != nil {
 		t.Fatalf("valid machine id rejected: %v", err)
 	}
-	// A user-owned identity file is NOT a trust root.
-	f := filepath.Join(t.TempDir(), "machine-id")
-	if err := os.WriteFile(f, []byte("0123456789abcdef0123456789abcdef\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := machineIDSHAAt(f); err == nil {
-		t.Fatal("user-owned identity file accepted as a trust root")
+	// A user-owned identity file is NOT a trust root (meaningless when
+	// the suite itself runs as root — then the fixture IS root-owned).
+	if os.Geteuid() != 0 {
+		f := filepath.Join(t.TempDir(), "machine-id")
+		if err := os.WriteFile(f, []byte("0123456789abcdef0123456789abcdef\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := machineIDSHAAt(f); err == nil {
+			t.Fatal("user-owned identity file accepted as a trust root")
+		}
 	}
 	// The REAL /etc/machine-id (root-owned) passes on this host.
 	if _, err := os.Stat("/etc/machine-id"); err == nil {
 		if _, err := machineIDSHA(); err != nil {
 			t.Fatalf("real machine-id refused: %v", err)
+		}
+	}
+}
+
+// P0-prep-r3 codex: the SHELL checker mirrors the Go verifier — modes
+// with a world-write bit, symlinks, and embedded whitespace all refuse.
+func TestMachineIDCheckScriptMirrorsDoctor(t *testing.T) {
+	script, err := filepath.Abs("../../scripts/machine-id-check.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	mk := func(name, content string, perm os.FileMode) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(content), perm); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	run := func(path string) error {
+		return exec.Command(script, path).Run()
+	}
+	valid := "0123456789abcdef0123456789abcdef\n"
+	// World-writable modes the old glob MISSED must refuse.
+	for _, perm := range []os.FileMode{0o602, 0o642, 0o646, 0o622} {
+		if err := run(mk(fmt.Sprintf("ww-%o", perm), valid, perm)); err == nil {
+			t.Fatalf("world-writable mode %o accepted by the script", perm)
+		}
+	}
+	// Embedded whitespace must refuse (no interior-whitespace deletion).
+	if err := run(mk("spaced", "0123456789abcdef 123456789abcdef\n", 0o644)); err == nil {
+		t.Fatal("embedded-whitespace id accepted by the script")
+	}
+	// A symlink must refuse.
+	target := mk("real", valid, 0o644)
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(link); err == nil {
+		t.Fatal("symlinked identity file accepted by the script")
+	}
+	// The ownership check itself: user-owned valid file refuses (unless
+	// the suite runs as root); the REAL /etc/machine-id passes.
+	if os.Geteuid() != 0 {
+		if err := run(mk("owned", valid, 0o644)); err == nil {
+			t.Fatal("user-owned file accepted by the script")
+		}
+	}
+	if _, err := os.Stat("/etc/machine-id"); err == nil {
+		out, err := exec.Command(script, "/etc/machine-id").Output()
+		if err != nil {
+			t.Fatalf("real machine-id refused by the script: %v", err)
+		}
+		if len(strings.TrimSpace(string(out))) != 32 {
+			t.Fatalf("script output shape: %q", out)
 		}
 	}
 }
