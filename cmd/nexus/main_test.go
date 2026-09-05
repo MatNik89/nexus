@@ -1369,4 +1369,58 @@ func TestOutboxIsDestinationBound(t *testing.T) {
 	if !strings.Contains(ownerRedeliver, "Re-queued") {
 		t.Fatalf("owner redeliver broken: %q", ownerRedeliver)
 	}
+	// CROSS-ADAPTER collision (P0-prep-r2 codex #2): an UNKNOWN row on a
+	// DIFFERENT adapter with the SAME chat identity is untouchable via
+	// the telegram command — the guard binds BOTH columns atomically.
+	if _, err := b.chanCore.EnqueueReply(context.Background(), "other-adapter", "chat-42", "private", "other adapter row"); err != nil {
+		t.Fatal(err)
+	}
+	b.chanCore.Flush(context.Background(), func(o channel.Outbound) error {
+		return fmt.Errorf("wobble: %w", channel.ErrAmbiguousSend)
+	})
+	others, _ := b.chanCore.UnreconciledFor(context.Background(), "other-adapter", "chat-42")
+	if len(others) != 1 {
+		t.Fatalf("fixture: %v", others)
+	}
+	crossReply, err := h(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 5,
+		Text: "redeliver " + others[0].DeliveryID, Profile: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(crossReply, "Redeliver failed") {
+		t.Fatalf("telegram command re-pended a foreign-adapter delivery: %q", crossReply)
+	}
+	if u, _ := b.chanCore.UnreconciledFor(context.Background(), "other-adapter", "chat-42"); len(u) != 1 {
+		t.Fatalf("foreign-adapter row mutated: %v", u)
+	}
+}
+
+// P0-prep-r2 codex #1: the machine identity must be VALID and the file
+// TRUSTWORTHY — templates, zeros, malformed content and user-writable
+// files all fail closed.
+func TestMachineIDValidation(t *testing.T) {
+	for _, bad := range []string{"", "uninitialized", "00000000000000000000000000000000",
+		"ABCDEF00000000000000000000000001", "abc", strings.Repeat("a", 33)} {
+		if err := validateMachineID(bad); err == nil {
+			t.Fatalf("invalid machine id %q accepted", bad)
+		}
+	}
+	if err := validateMachineID("0123456789abcdef0123456789abcdef"); err != nil {
+		t.Fatalf("valid machine id rejected: %v", err)
+	}
+	// A user-owned identity file is NOT a trust root.
+	f := filepath.Join(t.TempDir(), "machine-id")
+	if err := os.WriteFile(f, []byte("0123456789abcdef0123456789abcdef\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := machineIDSHAAt(f); err == nil {
+		t.Fatal("user-owned identity file accepted as a trust root")
+	}
+	// The REAL /etc/machine-id (root-owned) passes on this host.
+	if _, err := os.Stat("/etc/machine-id"); err == nil {
+		if _, err := machineIDSHA(); err != nil {
+			t.Fatalf("real machine-id refused: %v", err)
+		}
+	}
 }

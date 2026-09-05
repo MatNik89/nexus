@@ -985,16 +985,55 @@ func runtimeHostID() (string, error) {
 	return conv(u.Sysname) + " " + conv(u.Release) + " " + conv(u.Machine), nil
 }
 
-// machineIDSHA is the sha256 of the machine's stable identity file
-// (root-owned /etc/machine-id; hashed so the raw id never sits in the
-// attestation).
-func machineIDSHA() (string, error) {
-	raw, err := os.ReadFile("/etc/machine-id")
+// machineIDSHA is the sha256 of the machine's stable identity file.
+// The file must be TRUSTWORTHY (regular, root-owned, not group/world
+// writable) and VALID (exactly one nonzero 32-lowercase-hex id) — a
+// template, empty, or user-writable identity would let two machines
+// share a binding or a local writer choose one (P0-prep-r2 codex #1).
+func machineIDSHA() (string, error) { return machineIDSHAAt("/etc/machine-id") }
+
+func machineIDSHAAt(path string) (string, error) {
+	st, err := os.Lstat(path)
 	if err != nil {
 		return "", err
 	}
-	sum := sha256.Sum256([]byte(strings.TrimSpace(string(raw))))
+	if !st.Mode().IsRegular() {
+		return "", fmt.Errorf("%s is not a regular file (fail closed)", path)
+	}
+	sys, ok := st.Sys().(*syscall.Stat_t)
+	if !ok || sys.Uid != 0 || st.Mode().Perm()&0o022 != 0 {
+		return "", fmt.Errorf("%s is not a root-owned, non-writable identity file (fail closed)", path)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	id := strings.TrimSpace(string(raw))
+	if err := validateMachineID(id); err != nil {
+		return "", fmt.Errorf("%s: %w", path, err)
+	}
+	sum := sha256.Sum256([]byte(id))
 	return hex.EncodeToString(sum[:]), nil
+}
+
+// validateMachineID enforces the systemd machine-id shape.
+func validateMachineID(id string) error {
+	if len(id) != 32 {
+		return fmt.Errorf("machine id must be exactly 32 hex chars (fail closed)")
+	}
+	nonzero := false
+	for _, c := range id {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return fmt.Errorf("machine id must be lowercase hex (fail closed)")
+		}
+		if c != '0' {
+			nonzero = true
+		}
+	}
+	if !nonzero {
+		return fmt.Errorf("machine id is all zeros (uninitialized, fail closed)")
+	}
+	return nil
 }
 
 // mustProbeCore opens a throwaway channel core for the doctor's live
@@ -1225,7 +1264,7 @@ func telegramHandler(b *daemonBundle) telegram.Handler {
 			id := strings.TrimSpace(text[len("redeliver "):])
 			// Destination-bound: only THIS chat's deliveries (codex #2);
 			// the guard is atomic inside the projection transition.
-			if err := b.chanCore.ReconcileFor(ctx, id, false, in.ChannelIdentity, source); err != nil {
+			if err := b.chanCore.ReconcileFor(ctx, id, false, "telegram", in.ChannelIdentity, source); err != nil {
 				return "Redeliver failed: " + err.Error(), nil
 			}
 			return "Re-queued " + id + " — it will go out on the next flush (and may arrive twice).", nil

@@ -25,10 +25,18 @@ NEXUS_ACCEPT_BIN="$BIN" CGO_ENABLED=0 go test -count=1 -timeout 900s ./internal/
 # The attestation is SIGNED (T27-r2 codex #2: a plain JSON is forgeable
 # by any process that can write the config dir). NEXUS_RELEASE_KEY names
 # the owner ssh key; doctor verifies against <config>/nexus/allowed_signers.
+# Machine identity must be trustworthy and valid (mirrors doctor).
+MID_FILE=/etc/machine-id
+[ -f "$MID_FILE" ] || { echo "no $MID_FILE" >&2; exit 2; }
+[ "$(stat -c '%u' "$MID_FILE")" = "0" ] || { echo "$MID_FILE not root-owned" >&2; exit 2; }
+case "$(stat -c '%a' "$MID_FILE")" in *[2367]?|?[2367]) echo "$MID_FILE writable" >&2; exit 2;; esac
+MID="$(tr -d '[:space:]' < "$MID_FILE")"
+printf '%s' "$MID" | grep -Eq '^[0-9a-f]{32}$' || { echo "$MID_FILE malformed" >&2; exit 2; }
+[ "$MID" != "00000000000000000000000000000000" ] || { echo "$MID_FILE uninitialized" >&2; exit 2; }
 OUT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nexus/system"
 mkdir -p "$OUT_DIR"
 cat > "$OUT_DIR/acceptance.json" <<JSON
-{"binary_sha256":"$DIGEST","suite":"internal/acceptance","passed":true,"host":"$(uname -srm)","machine_id_sha256":"$(tr -d '\n' < /etc/machine-id | sha256sum | cut -d' ' -f1)","time":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
+{"binary_sha256":"$DIGEST","suite":"internal/acceptance","passed":true,"host":"$(uname -srm)","machine_id_sha256":"$(printf '%s' "$MID" | sha256sum | cut -d' ' -f1)","time":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
 JSON
 rm -f "$OUT_DIR/acceptance.json.sig"
 ssh-keygen -Y sign -f "$KEY" -n nexus-acceptance "$OUT_DIR/acceptance.json"
