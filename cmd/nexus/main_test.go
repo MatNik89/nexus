@@ -1476,6 +1476,9 @@ func TestMachineIDCheckScriptMirrorsDoctor(t *testing.T) {
 		// pure hex, wrong length: only the LENGTH guard catches this
 		// (charset alone would pass) — keeps that guard causal.
 		"shorthex": "0123456789abcdef\n",
+		// NUL-spliced: shell substitution would silently drop the NUL
+		// and normalize to valid 32-hex while Go refuses (r5 codex).
+		"nulsplice": "0123456789abcdef\x000123456789abcdef\n",
 	} {
 		reason, err := runReason(mk(name, content, 0o644))
 		if err == nil {

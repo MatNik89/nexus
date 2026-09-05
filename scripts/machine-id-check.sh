@@ -12,6 +12,11 @@ F="$1"
 [ -f "$F" ] || { echo "$F is not a regular file (fail closed)" >&2; exit 2; }
 PERMS="$(stat -c '%a' "$F")"
 [ $(( 0$PERMS & 022 )) -eq 0 ] || { echo "$F is group/world-writable ($PERMS, fail closed)" >&2; exit 2; }
+# NUL bytes first: shell command substitution silently DROPS them, so a
+# NUL-spliced id would normalize here while Go refuses it (r5 codex).
+RAW_LEN="$(wc -c < "$F")"
+NONUL_LEN="$(tr -d '\000' < "$F" | wc -c)"
+[ "$RAW_LEN" -eq "$NONUL_LEN" ] || { echo "$F content malformed (fail closed)" >&2; exit 2; }
 # WHOLE file, outer-whitespace-trimmed only (mirrors Go TrimSpace) —
 # trailing bytes after the id line are NOT ignored (r4 codex #1).
 CONTENT="$(cat "$F"; printf x)"; CONTENT="${CONTENT%x}"
