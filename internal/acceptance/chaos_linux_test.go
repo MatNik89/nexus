@@ -185,10 +185,21 @@ func TestChaosKillSurvival(t *testing.T) {
 				sigkill(t, cmd) // guaranteed mid-processing
 				inFlightKills++
 			case "complete":
-				before, berr := w.pollQuery("private", `SELECT COUNT(*) FROM chan_outbox WHERE text LIKE 'reply-for chaos-msg-%'`)
-				if berr != nil {
+				// Baseline accepts ONLY a successful sample (bounded loop).
+				before, berr := -1, error(nil)
+				for tries := 0; tries < 50; tries++ {
+					before, berr = w.pollQuery("private", `SELECT COUNT(*) FROM chan_outbox WHERE text LIKE 'reply-for chaos-msg-%'`)
+					if berr == nil {
+						break
+					}
+					if berr != errTransientBusy {
+						break
+					}
+					time.Sleep(100 * time.Millisecond)
+				}
+				if berr != nil || before < 0 {
 					sigkill(t, cmd)
-					t.Fatalf("phase B baseline: %v", berr)
+					t.Fatalf("phase B baseline never sampled cleanly: %v", berr)
 				}
 				if !waitStore(func() bool {
 					n, err := w.pollQuery("private", `SELECT COUNT(*) FROM chan_outbox WHERE text LIKE 'reply-for chaos-msg-%'`)
@@ -492,12 +503,17 @@ func (w *world) pollQuery(profile, q string, args ...interface{}) (int, error) {
 	var n int
 	if err := db.QueryRow(q, args...).Scan(&n); err != nil {
 		if strings.Contains(err.Error(), "locked") || strings.Contains(err.Error(), "busy") {
-			return 0, nil // transient: report no progress, let the deadline retry
+			// SENTINEL, never a fake zero (prep3-r4 codex): a transient
+			// lock must not masquerade as a real sample.
+			return 0, errTransientBusy
 		}
 		return 0, err
 	}
 	return n, nil
 }
+
+// errTransientBusy marks a retryable SQLite contention sample.
+var errTransientBusy = fmt.Errorf("transient sqlite busy/locked")
 
 // countSentReplies counts ENQUEUED chaos success replies (adaptive goal
 // signal; kills usually land before the 2s flush tick, so SENT-ness is
