@@ -185,7 +185,11 @@ func TestChaosKillSurvival(t *testing.T) {
 				sigkill(t, cmd) // guaranteed mid-processing
 				inFlightKills++
 			case "complete":
-				before := w.countSentReplies(t, "private")
+				before, berr := w.pollQuery("private", `SELECT COUNT(*) FROM chan_outbox WHERE text LIKE 'reply-for chaos-msg-%'`)
+				if berr != nil {
+					sigkill(t, cmd)
+					t.Fatalf("phase B baseline: %v", berr)
+				}
 				if !waitStore(func() bool {
 					n, err := w.pollQuery("private", `SELECT COUNT(*) FROM chan_outbox WHERE text LIKE 'reply-for chaos-msg-%'`)
 					return err == nil && n > before
@@ -259,7 +263,32 @@ func TestChaosKillSurvival(t *testing.T) {
 	// CALM drain: EVERY pushed id terminal AND the reminder DELIVERED —
 	// no fixed-sleep correctness (prep3 codex #5).
 	stopF, _ := w.daemon()
+	// OBSERVATION INTERVAL first (prep3-r3 codex #1): give the restarted
+	// daemon two full flush ticks with NO owner command — the phase-D
+	// row must stay UNKNOWN and its acceptance count unchanged (an
+	// automatic resend of a possibly-delivered send would show up here).
+	time.Sleep(5 * time.Second)
+	if got := bot.countSent(wantReply); got != acceptedBefore {
+		t.Fatalf("phase D: automatic resend during the observation interval (%d -> %d)", acceptedBefore, got)
+	}
+	if n, err := w.pollQuery("private", `SELECT COUNT(*) FROM chan_outbox WHERE status='UNKNOWN' AND text = ?`, wantReply); err != nil || n != 1 {
+		t.Fatalf("phase D: row left UNKNOWN during observation? n=%d err=%v", n, err)
+	}
+	// Exactly ONE owner command for the phase-D row, sent HERE (excluded
+	// from the generic drain loop below).
 	redelivered := map[string]bool{}
+	{
+		db := w.openStore(t, "private")
+		var dID string
+		if err := db.QueryRow(`SELECT delivery_id FROM chan_outbox WHERE status='UNKNOWN' AND text = ?`, wantReply).Scan(&dID); err != nil {
+			db.Close()
+			t.Fatalf("phase D: id lookup: %v", err)
+		}
+		db.Close()
+		redelivered[dID] = true
+		cmdID := bot.pushID("redeliver " + dID)
+		pushedIDs[cmdID] = true
+	}
 	deadline := time.Now().Add(90 * time.Second)
 	for time.Now().Before(deadline) {
 		// E9 UNKNOWN rows are a LEGITIMATE chaos outcome (a kill between
@@ -302,8 +331,8 @@ func TestChaosKillSurvival(t *testing.T) {
 	// row — only the drain's explicit redeliver may produce the second
 	// arrival (B2: no blind retry of a possibly-delivered send).
 	acceptedAfter := bot.countSent(wantReply)
-	if acceptedAfter < acceptedBefore+1 {
-		t.Fatalf("phase D: owner redeliver never re-sent the UNKNOWN row (%d -> %d)", acceptedBefore, acceptedAfter)
+	if acceptedAfter != acceptedBefore+1 {
+		t.Fatalf("phase D: EXACTLY one extra arrival required after ONE owner redeliver (%d -> %d)", acceptedBefore, acceptedAfter)
 	}
 	// Overlap proof: phase A guarantees at least three in-flight kills.
 	if inFlightKills < 3 {
