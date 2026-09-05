@@ -267,13 +267,13 @@ func TestSoakSurvival(t *testing.T) {
 	}
 	t.Cleanup(stopProducer) // runs on ANY failure path too (codex #2)
 	prodStart := time.Now()
+	var arrivals []time.Time // producer-owned timestamps for the cadence oracle
 	go func() {
 		defer close(prodDone)
 		next := prodStart
 		for {
 			next = next.Add(2 * time.Second)
-			wait := time.Until(next)
-			if wait > 0 {
+			if wait := time.Until(next); wait > 0 {
 				select {
 				case <-prodStop:
 					return
@@ -283,7 +283,7 @@ func TestSoakSurvival(t *testing.T) {
 				select {
 				case <-prodStop:
 					return
-				default: // missed deadline: catch up immediately
+				default: // late — push now; the SPACING oracle will judge it
 				}
 			}
 			mu.Lock()
@@ -291,7 +291,9 @@ func TestSoakSurvival(t *testing.T) {
 			marker := fmt.Sprintf("soak-msg-%06d", msg)
 			id := bot.pushID(marker)
 			pushedIDs[id] = true
-			sentAt[marker] = sentRec{seq: msg, t0: time.Now()}
+			now := time.Now()
+			sentAt[marker] = sentRec{seq: msg, t0: now}
+			arrivals = append(arrivals, now)
 			mu.Unlock()
 		}
 	}()
@@ -368,12 +370,24 @@ func TestSoakSurvival(t *testing.T) {
 	mu.Lock()
 	offered := msg
 	mu.Unlock()
-	// OFFERED-RATE assertion (prep4-r3 codex #1): the deadline-based
-	// producer catches up missed ticks, so the accepted arrival count
-	// must match elapsed/2s within one boundary tick.
+	// CADENCE oracle (prep4-r4 codex): total volume alone accepts both a
+	// stall-then-burst and an over-fast producer — so the count is
+	// two-sided AND the inter-arrival spacing is bounded on both sides.
 	expect := int(elapsed / (2 * time.Second))
-	if offered < expect-1 {
-		t.Fatalf("soak: offered %d arrivals, schedule implies >=%d (producer was stalled)", offered, expect-1)
+	if offered < expect-1 || offered > expect+1 {
+		t.Fatalf("soak: offered %d arrivals, schedule implies %d±1 (rate broken)", offered, expect)
+	}
+	mu.Lock()
+	arr := append([]time.Time{}, arrivals...)
+	mu.Unlock()
+	for i := 1; i < len(arr); i++ {
+		gap := arr[i].Sub(arr[i-1])
+		if gap > 3*time.Second {
+			t.Fatalf("soak: producer stalled — inter-arrival gap %v at arrival %d (>3s)", gap, i)
+		}
+		if gap < 1500*time.Millisecond {
+			t.Fatalf("soak: producer bursting — inter-arrival gap %v at arrival %d (<1.5s)", gap, i)
+		}
 	}
 	// Let the tail answer, then graceful stop.
 	tailDeadline := time.Now().Add(45 * time.Second)
