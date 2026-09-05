@@ -253,44 +253,74 @@ func TestSoakSurvival(t *testing.T) {
 	}
 	pushedIDs := map[int64]bool{}
 	sentAt := map[string]sentRec{}
-	var mu sync.Mutex
+	var mu sync.Mutex // guards sentAt+pushedIDs+msg ONLY for O(1) ops —
+	// reply lookups run on a snapshot OUTSIDE the lock (prep4-r3 codex
+	// #1: correlation must never stall the producer).
 	var latencies []latRec
 	msg := 0
 	prodStop := make(chan struct{})
 	prodDone := make(chan struct{})
+	var stopOnce sync.Once
+	stopProducer := func() {
+		stopOnce.Do(func() { close(prodStop) })
+		<-prodDone
+	}
+	t.Cleanup(stopProducer) // runs on ANY failure path too (codex #2)
+	prodStart := time.Now()
 	go func() {
 		defer close(prodDone)
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
+		next := prodStart
 		for {
-			select {
-			case <-prodStop:
-				return
-			case <-ticker.C:
-				mu.Lock()
-				msg++
-				marker := fmt.Sprintf("soak-msg-%06d", msg)
-				id := bot.pushID(marker)
-				pushedIDs[id] = true
-				sentAt[marker] = sentRec{seq: msg, t0: time.Now()}
-				mu.Unlock()
+			next = next.Add(2 * time.Second)
+			wait := time.Until(next)
+			if wait > 0 {
+				select {
+				case <-prodStop:
+					return
+				case <-time.After(wait):
+				}
+			} else {
+				select {
+				case <-prodStop:
+					return
+				default: // missed deadline: catch up immediately
+				}
 			}
+			mu.Lock()
+			msg++
+			marker := fmt.Sprintf("soak-msg-%06d", msg)
+			id := bot.pushID(marker)
+			pushedIDs[id] = true
+			sentAt[marker] = sentRec{seq: msg, t0: time.Now()}
+			mu.Unlock()
 		}
 	}()
 	collect := func() int {
+		// Snapshot under the lock; the linear bot scans happen unlocked.
 		mu.Lock()
-		defer mu.Unlock()
-		for m, rec := range sentAt {
+		snap := make(map[string]sentRec, len(sentAt))
+		for m, r := range sentAt {
+			snap[m] = r
+		}
+		mu.Unlock()
+		answered := []string{}
+		for m, rec := range snap {
 			if bot.countSent("reply-for "+m) >= 1 {
 				latencies = append(latencies, latRec{seq: rec.seq, ms: time.Since(rec.t0).Milliseconds()})
-				delete(sentAt, m)
+				answered = append(answered, m)
 				continue
 			}
 			if time.Since(rec.t0) > 60*time.Second {
 				t.Fatalf("soak: %s unanswered for >60s (backlog explosion)", m)
 			}
 		}
-		return len(sentAt)
+		mu.Lock()
+		for _, m := range answered {
+			delete(sentAt, m)
+		}
+		n := len(sentAt)
+		mu.Unlock()
+		return n
 	}
 	var samples []soakSample
 	tick := 0
@@ -333,8 +363,18 @@ func TestSoakSurvival(t *testing.T) {
 		}
 		time.Sleep(2 * time.Second)
 	}
-	close(prodStop)
-	<-prodDone
+	stopProducer()
+	elapsed := time.Since(prodStart)
+	mu.Lock()
+	offered := msg
+	mu.Unlock()
+	// OFFERED-RATE assertion (prep4-r3 codex #1): the deadline-based
+	// producer catches up missed ticks, so the accepted arrival count
+	// must match elapsed/2s within one boundary tick.
+	expect := int(elapsed / (2 * time.Second))
+	if offered < expect-1 {
+		t.Fatalf("soak: offered %d arrivals, schedule implies >=%d (producer was stalled)", offered, expect-1)
+	}
 	// Let the tail answer, then graceful stop.
 	tailDeadline := time.Now().Add(45 * time.Second)
 	for time.Now().Before(tailDeadline) {
