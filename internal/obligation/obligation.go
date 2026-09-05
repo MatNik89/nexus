@@ -1148,3 +1148,32 @@ func (l *LazyRunner) RunTool(ctx context.Context, call contracts.ToolCall, grant
 	}
 	return l.R.RunTool(ctx, call, grant)
 }
+
+// PendingDelivery is one occurrence awaiting its outbound notification.
+type PendingDelivery struct {
+	OccurrenceID string
+	ObligationID string
+	Body         string
+}
+
+// PendingDeliveries lists DELIVERY_PENDING reminders (T27: the daemon's
+// delivery loop pushes each to the owner's channel, then MarkDelivered
+// with the durable receipt — before this, DELIVERY_PENDING had no
+// production consumer and criterion 3 was never live end-to-end).
+func (m *Manager) PendingDeliveries(ctx context.Context) ([]PendingDelivery, error) {
+	rows, err := m.j.QueryProjection(ctx,
+		`SELECT occurrence_id, id, body FROM obl_obligations WHERE status='DELIVERY_PENDING' ORDER BY created`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PendingDelivery
+	for rows.Next() {
+		var d PendingDelivery
+		if err := rows.Scan(&d.OccurrenceID, &d.ObligationID, &d.Body); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}

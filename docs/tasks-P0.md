@@ -352,7 +352,7 @@ Reviews: docs/REVIEW-PHASE6*.md.
 
 ## Phase 7 — P0 closure
 
-**[ ] T27 — P0 acceptance run + release attestation + `P0-capable` grant.**
+**[x] T27 (3c9895a..HEAD) — P0 acceptance run + release attestation + `P0-capable` grant.**
 Scripted end-to-end checks for ALL SIX PRD §6 criteria + full hostile suite + minimal
 release signing (binary signed; built-in Telegram adapter integrity attested by that
 signature — HARDQ A1's second half) + doctor upgraded to grant `P0-capable` from live
