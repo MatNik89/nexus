@@ -860,6 +860,7 @@ func verifyAcceptanceAttestation(layout pathx.Layout) (bool, string) {
 		Suite        string `json:"suite"`
 		Passed       bool   `json:"passed"`
 		Host         string `json:"host"`
+		MachineID    string `json:"machine_id_sha256"`
 		Time         string `json:"time"`
 	}
 	if json.Unmarshal(raw, &att) != nil || !att.Passed || att.Suite != "internal/acceptance" || att.BinarySHA256 == "" {
@@ -884,8 +885,22 @@ func verifyAcceptanceAttestation(layout pathx.Layout) (bool, string) {
 	// HOST binding (P0-prep #2): the attestation is valid only on the
 	// host that ran the acceptance suite — copying the pair to another
 	// machine does not transfer the grant.
-	if att.Host != runtimeHostID() {
+	host, herr := runtimeHostID()
+	if herr != nil {
+		return false, "cannot read the host identity (fail closed): " + herr.Error()
+	}
+	if att.Host != host {
 		return false, "acceptance attestation was produced on a DIFFERENT host (fail closed) — run scripts/p0-accept.sh here"
+	}
+	// MACHINE binding (P0-prep-r1 codex #1): the kernel tuple is not
+	// unique — the attestation also carries sha256(/etc/machine-id),
+	// stable and root-owned per machine.
+	mid, merr := machineIDSHA()
+	if merr != nil {
+		return false, "cannot read /etc/machine-id (fail closed): " + merr.Error()
+	}
+	if att.MachineID != mid {
+		return false, "acceptance attestation was produced on a DIFFERENT machine (machine-id mismatch, fail closed)"
 	}
 	// PROVENANCE (T27-r2 codex #2, hardened per r3 codex #1): the
 	// attestation must carry the owner's signature, the trust anchor
@@ -952,10 +967,10 @@ func verifyAcceptanceAttestation(layout pathx.Layout) (bool, string) {
 
 // runtimeHostID formats the running kernel identity exactly as
 // `uname -srm` does (the attestation's host field).
-func runtimeHostID() string {
+func runtimeHostID() (string, error) {
 	var u syscall.Utsname
 	if err := syscall.Uname(&u); err != nil {
-		return "unknown"
+		return "", err
 	}
 	conv := func(f [65]int8) string {
 		b := make([]byte, 0, 65)
@@ -967,7 +982,19 @@ func runtimeHostID() string {
 		}
 		return string(b)
 	}
-	return conv(u.Sysname) + " " + conv(u.Release) + " " + conv(u.Machine)
+	return conv(u.Sysname) + " " + conv(u.Release) + " " + conv(u.Machine), nil
+}
+
+// machineIDSHA is the sha256 of the machine's stable identity file
+// (root-owned /etc/machine-id; hashed so the raw id never sits in the
+// attestation).
+func machineIDSHA() (string, error) {
+	raw, err := os.ReadFile("/etc/machine-id")
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256([]byte(strings.TrimSpace(string(raw))))
+	return hex.EncodeToString(sum[:]), nil
 }
 
 // mustProbeCore opens a throwaway channel core for the doctor's live
@@ -1175,7 +1202,7 @@ func telegramHandler(b *daemonBundle) telegram.Handler {
 			// UNKNOWN rows await HUMAN reconciliation (E9/B2): list them
 			// so the owner can decide (P0-prep #1 — a wire failure no
 			// longer dies silently).
-			rows, err := b.chanCore.Unreconciled(ctx)
+			rows, err := b.chanCore.UnreconciledFor(ctx, "telegram", in.ChannelIdentity)
 			if err != nil {
 				return "", err
 			}
@@ -1196,7 +1223,9 @@ func telegramHandler(b *daemonBundle) telegram.Handler {
 			// HUMAN-confirmed E9 reconciliation: the owner accepts the
 			// duplicate risk explicitly — never an automatic retry.
 			id := strings.TrimSpace(text[len("redeliver "):])
-			if err := b.chanCore.Reconcile(ctx, id, false); err != nil {
+			// Destination-bound: only THIS chat's deliveries (codex #2);
+			// the guard is atomic inside the projection transition.
+			if err := b.chanCore.ReconcileFor(ctx, id, false, in.ChannelIdentity, source); err != nil {
 				return "Redeliver failed: " + err.Error(), nil
 			}
 			return "Re-queued " + id + " — it will go out on the next flush (and may arrive twice).", nil

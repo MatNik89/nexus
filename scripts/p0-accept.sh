@@ -28,7 +28,7 @@ NEXUS_ACCEPT_BIN="$BIN" CGO_ENABLED=0 go test -count=1 -timeout 900s ./internal/
 OUT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nexus/system"
 mkdir -p "$OUT_DIR"
 cat > "$OUT_DIR/acceptance.json" <<JSON
-{"binary_sha256":"$DIGEST","suite":"internal/acceptance","passed":true,"host":"$(uname -srm)","time":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
+{"binary_sha256":"$DIGEST","suite":"internal/acceptance","passed":true,"host":"$(uname -srm)","machine_id_sha256":"$(tr -d '\n' < /etc/machine-id | sha256sum | cut -d' ' -f1)","time":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
 JSON
 rm -f "$OUT_DIR/acceptance.json.sig"
 ssh-keygen -Y sign -f "$KEY" -n nexus-acceptance "$OUT_DIR/acceptance.json"

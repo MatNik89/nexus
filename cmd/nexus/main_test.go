@@ -1316,3 +1316,57 @@ func TestOutboxRedeliverCommand(t *testing.T) {
 		t.Fatalf("clean outbox not reported: %q", clean)
 	}
 }
+
+// P0-prep-r1 codex #2: a SIBLING chat on the same profile can neither
+// SEE nor REDELIVER another chat's UNKNOWN delivery.
+func TestOutboxIsDestinationBound(t *testing.T) {
+	b := hitlBundle(t, "TG_OUTBOUND")
+	if _, err := b.chanCore.EnqueueReply(context.Background(), "telegram", "chat-42", "private", "for chat 42 only"); err != nil {
+		t.Fatal(err)
+	}
+	b.chanCore.Flush(context.Background(), func(o channel.Outbound) error {
+		return fmt.Errorf("wobble: %w", channel.ErrAmbiguousSend)
+	})
+	h := telegramHandler(b)
+	// The sibling chat sees a CLEAN outbox.
+	foreignList, err := h(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-666", UpdateID: 1,
+		Text: "outbox", Profile: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(foreignList, "for chat 42 only") || strings.Contains(foreignList, "dlv-") {
+		t.Fatalf("sibling chat saw another chat's delivery: %q", foreignList)
+	}
+	// Find the real id via the OWNER chat, then the sibling tries it.
+	ownerList, err := h(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 2,
+		Text: "outbox", Profile: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := ownerList[strings.Index(ownerList, "dlv-"):]
+	id = id[:strings.IndexByte(id, ':')]
+	foreignRedeliver, err := h(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-666", UpdateID: 3,
+		Text: "redeliver " + id, Profile: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(foreignRedeliver, "Redeliver failed") {
+		t.Fatalf("sibling chat re-pended another chat's delivery: %q", foreignRedeliver)
+	}
+	// The row is STILL UNKNOWN (untouched), and the owner still can.
+	if u, _ := b.chanCore.UnreconciledFor(context.Background(), "telegram", "chat-42"); len(u) != 1 {
+		t.Fatalf("foreign attempt mutated the row: %v", u)
+	}
+	ownerRedeliver, err := h(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 4,
+		Text: "redeliver " + id, Profile: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(ownerRedeliver, "Re-queued") {
+		t.Fatalf("owner redeliver broken: %q", ownerRedeliver)
+	}
+}

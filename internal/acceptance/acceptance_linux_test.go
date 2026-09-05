@@ -695,7 +695,8 @@ func writeAttestation(t *testing.T, w *world, bin string) {
 }
 
 // writeAttestationHost writes a signed attestation claiming a given host.
-func writeAttestationHost(t *testing.T, w *world, bin, host string) {
+// binDigest hashes one file.
+func binDigest(t *testing.T, bin string) string {
 	t.Helper()
 	f, err := os.Open(bin)
 	if err != nil {
@@ -706,7 +707,12 @@ func writeAttestationHost(t *testing.T, w *world, bin, host string) {
 	if _, err := io.Copy(h, f); err != nil {
 		t.Fatal(err)
 	}
-	writeAttestationFull(t, w, hex.EncodeToString(h.Sum(nil)), host)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func writeAttestationHost(t *testing.T, w *world, bin, host string) {
+	t.Helper()
+	writeAttestationMachine(t, w, binDigest(t, bin), host, localMachineSHA(t))
 }
 
 func writeAttestationDigest(t *testing.T, w *world, digest string) {
@@ -720,13 +726,29 @@ func writeAttestationDigest(t *testing.T, w *world, digest string) {
 
 func writeAttestationFull(t *testing.T, w *world, digest, host string) {
 	t.Helper()
+	writeAttestationMachine(t, w, digest, host, localMachineSHA(t))
+}
+
+// localMachineSHA mirrors the production machine binding.
+func localMachineSHA(t *testing.T) string {
+	t.Helper()
+	raw, err := os.ReadFile("/etc/machine-id")
+	if err != nil {
+		t.Skipf("no /etc/machine-id: %v", err)
+	}
+	sum := sha256.Sum256([]byte(strings.TrimSpace(string(raw))))
+	return hex.EncodeToString(sum[:])
+}
+
+func writeAttestationMachine(t *testing.T, w *world, digest, host, machine string) {
+	t.Helper()
 	dir := filepath.Join(w.base, "nexus", "system")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	attPath := filepath.Join(dir, "acceptance.json")
-	att := fmt.Sprintf(`{"binary_sha256":%q,"suite":"internal/acceptance","passed":true,"host":%q,"time":"2026-09-05T00:00:00Z"}`,
-		digest, host)
+	att := fmt.Sprintf(`{"binary_sha256":%q,"suite":"internal/acceptance","passed":true,"host":%q,"machine_id_sha256":%q,"time":"2026-09-05T00:00:00Z"}`,
+		digest, host, machine)
 	if err := os.WriteFile(attPath, []byte(att), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -953,6 +975,21 @@ func TestDoctorP0GrantLive(t *testing.T) {
 	outRogue, codeRogue := run(w.env())
 	if codeRogue == 0 || strings.Contains(outRogue, "P0-capable") {
 		t.Fatalf("rogue-signed attestation granted (exit %d):\n%s", codeRogue, outRogue)
+	}
+	writeAttestation(t, w, w.pinnedDoctorBin(t))
+	// A DIFFERENT-MACHINE attestation (same kernel tuple, other
+	// machine-id) withdraws the grant (P0-prep-r1 codex #1: the kernel
+	// tuple alone is not unique).
+	hostOut, herr := exec.Command("uname", "-srm").Output()
+	if herr != nil {
+		t.Fatal(herr)
+	}
+	digestSelf := binDigest(t, w.pinnedDoctorBin(t))
+	writeAttestationMachine(t, w, digestSelf, strings.TrimSpace(string(hostOut)),
+		"1111111111111111111111111111111111111111111111111111111111111111")
+	outMach, codeMach := run(w.env())
+	if codeMach == 0 || strings.Contains(outMach, "P0-capable") {
+		t.Fatalf("same-kernel other-machine attestation granted (exit %d):\n%s", codeMach, outMach)
 	}
 	writeAttestation(t, w, w.pinnedDoctorBin(t))
 	// A DIFFERENT-HOST attestation withdraws the grant (P0-prep #2:
