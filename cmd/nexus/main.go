@@ -915,7 +915,19 @@ func verifyAcceptanceAttestation(layout pathx.Layout) (bool, string) {
 		return false, err.Error()
 	}
 	defer attFile.Close()
-	cmd := exec.Command(verifier, "-Y", "verify", "-f", signers, "-I", "owner",
+	// The verifier must see EXACTLY the bytes the fingerprint check
+	// hashed — never re-read the mutable path (a swap between the hash
+	// and the verify call would otherwise slip through; T27-r4 codex).
+	pinnedDir, err := os.MkdirTemp("", "nexus-signers-")
+	if err != nil {
+		return false, err.Error()
+	}
+	defer os.RemoveAll(pinnedDir)
+	pinnedSigners := filepath.Join(pinnedDir, "allowed_signers")
+	if err := os.WriteFile(pinnedSigners, signersBytes, 0o600); err != nil {
+		return false, err.Error()
+	}
+	cmd := exec.Command(verifier, "-Y", "verify", "-f", pinnedSigners, "-I", "owner",
 		"-n", "nexus-acceptance", "-s", sigPath)
 	cmd.Stdin = attFile
 	if out, err := cmd.CombinedOutput(); err != nil {
