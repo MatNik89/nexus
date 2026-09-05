@@ -385,6 +385,11 @@ unchanged under --yolo; P0-capable grant bound to the signed, binary-pinned
 acceptance attestation. NOTE: codex output-filter interference required fresh-thread
 neutral-framing dispatches; all evidence machine-read. Reviews: docs/REVIEW-T27*.md.
 
+**Pre-P1 prep batch (2026-09-05, merged, 6 rounds → 3×PASS):** UNKNOWN-outbox
+human reconciliation ('outbox'/'redeliver', destination-bound atomic guard),
+machine-bound attestation (trusted /etc/machine-id, script mirrors verifier
+byte-for-byte), strict command-id routing. Reviews: docs/REVIEW-PREP1*.md.
+
 Deferred ledger (do NOT build in P0): full S7 (P2) · full S5 shadow-git/worktree (P3) ·
 **MEMORY_FORGET + DATA_PURGE (both P2.1 — their normative owner; P0 correction =
 supersession; USP #4 completes at P2)** ·
