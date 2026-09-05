@@ -1453,10 +1453,7 @@ func TestMachineIDCheckScriptMirrorsDoctor(t *testing.T) {
 		out, err := exec.Command(script, path).CombinedOutput()
 		return string(out), err
 	}
-	run := func(path string) error {
-		_, err := runReason(path)
-		return err
-	}
+
 	valid := "0123456789abcdef0123456789abcdef\n"
 	// World-writable modes the old glob MISSED must refuse FOR THE PERM
 	// REASON (the perm check runs before ownership, so this assertion is
@@ -1470,24 +1467,44 @@ func TestMachineIDCheckScriptMirrorsDoctor(t *testing.T) {
 			t.Fatalf("mode %o refused for the wrong reason (perm check not causal): %q", perm, reason)
 		}
 	}
-	// Embedded whitespace must refuse (no interior-whitespace deletion).
-	if err := run(mk("spaced", "0123456789abcdef 123456789abcdef\n", 0o644)); err == nil {
-		t.Fatal("embedded-whitespace id accepted by the script")
+	// Content guards run BEFORE ownership, so these are causal without
+	// root — each asserts ITS refusal reason (r4 codex #2).
+	for name, content := range map[string]string{
+		"spaced":  "0123456789abcdef 123456789abcdef\n",
+		"garbage": valid + "trailing garbage\n",
+		"twoline": valid + valid,
+		// pure hex, wrong length: only the LENGTH guard catches this
+		// (charset alone would pass) — keeps that guard causal.
+		"shorthex": "0123456789abcdef\n",
+	} {
+		reason, err := runReason(mk(name, content, 0o644))
+		if err == nil {
+			t.Fatalf("%s content accepted by the script", name)
+		}
+		if !strings.Contains(reason, "malformed") {
+			t.Fatalf("%s refused for the wrong reason (content check not causal): %q", name, reason)
+		}
 	}
-	// A symlink must refuse.
+	// A symlink must refuse FOR THE SYMLINK REASON (first check).
 	target := mk("real", valid, 0o644)
 	link := filepath.Join(dir, "link")
 	if err := os.Symlink(target, link); err != nil {
 		t.Fatal(err)
 	}
-	if err := run(link); err == nil {
+	if reason, err := runReason(link); err == nil {
 		t.Fatal("symlinked identity file accepted by the script")
+	} else if !strings.Contains(reason, "symlink") {
+		t.Fatalf("symlink refused for the wrong reason: %q", reason)
 	}
 	// The ownership check itself: user-owned valid file refuses (unless
 	// the suite runs as root); the REAL /etc/machine-id passes.
 	if os.Geteuid() != 0 {
-		if err := run(mk("owned", valid, 0o644)); err == nil {
+		reason, err := runReason(mk("owned", valid, 0o644))
+		if err == nil {
 			t.Fatal("user-owned file accepted by the script")
+		}
+		if !strings.Contains(reason, "not root-owned") {
+			t.Fatalf("ownership refused for the wrong reason: %q", reason)
 		}
 	}
 	if _, err := os.Stat("/etc/machine-id"); err == nil {
