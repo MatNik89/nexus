@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -910,14 +911,10 @@ func verifyAcceptanceAttestation(layout pathx.Layout) (bool, string) {
 	if sys, ok := vst.Sys().(*syscall.Stat_t); !ok || sys.Uid != 0 || vst.Mode().Perm()&0o022 != 0 {
 		return false, verifier + " is not a root-owned, non-writable executable (fail closed)"
 	}
-	attFile, err := os.Open(attPath)
-	if err != nil {
-		return false, err.Error()
-	}
-	defer attFile.Close()
-	// The verifier must see EXACTLY the bytes the fingerprint check
-	// hashed — never re-read the mutable path (a swap between the hash
-	// and the verify call would otherwise slip through; T27-r4 codex).
+	// SAME byte-binding rule for the attestation itself (T27-r4 codex,
+	// same class): the bytes whose fields granted are the bytes the
+	// signature verifies — `raw` was read ONCE at the top; the mutable
+	// path is never reopened.
 	pinnedDir, err := os.MkdirTemp("", "nexus-signers-")
 	if err != nil {
 		return false, err.Error()
@@ -927,9 +924,18 @@ func verifyAcceptanceAttestation(layout pathx.Layout) (bool, string) {
 	if err := os.WriteFile(pinnedSigners, signersBytes, 0o600); err != nil {
 		return false, err.Error()
 	}
+	// The signature file too is pinned to one read.
+	sigBytes, err := os.ReadFile(sigPath)
+	if err != nil {
+		return false, err.Error()
+	}
+	pinnedSig := filepath.Join(pinnedDir, "acceptance.json.sig")
+	if err := os.WriteFile(pinnedSig, sigBytes, 0o600); err != nil {
+		return false, err.Error()
+	}
 	cmd := exec.Command(verifier, "-Y", "verify", "-f", pinnedSigners, "-I", "owner",
-		"-n", "nexus-acceptance", "-s", sigPath)
-	cmd.Stdin = attFile
+		"-n", "nexus-acceptance", "-s", pinnedSig)
+	cmd.Stdin = bytes.NewReader(raw)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return false, "attestation signature verification FAILED: " + strings.TrimSpace(string(out))
 	}
