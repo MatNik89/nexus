@@ -390,6 +390,12 @@ human reconciliation ('outbox'/'redeliver', destination-bound atomic guard),
 machine-bound attestation (trusted /etc/machine-id, script mirrors verifier
 byte-for-byte), strict command-id routing. Reviews: docs/REVIEW-PREP1*.md.
 
+**Pre-P1 chaos harness (prep3, 2026-09-06, merged, 5 rounds → 3×PASS):**
+TestChaosKillSurvival — phased SIGKILLs (guaranteed in-flight, completed-turn, and
+post-remote-accept kills + random) over the real binary; store-level invariants incl.
+production-replay integrity and receipt-event binding; offset-faithful Bot API fake.
+Reviews: docs/REVIEW-PREP3*.md.
+
 Deferred ledger (do NOT build in P0): full S7 (P2) · full S5 shadow-git/worktree (P3) ·
 **MEMORY_FORGET + DATA_PURGE (both P2.1 — their normative owner; P0 correction =
 supersession; USP #4 completes at P2)** ·
