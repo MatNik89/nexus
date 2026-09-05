@@ -217,14 +217,16 @@ func TestChaosKillSurvival(t *testing.T) {
 	// retry); the drain later resolves it through the OWNER's redeliver.
 	ranCycles++
 	cmdD := w.killableDaemon(t)
-	// Quiesce: let every earlier pending row flush so the armed barrier
-	// can only catch OUR reply.
+	// Quiesce HARD: no pending outbox rows AND no admitted-in-flight
+	// turns — under full-suite CPU load late replies from the random
+	// phase otherwise keep hitting the armed barrier.
 	if !waitStore(func() bool {
-		n, err := w.pollQuery("private", `SELECT COUNT(*) FROM chan_outbox WHERE status='PENDING'`)
-		return err == nil && n == 0
-	}, 20*time.Second) {
+		p, err1 := w.pollQuery("private", `SELECT COUNT(*) FROM chan_outbox WHERE status='PENDING'`)
+		a, err2 := w.pollQuery("private", `SELECT COUNT(*) FROM chan_inbox WHERE status='ADMITTED'`)
+		return err1 == nil && err2 == nil && p == 0 && a == 0
+	}, 40*time.Second) {
 		sigkill(t, cmdD)
-		t.Fatal("phase D: outbox never quiesced")
+		t.Fatal("phase D: outbox/turns never quiesced")
 	}
 	markers++
 	wantReply := fmt.Sprintf("reply-for chaos-msg-%03d", markers)
@@ -232,7 +234,7 @@ func TestChaosKillSurvival(t *testing.T) {
 	idD := bot.pushID(fmt.Sprintf("chaos-msg-%03d", markers))
 	pushedIDs[idD] = true
 	var acceptedText string
-	for tries := 0; tries < 4; tries++ {
+	for tries := 0; tries < 10; tries++ {
 		select {
 		case acceptedText = <-sig:
 		case <-time.After(20 * time.Second):
