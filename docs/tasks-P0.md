@@ -396,6 +396,11 @@ post-remote-accept kills + random) over the real binary; store-level invariants 
 production-replay integrity and receipt-event binding; offset-faithful Bot API fake.
 Reviews: docs/REVIEW-PREP3*.md.
 
+**Pre-P1 soak harness (prep4, 2026-09-06, merged, 5 rounds → 3×PASS):**
+TestSoakSurvival (NEXUS_SOAK_MINUTES-gated) — open-loop fixed-cadence traffic over the
+real binary; per-incarnation resource budgets, WAL/latency/cold-start/end-state signals,
+all RED-capable. Reviews: docs/REVIEW-PREP4*.md.
+
 Deferred ledger (do NOT build in P0): full S7 (P2) · full S5 shadow-git/worktree (P3) ·
 **MEMORY_FORGET + DATA_PURGE (both P2.1 — their normative owner; P0 correction =
 supersession; USP #4 completes at P2)** ·
