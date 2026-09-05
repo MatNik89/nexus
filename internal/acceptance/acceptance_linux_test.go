@@ -198,6 +198,13 @@ type fakeBot struct {
 	updates []map[string]any
 	sent    []string
 	nextID  int64
+	// Post-accept kill barrier (prep3-r2 codex #2): when armed, the next
+	// sendMessage RECORDS acceptance, signals the harness, then blocks
+	// the HTTP response — the daemon is killed inside the exact
+	// remote-accepted-but-unacknowledged window.
+	blockArmed  bool
+	blockSignal chan string
+	blockHold   chan struct{}
 }
 
 func newFakeBot(t *testing.T) *fakeBot {
@@ -235,12 +242,40 @@ func newFakeBot(t *testing.T) *fakeBot {
 			json.NewDecoder(r.Body).Decode(&req)
 			b.mu.Lock()
 			b.sent = append(b.sent, req.Text)
+			armed := b.blockArmed
+			if armed {
+				b.blockArmed = false
+			}
+			sig, hold := b.blockSignal, b.blockHold
 			b.mu.Unlock()
+			if armed {
+				// Accepted — but the response never reaches the daemon
+				// in time: the harness kills it at this barrier.
+				if sig != nil {
+					sig <- req.Text
+				}
+				if hold != nil {
+					select {
+					case <-hold:
+					case <-time.After(30 * time.Second):
+					}
+				}
+			}
 			rw.Write([]byte(`{"ok":true,"result":{}}`))
 		}
 	}))
 	t.Cleanup(b.srv.Close)
 	return b
+}
+
+// armPostAcceptBarrier arms the next sendMessage to signal-and-block.
+func (b *fakeBot) armPostAcceptBarrier() (signal chan string, release chan struct{}) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.blockSignal = make(chan string, 1)
+	b.blockHold = make(chan struct{})
+	b.blockArmed = true
+	return b.blockSignal, b.blockHold
 }
 
 func (b *fakeBot) push(text string) {
@@ -1143,4 +1178,17 @@ func TestSealedOffStartupRunsNoConsumers(t *testing.T) {
 	stop3, _ := w.daemon()
 	defer stop3()
 	bot.waitSent(t, "sealed reminder", 25*time.Second)
+}
+
+// countSent counts arrivals of one exact text at the fake API.
+func (b *fakeBot) countSent(text string) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	n := 0
+	for _, s := range b.sent {
+		if s == text {
+			n++
+		}
+	}
+	return n
 }

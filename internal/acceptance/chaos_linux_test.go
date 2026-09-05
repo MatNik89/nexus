@@ -10,7 +10,8 @@
 //	I2 EXACT-SET admission: the pushed update-id set equals the inbox
 //	   set (nothing lost, nothing invented), each admitted once, all
 //	   TERMINAL after the drain;
-//	I3 EXACTLY-once effects: every marker's fact exists exactly once;
+//	I3 one OUTCOME per message: exactly one reply row (success or typed
+//	   error), never duplicated, all SENT after the drain;
 //	I4 the reminder converges to DELIVERED and its receipt is the exact
 //	   occurrence-derived delivery id, destination-bound and SENT;
 //	I5 the store reopens after every kill.
@@ -27,8 +28,10 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math/rand"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -53,6 +56,9 @@ import (
 // nothing).
 func (w *world) killableDaemon(t *testing.T) *exec.Cmd {
 	t.Helper()
+	// Remove the stale socket so the dial below can only reach the NEW
+	// incarnation.
+	os.Remove(filepath.Join(w.base, "nexus", "system", "daemon.sock"))
 	cmd := exec.Command(nexusBin(t), "daemon")
 	cmd.Env = w.env()
 	var sink strings.Builder
@@ -62,8 +68,12 @@ func (w *world) killableDaemon(t *testing.T) *exec.Cmd {
 	}
 	sock := filepath.Join(w.base, "nexus", "system", "daemon.sock")
 	ready := false
-	for i := 0; i < 300; i++ {
-		if _, err := os.Stat(sock); err == nil {
+	for i := 0; i < 400; i++ {
+		// CONNECT-readiness (prep3-r2 codex #4): a stale pathname from
+		// the killed incarnation is not readiness — only a live listener
+		// accepts a dial. The daemon re-creates the socket on start.
+		if conn, err := net.Dial("unix", sock); err == nil {
+			conn.Close()
 			ready = true
 			break
 		}
@@ -165,7 +175,10 @@ func TestChaosKillSurvival(t *testing.T) {
 			pushedIDs[id] = true
 			switch kind {
 			case "inflight":
-				if !waitStore(func() bool { return w.countInbox(t, "private", "ADMITTED") > 0 }, 10*time.Second) {
+				if !waitStore(func() bool {
+					n, err := w.pollQuery("private", `SELECT COUNT(*) FROM chan_inbox WHERE status='ADMITTED'`)
+					return err == nil && n > 0
+				}, 10*time.Second) {
 					sigkill(t, cmd)
 					t.Fatalf("phase A: update %d never became ADMITTED", id)
 				}
@@ -173,7 +186,10 @@ func TestChaosKillSurvival(t *testing.T) {
 				inFlightKills++
 			case "complete":
 				before := w.countSentReplies(t, "private")
-				if !waitStore(func() bool { return w.countSentReplies(t, "private") > before }, 15*time.Second) {
+				if !waitStore(func() bool {
+					n, err := w.pollQuery("private", `SELECT COUNT(*) FROM chan_outbox WHERE text LIKE 'reply-for chaos-msg-%'`)
+					return err == nil && n > before
+				}, 15*time.Second) {
 					sigkill(t, cmd)
 					t.Fatalf("phase B: no success reply enqueued for update %d", id)
 				}
@@ -190,18 +206,105 @@ func TestChaosKillSurvival(t *testing.T) {
 	phase("inflight", 3)
 	phase("complete", 3)
 	phase("random", cycles)
+	// Phase D (prep3-r2 codex #2): DETERMINISTIC kill inside the
+	// remote-accepted-but-unrecorded window — the fake API records the
+	// send, signals, and blocks the response while the daemon dies. The
+	// row must persist as UNKNOWN (B2: sent-but-unrecorded, no automatic
+	// retry); the drain later resolves it through the OWNER's redeliver.
+	ranCycles++
+	cmdD := w.killableDaemon(t)
+	// Quiesce: let every earlier pending row flush so the armed barrier
+	// can only catch OUR reply.
+	if !waitStore(func() bool {
+		n, err := w.pollQuery("private", `SELECT COUNT(*) FROM chan_outbox WHERE status='PENDING'`)
+		return err == nil && n == 0
+	}, 20*time.Second) {
+		sigkill(t, cmdD)
+		t.Fatal("phase D: outbox never quiesced")
+	}
+	markers++
+	wantReply := fmt.Sprintf("reply-for chaos-msg-%03d", markers)
+	sig, release := bot.armPostAcceptBarrier()
+	idD := bot.pushID(fmt.Sprintf("chaos-msg-%03d", markers))
+	pushedIDs[idD] = true
+	var acceptedText string
+	for tries := 0; tries < 4; tries++ {
+		select {
+		case acceptedText = <-sig:
+		case <-time.After(20 * time.Second):
+			sigkill(t, cmdD)
+			t.Fatal("phase D: flush never hit the armed barrier")
+		}
+		if acceptedText == wantReply {
+			break
+		}
+		// A stray row (reminder retry etc.) hit the barrier first: let it
+		// through and re-arm for ours.
+		t.Logf("phase D: stray barrier hit: %q", acceptedText)
+		close(release)
+		sig, release = bot.armPostAcceptBarrier()
+		acceptedText = ""
+	}
+	if acceptedText != wantReply {
+		sigkill(t, cmdD)
+		t.Fatalf("phase D: barrier kept catching stray rows, never %q", wantReply)
+	}
+	sigkill(t, cmdD) // dies with the send accepted but unacknowledged
+	close(release)
+	unknown, perr := w.pollQuery("private", `SELECT COUNT(*) FROM chan_outbox WHERE status='UNKNOWN' AND text = ?`, wantReply)
+	if perr != nil || unknown != 1 {
+		t.Fatalf("phase D: accepted-but-unrecorded row not parked UNKNOWN (n=%d err=%v)", unknown, perr)
+	}
+	acceptedBefore := bot.countSent(wantReply)
 	// CALM drain: EVERY pushed id terminal AND the reminder DELIVERED —
 	// no fixed-sleep correctness (prep3 codex #5).
 	stopF, _ := w.daemon()
-	deadline := time.Now().Add(60 * time.Second)
+	redelivered := map[string]bool{}
+	deadline := time.Now().Add(90 * time.Second)
 	for time.Now().Before(deadline) {
-		if w.inboxExactlyTerminal(t, "private", pushedIDs) && w.oblStatus(t, "private", "rem-chaos") == "DELIVERED" {
+		// E9 UNKNOWN rows are a LEGITIMATE chaos outcome (a kill between
+		// remote accept and the sent-mark): the harness plays the OWNER
+		// and drives the human `redeliver` command for each (prep3-r2
+		// kilo #1) — never expecting the daemon to auto-retry them.
+		if n, err := w.pollQuery("private", `SELECT COUNT(*) FROM chan_outbox WHERE status='UNKNOWN'`); err == nil && n > 0 {
+			db := w.openStore(t, "private")
+			ids := []string{}
+			if rows, qerr := db.Query(`SELECT delivery_id FROM chan_outbox WHERE status='UNKNOWN'`); qerr == nil {
+				for rows.Next() {
+					var id string
+					if rows.Scan(&id) == nil {
+						ids = append(ids, id)
+					}
+				}
+				rows.Close()
+			}
+			db.Close()
+			for _, id := range ids {
+				if redelivered[id] {
+					continue // one owner command per row (I3 accounting)
+				}
+				redelivered[id] = true
+				cmdID := bot.pushID("redeliver " + id)
+				pushedIDs[cmdID] = true // command updates are real messages
+			}
+		}
+		allSent, serr := w.pollQuery("private", `SELECT COUNT(*) FROM chan_outbox WHERE status NOT IN ('SENT')`)
+		if serr == nil && allSent == 0 &&
+			w.inboxExactlyTerminal(t, "private", pushedIDs) &&
+			w.oblStatus(t, "private", "rem-chaos") == "DELIVERED" {
 			break
 		}
-		time.Sleep(300 * time.Millisecond)
+		time.Sleep(400 * time.Millisecond)
 	}
 	stopF()
 
+	// Phase D honesty: the daemon must NOT have auto-resent the UNKNOWN
+	// row — only the drain's explicit redeliver may produce the second
+	// arrival (B2: no blind retry of a possibly-delivered send).
+	acceptedAfter := bot.countSent(wantReply)
+	if acceptedAfter < acceptedBefore+1 {
+		t.Fatalf("phase D: owner redeliver never re-sent the UNKNOWN row (%d -> %d)", acceptedBefore, acceptedAfter)
+	}
 	// Overlap proof: phase A guarantees at least three in-flight kills.
 	if inFlightKills < 3 {
 		t.Fatalf("only %d in-flight kills (phase A broken)", inFlightKills)
@@ -249,10 +352,6 @@ func TestChaosKillSurvival(t *testing.T) {
 	succeeded := 0
 	for m := 1; m <= markers; m++ {
 		marker := fmt.Sprintf("chaos-msg-%03d", m)
-		var ok, errish int
-		if err := db.QueryRow(`SELECT COUNT(*) FROM chan_outbox WHERE text = ? AND status='SENT'`, "reply-for "+marker).Scan(&ok); err != nil {
-			t.Fatalf("I3 query: %v", err)
-		}
 		var okAll int
 		if err := db.QueryRow(`SELECT COUNT(*) FROM chan_outbox WHERE text = ?`, "reply-for "+marker).Scan(&okAll); err != nil {
 			t.Fatal(err)
@@ -260,10 +359,39 @@ func TestChaosKillSurvival(t *testing.T) {
 		if okAll > 1 {
 			t.Fatalf("I3 marker %03d has %d success replies (duplicate reply)", m, okAll)
 		}
-		_ = errish
+		var ok int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM chan_outbox WHERE text = ? AND status='SENT'`, "reply-for "+marker).Scan(&ok); err != nil {
+			t.Fatalf("I3 query: %v", err)
+		}
+		if okAll == 1 && ok != 1 {
+			t.Fatalf("I3 marker %03d reply exists but is not SENT after the drain", m)
+		}
 		if ok == 1 {
 			succeeded++
 		}
+	}
+	// EVERY terminal chaos message owns exactly ONE outcome row: a
+	// success reply or the typed handler-error reply (prep3-r2 codex #3).
+	var errReplies int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM chan_outbox WHERE text LIKE 'I could not process%'`).Scan(&errReplies); err != nil {
+		t.Fatal(err)
+	}
+	chaosMsgs := 0
+	for id := range pushedIDs {
+		_ = id
+		chaosMsgs++
+	}
+	redeliverCmds := chaosMsgs - markers // drain-driven command updates
+	// command updates answer with "Re-queued..." rows; account for them:
+	var requeued int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM chan_outbox WHERE text LIKE 'Re-queued%'`).Scan(&requeued); err != nil {
+		t.Fatal(err)
+	}
+	if succeeded+errReplies != markers {
+		t.Fatalf("I3 outcome accounting broken: %d success + %d error != %d chaos messages", succeeded, errReplies, markers)
+	}
+	if requeued != redeliverCmds {
+		t.Fatalf("I3 %d Re-queued replies for %d redeliver commands", requeued, redeliverCmds)
 	}
 	if succeeded < 3 {
 		t.Fatalf("I3 under-evidenced: %d success replies (phase B guarantees 3)", succeeded)
@@ -298,6 +426,16 @@ func TestChaosKillSurvival(t *testing.T) {
 	if extra != 0 {
 		t.Fatalf("I4 %d extra delivery rows beyond the stable id", extra)
 	}
+	// The DURABLE receipt EVENT must itself carry the occurrence-derived
+	// id and the telegram producer (prep3-r2 codex #1: the outbox row and
+	// the obligation state must not merely coexist).
+	producer, receipt, derr := deliveredReceipt(w, "private", "occ-rem-chaos#1")
+	if derr != nil {
+		t.Fatalf("I4 delivered event: %v", derr)
+	}
+	if producer != "telegram" || receipt != wantDlv {
+		t.Fatalf("I4 receipt event diverges: producer=%q receipt=%q want telegram/%s", producer, receipt, wantDlv)
+	}
 	t.Logf("chaos: %d cycles, %d updates, %d in-flight kills, %d/%d replies succeeded, reminder DELIVERED via %s",
 		ranCycles, len(pushedIDs), inFlightKills, succeeded, markers, wantDlv)
 }
@@ -309,6 +447,25 @@ func (b *fakeBot) pushID(text string) int64 {
 	b.mu.Unlock()
 	b.push(text)
 	return id
+}
+
+// pollQuery runs a single-int query tolerating TRANSIENT SQLite
+// busy/locked errors (prep3-r2 codex #5): the poll deadline owns the
+// retry budget; non-transient errors surface.
+func (w *world) pollQuery(profile, q string, args ...interface{}) (int, error) {
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(w.base, "nexus", "profiles", profile, "journal.db")+"?mode=ro")
+	if err != nil {
+		return 0, err
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRow(q, args...).Scan(&n); err != nil {
+		if strings.Contains(err.Error(), "locked") || strings.Contains(err.Error(), "busy") {
+			return 0, nil // transient: report no progress, let the deadline retry
+		}
+		return 0, err
+	}
+	return n, nil
 }
 
 // countSentReplies counts ENQUEUED chaos success replies (adaptive goal
@@ -485,4 +642,67 @@ func TestChaosCheckerDetectsCorruption(t *testing.T) {
 		`UPDATE events SET envelope=replace(envelope,'"schema_version":1','"schema_version":9') WHERE journal_offset=(SELECT MAX(journal_offset) FROM events)`)
 	corrupt("denormalized-column",
 		`UPDATE events SET run_id='run-forged' WHERE journal_offset=(SELECT MAX(journal_offset) FROM events)`)
+}
+
+// deliveredReceipt extracts the durable obligation.delivered event for
+// one occurrence via the production replay (payload authenticity rides
+// the verified chain).
+func deliveredReceipt(w *world, profile, occ string) (producer, receipt string, err error) {
+	reg, rerr := obligation.NewRegistry(map[string]obligation.Kind{
+		"file_note": {Handler: obligation.FileNoteHandler("/tmp"), ValidateParams: obligation.ValidateFileNoteParams},
+	})
+	if rerr != nil {
+		return "", "", rerr
+	}
+	events := map[string]journal.PayloadValidator{"policy.allowed_by_yolo": nil}
+	for _, n := range machine.EventTypes() {
+		events[n] = nil
+	}
+	for n, v := range memory.Events() {
+		events[n] = v
+	}
+	for n, v := range schedule.Events() {
+		events[n] = v
+	}
+	for n, v := range obligation.Events(reg, obligation.NewDoneGate()) {
+		events[n] = v
+	}
+	for n, v := range channel.Events() {
+		events[n] = v
+	}
+	for n, v := range approval.Events() {
+		events[n] = v
+	}
+	j, jerr := journal.Open(filepath.Join(w.base, "nexus", "profiles", profile, "journal.db"),
+		"private", redact.None{}, events)
+	if jerr != nil {
+		return "", "", jerr
+	}
+	defer j.Close()
+	found := 0
+	err = j.Replay(0, func(ev journal.Event) error {
+		if ev.Envelope.EventType != "obligation.delivered" {
+			return nil
+		}
+		var p struct {
+			OccurrenceID string `json:"occurrence_id"`
+			Producer     string `json:"producer"`
+			ReceiptID    string `json:"receipt_id"`
+		}
+		if e := json.Unmarshal(ev.Envelope.Payload, &p); e != nil {
+			return e
+		}
+		if p.OccurrenceID == occ {
+			found++
+			producer, receipt = p.Producer, p.ReceiptID
+		}
+		return nil
+	})
+	if err != nil {
+		return "", "", err
+	}
+	if found != 1 {
+		return "", "", fmt.Errorf("%d delivered events for %s (want 1)", found, occ)
+	}
+	return producer, receipt, nil
 }
