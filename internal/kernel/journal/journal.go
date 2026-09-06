@@ -157,11 +157,12 @@ func Open(path string, profile contracts.ProfileID, r redact.Redactor, events ma
 	if len(events) == 0 {
 		return nil, fmt.Errorf("journal open: a closed event-type set is required (fail closed)")
 	}
-	// The POOL BOUND below is the primary memory cap (soak S1
-	// 2026-09-06: an unbounded pool grew daemon RSS with database size
-	// until the 24h budget tripped — pool x per-connection page cache,
-	// bounded growth, not an unbounded leak; final confirmation rides
-	// the next post-fix 24h run, see docs/SOAK-S1-DIAGNOSIS.md).
+	// The POOL BOUND below and the cache declaration exist because the
+	// pool was formally UNBOUNDED when the first 24h soak tripped its
+	// RSS budget (S1, 2026-09-06). Measurements attribute NO specific
+	// cause: pre/post 20k curves grew about the same, so the pool was
+	// not the dominant term on that workload — this is a by-design
+	// guard, not the proven fix; see docs/SOAK-S1-DIAGNOSIS.md.
 	// cache_size(-1600) is deliberately NOT the driver default (-2000):
 	// the declaration is enforceable (a dropped pragma turns the
 	// regression RED) and immune to a driver-default change.
@@ -171,9 +172,10 @@ func Open(path string, profile contracts.ProfileID, r redact.Redactor, events ma
 		return nil, fmt.Errorf("journal open: %w", err)
 	}
 	// Bounded pool: writes are serialized by the single append actor
-	// anyway; reads are short. 4 connections x 1.6MB cache bound the
-	// SQLite memory to ~6.4MB per journal regardless of database size
-	// or reader concurrency.
+	// anyway; reads are short. 4 connections x the ~1.6MB SUGGESTED
+	// page-cache maximum bound the page caches to roughly 6.4MB per
+	// journal (cache_size is approximate and covers page cache only,
+	// not all SQLite/driver memory).
 	db.SetMaxOpenConns(4)
 	db.SetMaxIdleConns(4)
 	fail := func(e error) (*Journal, error) { db.Close(); return nil, e }

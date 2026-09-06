@@ -35,9 +35,10 @@ monotonic-looking RSS growth of ~13 MiB over 24h (~43k messages).
   live-heap leak in the turn and adapter/outbox paths. That is the
   extent of what the collected evidence establishes.
 - The committed fix (pool bound 4 + non-default `cache_size(-1600)`)
-  makes the SQLite side **bounded by design** (~6.4 MB/journal hard cap
-  regardless of database size or reader concurrency). It is a real
-  guard: before it, the pool was formally unbounded.
+  bounds the SQLite **page caches** to a suggested maximum of roughly
+  6.4 MB/journal (`cache_size` is approximate and does not bound all
+  SQLite/driver memory). It is a real by-design guard: before it, the
+  pool was formally unbounded.
 - The near-identical pre/post curves show the unbounded pool was **not
   the dominant term** of the observed growth on this workload. The
   remainder is **unattributed** saturating growth: plausible
