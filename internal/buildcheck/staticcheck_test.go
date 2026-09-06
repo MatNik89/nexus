@@ -13,11 +13,17 @@ import (
 
 func repoRoot(t *testing.T) string {
 	t.Helper()
-	out, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
-	if err != nil {
-		t.Fatalf("repo root: %v", err)
+	// Source-tree-relative, NOT git-dependent (fresh-audit codex #5): a
+	// clean `git archive` export must still run these oracles.
+	_, self, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("repo root: runtime.Caller failed")
 	}
-	return string(out[:len(out)-1])
+	root := filepath.Dir(filepath.Dir(filepath.Dir(self)))
+	if _, err := os.Stat(filepath.Join(root, "scripts", "static-check.sh")); err != nil {
+		t.Fatalf("repo root %s does not hold scripts/static-check.sh: %v", root, err)
+	}
+	return root
 }
 
 func runCheck(t *testing.T, root, target string) (int, string) {
@@ -37,7 +43,7 @@ func runCheck(t *testing.T, root, target string) (int, string) {
 func TestStaticCheckPassesStaticNexusBinary(t *testing.T) {
 	root := repoRoot(t)
 	bin := filepath.Join(t.TempDir(), "nexus")
-	cmd := exec.Command("go", "build", "-o", bin, "github.com/MatNik89/nexus/cmd/nexus")
+	cmd := exec.Command("go", "build", "-buildvcs=false", "-o", bin, "github.com/MatNik89/nexus/cmd/nexus")
 	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("build: %v\n%s", err, out)

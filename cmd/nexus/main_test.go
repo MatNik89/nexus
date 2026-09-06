@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -1562,5 +1563,242 @@ func TestMachineIDCheckScriptMirrorsDoctor(t *testing.T) {
 		if len(strings.TrimSpace(string(out))) != 32 {
 			t.Fatalf("script output shape: %q", out)
 		}
+	}
+}
+
+// FRESH-AUDIT codex #1 (HIGH): the effect COMMITS, then the durable
+// completion record fails (journal closed at the post-effect boundary).
+// Reporting plain success is an externally false claim — and any retry
+// invitation risks re-running an already-committed irreversible effect.
+// The outcome must surface as an explicit E9 UNKNOWN error.
+func TestPostEffectDurabilityFailureIsNotSuccess(t *testing.T) {
+	b := hitlBundle(t, "TG_POSTFX")
+	c := shortDeadlineCall(t, time.Hour)
+	ch, err := b.approvals.Suspend(context.Background(), "turn-px", "run-px", c, "tg:chat-42", testBlocks(t, "original request"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.approvals.Approve(context.Background(), ch.ChallengeID, "tg:chat-42"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NEXUS_TEST_CLOSE_JOURNAL_POST_EFFECT", "1")
+	out, rerr := b.resumeApproved(context.Background(), "chat-42", ch.ChallengeID)
+	if rerr == nil {
+		t.Fatalf("post-effect durability failure reported as success: %q", out)
+	}
+	if !strings.Contains(rerr.Error(), "EXECUTED") {
+		t.Fatalf("UNKNOWN outcome does not state the effect committed: %v", rerr)
+	}
+	if strings.Contains(rerr.Error(), "Reply retry") {
+		t.Fatalf("UNKNOWN outcome invites a retry of a committed effect: %v", rerr)
+	}
+}
+
+// FRESH-AUDIT codex #3 r2: every reminders-criterion branch is
+// RED-capable — dirty health always fails, a stale heartbeat is a hard
+// failure, a fresh heartbeat is LIVE, no heartbeat is READY substrate.
+func TestReminderReadinessBranches(t *testing.T) {
+	cases := []struct {
+		name              string
+		health            string
+		hbAge             time.Duration
+		hbExists, profOK  bool
+		wantOK            bool
+		wantState, wantIn string
+	}{
+		{"dirty health", "sweep failed", 0, true, true, false, "OFF", "scheduler health"},
+		{"stale heartbeat", "", time.Minute, true, true, false, "OFF", "STALE"},
+		{"fresh heartbeat", "", time.Second, true, true, true, "LIVE", "heartbeat fresh"},
+		{"no daemon", "", 0, false, true, true, "READY", "substrate ready"},
+		{"no daemon, profiles broken", "", 0, false, false, false, "READY", "substrate ready"},
+	}
+	for _, c := range cases {
+		ok, state, why := reminderReadiness(c.health, c.hbAge, c.hbExists, c.profOK)
+		if ok != c.wantOK || state != c.wantState || !strings.Contains(why, c.wantIn) {
+			t.Fatalf("%s: got (%v,%s,%q), want (%v,%s,*%s*)", c.name, ok, state, why, c.wantOK, c.wantState, c.wantIn)
+		}
+	}
+}
+
+// FRESH-AUDIT codex #4 r3: the trust SET publishes as ONE generation
+// directory behind a single atomically-switched pointer — ANY
+// interruption (cooperative failure or SIGKILL) before the switch leaves
+// the previous complete generation current; only the un-faulted run
+// flips the pointer, and the prior generation stays on disk for
+// recovery.
+func TestAcceptPublishGenerationSwitchIsAtomic(t *testing.T) {
+	root := repoRootFromCaller(t)
+	conf := t.TempDir()
+	script := filepath.Join(root, "scripts", "p0-accept.sh")
+	stageSet := func(names [3]string) [3]string {
+		dir := t.TempDir()
+		var out [3]string
+		for i, c := range names {
+			p := filepath.Join(dir, fmt.Sprintf("s%d", i))
+			if err := os.WriteFile(p, []byte(c+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			out[i] = p
+		}
+		return out
+	}
+	readCurrent := func() map[string]string {
+		t.Helper()
+		got := map[string]string{}
+		base := filepath.Join(conf, "nexus", "trust", "current")
+		for _, n := range []string{"allowed_signers", "acceptance.json", "acceptance.json.sig"} {
+			b, err := os.ReadFile(filepath.Join(base, n))
+			if err != nil {
+				t.Fatalf("current generation incomplete: %v", err)
+			}
+			got[n] = string(b)
+		}
+		return got
+	}
+	publish := func(staged [3]string, extraEnv ...string) ([]byte, error) {
+		cmd := exec.Command("sh", script, staged[0], staged[1], staged[2])
+		cmd.Env = append(append(os.Environ(), "XDG_CONFIG_HOME="+conf,
+			"NEXUS_ACCEPT_TEST_PUBLISH_ONLY=1"), extraEnv...)
+		return cmd.CombinedOutput()
+	}
+	// Baseline generation installs cleanly.
+	oldSet := stageSet([3]string{"OLD-ANCHOR", "OLD-ATT", "OLD-SIG"})
+	if out, err := publish(oldSet); err != nil {
+		t.Fatalf("baseline publication failed: %v\n%s", err, out)
+	}
+	oldGen, err := os.Readlink(filepath.Join(conf, "nexus", "trust", "current"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"allowed_signers": "OLD-ANCHOR\n",
+		"acceptance.json": "OLD-ATT\n", "acceptance.json.sig": "OLD-SIG\n"}
+	newSet := stageSet([3]string{"NEW-ANCHOR", "NEW-ATT", "NEW-SIG"})
+	// Interruption class 1: cooperative failure before the switch.
+	if out, err := publish(newSet, "NEXUS_ACCEPT_TEST_FAIL_AFTER=stage"); err == nil {
+		t.Fatalf("interrupted publication exited 0:\n%s", out)
+	}
+	// Interruption class 2: SIGKILL — no rollback code can run; only the
+	// pointer discipline protects the set. "stage" kills after staging,
+	// "switch" kills at the LAST instant before the atomic rename: in
+	// BOTH cases the complete old generation must stay current.
+	for _, at := range []string{"stage", "switch"} {
+		if _, err := publish(newSet, "NEXUS_ACCEPT_TEST_KILL_AT="+at); err == nil {
+			t.Fatalf("SIGKILLed publication (%s) exited 0", at)
+		}
+	}
+	for n, w := range want {
+		if got := readCurrent()[n]; got != w {
+			t.Fatalf("after interruptions %s = %q, want %q — MIXED trust generation", n, got, w)
+		}
+	}
+	if g, _ := os.Readlink(filepath.Join(conf, "nexus", "trust", "current")); g != oldGen {
+		t.Fatalf("pointer moved to %q during interrupted publications", g)
+	}
+	// The un-faulted publication flips the pointer to the complete NEW
+	// set and RETAINS the previous generation for recovery.
+	if out, err := publish(newSet); err != nil {
+		t.Fatalf("clean publication failed: %v\n%s", err, out)
+	}
+	got := readCurrent()
+	for n, w := range map[string]string{"allowed_signers": "NEW-ANCHOR\n",
+		"acceptance.json": "NEW-ATT\n", "acceptance.json.sig": "NEW-SIG\n"} {
+		if got[n] != w {
+			t.Fatalf("clean publication: %s = %q, want %q", n, got[n], w)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(conf, "nexus", "trust", oldGen, "allowed_signers")); err != nil {
+		t.Fatalf("previous generation not retained for recovery: %v", err)
+	}
+}
+
+func repoRootFromCaller(t *testing.T) string {
+	t.Helper()
+	_, self, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	return filepath.Dir(filepath.Dir(filepath.Dir(self)))
+}
+
+// FRESH-AUDIT r4 (codex+kilo): SEAM-FREE atomicity detector — a reader
+// hammering trust/current during repeated publications must NEVER
+// observe a missing pointer or a mixed generation. This turns RED on any
+// non-atomic pointer replacement (e.g. rm+ln) WITHOUT relying on a kill
+// seam the ablation could carry along or drop.
+func TestTrustPointerNeverUnresolvableUnderConcurrentPublish(t *testing.T) {
+	root := repoRootFromCaller(t)
+	conf := t.TempDir()
+	script := filepath.Join(root, "scripts", "p0-accept.sh")
+	stage := func(tag string) [3]string {
+		dir := t.TempDir()
+		var out [3]string
+		for i, n := range []string{"anchor", "att", "sig"} {
+			p := filepath.Join(dir, n)
+			if err := os.WriteFile(p, []byte(tag+"-"+n+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			out[i] = p
+		}
+		return out
+	}
+	sets := [2][3]string{stage("A"), stage("B")}
+	publish := func(s [3]string) error {
+		cmd := exec.Command("sh", script, s[0], s[1], s[2])
+		cmd.Env = append(os.Environ(), "XDG_CONFIG_HOME="+conf, "NEXUS_ACCEPT_TEST_PUBLISH_ONLY=1")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("%v\n%s", err, out)
+		}
+		return nil
+	}
+	if err := publish(sets[0]); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(conf, "nexus", "trust", "current")
+	stop := make(chan struct{})
+	violation := make(chan string, 1)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			gen, err := os.Readlink(link)
+			if err != nil {
+				violation <- "pointer unresolvable mid-publication: " + err.Error()
+				return
+			}
+			dir := filepath.Join(conf, "nexus", "trust", gen)
+			var tags []string
+			for _, n := range []string{"allowed_signers", "acceptance.json", "acceptance.json.sig"} {
+				b, rerr := os.ReadFile(filepath.Join(dir, n))
+				if rerr != nil {
+					violation <- "generation incomplete mid-publication: " + rerr.Error()
+					return
+				}
+				tags = append(tags, strings.SplitN(string(b), "-", 2)[0])
+			}
+			if tags[0] != tags[1] || tags[1] != tags[2] {
+				violation <- fmt.Sprintf("MIXED generation observed: %v", tags)
+				return
+			}
+		}
+	}()
+	for i := 0; i < 40; i++ {
+		if err := publish(sets[i%2]); err != nil {
+			close(stop)
+			t.Fatal(err)
+		}
+		select {
+		case v := <-violation:
+			t.Fatal(v)
+		default:
+		}
+	}
+	close(stop)
+	select {
+	case v := <-violation:
+		t.Fatal(v)
+	default:
 	}
 }

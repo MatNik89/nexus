@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"syscall"
+	"testing"
 	"time"
 
 	"github.com/MatNik89/nexus/internal/app/daemon"
@@ -354,13 +355,24 @@ func (b *daemonBundle) resumeApproved(ctx context.Context, identity, challengeID
 	if err != nil {
 		return "", err
 	}
+	if testing.Testing() && os.Getenv("NEXUS_TEST_CLOSE_JOURNAL_POST_EFFECT") != "" {
+		// Test seam (fresh-audit codex #1): fault injection at the exact
+		// post-effect boundary — the effect committed, durability fails.
+		b.j.Close()
+	}
 	final, ferr := b.d.ResumeChannelTurn(ctx, identity, turn, run, challengeID, continuation)
 	if merr := b.approvals.MarkResumeCompleted(ctx, challengeID); merr != nil {
-		fmt.Fprintf(os.Stderr, "nexus: resume-completed mark %s: %v\n", challengeID, merr)
+		// The effect COMMITTED but its durable completion record did not
+		// — an E9 UNKNOWN (fresh-audit codex #1). Never plain success:
+		// the challenge replays as consumed-unfinished at the next
+		// startup, and a retry invitation here would re-authorize an
+		// already-committed effect.
+		return "", fmt.Errorf("the approved action EXECUTED (result: %s), but recording its completion failed: %w. Do NOT retry %s — the daemon reconciles it at the next startup", result, merr, challengeID)
 	}
 	if ferr != nil {
-		// The effect DID run and the approval is consumed — report the
-		// tool result honestly even when the continuation fails.
+		// The effect DID run, the approval is consumed and durably
+		// closed — report the tool result honestly even when the
+		// continuation fails.
 		return result, nil
 	}
 	return final, nil
@@ -718,12 +730,14 @@ func runDoctorP0() int {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	type crit struct {
-		name string
-		ok   bool
-		why  string
+		name  string
+		ok    bool
+		state string // LIVE = measured round trip now; READY = durable substrate verified
+		why   string
 	}
 	var criteria []crit
-	add := func(name string, ok bool, why string) { criteria = append(criteria, crit{name, ok, why}) }
+	add := func(name string, ok bool, why string) { criteria = append(criteria, crit{name, ok, "LIVE", why}) }
+	addReady := func(name string, ok bool, why string) { criteria = append(criteria, crit{name, ok, "READY", why}) }
 
 	// 1. conversation — LIVE provider round trip.
 	authority := s7min.NewAuthority(nil, 5*time.Minute)
@@ -777,7 +791,9 @@ func runDoctorP0() int {
 		for n, v := range approval.Events() {
 			events[n] = v
 		}
-		j, jerr := journal.Open(jp, prof, redact.None{}, events)
+		j, jerr := journal.Open(jp, prof, redact.None{}, events,
+			memory.NewProjection(), schedule.NewProjection(), obligation.NewProjection(),
+			channel.NewProjection(), approval.NewProjection())
 		if jerr != nil {
 			profilesOK = false
 			add("profiles", false, string(prof)+": "+jerr.Error())
@@ -786,17 +802,23 @@ func runDoctorP0() int {
 		j.Close()
 	}
 	if profilesOK {
-		add("memory", true, "profile journals open, projections folded")
-		add("profiles", true, "work and private journals independently open")
+		addReady("memory", true, "profile journals open, projections folded — durable substrate, not a live round trip")
+		addReady("profiles", true, "work and private journals independently open")
 	} else {
-		add("memory", false, "profile journal not openable")
+		addReady("memory", false, "profile journal not openable")
 	}
-	healthPath := filepath.Join(layout.SystemDir(), "scheduler_health")
-	if hb, herr := os.ReadFile(healthPath); herr == nil && len(strings.TrimSpace(string(hb))) > 0 {
-		add("reminders", false, "scheduler health: "+strings.TrimSpace(string(hb)))
-	} else {
-		add("reminders", profilesOK, "durable scheduler substrate ready")
+	// Reminders honesty (fresh-audit codex #3 r2): the pure decision is
+	// factored out so every branch has a RED-capable unit test.
+	health := ""
+	if hb, herr := os.ReadFile(filepath.Join(layout.SystemDir(), "scheduler_health")); herr == nil {
+		health = strings.TrimSpace(string(hb))
 	}
+	hbAge, hbExists := time.Duration(0), false
+	if hbStat, herr := os.Stat(filepath.Join(layout.SystemDir(), "heartbeat")); herr == nil {
+		hbAge, hbExists = time.Since(hbStat.ModTime()), true
+	}
+	rOK, rState, rWhy := reminderReadiness(health, hbAge, hbExists, profilesOK)
+	criteria = append(criteria, crit{"reminders", rOK, rState, rWhy})
 	// 4. telegram — token + strict bindings + LIVE getMe.
 	probeCore, probeCleanup := mustProbeCore(layout, resolved)
 	defer probeCleanup()
@@ -835,23 +857,58 @@ func runDoctorP0() int {
 
 	all := true
 	for _, c := range criteria {
-		state := "LIVE"
+		state := c.state
 		if !c.ok {
-			state, all = "OFF ", false
+			state, all = "OFF", false
 		}
-		fmt.Printf("%s %-14s %s\n", state, c.name, c.why)
+		fmt.Printf("%-5s %-14s %s\n", state, c.name, c.why)
 	}
 	if all {
-		fmt.Println("P0-capable — all six PRD §6 capabilities measured live AND the acceptance suite attested this exact binary")
+		fmt.Println("P0-capable — live probes passed (conversation, telegram, sandbox), durable substrates verified (memory, obligations, profiles), and the acceptance suite attested this exact binary")
 		return 0
 	}
 	fmt.Println("prerequisites-ready at most — criteria above are not all live (fail closed)")
 	return 1
 }
 
+// reminderReadiness is the PURE reminders-criterion decision (fresh-audit
+// codex #3 r2 — every branch unit-testable): a dirty scheduler-health
+// mirror always fails; a FRESH daemon heartbeat promotes the claim to
+// live scheduling; a STALE heartbeat is a hard failure (the daemon
+// died); no heartbeat at all is the pre-daemon install flow — substrate
+// READY only.
+func reminderReadiness(health string, hbAge time.Duration, hbExists, profilesOK bool) (bool, string, string) {
+	switch {
+	case health != "":
+		return false, "OFF", "scheduler health: " + health
+	case hbExists && hbAge > 30*time.Second:
+		return false, "OFF", "daemon heartbeat is STALE (daemon dead?) — scheduler not running"
+	case hbExists:
+		return profilesOK, "LIVE", "daemon heartbeat fresh, scheduler health clean"
+	default:
+		return profilesOK, "READY", "durable scheduler substrate ready — no daemon running yet"
+	}
+}
+
 // verifyAcceptanceAttestation binds the grant to the graded binary.
 func verifyAcceptanceAttestation(layout pathx.Layout) (bool, string) {
-	raw, err := os.ReadFile(filepath.Join(layout.SystemDir(), "acceptance.json"))
+	// GENERATION POINTER (fresh-audit codex #4 r3): the trust set
+	// (anchor + attestation + signature) lives in one generation
+	// directory; <config>/trust/current is a symlink switched by a
+	// SINGLE atomic rename in p0-accept.sh — a kill at ANY point of
+	// publication leaves the previous complete generation installed.
+	// The pointer target is resolved ONCE and must be a bare directory
+	// name (no path traversal).
+	trustDir := filepath.Join(layout.Base, "trust")
+	genName, lerr := os.Readlink(filepath.Join(trustDir, "current"))
+	if lerr != nil {
+		return false, "no acceptance trust generation — run scripts/p0-accept.sh on this host"
+	}
+	if strings.ContainsAny(genName, "/\\") || genName == "." || genName == ".." {
+		return false, "trust generation pointer is not a bare directory name (fail closed)"
+	}
+	genDir := filepath.Join(trustDir, genName)
+	raw, err := os.ReadFile(filepath.Join(genDir, "acceptance.json"))
 	if err != nil {
 		return false, "no acceptance attestation — run scripts/p0-accept.sh on this host"
 	}
@@ -863,7 +920,7 @@ func verifyAcceptanceAttestation(layout pathx.Layout) (bool, string) {
 		MachineID    string `json:"machine_id_sha256"`
 		Time         string `json:"time"`
 	}
-	if json.Unmarshal(raw, &att) != nil || !att.Passed || att.Suite != "internal/acceptance" || att.BinarySHA256 == "" {
+	if json.Unmarshal(raw, &att) != nil || !att.Passed || att.Suite != "internal/acceptance+probe+sandbox" || att.BinarySHA256 == "" {
 		return false, "acceptance attestation malformed or not a pass (fail closed)"
 	}
 	self, err := os.Executable()
@@ -912,9 +969,8 @@ func verifyAcceptanceAttestation(layout pathx.Layout) (bool, string) {
 	if acceptanceSignerFingerprint == "" {
 		return false, "this build carries no pinned acceptance signer (build via scripts/p0-accept.sh)"
 	}
-	attPath := filepath.Join(layout.SystemDir(), "acceptance.json")
-	sigPath := attPath + ".sig"
-	signers := filepath.Join(layout.Base, "allowed_signers")
+	sigPath := filepath.Join(genDir, "acceptance.json.sig")
+	signers := filepath.Join(genDir, "allowed_signers")
 	if _, err := os.Stat(sigPath); err != nil {
 		return false, "acceptance attestation is UNSIGNED — run scripts/p0-accept.sh with NEXUS_RELEASE_KEY"
 	}

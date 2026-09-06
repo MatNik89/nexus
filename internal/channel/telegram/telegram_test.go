@@ -377,3 +377,31 @@ func TestRequestConstructionSanitized(t *testing.T) {
 		t.Fatalf("token leaked from request construction: %v", perr)
 	}
 }
+
+// FRESH-AUDIT kilo F3: a crash between a typed refusal and the next
+// poll's offset confirmation makes Telegram REDELIVER the refused update
+// — the refusal delivery id is derived from the update identity, so the
+// redelivered refusal is an idempotent no-op (ONE outbox row, one send),
+// never a second user-visible message.
+func TestRedeliveredRefusalIsIdempotent(t *testing.T) {
+	h := build(t, map[int64]string{42: "work"})
+	// Same unbound-chat update delivered twice (adapter restarted with
+	// offset 0 → Telegram re-serves the unconfirmed update).
+	h.bot.batches = [][]map[string]any{
+		{textUpdate(7, 999, "sneaky")},
+		{textUpdate(7, 999, "sneaky")},
+	}
+	if err := h.a.PollOnce(ctxT()); err != nil {
+		t.Fatal(err)
+	}
+	h.a.offset = 0 // simulate the restart: in-memory offset is gone
+	if err := h.a.PollOnce(ctxT()); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.a.FlushOutbox(ctxT()); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.bot.sent) != 1 {
+		t.Fatalf("redelivered refusal produced %d sends, want exactly 1: %v", len(h.bot.sent), h.bot.sent)
+	}
+}
