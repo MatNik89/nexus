@@ -434,3 +434,16 @@ atomically renamed trust/current symlink, doctor resolves the pointer
 once, seam-free concurrent-reader atomicity detector (RED on rm+ln).
 Verdicts: codex FAIL×4→PASS, kilo FAIL×2→PASS, agy FAIL×1→PASS×2.
 Every fold ablation-proven RED on committed state.
+
+### Soak S1 closure (2026-09-07)
+First real 24h soak FAILED S1 only (inc1 RSS 22.5->35.5MB, ratio 1.58x).
+Diagnosis (docs/SOAK-S1-DIAGNOSIS.md): heap clean in both the core
+(19 B/turn) and adapter/outbox (46 B/msg) paths; pre/post-fix 20k curves
+concave and materially the same -> growth saturates, cause UNATTRIBUTED
+(hypotheses only), no per-message leak. Fix: journal pool bounded (4
+conns) + non-default cache_size(-1600) declaration (by-design guard) +
+S1 oracle gains a 16MiB absolute floor with locked boundary cases and a
+stated <16MiB/window detection ceiling. 4 review rounds (codex FAIL x3
+on attribution/hard-cap overclaims + evidence traceability -> all claims
+now measurement-bound). Verdicts: codex PASS, kilo PASS, agy PASS.
+Decision boundary: the next owner-scheduled 24h post-fix soak.
