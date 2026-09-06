@@ -17,8 +17,9 @@ PERMS="$(stat -c '%a' "$F")"
 RAW_LEN="$(wc -c < "$F")"
 NONUL_LEN="$(tr -d '\000' < "$F" | wc -c)"
 [ "$RAW_LEN" -eq "$NONUL_LEN" ] || { echo "$F content malformed (fail closed)" >&2; exit 2; }
-# WHOLE file, outer-whitespace-trimmed only (mirrors Go TrimSpace) —
-# trailing bytes after the id line are NOT ignored (r4 codex #1).
+# WHOLE file, outer-whitespace-trimmed only (the shared ASCII [ \t\r\n]
+# contract of trimMachineID) — trailing bytes after the id line are NOT
+# ignored (r4 codex #1).
 CONTENT="$(cat "$F"; printf x)"; CONTENT="${CONTENT%x}"
 # WHOLE-byte-sequence outer trim of EXACTLY the ASCII set [ \t\r\n] —
 # mirrors trimMachineID in the doctor byte for byte (prep-low codex r2:
