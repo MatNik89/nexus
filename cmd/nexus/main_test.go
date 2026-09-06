@@ -1564,3 +1564,31 @@ func TestMachineIDCheckScriptMirrorsDoctor(t *testing.T) {
 		}
 	}
 }
+
+// FRESH-AUDIT codex #1 (HIGH): the effect COMMITS, then the durable
+// completion record fails (journal closed at the post-effect boundary).
+// Reporting plain success is an externally false claim — and any retry
+// invitation risks re-running an already-committed irreversible effect.
+// The outcome must surface as an explicit E9 UNKNOWN error.
+func TestPostEffectDurabilityFailureIsNotSuccess(t *testing.T) {
+	b := hitlBundle(t, "TG_POSTFX")
+	c := shortDeadlineCall(t, time.Hour)
+	ch, err := b.approvals.Suspend(context.Background(), "turn-px", "run-px", c, "tg:chat-42", testBlocks(t, "original request"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.approvals.Approve(context.Background(), ch.ChallengeID, "tg:chat-42"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NEXUS_TEST_CLOSE_JOURNAL_POST_EFFECT", "1")
+	out, rerr := b.resumeApproved(context.Background(), "chat-42", ch.ChallengeID)
+	if rerr == nil {
+		t.Fatalf("post-effect durability failure reported as success: %q", out)
+	}
+	if !strings.Contains(rerr.Error(), "EXECUTED") {
+		t.Fatalf("UNKNOWN outcome does not state the effect committed: %v", rerr)
+	}
+	if strings.Contains(rerr.Error(), "Reply retry") {
+		t.Fatalf("UNKNOWN outcome invites a retry of a committed effect: %v", rerr)
+	}
+}

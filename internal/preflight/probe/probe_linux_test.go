@@ -35,6 +35,9 @@ func mustDetect(t *testing.T) Availability {
 	t.Helper()
 	av, err := Detect()
 	if err != nil {
+		if os.Getenv("NEXUS_ACCEPT_REQUIRE_SANDBOX") != "" {
+			t.Fatalf("bwrap REQUIRED for the graded acceptance run: %v", err)
+		}
 		t.Skipf("bwrap unavailable (fail-closed path covered by TestDetect*): %v", err)
 	}
 	return av

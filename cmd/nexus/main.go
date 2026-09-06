@@ -354,13 +354,24 @@ func (b *daemonBundle) resumeApproved(ctx context.Context, identity, challengeID
 	if err != nil {
 		return "", err
 	}
+	if os.Getenv("NEXUS_TEST_CLOSE_JOURNAL_POST_EFFECT") != "" {
+		// Test seam (fresh-audit codex #1): fault injection at the exact
+		// post-effect boundary — the effect committed, durability fails.
+		b.j.Close()
+	}
 	final, ferr := b.d.ResumeChannelTurn(ctx, identity, turn, run, challengeID, continuation)
 	if merr := b.approvals.MarkResumeCompleted(ctx, challengeID); merr != nil {
-		fmt.Fprintf(os.Stderr, "nexus: resume-completed mark %s: %v\n", challengeID, merr)
+		// The effect COMMITTED but its durable completion record did not
+		// — an E9 UNKNOWN (fresh-audit codex #1). Never plain success:
+		// the challenge replays as consumed-unfinished at the next
+		// startup, and a retry invitation here would re-authorize an
+		// already-committed effect.
+		return "", fmt.Errorf("the approved action EXECUTED (result: %s), but recording its completion failed: %w. Do NOT retry %s — the daemon reconciles it at the next startup", result, merr, challengeID)
 	}
 	if ferr != nil {
-		// The effect DID run and the approval is consumed — report the
-		// tool result honestly even when the continuation fails.
+		// The effect DID run, the approval is consumed and durably
+		// closed — report the tool result honestly even when the
+		// continuation fails.
 		return result, nil
 	}
 	return final, nil
@@ -777,7 +788,9 @@ func runDoctorP0() int {
 		for n, v := range approval.Events() {
 			events[n] = v
 		}
-		j, jerr := journal.Open(jp, prof, redact.None{}, events)
+		j, jerr := journal.Open(jp, prof, redact.None{}, events,
+			memory.NewProjection(), schedule.NewProjection(), obligation.NewProjection(),
+			channel.NewProjection(), approval.NewProjection())
 		if jerr != nil {
 			profilesOK = false
 			add("profiles", false, string(prof)+": "+jerr.Error())
@@ -786,16 +799,26 @@ func runDoctorP0() int {
 		j.Close()
 	}
 	if profilesOK {
-		add("memory", true, "profile journals open, projections folded")
-		add("profiles", true, "work and private journals independently open")
+		add("memory", true, "profile journals open, projections folded (READY — durable substrate, not a live round trip)")
+		add("profiles", true, "work and private journals independently open (READY)")
 	} else {
 		add("memory", false, "profile journal not openable")
 	}
+	// Reminders honesty (fresh-audit codex #3): a FRESH daemon heartbeat
+	// promotes the claim to live scheduling; a STALE heartbeat is a hard
+	// failure (the daemon died); no heartbeat at all = substrate READY
+	// only (the pre-daemon install flow).
 	healthPath := filepath.Join(layout.SystemDir(), "scheduler_health")
 	if hb, herr := os.ReadFile(healthPath); herr == nil && len(strings.TrimSpace(string(hb))) > 0 {
 		add("reminders", false, "scheduler health: "+strings.TrimSpace(string(hb)))
+	} else if hbStat, herr := os.Stat(filepath.Join(layout.SystemDir(), "heartbeat")); herr == nil {
+		if time.Since(hbStat.ModTime()) > 30*time.Second {
+			add("reminders", false, "daemon heartbeat is STALE (daemon dead?) — scheduler not running")
+		} else {
+			add("reminders", profilesOK, "daemon heartbeat fresh, scheduler health clean")
+		}
 	} else {
-		add("reminders", profilesOK, "durable scheduler substrate ready")
+		add("reminders", profilesOK, "durable scheduler substrate ready (READY — no daemon running yet)")
 	}
 	// 4. telegram — token + strict bindings + LIVE getMe.
 	probeCore, probeCleanup := mustProbeCore(layout, resolved)
@@ -842,7 +865,7 @@ func runDoctorP0() int {
 		fmt.Printf("%s %-14s %s\n", state, c.name, c.why)
 	}
 	if all {
-		fmt.Println("P0-capable — all six PRD §6 capabilities measured live AND the acceptance suite attested this exact binary")
+		fmt.Println("P0-capable — live probes passed (conversation, telegram, sandbox), durable substrates verified (memory, obligations, profiles), and the acceptance suite attested this exact binary")
 		return 0
 	}
 	fmt.Println("prerequisites-ready at most — criteria above are not all live (fail closed)")
@@ -863,7 +886,7 @@ func verifyAcceptanceAttestation(layout pathx.Layout) (bool, string) {
 		MachineID    string `json:"machine_id_sha256"`
 		Time         string `json:"time"`
 	}
-	if json.Unmarshal(raw, &att) != nil || !att.Passed || att.Suite != "internal/acceptance" || att.BinarySHA256 == "" {
+	if json.Unmarshal(raw, &att) != nil || !att.Passed || att.Suite != "internal/acceptance+probe+sandbox" || att.BinarySHA256 == "" {
 		return false, "acceptance attestation malformed or not a pass (fail closed)"
 	}
 	self, err := os.Executable()

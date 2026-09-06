@@ -581,6 +581,12 @@ func (j *Journal) AppendBatch(ctx context.Context, batch []contracts.EnvelopePar
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+	// This wait needs no done/ctx guard: reqs is UNBUFFERED, so the send
+	// above commits only on rendezvous — the actor has the request and
+	// always answers through the buffered reply channel before honoring
+	// done (fresh-audit kilo F2 rejected on select semantics: a send the
+	// actor never received cannot commit, the sender re-parks and the
+	// done case fires).
 	rep := <-req.reply
 	return rep.evs, rep.err
 }

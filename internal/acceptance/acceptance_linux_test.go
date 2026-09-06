@@ -712,6 +712,12 @@ func TestCriterion6SensitivityNoSandbox(t *testing.T) {
 func requireBwrap(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("bwrap"); err != nil {
+		if os.Getenv("NEXUS_ACCEPT_REQUIRE_SANDBOX") != "" {
+			// The graded acceptance run (p0-accept.sh) must never
+			// skip the sandbox criteria — absence is a hard failure
+			// (fresh-audit codex #2).
+			t.Fatalf("bwrap REQUIRED for the graded acceptance run: %v", err)
+		}
 		t.Skipf("bwrap unavailable: %v", err)
 	}
 }
@@ -804,7 +810,7 @@ func writeAttestationMachine(t *testing.T, w *world, digest, host, machine strin
 		t.Fatal(err)
 	}
 	attPath := filepath.Join(dir, "acceptance.json")
-	att := fmt.Sprintf(`{"binary_sha256":%q,"suite":"internal/acceptance","passed":true,"host":%q,"machine_id_sha256":%q,"time":"2026-09-05T00:00:00Z"}`,
+	att := fmt.Sprintf(`{"binary_sha256":%q,"suite":"internal/acceptance+probe+sandbox","passed":true,"host":%q,"machine_id_sha256":%q,"time":"2026-09-05T00:00:00Z"}`,
 		digest, host, machine)
 	if err := os.WriteFile(attPath, []byte(att), 0o600); err != nil {
 		t.Fatal(err)

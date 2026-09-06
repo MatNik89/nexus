@@ -14,6 +14,8 @@ package telegram
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -56,7 +58,11 @@ type Adapter struct {
 	core     *channel.Core
 	handle   Handler
 	client   *http.Client
-	offset   int64
+	// offset is in-memory BY DESIGN (fresh-audit kilo F3): Telegram
+	// confirms server-side via the NEXT getUpdates offset, so a restart
+	// re-fetches only the unconfirmed tail; T22 dedup + stable refusal
+	// ids keep redelivery idempotent.
+	offset int64
 }
 
 func New(cfg Config, core *channel.Core, h Handler) (*Adapter, error) {
@@ -200,6 +206,16 @@ func (a *Adapter) PollOnce(ctx context.Context) error {
 	return nil
 }
 
+// refusalID derives the CALLER-STABLE delivery id for a typed refusal
+// from the update identity (fresh-audit kilo F3): a crash between the
+// refusal enqueue and the next poll's offset confirmation makes Telegram
+// redeliver the update — the stable id turns the re-enqueue into an
+// idempotent no-op instead of a second user-visible refusal.
+func refusalID(identity string, updateID int64) string {
+	sum := sha256.Sum256([]byte("tg-refusal|" + identity + "|" + strconv.FormatInt(updateID, 10)))
+	return "dlv-" + hex.EncodeToString(sum[:12])
+}
+
 func (a *Adapter) processUpdate(ctx context.Context, u tgUpdate) error {
 	if u.Message == nil {
 		return nil // non-message update classes are ignored in P0
@@ -210,7 +226,7 @@ func (a *Adapter) processUpdate(ctx context.Context, u tgUpdate) error {
 	// group every member would inherit the owner's USER trust. Fail
 	// closed on anything else (and on a missing sender identity).
 	if u.Message.Chat.Type != "private" || u.Message.From == nil {
-		_, err := a.core.EnqueueReply(ctx, adapterID, identity, a.profile,
+		_, err := a.core.EnqueueReplyID(ctx, refusalID(identity, u.UpdateID), adapterID, identity, a.profile,
 			"NEXUS talks only in a private chat with its owner.")
 		return err
 	}
@@ -219,14 +235,14 @@ func (a *Adapter) processUpdate(ctx context.Context, u tgUpdate) error {
 	// typed reply and NOTHING is admitted.
 	bound, ok := a.bindings[chat]
 	if !ok || bound != a.profile {
-		_, err := a.core.EnqueueReply(ctx, adapterID, identity, a.profile,
+		_, err := a.core.EnqueueReplyID(ctx, refusalID(identity, u.UpdateID), adapterID, identity, a.profile,
 			"This chat is not bound to a profile. Ask the NEXUS owner to bind it before I can talk here.")
 		return err
 	}
 	// C2: only text is processable in P0 — typed fail-closed reply,
 	// nothing admitted, loop alive.
 	if u.Message.Text == "" {
-		_, err := a.core.EnqueueReply(ctx, adapterID, identity, a.profile,
+		_, err := a.core.EnqueueReplyID(ctx, refusalID(identity, u.UpdateID), adapterID, identity, a.profile,
 			"I can handle only text messages for now (photos, voice and files are not supported yet).")
 		return err
 	}

@@ -322,6 +322,10 @@ func (b *Bwrap) Launch(ctx context.Context, policy CompiledPolicy) (*Process, er
 			return nil, fmt.Errorf("sandbox: closure member %s changed since Compile — refused (fail closed)", dest)
 		}
 	}
+	// One buffer for BOTH streams is safe WITHOUT a mutex: os/exec
+	// documents that when Stdout and Stderr are the same ==-comparable
+	// writer, at most one goroutine at a time calls Write (fresh-audit
+	// kilo F1 rejected on that guarantee — do not "fix" this).
 	out := &boundedBuffer{limit: 1 << 20}
 	if err := h.SetOutput(out, out); err != nil {
 		h.Close()

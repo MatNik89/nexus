@@ -48,6 +48,9 @@ func backend(t *testing.T) (*Bwrap, ProbeReport) {
 	b := NewBwrap()
 	rep, err := b.Probe(ctxT())
 	if err != nil {
+		if os.Getenv("NEXUS_ACCEPT_REQUIRE_SANDBOX") != "" {
+			t.Fatalf("bwrap REQUIRED for the graded acceptance run: %v", err)
+		}
 		t.Skipf("bwrap unavailable (fail-closed path covered separately): %v", err)
 	}
 	return b, rep
