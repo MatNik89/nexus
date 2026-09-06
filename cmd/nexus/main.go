@@ -1008,7 +1008,11 @@ func machineIDSHAAt(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	id := strings.TrimSpace(string(raw))
+	// TRIM CONTRACT (prep-low codex): both the doctor and the shell
+	// checker strip EXACTLY the ASCII set [ \t\r\n] — never
+	// locale/Unicode whitespace, so a U+00A0-padded id is malformed on
+	// BOTH sides instead of diverging.
+	id := strings.Trim(string(raw), " \t\r\n")
 	if err := validateMachineID(id); err != nil {
 		return "", fmt.Errorf("%s: %w", path, err)
 	}

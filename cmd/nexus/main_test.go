@@ -1410,6 +1410,12 @@ func TestMachineIDValidation(t *testing.T) {
 	if err := validateMachineID("0123456789abcdef0123456789abcdef"); err != nil {
 		t.Fatalf("valid machine id rejected: %v", err)
 	}
+	// TRIM CONTRACT: the doctor strips ONLY the ASCII set [ \t\r\n], so a
+	// U+00A0-padded id must be refused — Unicode TrimSpace would accept
+	// it and diverge from the shell checker (prep-low codex parity).
+	if err := validateMachineID(strings.Trim(" 0123456789abcdef0123456789abcdef ", " \t\r\n")); err == nil {
+		t.Fatal("NBSP-padded machine id survived the ASCII trim contract")
+	}
 	// A user-owned identity file is NOT a trust root (meaningless when
 	// the suite itself runs as root — then the fixture IS root-owned).
 	if os.Geteuid() != 0 {
@@ -1479,6 +1485,11 @@ func TestMachineIDCheckScriptMirrorsDoctor(t *testing.T) {
 		// NUL-spliced: shell substitution would silently drop the NUL
 		// and normalize to valid 32-hex while Go refuses (r5 codex).
 		"nulsplice": "0123456789abcdef\x000123456789abcdef\n",
+		// U+00A0 NO-BREAK SPACE padding: the trim contract is the ASCII
+		// set [ \t\r\n] ONLY, so NBSP is malformed on BOTH sides — a
+		// locale-dependent [[:space:]] or Unicode TrimSpace diverges
+		// here (prep-low codex parity probe).
+		"nbsppad": "\u00a0" + strings.TrimSuffix(valid, "\n") + "\n",
 	} {
 		reason, err := runReason(mk(name, content, 0o644))
 		if err == nil {
