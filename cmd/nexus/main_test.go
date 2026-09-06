@@ -1413,7 +1413,7 @@ func TestMachineIDValidation(t *testing.T) {
 	// TRIM CONTRACT: the doctor strips ONLY the ASCII set [ \t\r\n], so a
 	// U+00A0-padded id must be refused — Unicode TrimSpace would accept
 	// it and diverge from the shell checker (prep-low codex parity).
-	if err := validateMachineID(strings.Trim(" 0123456789abcdef0123456789abcdef ", " \t\r\n")); err == nil {
+	if err := validateMachineID(trimMachineID(" 0123456789abcdef0123456789abcdef ")); err == nil {
 		t.Fatal("NBSP-padded machine id survived the ASCII trim contract")
 	}
 	// A user-owned identity file is NOT a trust root (meaningless when
