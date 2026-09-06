@@ -43,7 +43,7 @@ func runCheck(t *testing.T, root, target string) (int, string) {
 func TestStaticCheckPassesStaticNexusBinary(t *testing.T) {
 	root := repoRoot(t)
 	bin := filepath.Join(t.TempDir(), "nexus")
-	cmd := exec.Command("go", "build", "-o", bin, "github.com/MatNik89/nexus/cmd/nexus")
+	cmd := exec.Command("go", "build", "-buildvcs=false", "-o", bin, "github.com/MatNik89/nexus/cmd/nexus")
 	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("build: %v\n%s", err, out)

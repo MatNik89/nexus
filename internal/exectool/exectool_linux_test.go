@@ -43,7 +43,7 @@ func stableHelper(t *testing.T) string {
 		return stableHelperPath
 	}
 	bin := filepath.Join(os.TempDir(), "nexus-test-probehelper")
-	cmd := exec.Command("go", "build", "-o", bin, "github.com/MatNik89/nexus/cmd/probehelper")
+	cmd := exec.Command("go", "build", "-buildvcs=false", "-o", bin, "github.com/MatNik89/nexus/cmd/probehelper")
 	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("building probehelper: %v\n%s", err, out)

@@ -25,7 +25,7 @@ func ctxT() context.Context { return context.Background() }
 func helperPath(t *testing.T) string {
 	t.Helper()
 	bin := filepath.Join(t.TempDir(), "probehelper")
-	cmd := exec.Command("go", "build", "-o", bin, "github.com/MatNik89/nexus/cmd/probehelper")
+	cmd := exec.Command("go", "build", "-buildvcs=false", "-o", bin, "github.com/MatNik89/nexus/cmd/probehelper")
 	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("building probehelper: %v\n%s", err, out)

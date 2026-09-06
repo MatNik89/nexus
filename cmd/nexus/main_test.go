@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -1591,4 +1592,102 @@ func TestPostEffectDurabilityFailureIsNotSuccess(t *testing.T) {
 	if strings.Contains(rerr.Error(), "Reply retry") {
 		t.Fatalf("UNKNOWN outcome invites a retry of a committed effect: %v", rerr)
 	}
+}
+
+// FRESH-AUDIT codex #3 r2: every reminders-criterion branch is
+// RED-capable — dirty health always fails, a stale heartbeat is a hard
+// failure, a fresh heartbeat is LIVE, no heartbeat is READY substrate.
+func TestReminderReadinessBranches(t *testing.T) {
+	cases := []struct {
+		name              string
+		health            string
+		hbAge             time.Duration
+		hbExists, profOK  bool
+		wantOK            bool
+		wantState, wantIn string
+	}{
+		{"dirty health", "sweep failed", 0, true, true, false, "OFF", "scheduler health"},
+		{"stale heartbeat", "", time.Minute, true, true, false, "OFF", "STALE"},
+		{"fresh heartbeat", "", time.Second, true, true, true, "LIVE", "heartbeat fresh"},
+		{"no daemon", "", 0, false, true, true, "READY", "substrate ready"},
+		{"no daemon, profiles broken", "", 0, false, false, false, "READY", "substrate ready"},
+	}
+	for _, c := range cases {
+		ok, state, why := reminderReadiness(c.health, c.hbAge, c.hbExists, c.profOK)
+		if ok != c.wantOK || state != c.wantState || !strings.Contains(why, c.wantIn) {
+			t.Fatalf("%s: got (%v,%s,%q), want (%v,%s,*%s*)", c.name, ok, state, why, c.wantOK, c.wantState, c.wantIn)
+		}
+	}
+}
+
+// FRESH-AUDIT codex #4 r2: the trust SET (anchor + attestation +
+// signature) publishes coherently — an interrupted publication restores
+// the ENTIRE previous generation, never a mixed one.
+func TestAcceptPublishRollbackRestoresWholeSet(t *testing.T) {
+	root := repoRootFromCaller(t)
+	conf := t.TempDir()
+	sysDir := filepath.Join(conf, "nexus", "system")
+	if err := os.MkdirAll(sysDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	prior := map[string]string{
+		filepath.Join(conf, "nexus", "allowed_signers"): "OLD-ANCHOR\n",
+		filepath.Join(sysDir, "acceptance.json"):        "OLD-ATT\n",
+		filepath.Join(sysDir, "acceptance.json.sig"):    "OLD-SIG\n",
+	}
+	for p, c := range prior {
+		if err := os.WriteFile(p, []byte(c), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stage := t.TempDir()
+	var staged []string
+	for i, c := range []string{"NEW-ANCHOR\n", "NEW-ATT\n", "NEW-SIG\n"} {
+		p := filepath.Join(stage, fmt.Sprintf("s%d", i))
+		if err := os.WriteFile(p, []byte(c), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		staged = append(staged, p)
+	}
+	script := filepath.Join(root, "scripts", "p0-accept.sh")
+	// Fail after each rename step in turn: EVERY interruption point must
+	// restore the complete OLD generation.
+	for _, step := range []string{"1", "2"} {
+		cmd := exec.Command("sh", script, staged[0], staged[1], staged[2])
+		cmd.Env = append(os.Environ(), "XDG_CONFIG_HOME="+conf,
+			"NEXUS_ACCEPT_TEST_PUBLISH_ONLY=1", "NEXUS_ACCEPT_TEST_FAIL_AFTER="+step)
+		if out, err := cmd.CombinedOutput(); err == nil {
+			t.Fatalf("step %s: interrupted publication exited 0:\n%s", step, out)
+		}
+		for p, want := range prior {
+			got, err := os.ReadFile(p)
+			if err != nil || string(got) != want {
+				t.Fatalf("step %s: %s not restored (got %q, err %v) — MIXED trust generation", step, p, got, err)
+			}
+		}
+	}
+	// And the un-faulted publication installs the complete NEW set.
+	cmd := exec.Command("sh", script, staged[0], staged[1], staged[2])
+	cmd.Env = append(os.Environ(), "XDG_CONFIG_HOME="+conf, "NEXUS_ACCEPT_TEST_PUBLISH_ONLY=1")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("clean publication failed: %v\n%s", err, out)
+	}
+	for p, want := range map[string]string{
+		filepath.Join(conf, "nexus", "allowed_signers"): "NEW-ANCHOR\n",
+		filepath.Join(sysDir, "acceptance.json"):        "NEW-ATT\n",
+		filepath.Join(sysDir, "acceptance.json.sig"):    "NEW-SIG\n",
+	} {
+		if got, err := os.ReadFile(p); err != nil || string(got) != want {
+			t.Fatalf("clean publication: %s = %q (%v), want %q", p, got, err, want)
+		}
+	}
+}
+
+func repoRootFromCaller(t *testing.T) string {
+	t.Helper()
+	_, self, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	return filepath.Dir(filepath.Dir(filepath.Dir(self)))
 }

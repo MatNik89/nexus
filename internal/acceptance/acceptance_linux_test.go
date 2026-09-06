@@ -54,7 +54,7 @@ func TestMain(m *testing.M) {
 		binPath = pre
 	} else {
 		binPath = filepath.Join(harnessDir, "nexus")
-		cmd := exec.Command("go", "build", "-o", binPath, "github.com/MatNik89/nexus/cmd/nexus")
+		cmd := exec.Command("go", "build", "-buildvcs=false", "-o", binPath, "github.com/MatNik89/nexus/cmd/nexus")
 		cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 		if out, berr := cmd.CombinedOutput(); berr != nil {
 			binErr = fmt.Errorf("%v\n%s", berr, out)
@@ -730,7 +730,7 @@ func buildHelper(t *testing.T) string {
 	t.Helper()
 	helperOnce.Do(func() {
 		helperBin = filepath.Join(harnessDir, "probehelper")
-		cmd := exec.Command("go", "build", "-o", helperBin, "github.com/MatNik89/nexus/cmd/probehelper")
+		cmd := exec.Command("go", "build", "-buildvcs=false", "-o", helperBin, "github.com/MatNik89/nexus/cmd/probehelper")
 		cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 		if out, err := cmd.CombinedOutput(); err != nil {
 			helperErr = fmt.Errorf("%v\n%s", err, out)
@@ -838,7 +838,7 @@ func (w *world) pinnedDoctorBin(t *testing.T) string {
 	}
 	sum := sha256.Sum256(signers)
 	bin := filepath.Join(w.base, "nexus-pinned")
-	cmd := exec.Command("go", "build",
+	cmd := exec.Command("go", "build", "-buildvcs=false",
 		"-ldflags", "-X main.acceptanceSignerFingerprint="+hex.EncodeToString(sum[:]),
 		"-o", bin, "github.com/MatNik89/nexus/cmd/nexus")
 	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
@@ -1081,7 +1081,7 @@ func TestDoctorP0GrantLive(t *testing.T) {
 	if code2 == 0 || strings.Contains(out2, "P0-capable") {
 		t.Fatalf("grant survived a dead channel (exit %d):\n%s", code2, out2)
 	}
-	if !strings.Contains(out2, "OFF  telegram") {
+	if !strings.Contains(out2, "OFF   telegram") {
 		t.Fatalf("wrong criterion went off:\n%s", out2)
 	}
 }

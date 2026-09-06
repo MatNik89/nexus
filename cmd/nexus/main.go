@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"syscall"
+	"testing"
 	"time"
 
 	"github.com/MatNik89/nexus/internal/app/daemon"
@@ -354,7 +355,7 @@ func (b *daemonBundle) resumeApproved(ctx context.Context, identity, challengeID
 	if err != nil {
 		return "", err
 	}
-	if os.Getenv("NEXUS_TEST_CLOSE_JOURNAL_POST_EFFECT") != "" {
+	if testing.Testing() && os.Getenv("NEXUS_TEST_CLOSE_JOURNAL_POST_EFFECT") != "" {
 		// Test seam (fresh-audit codex #1): fault injection at the exact
 		// post-effect boundary — the effect committed, durability fails.
 		b.j.Close()
@@ -729,12 +730,14 @@ func runDoctorP0() int {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	type crit struct {
-		name string
-		ok   bool
-		why  string
+		name  string
+		ok    bool
+		state string // LIVE = measured round trip now; READY = durable substrate verified
+		why   string
 	}
 	var criteria []crit
-	add := func(name string, ok bool, why string) { criteria = append(criteria, crit{name, ok, why}) }
+	add := func(name string, ok bool, why string) { criteria = append(criteria, crit{name, ok, "LIVE", why}) }
+	addReady := func(name string, ok bool, why string) { criteria = append(criteria, crit{name, ok, "READY", why}) }
 
 	// 1. conversation — LIVE provider round trip.
 	authority := s7min.NewAuthority(nil, 5*time.Minute)
@@ -799,27 +802,23 @@ func runDoctorP0() int {
 		j.Close()
 	}
 	if profilesOK {
-		add("memory", true, "profile journals open, projections folded (READY — durable substrate, not a live round trip)")
-		add("profiles", true, "work and private journals independently open (READY)")
+		addReady("memory", true, "profile journals open, projections folded — durable substrate, not a live round trip")
+		addReady("profiles", true, "work and private journals independently open")
 	} else {
-		add("memory", false, "profile journal not openable")
+		addReady("memory", false, "profile journal not openable")
 	}
-	// Reminders honesty (fresh-audit codex #3): a FRESH daemon heartbeat
-	// promotes the claim to live scheduling; a STALE heartbeat is a hard
-	// failure (the daemon died); no heartbeat at all = substrate READY
-	// only (the pre-daemon install flow).
-	healthPath := filepath.Join(layout.SystemDir(), "scheduler_health")
-	if hb, herr := os.ReadFile(healthPath); herr == nil && len(strings.TrimSpace(string(hb))) > 0 {
-		add("reminders", false, "scheduler health: "+strings.TrimSpace(string(hb)))
-	} else if hbStat, herr := os.Stat(filepath.Join(layout.SystemDir(), "heartbeat")); herr == nil {
-		if time.Since(hbStat.ModTime()) > 30*time.Second {
-			add("reminders", false, "daemon heartbeat is STALE (daemon dead?) — scheduler not running")
-		} else {
-			add("reminders", profilesOK, "daemon heartbeat fresh, scheduler health clean")
-		}
-	} else {
-		add("reminders", profilesOK, "durable scheduler substrate ready (READY — no daemon running yet)")
+	// Reminders honesty (fresh-audit codex #3 r2): the pure decision is
+	// factored out so every branch has a RED-capable unit test.
+	health := ""
+	if hb, herr := os.ReadFile(filepath.Join(layout.SystemDir(), "scheduler_health")); herr == nil {
+		health = strings.TrimSpace(string(hb))
 	}
+	hbAge, hbExists := time.Duration(0), false
+	if hbStat, herr := os.Stat(filepath.Join(layout.SystemDir(), "heartbeat")); herr == nil {
+		hbAge, hbExists = time.Since(hbStat.ModTime()), true
+	}
+	rOK, rState, rWhy := reminderReadiness(health, hbAge, hbExists, profilesOK)
+	criteria = append(criteria, crit{"reminders", rOK, rState, rWhy})
 	// 4. telegram — token + strict bindings + LIVE getMe.
 	probeCore, probeCleanup := mustProbeCore(layout, resolved)
 	defer probeCleanup()
@@ -858,11 +857,11 @@ func runDoctorP0() int {
 
 	all := true
 	for _, c := range criteria {
-		state := "LIVE"
+		state := c.state
 		if !c.ok {
-			state, all = "OFF ", false
+			state, all = "OFF", false
 		}
-		fmt.Printf("%s %-14s %s\n", state, c.name, c.why)
+		fmt.Printf("%-5s %-14s %s\n", state, c.name, c.why)
 	}
 	if all {
 		fmt.Println("P0-capable — live probes passed (conversation, telegram, sandbox), durable substrates verified (memory, obligations, profiles), and the acceptance suite attested this exact binary")
@@ -870,6 +869,25 @@ func runDoctorP0() int {
 	}
 	fmt.Println("prerequisites-ready at most — criteria above are not all live (fail closed)")
 	return 1
+}
+
+// reminderReadiness is the PURE reminders-criterion decision (fresh-audit
+// codex #3 r2 — every branch unit-testable): a dirty scheduler-health
+// mirror always fails; a FRESH daemon heartbeat promotes the claim to
+// live scheduling; a STALE heartbeat is a hard failure (the daemon
+// died); no heartbeat at all is the pre-daemon install flow — substrate
+// READY only.
+func reminderReadiness(health string, hbAge time.Duration, hbExists, profilesOK bool) (bool, string, string) {
+	switch {
+	case health != "":
+		return false, "OFF", "scheduler health: " + health
+	case hbExists && hbAge > 30*time.Second:
+		return false, "OFF", "daemon heartbeat is STALE (daemon dead?) — scheduler not running"
+	case hbExists:
+		return profilesOK, "LIVE", "daemon heartbeat fresh, scheduler health clean"
+	default:
+		return profilesOK, "READY", "durable scheduler substrate ready — no daemon running yet"
+	}
 }
 
 // verifyAcceptanceAttestation binds the grant to the graded binary.
