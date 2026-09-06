@@ -35,8 +35,11 @@ publish_trust_set() {
 		echo "acceptance: publication interrupted BEFORE the pointer switch — previous generation still current" >&2
 		return 1
 	fi
-	if [ "${NEXUS_ACCEPT_TEST_KILL_AT:-}" = "switch" ]; then kill -KILL "$$"; fi
 	ln -s "$GEN" "$TRUST/current.new.$$"
+	# "switch" = the LAST instant before the atomic rename (between the
+	# staging symlink and mv -T) — fresh-audit r4: the earlier placement
+	# sat at the same observable state as "stage".
+	if [ "${NEXUS_ACCEPT_TEST_KILL_AT:-}" = "switch" ]; then kill -KILL "$$"; fi
 	# -T: replace the SYMLINK itself (never descend into the old target);
 	# GNU coreutils is a given on the Linux-only deployment target.
 	mv -T "$TRUST/current.new.$$" "$TRUST/current"

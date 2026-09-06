@@ -1719,3 +1719,86 @@ func repoRootFromCaller(t *testing.T) string {
 	}
 	return filepath.Dir(filepath.Dir(filepath.Dir(self)))
 }
+
+// FRESH-AUDIT r4 (codex+kilo): SEAM-FREE atomicity detector — a reader
+// hammering trust/current during repeated publications must NEVER
+// observe a missing pointer or a mixed generation. This turns RED on any
+// non-atomic pointer replacement (e.g. rm+ln) WITHOUT relying on a kill
+// seam the ablation could carry along or drop.
+func TestTrustPointerNeverUnresolvableUnderConcurrentPublish(t *testing.T) {
+	root := repoRootFromCaller(t)
+	conf := t.TempDir()
+	script := filepath.Join(root, "scripts", "p0-accept.sh")
+	stage := func(tag string) [3]string {
+		dir := t.TempDir()
+		var out [3]string
+		for i, n := range []string{"anchor", "att", "sig"} {
+			p := filepath.Join(dir, n)
+			if err := os.WriteFile(p, []byte(tag+"-"+n+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			out[i] = p
+		}
+		return out
+	}
+	sets := [2][3]string{stage("A"), stage("B")}
+	publish := func(s [3]string) error {
+		cmd := exec.Command("sh", script, s[0], s[1], s[2])
+		cmd.Env = append(os.Environ(), "XDG_CONFIG_HOME="+conf, "NEXUS_ACCEPT_TEST_PUBLISH_ONLY=1")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("%v\n%s", err, out)
+		}
+		return nil
+	}
+	if err := publish(sets[0]); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(conf, "nexus", "trust", "current")
+	stop := make(chan struct{})
+	violation := make(chan string, 1)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			gen, err := os.Readlink(link)
+			if err != nil {
+				violation <- "pointer unresolvable mid-publication: " + err.Error()
+				return
+			}
+			dir := filepath.Join(conf, "nexus", "trust", gen)
+			var tags []string
+			for _, n := range []string{"allowed_signers", "acceptance.json", "acceptance.json.sig"} {
+				b, rerr := os.ReadFile(filepath.Join(dir, n))
+				if rerr != nil {
+					violation <- "generation incomplete mid-publication: " + rerr.Error()
+					return
+				}
+				tags = append(tags, strings.SplitN(string(b), "-", 2)[0])
+			}
+			if tags[0] != tags[1] || tags[1] != tags[2] {
+				violation <- fmt.Sprintf("MIXED generation observed: %v", tags)
+				return
+			}
+		}
+	}()
+	for i := 0; i < 40; i++ {
+		if err := publish(sets[i%2]); err != nil {
+			close(stop)
+			t.Fatal(err)
+		}
+		select {
+		case v := <-violation:
+			t.Fatal(v)
+		default:
+		}
+	}
+	close(stop)
+	select {
+	case v := <-violation:
+		t.Fatal(v)
+	default:
+	}
+}
