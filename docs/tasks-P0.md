@@ -419,3 +419,18 @@ whole-byte-sequence shell trim (leading-LF parity) → r4 uid-independent
 fixture table + stale comments. Every fold ablation-proven RED on
 committed state. Verdicts: codex FAIL×3→PASS, kilo PASS×4, agy PASS×4.
 Review prompts now state: FAIL for ANY unresolved finding of ANY severity.
+
+### Fresh fourth-eyes audit convergence (pre-P1 item 5, 2026-09-06)
+gh models retired (410 brownout) — substituted with UNANCHORED fresh /new
+threads of codex/kilo/agy over the whole repo (no prior-review reading).
+Yield: codex 3 HIGH (false-success post-effect resume; acceptance gate
+insensitive to sandbox absence + syscall floor; doctor LIVE overclaim) +
+1 MED (trust-anchor corruption pre-validation) + 1 LOW (buildcheck .git
+dependency); kilo 1 real LOW (duplicate refusal replies) + 2 rejected
+with decisive evidence (os/exec shared-writer guarantee; unbuffered
+select rendezvous). 5 rounds to convergence; the MED escalated into the
+generation-pointer redesign: trust set = one generation dir behind an
+atomically renamed trust/current symlink, doctor resolves the pointer
+once, seam-free concurrent-reader atomicity detector (RED on rm+ln).
+Verdicts: codex FAIL×4→PASS, kilo FAIL×2→PASS, agy FAIL×1→PASS×2.
+Every fold ablation-proven RED on committed state.
