@@ -157,11 +157,21 @@ func Open(path string, profile contracts.ProfileID, r redact.Redactor, events ma
 	if len(events) == 0 {
 		return nil, fmt.Errorf("journal open: a closed event-type set is required (fail closed)")
 	}
-	dsn := fmt.Sprintf("file:%s?_txlock=immediate&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(FULL)", path)
+	// cache_size is DECLARED (2MB/connection), never inherited: each
+	// pooled connection owns a page cache, so the journal's memory cap
+	// is maxOpenConns x cache_size (soak S1 2026-09-06: an unbounded
+	// pool grew daemon RSS with database size until the 24h budget
+	// tripped — the growth was pool x cache, not a leak).
+	dsn := fmt.Sprintf("file:%s?_txlock=immediate&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(FULL)&_pragma=cache_size(-2000)", path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("journal open: %w", err)
 	}
+	// Bounded pool: writes are serialized by the single append actor
+	// anyway; reads are short. 4 connections bound the SQLite memory to
+	// ~8MB per journal regardless of database size or reader concurrency.
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(4)
 	fail := func(e error) (*Journal, error) { db.Close(); return nil, e }
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS events (
 		journal_offset INTEGER PRIMARY KEY,

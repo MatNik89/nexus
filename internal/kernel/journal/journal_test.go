@@ -706,3 +706,21 @@ func TestAppendBatchAllOrNothing(t *testing.T) {
 		t.Fatalf("poisoned batch left %d run-c events", count)
 	}
 }
+
+// SOAK S1 (2026-09-06): the journal's SQLite memory is BOUNDED BY
+// DESIGN — a capped connection pool (each pooled connection owns a page
+// cache, so unbounded pool = RSS growing with database size) and a
+// declared per-connection cache_size.
+func TestJournalPoolAndCacheBounded(t *testing.T) {
+	j := open(t, t.TempDir(), redact.None{})
+	if got := j.db.Stats().MaxOpenConnections; got != 4 {
+		t.Fatalf("connection pool unbounded or wrong cap: MaxOpenConnections=%d, want 4", got)
+	}
+	var cs int
+	if err := j.db.QueryRow("PRAGMA cache_size").Scan(&cs); err != nil {
+		t.Fatal(err)
+	}
+	if cs != -2000 {
+		t.Fatalf("cache_size not the declared -2000 (2MB/conn): %d", cs)
+	}
+}
