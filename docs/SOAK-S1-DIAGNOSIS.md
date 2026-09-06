@@ -30,18 +30,23 @@ monotonic-looking RSS growth of ~13 MiB over 24h (~43k messages).
 
 ## Honest attribution
 
-- The growth **saturates with workload steady-state**; there is no
-  linear per-message component beyond noise (points 1-3).
+- Both 20k curves are **concave and flatten in their final thirds**;
+  the in-process heap measurements (points 1-2) rule out a per-message
+  live-heap leak in the turn and adapter/outbox paths. That is the
+  extent of what the collected evidence establishes.
 - The committed fix (pool bound 4 + non-default `cache_size(-1600)`)
   makes the SQLite side **bounded by design** (~6.4 MB/journal hard cap
   regardless of database size or reader concurrency). It is a real
   guard: before it, the pool was formally unbounded.
-- BUT the near-identical pre/post curves show the unbounded pool was
-  **not the dominant term** of the observed growth on this workload —
-  the remainder is Go allocator steady-state (retained spans after
-  processing peaks) plus the now-capped page cache warming as the
-  database grows. That is growth tied to workload and database size,
-  which levels off — not growth tied to time.
+- The near-identical pre/post curves show the unbounded pool was **not
+  the dominant term** of the observed growth on this workload. The
+  remainder is **unattributed** saturating growth: plausible
+  contributors are Go allocator retained spans and page-cache warm-up,
+  but no allocator/RSS decomposition, DB-size series, connection-count
+  series, or idle/time control was collected, so those names are
+  hypotheses, not findings. "Saturating rather than time-linear" rests
+  on the two 20k curves' concavity alone; the 24h post-fix run is the
+  decision boundary.
 
 ## Proof ceiling (stated, not hidden)
 
@@ -59,5 +64,8 @@ Pre-fix 20k (msgs → rssKB): 0→20720, 500→23744, 5000→24080,
 10000→29488, 15000→31232, 20000→31008.
 Post-fix 20k: 0→20176, 500→22688, 5000→26000, 10000→25696,
 15000→31600, 20000→29712.
-Full logs: `~/HARNESS/nexus-soak/diag-curve-run.log` (pre),
-`diag-postfix.log` (post) on the dev host.
+Full sample series on the dev host:
+`~/HARNESS/nexus-soak/diag-prefix-20k.log` (pre-fix, 42 samples) and
+`~/HARNESS/nexus-soak/diag-postfix.log` (post-fix). (`diag-curve-run.log`
+is an aborted earlier harness run — a timeout panic with one sample —
+and is NOT the pre-fix evidence.)
