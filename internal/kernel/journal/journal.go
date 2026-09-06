@@ -157,19 +157,23 @@ func Open(path string, profile contracts.ProfileID, r redact.Redactor, events ma
 	if len(events) == 0 {
 		return nil, fmt.Errorf("journal open: a closed event-type set is required (fail closed)")
 	}
-	// cache_size is DECLARED (2MB/connection), never inherited: each
-	// pooled connection owns a page cache, so the journal's memory cap
-	// is maxOpenConns x cache_size (soak S1 2026-09-06: an unbounded
-	// pool grew daemon RSS with database size until the 24h budget
-	// tripped — the growth was pool x cache, not a leak).
-	dsn := fmt.Sprintf("file:%s?_txlock=immediate&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(FULL)&_pragma=cache_size(-2000)", path)
+	// The POOL BOUND below is the primary memory cap (soak S1
+	// 2026-09-06: an unbounded pool grew daemon RSS with database size
+	// until the 24h budget tripped — pool x per-connection page cache,
+	// bounded growth, not an unbounded leak; final confirmation rides
+	// the next post-fix 24h run, see docs/SOAK-S1-DIAGNOSIS.md).
+	// cache_size(-1600) is deliberately NOT the driver default (-2000):
+	// the declaration is enforceable (a dropped pragma turns the
+	// regression RED) and immune to a driver-default change.
+	dsn := fmt.Sprintf("file:%s?_txlock=immediate&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(FULL)&_pragma=cache_size(-1600)", path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("journal open: %w", err)
 	}
 	// Bounded pool: writes are serialized by the single append actor
-	// anyway; reads are short. 4 connections bound the SQLite memory to
-	// ~8MB per journal regardless of database size or reader concurrency.
+	// anyway; reads are short. 4 connections x 1.6MB cache bound the
+	// SQLite memory to ~6.4MB per journal regardless of database size
+	// or reader concurrency.
 	db.SetMaxOpenConns(4)
 	db.SetMaxIdleConns(4)
 	fail := func(e error) (*Journal, error) { db.Close(); return nil, e }

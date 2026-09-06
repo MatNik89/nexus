@@ -13,8 +13,10 @@
 //	   now-bounded pool is worth ~10 MiB and is growth tied to database
 //	   size, not time; on a ~22 MiB baseline the pure ratio misread it
 //	   as a leak). A real leak (>16 MiB/day absolute) still fails. This
-//	   is a window-scoped growth budget, not a universal leak proof (a
-//	   sub-budget slow leak needs a longer run — stated, not hidden).
+//	   is a window-scoped growth budget, not a universal leak proof: a
+//	   leak slower than 16 MiB per run window is UNDETECTED here by
+//	   construction — the ratchet against it is a longer run, stated,
+//	   not hidden (soak-s1 codex).
 //	S2 FD budget PER INCARNATION: peak <= incarnation baseline + 10.
 //	S3 WAL: MAX VALID sample over the whole run <= 8 MiB; a failed WAL
 //	   stat is an INVALID sample (never a healthy zero) and more than
@@ -517,6 +519,35 @@ func TestSoakVerdictSensitivity(t *testing.T) {
 	}
 	if err := soakVerdict(warm, lat(100, 10), lat(120, 10), 3, 1); err != nil {
 		t.Fatalf("cache-warm-up shape (sub-16MiB absolute growth) failed the budget: %v", err)
+	}
+	// S1 ABSOLUTE-FLOOR BOUNDARY (soak-s1 codex LOW): exactly +16MiB
+	// passes the strict > floor; one KiB more fails. Locks the boundary
+	// so later edits cannot silently widen it.
+	edge := mk(1, 30)
+	for i := 0; i < 10; i++ {
+		edge[i].rssKB = 22544
+	}
+	for i := 10; i < 20; i++ {
+		edge[i].rssKB = 30000
+	}
+	for i := 20; i < 30; i++ {
+		edge[i].rssKB = 22544 + 16*1024 // exactly the floor: > is not tripped
+	}
+	if err := soakVerdict(edge, lat(100, 10), lat(120, 10), 3, 1); err != nil {
+		t.Fatalf("exact-floor growth (+16MiB) must pass the strict > boundary: %v", err)
+	}
+	over := mk(1, 30)
+	for i := 0; i < 10; i++ {
+		over[i].rssKB = 22544
+	}
+	for i := 10; i < 20; i++ {
+		over[i].rssKB = 30000
+	}
+	for i := 20; i < 30; i++ {
+		over[i].rssKB = 22544 + 16*1024 + 1 // one KiB over: ratio + absolute both trip
+	}
+	if err := soakVerdict(over, lat(100, 10), lat(120, 10), 3, 1); err == nil || !strings.Contains(err.Error(), "S1") {
+		t.Fatalf("floor+1KiB growth not caught: %v", err)
 	}
 	// S1 PRE-RESTART PEAK laundered by the restart (reviewer probe).
 	peak := append(mk(1, 15), mk(2, 15)...)

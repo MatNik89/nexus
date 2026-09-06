@@ -720,7 +720,11 @@ func TestJournalPoolAndCacheBounded(t *testing.T) {
 	if err := j.db.QueryRow("PRAGMA cache_size").Scan(&cs); err != nil {
 		t.Fatal(err)
 	}
-	if cs != -2000 {
-		t.Fatalf("cache_size not the declared -2000 (2MB/conn): %d", cs)
+	// -1600 is deliberately NOT the driver default (-2000), so this
+	// assertion proves the DECLARATION took effect — dropping the
+	// pragma turns it RED (soak-s1 review kilo F2: asserting the
+	// default was vacuous).
+	if cs != -1600 {
+		t.Fatalf("cache_size not the declared non-default -1600: %d", cs)
 	}
 }
