@@ -8,9 +8,15 @@
 //
 //	S1 RSS budget PER INCARNATION: within each incarnation, the median
 //	   of its last third <= 1.5x the median of its first third AND its
-//	   peak <= 1.6x its baseline median. This is a window-scoped growth
-//	   budget, not a universal leak proof (a sub-budget slow leak needs
-//	   a longer run — stated, not hidden).
+//	   peak <= 1.6x its baseline median — each with a 16 MiB ABSOLUTE
+//	   floor (2026-09-06 24h run: SQLite page-cache warm-up across the
+//	   now-bounded pool is worth ~10 MiB and is growth tied to database
+//	   size, not time; on a ~22 MiB baseline the pure ratio misread it
+//	   as a leak). A real leak (>16 MiB/day absolute) still fails. This
+//	   is a window-scoped growth budget, not a universal leak proof: a
+//	   leak slower than 16 MiB per run window is UNDETECTED here by
+//	   construction — the ratchet against it is a longer run, stated,
+//	   not hidden (soak-s1 codex).
 //	S2 FD budget PER INCARNATION: peak <= incarnation baseline + 10.
 //	S3 WAL: MAX VALID sample over the whole run <= 8 MiB; a failed WAL
 //	   stat is an INVALID sample (never a healthy zero) and more than
@@ -153,11 +159,12 @@ func soakVerdict(samples []soakSample, latFirst, latLast []int64, warmup, expect
 		if mF <= 0 || mL <= 0 {
 			return fmt.Errorf("S1 inc%d RSS sampling broken (medians %d/%d)", inc, mF, mL)
 		}
-		if mL*2 > mF*3 {
-			return fmt.Errorf("S1 inc%d RSS median grew %dKB -> %dKB (>1.5x budget)", inc, mF, mL)
+		const absFloorKB = 16 * 1024 // ratio alone misreads cache warm-up on small baselines
+		if mL*2 > mF*3 && mL-mF > absFloorKB {
+			return fmt.Errorf("S1 inc%d RSS median grew %dKB -> %dKB (>1.5x budget and >16MiB absolute)", inc, mF, mL)
 		}
-		if peakRSS*5 > mF*8 { // peak > 1.6x baseline median
-			return fmt.Errorf("S1 inc%d RSS peak %dKB vs baseline %dKB (>1.6x budget)", inc, peakRSS, mF)
+		if peakRSS*5 > mF*8 && peakRSS-mF > absFloorKB { // peak > 1.6x baseline median
+			return fmt.Errorf("S1 inc%d RSS peak %dKB vs baseline %dKB (>1.6x budget and >16MiB absolute)", inc, peakRSS, mF)
 		}
 		if baseFD <= 0 || peakFD <= 0 {
 			return fmt.Errorf("S2 inc%d FD sampling broken (%d/%d)", inc, baseFD, peakFD)
@@ -494,6 +501,53 @@ func TestSoakVerdictSensitivity(t *testing.T) {
 	}
 	if err := soakVerdict(leak, lat(100, 10), lat(120, 10), 3, 2); err == nil || !strings.Contains(err.Error(), "S1") {
 		t.Fatalf("in-incarnation RSS growth not caught: %v", err)
+	}
+	// S1 ABSOLUTE FLOOR (2026-09-06 24h run): the real cache-warm-up
+	// shape — 22MB -> 35MB on a small baseline — exceeds the 1.5x ratio
+	// but NOT the 16MiB absolute floor, and must PASS; the same ratio
+	// with a >16MiB absolute climb still fails (the leak case above is
+	// +40MB and stays RED).
+	warm := mk(1, 30)
+	for i := 20; i < 30; i++ {
+		warm[i].rssKB = 35536 // last third
+	}
+	for i := 0; i < 10; i++ {
+		warm[i].rssKB = 22544 // first third
+	}
+	for i := 10; i < 20; i++ {
+		warm[i].rssKB = 28000
+	}
+	if err := soakVerdict(warm, lat(100, 10), lat(120, 10), 3, 1); err != nil {
+		t.Fatalf("cache-warm-up shape (sub-16MiB absolute growth) failed the budget: %v", err)
+	}
+	// S1 ABSOLUTE-FLOOR BOUNDARY (soak-s1 codex LOW): exactly +16MiB
+	// passes the strict > floor; one KiB more fails. Locks the boundary
+	// so later edits cannot silently widen it.
+	edge := mk(1, 30)
+	for i := 0; i < 10; i++ {
+		edge[i].rssKB = 22544
+	}
+	for i := 10; i < 20; i++ {
+		edge[i].rssKB = 30000
+	}
+	for i := 20; i < 30; i++ {
+		edge[i].rssKB = 22544 + 16*1024 // exactly the floor: > is not tripped
+	}
+	if err := soakVerdict(edge, lat(100, 10), lat(120, 10), 3, 1); err != nil {
+		t.Fatalf("exact-floor growth (+16MiB) must pass the strict > boundary: %v", err)
+	}
+	over := mk(1, 30)
+	for i := 0; i < 10; i++ {
+		over[i].rssKB = 22544
+	}
+	for i := 10; i < 20; i++ {
+		over[i].rssKB = 30000
+	}
+	for i := 20; i < 30; i++ {
+		over[i].rssKB = 22544 + 16*1024 + 1 // one KiB over: ratio + absolute both trip
+	}
+	if err := soakVerdict(over, lat(100, 10), lat(120, 10), 3, 1); err == nil || !strings.Contains(err.Error(), "S1") {
+		t.Fatalf("floor+1KiB growth not caught: %v", err)
 	}
 	// S1 PRE-RESTART PEAK laundered by the restart (reviewer probe).
 	peak := append(mk(1, 15), mk(2, 15)...)

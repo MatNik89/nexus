@@ -706,3 +706,25 @@ func TestAppendBatchAllOrNothing(t *testing.T) {
 		t.Fatalf("poisoned batch left %d run-c events", count)
 	}
 }
+
+// SOAK S1 (2026-09-06): the journal's SQLite memory is BOUNDED BY
+// DESIGN — a capped connection pool (each pooled connection owns a page
+// cache, so unbounded pool = RSS growing with database size) and a
+// declared per-connection cache_size.
+func TestJournalPoolAndCacheBounded(t *testing.T) {
+	j := open(t, t.TempDir(), redact.None{})
+	if got := j.db.Stats().MaxOpenConnections; got != 4 {
+		t.Fatalf("connection pool unbounded or wrong cap: MaxOpenConnections=%d, want 4", got)
+	}
+	var cs int
+	if err := j.db.QueryRow("PRAGMA cache_size").Scan(&cs); err != nil {
+		t.Fatal(err)
+	}
+	// -1600 is deliberately NOT the driver default (-2000), so this
+	// assertion proves the DECLARATION took effect — dropping the
+	// pragma turns it RED (soak-s1 review kilo F2: asserting the
+	// default was vacuous).
+	if cs != -1600 {
+		t.Fatalf("cache_size not the declared non-default -1600: %d", cs)
+	}
+}
