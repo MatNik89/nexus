@@ -5,56 +5,41 @@
 # grant P0-capable (the doctor never self-certifies — codex T27 #3).
 # Usage: p0-accept.sh   (run from the repo root on the deployment host)
 #
-# PUBLICATION DISCIPLINE (fresh-audit codex #4): every input is validated
-# and every artifact is STAGED in the private work directory first; the
-# installed trust anchor and attestation are only replaced — atomically,
-# via same-directory rename — after the whole grade has passed. A failed
-# run never mutates the previously installed trust set.
+# PUBLICATION DISCIPLINE (fresh-audit codex #4 r3): every input is
+# validated and every artifact is STAGED first; the trust set publishes
+# as ONE generation directory activated by a single atomic pointer
+# rename. A failed or killed run never mutates the installed trust set.
 set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
-# --- PUBLISH: replace the installed trust SET (anchor + attestation +
-# signature) coherently. Each rename is atomic; a failure between them
-# would mix generations (fresh-audit codex #4 r2), so the previous set is
-# snapshotted first and ANY interrupted publication restores it in full.
+# --- PUBLISH: the trust SET (anchor + attestation + signature) is ONE
+# generation directory; <config>/nexus/trust/current is a symlink flipped
+# by a SINGLE atomic rename (fresh-audit codex #4 r3). A kill at ANY
+# point — SIGKILL included — leaves the previous complete generation
+# installed; an interrupted run leaves only an unreferenced staging dir.
+# topknot: prior generation dirs are retained for recovery, never pruned
+# automatically; prune by hand if the trust dir ever grows past taste.
 publish_trust_set() {
 	# $1=staged signers  $2=staged attestation  $3=staged signature
 	CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nexus"
-	OUT_DIR="$CONF_DIR/system"
-	mkdir -p "$OUT_DIR"
-	RB="$WORK/rollback"
-	mkdir -p "$RB"
-	for f in "$CONF_DIR/allowed_signers" "$OUT_DIR/acceptance.json" "$OUT_DIR/acceptance.json.sig"; do
-		[ -f "$f" ] && cp "$f" "$RB/$(basename "$f")"
-	done
-	rollback() {
-		for f in allowed_signers:"$CONF_DIR" acceptance.json:"$OUT_DIR" acceptance.json.sig:"$OUT_DIR"; do
-			name="${f%%:*}"; dir="${f#*:}"
-			if [ -f "$RB/$name" ]; then
-				cp "$RB/$name" "$dir/$name.rb" && mv "$dir/$name.rb" "$dir/$name"
-			else
-				rm -f "$dir/$name"
-			fi
-		done
-		echo "acceptance: interrupted publication ROLLED BACK — previous trust set restored" >&2
-	}
-	# fault seam for the rollback test ONLY (NEXUS_ACCEPT_TEST_FAIL_AFTER=n
-	# fails after the n-th rename); inert unless explicitly set.
-	step=0
-	fail_seam() {
-		step=$((step + 1))
-		[ "${NEXUS_ACCEPT_TEST_FAIL_AFTER:-}" = "$step" ] && { rollback; return 1; }
-		return 0
-	}
-	cp "$1" "$CONF_DIR/allowed_signers.tmp"
-	cp "$2" "$OUT_DIR/acceptance.json.tmp"
-	cp "$3" "$OUT_DIR/acceptance.json.sig.tmp"
-	if ! mv "$CONF_DIR/allowed_signers.tmp" "$CONF_DIR/allowed_signers"; then rollback; return 1; fi
-	fail_seam || return 1
-	if ! mv "$OUT_DIR/acceptance.json.tmp" "$OUT_DIR/acceptance.json"; then rollback; return 1; fi
-	fail_seam || return 1
-	if ! mv "$OUT_DIR/acceptance.json.sig.tmp" "$OUT_DIR/acceptance.json.sig"; then rollback; return 1; fi
+	TRUST="$CONF_DIR/trust"
+	GEN="gen-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+	mkdir -p "$TRUST/$GEN"
+	cp "$1" "$TRUST/$GEN/allowed_signers"
+	cp "$2" "$TRUST/$GEN/acceptance.json"
+	cp "$3" "$TRUST/$GEN/acceptance.json.sig"
+	# fault seams for the atomicity test ONLY; inert unless explicitly set.
+	if [ "${NEXUS_ACCEPT_TEST_KILL_AT:-}" = "stage" ]; then kill -KILL "$$"; fi
+	if [ "${NEXUS_ACCEPT_TEST_FAIL_AFTER:-}" = "stage" ]; then
+		echo "acceptance: publication interrupted BEFORE the pointer switch — previous generation still current" >&2
+		return 1
+	fi
+	if [ "${NEXUS_ACCEPT_TEST_KILL_AT:-}" = "switch" ]; then kill -KILL "$$"; fi
+	ln -s "$GEN" "$TRUST/current.new.$$"
+	# -T: replace the SYMLINK itself (never descend into the old target);
+	# GNU coreutils is a given on the Linux-only deployment target.
+	mv -T "$TRUST/current.new.$$" "$TRUST/current"
 	return 0
 }
 # TEST-ONLY entry (rollback conformance): publish the three given staged
@@ -98,7 +83,7 @@ JSON
 ssh-keygen -Y sign -f "$KEY" -n nexus-acceptance "$ATT_STAGE"
 publish_trust_set "$SIGNERS_STAGE" "$ATT_STAGE" "$ATT_STAGE.sig"
 # Install the EXACT graded binary so the running nexus matches the digest.
-echo "acceptance PASS — attestation written: $OUT_DIR/acceptance.json"
+echo "acceptance PASS — trust generation activated: ${XDG_CONFIG_HOME:-$HOME/.config}/nexus/trust/current"
 echo "install the graded binary (its sha256 must match at doctor time), e.g.:"
 echo "  install -m 0755 $BIN ~/bin/nexus   # before \$WORK is cleaned"
 INSTALL_TO="${NEXUS_INSTALL_TO:-}"

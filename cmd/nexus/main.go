@@ -892,7 +892,23 @@ func reminderReadiness(health string, hbAge time.Duration, hbExists, profilesOK 
 
 // verifyAcceptanceAttestation binds the grant to the graded binary.
 func verifyAcceptanceAttestation(layout pathx.Layout) (bool, string) {
-	raw, err := os.ReadFile(filepath.Join(layout.SystemDir(), "acceptance.json"))
+	// GENERATION POINTER (fresh-audit codex #4 r3): the trust set
+	// (anchor + attestation + signature) lives in one generation
+	// directory; <config>/trust/current is a symlink switched by a
+	// SINGLE atomic rename in p0-accept.sh — a kill at ANY point of
+	// publication leaves the previous complete generation installed.
+	// The pointer target is resolved ONCE and must be a bare directory
+	// name (no path traversal).
+	trustDir := filepath.Join(layout.Base, "trust")
+	genName, lerr := os.Readlink(filepath.Join(trustDir, "current"))
+	if lerr != nil {
+		return false, "no acceptance trust generation — run scripts/p0-accept.sh on this host"
+	}
+	if strings.ContainsAny(genName, "/\\") || genName == "." || genName == ".." {
+		return false, "trust generation pointer is not a bare directory name (fail closed)"
+	}
+	genDir := filepath.Join(trustDir, genName)
+	raw, err := os.ReadFile(filepath.Join(genDir, "acceptance.json"))
 	if err != nil {
 		return false, "no acceptance attestation — run scripts/p0-accept.sh on this host"
 	}
@@ -953,9 +969,8 @@ func verifyAcceptanceAttestation(layout pathx.Layout) (bool, string) {
 	if acceptanceSignerFingerprint == "" {
 		return false, "this build carries no pinned acceptance signer (build via scripts/p0-accept.sh)"
 	}
-	attPath := filepath.Join(layout.SystemDir(), "acceptance.json")
-	sigPath := attPath + ".sig"
-	signers := filepath.Join(layout.Base, "allowed_signers")
+	sigPath := filepath.Join(genDir, "acceptance.json.sig")
+	signers := filepath.Join(genDir, "allowed_signers")
 	if _, err := os.Stat(sigPath); err != nil {
 		return false, "acceptance attestation is UNSIGNED — run scripts/p0-accept.sh with NEXUS_RELEASE_KEY"
 	}

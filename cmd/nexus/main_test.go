@@ -1620,66 +1620,94 @@ func TestReminderReadinessBranches(t *testing.T) {
 	}
 }
 
-// FRESH-AUDIT codex #4 r2: the trust SET (anchor + attestation +
-// signature) publishes coherently — an interrupted publication restores
-// the ENTIRE previous generation, never a mixed one.
-func TestAcceptPublishRollbackRestoresWholeSet(t *testing.T) {
+// FRESH-AUDIT codex #4 r3: the trust SET publishes as ONE generation
+// directory behind a single atomically-switched pointer — ANY
+// interruption (cooperative failure or SIGKILL) before the switch leaves
+// the previous complete generation current; only the un-faulted run
+// flips the pointer, and the prior generation stays on disk for
+// recovery.
+func TestAcceptPublishGenerationSwitchIsAtomic(t *testing.T) {
 	root := repoRootFromCaller(t)
 	conf := t.TempDir()
-	sysDir := filepath.Join(conf, "nexus", "system")
-	if err := os.MkdirAll(sysDir, 0o700); err != nil {
+	script := filepath.Join(root, "scripts", "p0-accept.sh")
+	stageSet := func(names [3]string) [3]string {
+		dir := t.TempDir()
+		var out [3]string
+		for i, c := range names {
+			p := filepath.Join(dir, fmt.Sprintf("s%d", i))
+			if err := os.WriteFile(p, []byte(c+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			out[i] = p
+		}
+		return out
+	}
+	readCurrent := func() map[string]string {
+		t.Helper()
+		got := map[string]string{}
+		base := filepath.Join(conf, "nexus", "trust", "current")
+		for _, n := range []string{"allowed_signers", "acceptance.json", "acceptance.json.sig"} {
+			b, err := os.ReadFile(filepath.Join(base, n))
+			if err != nil {
+				t.Fatalf("current generation incomplete: %v", err)
+			}
+			got[n] = string(b)
+		}
+		return got
+	}
+	publish := func(staged [3]string, extraEnv ...string) ([]byte, error) {
+		cmd := exec.Command("sh", script, staged[0], staged[1], staged[2])
+		cmd.Env = append(append(os.Environ(), "XDG_CONFIG_HOME="+conf,
+			"NEXUS_ACCEPT_TEST_PUBLISH_ONLY=1"), extraEnv...)
+		return cmd.CombinedOutput()
+	}
+	// Baseline generation installs cleanly.
+	oldSet := stageSet([3]string{"OLD-ANCHOR", "OLD-ATT", "OLD-SIG"})
+	if out, err := publish(oldSet); err != nil {
+		t.Fatalf("baseline publication failed: %v\n%s", err, out)
+	}
+	oldGen, err := os.Readlink(filepath.Join(conf, "nexus", "trust", "current"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	prior := map[string]string{
-		filepath.Join(conf, "nexus", "allowed_signers"): "OLD-ANCHOR\n",
-		filepath.Join(sysDir, "acceptance.json"):        "OLD-ATT\n",
-		filepath.Join(sysDir, "acceptance.json.sig"):    "OLD-SIG\n",
+	want := map[string]string{"allowed_signers": "OLD-ANCHOR\n",
+		"acceptance.json": "OLD-ATT\n", "acceptance.json.sig": "OLD-SIG\n"}
+	newSet := stageSet([3]string{"NEW-ANCHOR", "NEW-ATT", "NEW-SIG"})
+	// Interruption class 1: cooperative failure before the switch.
+	if out, err := publish(newSet, "NEXUS_ACCEPT_TEST_FAIL_AFTER=stage"); err == nil {
+		t.Fatalf("interrupted publication exited 0:\n%s", out)
 	}
-	for p, c := range prior {
-		if err := os.WriteFile(p, []byte(c), 0o600); err != nil {
-			t.Fatal(err)
+	// Interruption class 2: SIGKILL — no rollback code can run; only the
+	// pointer discipline protects the set. "stage" kills after staging,
+	// "switch" kills at the LAST instant before the atomic rename: in
+	// BOTH cases the complete old generation must stay current.
+	for _, at := range []string{"stage", "switch"} {
+		if _, err := publish(newSet, "NEXUS_ACCEPT_TEST_KILL_AT="+at); err == nil {
+			t.Fatalf("SIGKILLed publication (%s) exited 0", at)
 		}
 	}
-	stage := t.TempDir()
-	var staged []string
-	for i, c := range []string{"NEW-ANCHOR\n", "NEW-ATT\n", "NEW-SIG\n"} {
-		p := filepath.Join(stage, fmt.Sprintf("s%d", i))
-		if err := os.WriteFile(p, []byte(c), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		staged = append(staged, p)
-	}
-	script := filepath.Join(root, "scripts", "p0-accept.sh")
-	// Fail after each rename step in turn: EVERY interruption point must
-	// restore the complete OLD generation.
-	for _, step := range []string{"1", "2"} {
-		cmd := exec.Command("sh", script, staged[0], staged[1], staged[2])
-		cmd.Env = append(os.Environ(), "XDG_CONFIG_HOME="+conf,
-			"NEXUS_ACCEPT_TEST_PUBLISH_ONLY=1", "NEXUS_ACCEPT_TEST_FAIL_AFTER="+step)
-		if out, err := cmd.CombinedOutput(); err == nil {
-			t.Fatalf("step %s: interrupted publication exited 0:\n%s", step, out)
-		}
-		for p, want := range prior {
-			got, err := os.ReadFile(p)
-			if err != nil || string(got) != want {
-				t.Fatalf("step %s: %s not restored (got %q, err %v) — MIXED trust generation", step, p, got, err)
-			}
+	for n, w := range want {
+		if got := readCurrent()[n]; got != w {
+			t.Fatalf("after interruptions %s = %q, want %q — MIXED trust generation", n, got, w)
 		}
 	}
-	// And the un-faulted publication installs the complete NEW set.
-	cmd := exec.Command("sh", script, staged[0], staged[1], staged[2])
-	cmd.Env = append(os.Environ(), "XDG_CONFIG_HOME="+conf, "NEXUS_ACCEPT_TEST_PUBLISH_ONLY=1")
-	if out, err := cmd.CombinedOutput(); err != nil {
+	if g, _ := os.Readlink(filepath.Join(conf, "nexus", "trust", "current")); g != oldGen {
+		t.Fatalf("pointer moved to %q during interrupted publications", g)
+	}
+	// The un-faulted publication flips the pointer to the complete NEW
+	// set and RETAINS the previous generation for recovery.
+	if out, err := publish(newSet); err != nil {
 		t.Fatalf("clean publication failed: %v\n%s", err, out)
 	}
-	for p, want := range map[string]string{
-		filepath.Join(conf, "nexus", "allowed_signers"): "NEW-ANCHOR\n",
-		filepath.Join(sysDir, "acceptance.json"):        "NEW-ATT\n",
-		filepath.Join(sysDir, "acceptance.json.sig"):    "NEW-SIG\n",
-	} {
-		if got, err := os.ReadFile(p); err != nil || string(got) != want {
-			t.Fatalf("clean publication: %s = %q (%v), want %q", p, got, err, want)
+	got := readCurrent()
+	for n, w := range map[string]string{"allowed_signers": "NEW-ANCHOR\n",
+		"acceptance.json": "NEW-ATT\n", "acceptance.json.sig": "NEW-SIG\n"} {
+		if got[n] != w {
+			t.Fatalf("clean publication: %s = %q, want %q", n, got[n], w)
 		}
+	}
+	if _, err := os.Stat(filepath.Join(conf, "nexus", "trust", oldGen, "allowed_signers")); err != nil {
+		t.Fatalf("previous generation not retained for recovery: %v", err)
 	}
 }
 

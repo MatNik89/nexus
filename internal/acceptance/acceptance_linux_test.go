@@ -85,6 +85,7 @@ type world struct {
 	bot       *fakeBot
 	extraEnv  []string
 	pinnedBin string
+	genN      int
 	// providerDelay stretches every provider turn (chaos harness: widens
 	// the admitted-but-not-terminal window so random kills provably land
 	// in flight).
@@ -805,8 +806,22 @@ func localMachineSHA(t *testing.T) string {
 
 func writeAttestationMachine(t *testing.T, w *world, digest, host, machine string) {
 	t.Helper()
-	dir := filepath.Join(w.base, "nexus", "system")
+	// The trust set is ONE generation dir behind the atomically-switched
+	// trust/current pointer (fresh-audit codex #4 r3) — the fixture
+	// publishes exactly like scripts/p0-accept.sh.
+	trust := filepath.Join(w.base, "nexus", "trust")
+	w.genN++
+	gen := fmt.Sprintf("gen-test-%d", w.genN)
+	dir := filepath.Join(trust, gen)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	key := w.ownerKey(t)
+	signers, err := os.ReadFile(filepath.Join(w.base, "nexus", "allowed_signers"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "allowed_signers"), signers, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	attPath := filepath.Join(dir, "acceptance.json")
@@ -817,11 +832,27 @@ func writeAttestationMachine(t *testing.T, w *world, digest, host, machine strin
 	}
 	// SIGN it as the owner (T27-r2 codex #2): unsigned JSON is not
 	// evidence; the world carries its own owner key + allowed_signers.
-	key := w.ownerKey(t)
-	os.Remove(attPath + ".sig")
 	if out, err := exec.Command("ssh-keygen", "-Y", "sign", "-f", key, "-n", "nexus-acceptance", attPath).CombinedOutput(); err != nil {
 		t.Fatalf("attestation sign: %v\n%s", err, out)
 	}
+	tmp := filepath.Join(trust, fmt.Sprintf("current.new.%d", w.genN))
+	if err := os.Symlink(gen, tmp); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, filepath.Join(trust, "current")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// trustCurrent resolves the world's installed trust generation dir.
+func (w *world) trustCurrent(t *testing.T) string {
+	t.Helper()
+	link := filepath.Join(w.base, "nexus", "trust", "current")
+	gen, err := os.Readlink(link)
+	if err != nil {
+		t.Fatalf("no trust generation: %v", err)
+	}
+	return filepath.Join(w.base, "nexus", "trust", gen)
 }
 
 // pinnedDoctorBin builds (once per world) a nexus binary whose
@@ -973,7 +1004,7 @@ func TestDoctorP0GrantLive(t *testing.T) {
 	}
 	// A FORGED (unsigned) attestation withdraws the grant even with a
 	// correct digest (codex-r2 #2).
-	os.Remove(filepath.Join(w.base, "nexus", "system", "acceptance.json.sig"))
+	os.Remove(filepath.Join(w.trustCurrent(t), "acceptance.json.sig"))
 	outForged, codeForged := run(w.env())
 	if codeForged == 0 || strings.Contains(outForged, "P0-capable") {
 		t.Fatalf("unsigned attestation granted (exit %d):\n%s", codeForged, outForged)
@@ -985,7 +1016,7 @@ func TestDoctorP0GrantLive(t *testing.T) {
 	if out, err := exec.Command("ssh-keygen", "-t", "ed25519", "-N", "", "-C", "ra", "-f", rogueAnchor).CombinedOutput(); err != nil {
 		t.Fatalf("rogue anchor keygen: %v\n%s", err, out)
 	}
-	signersPath := filepath.Join(w.base, "nexus", "allowed_signers")
+	signersPath := filepath.Join(w.trustCurrent(t), "allowed_signers")
 	origSigners, err := os.ReadFile(signersPath)
 	if err != nil {
 		t.Fatal(err)
@@ -994,7 +1025,7 @@ func TestDoctorP0GrantLive(t *testing.T) {
 	if err := os.WriteFile(signersPath, []byte("owner "+string(roguePub)), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	attP := filepath.Join(w.base, "nexus", "system", "acceptance.json")
+	attP := filepath.Join(w.trustCurrent(t), "acceptance.json")
 	os.Remove(attP + ".sig")
 	if out, err := exec.Command("ssh-keygen", "-Y", "sign", "-f", rogueAnchor, "-n", "nexus-acceptance", attP).CombinedOutput(); err != nil {
 		t.Fatalf("rogue anchor sign: %v\n%s", err, out)
@@ -1012,7 +1043,9 @@ func TestDoctorP0GrantLive(t *testing.T) {
 	shimDir := filepath.Join(w.base, "shim")
 	os.MkdirAll(shimDir, 0o700)
 	os.WriteFile(filepath.Join(shimDir, "ssh-keygen"), []byte("#!/bin/sh\nexit 0\n"), 0o755)
-	os.Remove(attP + ".sig") // unsigned + zero-exit shim: must STILL refuse
+	// unsigned + zero-exit shim: must STILL refuse (resolve the CURRENT
+	// generation — the pointer moved since attP was computed)
+	os.Remove(filepath.Join(w.trustCurrent(t), "acceptance.json.sig"))
 	envShim := append([]string{}, w.env()...)
 	for i, e := range envShim {
 		if strings.HasPrefix(e, "PATH=") {
@@ -1030,7 +1063,7 @@ func TestDoctorP0GrantLive(t *testing.T) {
 	if out, err := exec.Command("ssh-keygen", "-t", "ed25519", "-N", "", "-C", "rogue", "-f", rogue).CombinedOutput(); err != nil {
 		t.Fatalf("rogue keygen: %v\n%s", err, out)
 	}
-	attPath := filepath.Join(w.base, "nexus", "system", "acceptance.json")
+	attPath := filepath.Join(w.trustCurrent(t), "acceptance.json")
 	os.Remove(attPath + ".sig")
 	if out, err := exec.Command("ssh-keygen", "-Y", "sign", "-f", rogue, "-n", "nexus-acceptance", attPath).CombinedOutput(); err != nil {
 		t.Fatalf("rogue sign: %v\n%s", err, out)
