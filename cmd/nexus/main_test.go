@@ -1503,12 +1503,21 @@ func TestMachineIDCheckScriptMirrorsDoctor(t *testing.T) {
 	// falls through to ownership — the r5 slurp no-op refused it as
 	// malformed, diverging from the verifier (prep-low fix).
 	if os.Geteuid() != 0 {
-		reason, err := runReason(mk("padded", " "+strings.TrimSuffix(valid, "\n")+" \n", 0o644))
-		if err == nil {
-			t.Fatal("padded id on a user-owned file accepted")
-		}
-		if !strings.Contains(reason, "not root-owned") {
-			t.Fatalf("padded id refused as content (script diverges from Go): %q", reason)
+		for name, content := range map[string]string{
+			"padded": " " + strings.TrimSuffix(valid, "\n") + " \n",
+			// Leading LF: a per-line trim keeps the empty first record
+			// while Go strips it (prep-low codex r2) — the contract is a
+			// WHOLE-byte-sequence outer trim of [ \t\r\n].
+			"leadlf": "\n" + valid,
+			"outmix": " \t" + strings.TrimSuffix(valid, "\n") + "\r\n",
+		} {
+			reason, err := runReason(mk(name, content, 0o644))
+			if err == nil {
+				t.Fatalf("%s id on a user-owned file accepted", name)
+			}
+			if !strings.Contains(reason, "not root-owned") {
+				t.Fatalf("%s id refused as content (script diverges from Go): %q", name, reason)
+			}
 		}
 	}
 	// A symlink must refuse FOR THE SYMLINK REASON (first check).
