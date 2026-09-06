@@ -1410,6 +1410,12 @@ func TestMachineIDValidation(t *testing.T) {
 	if err := validateMachineID("0123456789abcdef0123456789abcdef"); err != nil {
 		t.Fatalf("valid machine id rejected: %v", err)
 	}
+	// TRIM CONTRACT: the doctor strips ONLY the ASCII set [ \t\r\n], so a
+	// U+00A0-padded id must be refused — Unicode TrimSpace would accept
+	// it and diverge from the shell checker (prep-low codex parity).
+	if err := validateMachineID(trimMachineID(" 0123456789abcdef0123456789abcdef ")); err == nil {
+		t.Fatal("NBSP-padded machine id survived the ASCII trim contract")
+	}
 	// A user-owned identity file is NOT a trust root (meaningless when
 	// the suite itself runs as root — then the fixture IS root-owned).
 	if os.Geteuid() != 0 {
@@ -1479,6 +1485,11 @@ func TestMachineIDCheckScriptMirrorsDoctor(t *testing.T) {
 		// NUL-spliced: shell substitution would silently drop the NUL
 		// and normalize to valid 32-hex while Go refuses (r5 codex).
 		"nulsplice": "0123456789abcdef\x000123456789abcdef\n",
+		// U+00A0 NO-BREAK SPACE padding: the trim contract is the ASCII
+		// set [ \t\r\n] ONLY, so NBSP is malformed on BOTH sides — a
+		// locale-dependent [[:space:]] or Unicode TrimSpace diverges
+		// here (prep-low codex parity probe).
+		"nbsppad": "\u00a0" + strings.TrimSuffix(valid, "\n") + "\n",
 	} {
 		reason, err := runReason(mk(name, content, 0o644))
 		if err == nil {
@@ -1486,6 +1497,39 @@ func TestMachineIDCheckScriptMirrorsDoctor(t *testing.T) {
 		}
 		if !strings.Contains(reason, "malformed") {
 			t.Fatalf("%s refused for the wrong reason (content check not causal): %q", name, reason)
+		}
+	}
+	// A WHITESPACE-PADDED id passes content (the shared ASCII [ \t\r\n]
+	// contract of trimMachineID) and falls through to ownership — the r5
+	// slurp no-op refused it as malformed, diverging from the verifier
+	// (prep-low fix). Runs under EVERY uid (prep-low codex r3): under
+	// root the fixture IS root-owned so the checker must SUCCEED; under
+	// non-root the exact "not root-owned" refusal is the evidence that
+	// content validation accepted the trimmed id. Either way, a
+	// "malformed" result is a trim-contract divergence.
+	for name, content := range map[string]string{
+		"padded": " " + strings.TrimSuffix(valid, "\n") + " \n",
+		// Leading LF: a per-line trim keeps the empty first record
+		// while Go strips it (prep-low codex r2) — the contract is a
+		// WHOLE-byte-sequence outer trim of [ \t\r\n].
+		"leadlf": "\n" + valid,
+		"outmix": " \t" + strings.TrimSuffix(valid, "\n") + "\r\n",
+	} {
+		reason, err := runReason(mk(name, content, 0o644))
+		if strings.Contains(reason, "malformed") {
+			t.Fatalf("%s id refused as content (script diverges from Go): %q", name, reason)
+		}
+		if os.Geteuid() == 0 {
+			if err != nil {
+				t.Fatalf("%s id refused on a root-owned fixture: %q", name, reason)
+			}
+		} else {
+			if err == nil {
+				t.Fatalf("%s id on a user-owned file accepted", name)
+			}
+			if !strings.Contains(reason, "not root-owned") {
+				t.Fatalf("%s id refused for the wrong reason: %q", name, reason)
+			}
 		}
 	}
 	// A symlink must refuse FOR THE SYMLINK REASON (first check).

@@ -1008,12 +1008,20 @@ func machineIDSHAAt(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	id := strings.TrimSpace(string(raw))
+	id := trimMachineID(string(raw))
 	if err := validateMachineID(id); err != nil {
 		return "", fmt.Errorf("%s: %w", path, err)
 	}
 	sum := sha256.Sum256([]byte(id))
 	return hex.EncodeToString(sum[:]), nil
+}
+
+// trimMachineID strips EXACTLY the ASCII set [ \t\r\n] — the shared
+// trim contract with scripts/machine-id-check.sh (prep-low codex). Never
+// locale/Unicode whitespace: a U+00A0-padded id stays malformed on BOTH
+// sides instead of diverging.
+func trimMachineID(raw string) string {
+	return strings.Trim(raw, " \t\r\n")
 }
 
 // validateMachineID enforces the systemd machine-id shape.
