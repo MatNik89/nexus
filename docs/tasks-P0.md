@@ -408,3 +408,14 @@ Decay+Audn (P1) · transactional Activator (P4+) · entropy secret detection (P4
 SemanticHealth evaluator (P2+; C8's two positive signals ARE in T17/T20) · upcast
 chain/quarantine (v2) · native sandbox helper (P1 hardening) · plugin channels (P) ·
 coding trio TIA/symedit/deep evidence (P1).
+
+### Prep-low convergence (LOW-severity leak closure, 2026-09-06)
+Branch slice/p0-prep-low: the 2 LOWs that slipped through earlier PASS
+verdicts (sed slurp no-op mirror; suspended-turn redelivery recovery) plus
+codex's escalation chain on the trim contract. 4 rounds: r1 sed per-line +
+recovery case → r2 shared ASCII [ \t\r\n] contract (trimMachineID) +
+Suspend-built redelivery test with success-beats-suspension assert → r3
+whole-byte-sequence shell trim (leading-LF parity) → r4 uid-independent
+fixture table + stale comments. Every fold ablation-proven RED on
+committed state. Verdicts: codex FAIL×3→PASS, kilo PASS×4, agy PASS×4.
+Review prompts now state: FAIL for ANY unresolved finding of ANY severity.
