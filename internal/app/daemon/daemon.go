@@ -206,24 +206,26 @@ func (d *Daemon) handle(ctx context.Context, conn net.Conn) {
 		}
 		turn := contracts.TurnID(fmt.Sprintf("turn-%d-%d-%d", d.nonce, session, msgN))
 		run := contracts.RunID(fmt.Sprintf("run-%d-%d-%d", d.nonce, session, msgN))
-		blocks := []contracts.ContextBlock{block}
-		if len(hist) > 0 {
-			var sb strings.Builder
-			start := 0
-			if len(hist) > 12 {
-				start = len(hist) - 12
-			}
-			for _, h := range hist[start:] {
-				fmt.Fprintf(&sb, "User: %s\nNEXUS: %s\n", h.user, h.final)
-			}
-			hb, hbErr := sourcedBlock(fmt.Sprintf("hist-%d-%d", session, msgN),
-				"Recent conversation with this user (oldest first):\n"+sb.String(),
-				"nexus://repl/history", "daemon")
-			if hbErr == nil {
-				hb.Kind = "conversation_history"
-				blocks = append([]contracts.ContextBlock{hb}, blocks...)
-			}
+		start := 0
+		if len(hist) > 12 {
+			start = len(hist) - 12
 		}
+		window := hist[start:]
+		ids := make([]string, len(window))
+		for i := range window {
+			ids[i] = fmt.Sprintf("%d", i)
+		}
+		hb, hbErr := historyBlocks(fmt.Sprintf("repl-%d", session), "nexus://repl/history", ids,
+			func(id string) (string, string) {
+				var i int
+				fmt.Sscanf(id, "%d", &i)
+				return window[i].user, window[i].final
+			})
+		if hbErr != nil {
+			writeFrame(conn, frame{Type: "error", Text: "history assembly failed"})
+			continue
+		}
+		blocks := append(hb, block)
 		final, terr := l.RunTurn(ctx, turn, run, d.deps.Profile, blocks)
 		if terr != nil {
 			// Typed sentinels keep their names (NEEDS_APPROVAL etc.);
@@ -260,12 +262,11 @@ func (d *Daemon) RunChannelTurn(ctx context.Context, identity string, updateID i
 	// CONVERSATION HISTORY (dogfood 2026-09-07): without it every turn
 	// answered "no prior context". The recent history of THIS identity
 	// rides in as one chronological block ahead of the current message.
-	blocks := []contracts.ContextBlock{block}
-	if hist, herr := d.conversationHistory(identity, turn); herr != nil {
+	hist, herr := d.conversationHistory(identity, turn)
+	if herr != nil {
 		return "", fmt.Errorf("conversation history: %w", herr)
-	} else if hist != nil {
-		blocks = append([]contracts.ContextBlock{*hist}, blocks...)
 	}
+	blocks := append(hist, block)
 	final, err := l.RunTurn(ctx, turn, run, d.deps.Profile, blocks)
 	if err != nil {
 		// Crash between turn completion and channel delivery (Phase-5-r3
@@ -308,7 +309,7 @@ func (d *Daemon) RunChannelTurn(ctx context.Context, identity string, updateID i
 // topknot: full journal replay per turn is O(events); acceptable at P0
 // message volumes — trigger for a transcript projection: replay latency
 // visibly lagging a chat turn.
-func (d *Daemon) conversationHistory(identity string, current contracts.TurnID) (*contracts.ContextBlock, error) {
+func (d *Daemon) conversationHistory(identity string, current contracts.TurnID) ([]contracts.ContextBlock, error) {
 	const historyMaxPairs = 12
 	const entryCap = 1500
 	prefix := "turn-chan-" + identity + "-"
@@ -361,36 +362,50 @@ func (d *Daemon) conversationHistory(identity string, current contracts.TurnID) 
 	if len(order) > historyMaxPairs {
 		order = order[len(order)-historyMaxPairs:]
 	}
+	return historyBlocks(identity, "nexus://telegram/"+identity+"/history", order, func(id string) (string, string) {
+		return pairs[id].user, pairs[id].final
+	})
+}
+
+// historyBlocks emits history_user/history_assistant blocks with
+// zero-padded BlockIDs so the planner reconstructs chronology. The
+// stolen shape (karfly/chatgpt_telegram_bot and every mature Telegram
+// AI gateway): history is alternating ROLE messages, FIFO-capped —
+// past finals reach the model as the assistant role, so model output
+// is never re-minted as user-trust text.
+//
+// topknot: full-journal replay per channel turn is O(events);
+// acceptable at P0 volumes — trigger for a transcript projection:
+// replay latency visibly lagging a chat turn.
+func historyBlocks(scope, sourceURI string, order []string, get func(id string) (user, final string)) ([]contracts.ContextBlock, error) {
+	const entryCap = 1500
 	clip := func(s string) string {
 		if len(s) > entryCap {
 			return s[:entryCap] + "…"
 		}
 		return s
 	}
-	var sb strings.Builder
-	for _, id := range order {
-		pr := pairs[id]
-		if pr.user == "" && pr.final == "" {
-			continue
+	var out []contracts.ContextBlock
+	for i, id := range order {
+		user, final := get(id)
+		if user != "" {
+			b, err := sourcedBlock(fmt.Sprintf("hist-%s-%06d-a-user", scope, i), clip(user), sourceURI, "daemon")
+			if err != nil {
+				return nil, err
+			}
+			b.Kind = "history_user"
+			out = append(out, b)
 		}
-		if pr.user != "" {
-			fmt.Fprintf(&sb, "User: %s\n", clip(pr.user))
-		}
-		if pr.final != "" {
-			fmt.Fprintf(&sb, "NEXUS: %s\n", clip(pr.final))
+		if final != "" {
+			b, err := sourcedBlock(fmt.Sprintf("hist-%s-%06d-b-nexus", scope, i), clip(final), sourceURI, "daemon")
+			if err != nil {
+				return nil, err
+			}
+			b.Kind = "history_assistant"
+			out = append(out, b)
 		}
 	}
-	if sb.Len() == 0 {
-		return nil, nil
-	}
-	content := "Recent conversation with this user (oldest first):\n" + sb.String()
-	blk, err := sourcedBlock("chan-history-"+identity, content,
-		"nexus://telegram/"+identity+"/history", "daemon")
-	if err != nil {
-		return nil, err
-	}
-	blk.Kind = "conversation_history"
-	return &blk, nil
+	return out, nil
 }
 
 func (d *Daemon) completedTurnFinal(turn contracts.TurnID) (string, bool, error) {
