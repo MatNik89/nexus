@@ -3,6 +3,7 @@ package planner
 
 import (
 	"encoding/json"
+	"io"
 	"strings"
 
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
@@ -59,8 +60,8 @@ func topLevelWalk(raw string) (pairs [][2]string, whole bool) {
 			}
 		}
 	}
-	if _, err := dec.Token(); err == nil {
-		return nil, false // trailing content: not one whole object
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, false // trailing content (even malformed): not one whole object
 	}
 	return pairs, true
 }
@@ -131,16 +132,14 @@ func classifyView(reply string) (view string, stillFenced bool) {
 	if !strings.HasPrefix(t, "```") {
 		return t, false
 	}
-	// drop the opening fence line and a trailing fence line
-	lines := strings.SplitN(t, "\n", 2)
-	if len(lines) < 2 {
+	// STRICT wrapping fence only (impl review codex #4): the LAST
+	// non-empty line must be exactly ``` and nothing may follow it —
+	// an unclosed fence or fence-then-prose is prose, not a view.
+	lines := strings.Split(t, "\n")
+	if len(lines) < 2 || strings.TrimSpace(lines[len(lines)-1]) != "```" {
 		return t, true
 	}
-	body := lines[1]
-	if i := strings.LastIndex(body, "```"); i >= 0 {
-		body = body[:i]
-	}
-	body = strings.TrimSpace(body)
+	body := strings.TrimSpace(strings.Join(lines[1:len(lines)-1], "\n"))
 	return body, strings.HasPrefix(body, "```")
 }
 

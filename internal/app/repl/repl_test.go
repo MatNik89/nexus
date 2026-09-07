@@ -80,3 +80,37 @@ func TestRenderStreamingAndErrors(t *testing.T) {
 		t.Fatalf("prompt with mode not rendered: %q", got)
 	}
 }
+
+// TGOUT impl codex #1/#7: a drift error frame maps STRUCTURALLY at the
+// repl edge — the Croatian message, never the raw text field.
+func TestDriftFrameMapsStructurally(t *testing.T) {
+	dir := t.TempDir()
+	sock := dir + "/s.sock"
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		r := bufio.NewReader(conn)
+		r.ReadString('\n') // hello
+		r.ReadString('\n') // chat
+		conn.Write([]byte(`{"type":"error","text":"opaque-safe-message","code":"TOOL_SCHEMA_DRIFT","tool":"memory_recall"}` + "\n"))
+	}()
+	in := strings.NewReader("do it\n")
+	var out strings.Builder
+	if err := Run(in, &out, sock, false); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "Nisam uspio ispravno pozvati alat (memory_recall)") {
+		t.Fatalf("drift not mapped at the edge: %q", out.String())
+	}
+	if strings.Contains(out.String(), "opaque-safe-message") {
+		t.Fatalf("edge leaked the raw text instead of mapping the code: %q", out.String())
+	}
+}

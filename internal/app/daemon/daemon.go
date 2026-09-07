@@ -289,7 +289,7 @@ func (d *Daemon) RunChannelTurn(ctx context.Context, identity string, updateID i
 		}
 		if ok {
 			switch {
-			case rec.Kind == "FAILED" && rec.Code != "":
+			case rec.Kind == "FAILED" && rec.Code == "TOOL_SCHEMA_DRIFT":
 				// Reconstructed typed outcome (tgout: restart-stable
 				// drift recovery) — the edge maps the code; constants
 				// are reconstructed for this code by contract.

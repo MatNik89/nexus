@@ -50,8 +50,9 @@ func validateRendered(t *testing.T, out string) {
 			t.Fatalf("unescaped %q outside renderer tags: %q", c, out)
 		}
 	}
-	if m := regexp.MustCompile(`&[^#a-zA-Z]`).FindString(outside.String()); m != "" {
-		t.Fatalf("raw ampersand outside entities: %q in %q", m, out)
+	deent := regexp.MustCompile(`&(amp|lt|gt|quot|#[0-9]+|#x[0-9a-fA-F]+);`).ReplaceAllString(outside.String(), "")
+	if strings.Contains(deent, "&") {
+		t.Fatalf("raw ampersand outside entities in %q", out)
 	}
 	if strings.Contains(out, "<b></b>") || strings.Contains(out, "<code></code>") || strings.Contains(out, "<pre></pre>") {
 		t.Fatalf("EMPTY tag emitted: %q", out)
@@ -81,6 +82,8 @@ func TestRenderHTMLPropertyValidator(t *testing.T) {
 		"| A | B |\n|---|---|\n| `x|y` | 2 |",
 		"**use `ls` now** overlapping-ish spans",
 		"`code with **bold** inside` must not nest",
+		"A&B raw ampersand",
+		"| Name | Role |\n|---|---|\n| ana | ana |",
 		strings.Repeat("**b** ", 200),
 		strings.Repeat("x", 5000),
 		"| H1 | H2 |\n|---|---|\n| v1 | v2 | v3 |",

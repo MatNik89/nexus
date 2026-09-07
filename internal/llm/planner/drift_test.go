@@ -116,6 +116,9 @@ func TestDeclaredProseLimits(t *testing.T) {
 		"other-key":        `{"description":"memory_recall"}`,
 		"double-fenced":    "```\n```json\n{\"action\":\"memory_recall\"}\n```\n```",
 		"mixed":            "Sure! Here it is: {\"action\":\"memory_recall\"}",
+		"trailing-prose":   "{\"action\":\"memory_recall\"} trailing prose",
+		"unclosed-fence":   "```json\n{\"action\":\"memory_recall\"}",
+		"fence-then-prose": "```json\n{\"action\":\"memory_recall\"}\n```\nthis is prose",
 	} {
 		a, err, _ := planDrift(t, reply)
 		if err != nil || a.Final == nil {

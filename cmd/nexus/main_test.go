@@ -1802,3 +1802,40 @@ func TestTrustPointerNeverUnresolvableUnderConcurrentPublish(t *testing.T) {
 	default:
 	}
 }
+
+// TGOUT impl #7: the Telegram edge maps the drift code to the exact
+// Croatian message — live path, structural extraction.
+func TestTelegramEdgeMapsDriftCroatian(t *testing.T) {
+	b := hitlBundle(t, "TG_DRIFT")
+	// Force a drift by planting a durable drifted turn and colliding.
+	turn := contracts.TurnID("turn-chan-chat-42-31")
+	for i, evt := range []struct{ typ, payload string }{
+		{"turn.failed", `{"turn_id":"turn-chan-chat-42-31","error_code":"TOOL_SCHEMA_DRIFT","tool":"memory_recall"}`},
+		{"turn.created", `{"turn_id":"turn-chan-chat-42-31"}`},
+	} {
+		id := contracts.EventID(fmt.Sprintf("ev-tgd-%d", i))
+		if evt.typ == "turn.created" {
+			id = "ev-turn-chan-chat-42-31-turn.created-1"
+		}
+		if _, err := b.j.Append(context.Background(), contracts.EnvelopeParams{
+			SchemaID: "nexus.event", SchemaVersion: 1,
+			EventID: id, EventType: evt.typ,
+			RunID: "run-chan-chat-42-31", TurnID: &turn, EmittedAt: time.Now().UTC(),
+			ActorType: contracts.ActorSystem, ActorID: "loop", PrincipalID: "nexus",
+			WorkspaceID: "local", ProfileID: "private", AttemptNo: 1,
+			Payload: []byte(evt.payload), PayloadHash: "recomputed",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reply, err := telegramHandler(b)(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 31,
+		Text: "anything", Profile: "private"})
+	if err != nil {
+		t.Fatalf("edge did not map the drift: %v", err)
+	}
+	want := "Nisam uspio ispravno pozvati alat (memory_recall). Preformuliraj zahtjev."
+	if reply != want {
+		t.Fatalf("wrong Croatian mapping: %q, want %q", reply, want)
+	}
+}

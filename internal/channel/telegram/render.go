@@ -164,13 +164,14 @@ func renderTableBlock(block []string) (string, int, bool) {
 	for idx, row := range block[2:] {
 		cells := splitCells(row)
 		heading := ""
+		headingIdx := -1 // index INTO data of the cell promoted to heading
 		var data []string
 		if len(cells) == len(headers)+1 && cells[0] != "" {
 			heading, data = cells[0], cells[1:]
 		} else {
-			for _, c := range cells {
+			for hi, c := range cells {
 				if c != "" {
-					heading = c
+					heading, headingIdx = c, hi
 					break
 				}
 			}
@@ -191,8 +192,9 @@ func renderTableBlock(block []string) (string, int, bool) {
 			if val == "" {
 				val = "—" // lossless: empty cell -> placeholder
 			}
-			if val == heading && ci < len(headers) {
-				continue // hermes rule: skip the bullet duplicating the heading
+			if ci == headingIdx {
+				continue // skip ONLY the promoted heading cell itself
+				// (impl codex #2: equal VALUES elsewhere are real data)
 			}
 			b.WriteString("• " + html.EscapeString(label) + ": " + html.EscapeString(val) + "\n")
 		}

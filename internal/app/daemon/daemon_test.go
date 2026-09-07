@@ -1110,3 +1110,91 @@ func TestResumedWithoutTerminalSuppressesChallenge(t *testing.T) {
 		t.Fatalf("stale challenge replayed after resume: %q", out)
 	}
 }
+
+// TGOUT impl #7: a drifted turn NEVER enters conversation history as an
+// assistant reply (history folds only turn.succeeded).
+func TestDriftTurnExcludedFromHistory(t *testing.T) {
+	seq := 0
+	p := &mixedPlanner{}
+	d, _, j := testDaemon(t, p, nil)
+	core, err := channel.New(j)
+	if err != nil {
+		t.Fatal(err)
+	}
+	send := func(uid int64, text string) {
+		t.Helper()
+		seq++
+		if _, err := core.Admit(context.Background(), channel.Inbound{
+			AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: uid,
+			Text: text, Profile: "work"}); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = d.RunChannelTurn(context.Background(), "chat-42", uid, text)
+	}
+	send(1, "normal question")
+	send(2, "DRIFT trigger")
+	send(3, "third message")
+	hist, err := d.conversationHistory("chat-42", "turn-chan-chat-42-99")
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := ""
+	for _, b := range hist {
+		joined += *b.Content + "\n"
+	}
+	if strings.Contains(joined, "DRIFT trigger") {
+		t.Fatalf("drifted turn's user message entered history as a completed pair:\n%s", joined)
+	}
+	if !strings.Contains(joined, "normal question") || !strings.Contains(joined, "third message") {
+		t.Fatalf("completed pairs missing:\n%s", joined)
+	}
+}
+
+type mixedPlanner struct{}
+
+func (mixedPlanner) Plan(ctx context.Context, blocks []contracts.ContextBlock) (loop.Action, error) {
+	last := blocks[len(blocks)-1]
+	if last.Content != nil && strings.Contains(*last.Content, "DRIFT") {
+		return loop.Action{}, loop.DriftError{Typed: contracts.TypedError{
+			Code: "TOOL_SCHEMA_DRIFT", Category: contracts.ErrCatValidation,
+			Retryability: contracts.RetryNever, SafeMessage: "drift", Origin: "planner",
+		}, Tool: "memory_recall"}
+	}
+	final := "ok"
+	return loop.Action{Final: &final}, nil
+}
+
+// TGOUT impl #5-case: an OTHER failure code recovered on collision keeps
+// the generic path — only TOOL_SCHEMA_DRIFT reconstructs DriftError.
+func TestOtherFailureCodeStaysGeneric(t *testing.T) {
+	p := &blockCapturingPlanner{}
+	d, _, j := testDaemon(t, p, nil)
+	soTurn := contracts.TurnID("turn-chan-chat-42-21")
+	for i, evt := range []struct{ typ, payload string }{
+		{"turn.failed", `{"turn_id":"turn-chan-chat-42-21","error_code":"OTHER_FAILURE","tool":"memory_recall"}`},
+		{"turn.created", `{"turn_id":"turn-chan-chat-42-21"}`},
+	} {
+		id := contracts.EventID(fmt.Sprintf("ev-of-%d", i))
+		if evt.typ == "turn.created" {
+			id = "ev-turn-chan-chat-42-21-turn.created-1"
+		}
+		if _, err := j.Append(context.Background(), contracts.EnvelopeParams{
+			SchemaID: "nexus.event", SchemaVersion: 1,
+			EventID: id, EventType: evt.typ,
+			RunID: "run-chan-chat-42-21", TurnID: &soTurn, EmittedAt: time.Now().UTC(),
+			ActorType: contracts.ActorSystem, ActorID: "loop", PrincipalID: "nexus",
+			WorkspaceID: "local", ProfileID: "work", AttemptNo: 1,
+			Payload: []byte(evt.payload), PayloadHash: "recomputed",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err := d.RunChannelTurn(context.Background(), "chat-42", 21, "x")
+	if err == nil {
+		t.Fatal("want generic error")
+	}
+	var de loop.DriftError
+	if errors.As(err, &de) {
+		t.Fatalf("OTHER_FAILURE reconstructed as DriftError: %v", err)
+	}
+}
