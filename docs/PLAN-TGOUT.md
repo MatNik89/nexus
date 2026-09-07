@@ -57,8 +57,14 @@ Multipart/chunking is a separate future slice. See Non-goals.
 UNKNOWN dialects can still reach the user; every observed dialect gets
 a committed case and the classifier grows per dialect.)
 - ORDERED, MUTUALLY EXCLUSIVE (codex F1): (1) strict
-  `toolCallFromReply` on the RAW reply first — a valid bare protocol
-  call EXECUTES exactly as today (committed positive-control test);
+  `toolCallFromReply` on the RAW reply first — extended with a
+  TOP-LEVEL duplicate-member gate (reuse the existing
+  HasDuplicateJSONKeys owner, today applied only to arguments): any
+  duplicate top-level key means NOT a valid call (falls to the
+  classifier; r6 codex HIGH — Go's last-member-wins decode must never
+  pick an effect). A valid, duplicate-free bare protocol call EXECUTES
+  exactly as today (committed positive control; committed
+  duplicate-key case asserts drift, not execution);
   (2) only when it says not-a-tool, build the classification view (one
   wrapping fence stripped; still-fenced-after-one -> prose); (3) DRIFT
   when the view is a single JSON object AND any of action/tool_id/name
@@ -76,7 +82,10 @@ a committed case and the classifier grows per dialect.)
   assistant reply — declared and asserted in a committed test.
   FIELD PRECEDENCE (r5 codex F5): when several fields match known
   tools, action > tool_id > name decides the reported <tool>;
-  the conflicting-fields case is a committed test.
+  the conflicting-fields case is a committed test. The Croatian edge
+  message says "Preformuliraj zahtjev." only — no "pokušaj ponovno"
+  (r6 kilo F1: a failed turn leaves no history pair, so "again" has no
+  referent; rephrasing restates the question as the current message).
 - DECLARED LIMITS (committed tests assert each): the known-tool content
   collision suppresses a legitimate answer (fail-closed, visible);
   prose+JSON mixed replies are delivered as prose (agy #2 — classifier
@@ -116,6 +125,13 @@ Renderer construction rules (v4 base plus):
 - EMPTY SPANS ARE NEVER WRAPPED (agy #1): `****`, empty inline code
   and empty table cells emit no tag (markers become literal escaped
   text; empty cells use the '—' placeholder from v2 rules);
+- PIPES INSIDE CELL CONTENT (r6 codex MED): the cell splitter is the
+  naive hermes split; any candidate table block containing an escaped
+  pipe (`\|`) or a backtick span with a `|` is NOT split — the whole
+  block passes through escaped, verbatim (lossless beats pretty).
+  Committed cases for both shapes;
+- COUNTING UNIT (r6 codex LOW): the budget counts OPENING tags (spans),
+  "span count <= 90"; the 90/91 boundary tests count spans;
 - property validator: only renderer tags, balanced, never nested,
   NO EMPTY TAG, all & < > outside tags escaped, RENDERER tag count
   <= 90 (local budget — the validator makes no total-entity claim),
