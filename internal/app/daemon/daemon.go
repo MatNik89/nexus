@@ -13,6 +13,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -80,6 +81,11 @@ type frame struct {
 	Type string `json:"type"`
 	Text string `json:"text,omitempty"`
 	Yolo bool   `json:"yolo,omitempty"`
+	// Code carries a typed error code STRUCTURALLY across the UDS
+	// boundary (tgout plan: the repl edge maps codes without string
+	// classification). Tool names the drift's precedence winner.
+	Code string `json:"code,omitempty"`
+	Tool string `json:"tool,omitempty"`
 }
 
 // Serve accepts sessions until ctx ends. The socket is created 0600 in a
@@ -214,6 +220,14 @@ func (d *Daemon) handle(ctx context.Context, conn net.Conn) {
 		if terr != nil {
 			// Typed sentinels keep their names (NEEDS_APPROVAL etc.);
 			// known secret references are scrubbed before the UI boundary.
+			// A typed drift crosses the UDS boundary STRUCTURALLY
+			// (tgout plan): code+tool fields, no string classification.
+			var de loop.DriftError
+			if errors.As(terr, &de) {
+				writeFrame(conn, frame{Type: "error", Code: de.Typed.Code, Tool: string(de.Tool),
+					Text: loop.RedactText(d.deps.Redactor, de.Typed.SafeMessage)})
+				continue
+			}
 			writeFrame(conn, frame{Type: "error", Text: loop.RedactText(d.deps.Redactor, terr.Error())})
 			continue
 		}
@@ -266,7 +280,7 @@ func (d *Daemon) RunChannelTurn(ctx context.Context, identity string, updateID i
 		// codex #3): the redelivered update re-enters the same turn and
 		// collides on its event ids — recover the DURABLE final from the
 		// journal instead of reporting a false failure.
-		recovered, ok, rerr := d.completedTurnFinal(turn)
+		rec, ok, rerr := d.recoveredTurnOutcome(turn)
 		if rerr != nil {
 			// The DECISIVE failure is the broken canonical stream — never
 			// mask it behind the duplicate-event symptom (Phase-5-r5
@@ -274,7 +288,24 @@ func (d *Daemon) RunChannelTurn(ctx context.Context, identity string, updateID i
 			return "", fmt.Errorf("daemon: completed-turn recovery refused: %w", rerr)
 		}
 		if ok {
-			return recovered, nil
+			switch {
+			case rec.Kind == "FAILED" && rec.Code == "TOOL_SCHEMA_DRIFT":
+				// Reconstructed typed outcome (tgout: restart-stable
+				// drift recovery) — the edge maps the code; constants
+				// are reconstructed for this code by contract.
+				return "", loop.DriftError{Typed: contracts.TypedError{
+					Code: rec.Code, Category: contracts.ErrCatValidation,
+					Retryability: contracts.RetryNever,
+					SafeMessage:  "the model reply named tool " + string(rec.Tool) + " but broke the tool-call schema",
+					Origin:       "planner",
+				}, Tool: rec.Tool}
+			case rec.Kind == "FAILED":
+				// Ordinary terminal failure: exactly today's collision
+				// error path — no invented user response (tgout v15).
+				return "", err
+			default:
+				return rec.Final, nil
+			}
 		}
 		return "", err
 	}
@@ -408,8 +439,21 @@ func historyBlocks(scope, sourceURI string, entries []histPair) ([]contracts.Con
 // turn from its journaled turn.succeeded payload.
 // topknot ceiling: full-journal replay per recovery lookup — a turn-state
 // projection is the upgrade when replay latency is measurable (P1).
-func (d *Daemon) completedTurnFinal(turn contracts.TurnID) (string, bool, error) {
-	final, found := "", false
+// RecoveredOutcome is the closed sum a turn collision can recover
+// (tgout plan v14): later success wins; a suspension candidate is
+// SUPPRESSED by a later turn.resumed for the same turn; a terminal
+// turn.failed after that supersedes — with code+tool when the failure
+// was a typed drift, empty Code for ordinary failures ("terminal
+// observed, no renderable payload").
+type RecoveredOutcome struct {
+	Kind  string // "SUCCEEDED" | "SUSPENDED" | "FAILED"
+	Final string // succeeded final or suspension summary
+	Code  string // turn.failed error_code ("" = ordinary failure)
+	Tool  contracts.ToolID
+}
+
+func (d *Daemon) recoveredTurnOutcome(turn contracts.TurnID) (RecoveredOutcome, bool, error) {
+	out, found := RecoveredOutcome{}, false
 	err := d.deps.Journal.Replay(0, func(ev journal.Event) error {
 		switch ev.Envelope.EventType {
 		case "turn.succeeded":
@@ -418,20 +462,38 @@ func (d *Daemon) completedTurnFinal(turn contracts.TurnID) (string, bool, error)
 					Final string `json:"final"`
 				}
 				if json.Unmarshal(ev.Envelope.Payload, &p) == nil && p.Final != "" {
-					final, found = p.Final, true
+					out, found = RecoveredOutcome{Kind: "SUCCEEDED", Final: p.Final}, true
 				}
 			}
 		case "approval.turn_suspended":
-			// SUSPENDED analog of the success recovery (phase5-r4 kilo
-			// LOW): a crash between the suspension and the channel
-			// terminal must replay the CHALLENGE SUMMARY, not a generic
-			// failure. A later turn.succeeded (resume) overrides this.
+			// A crash between the suspension and the channel terminal
+			// must replay the CHALLENGE SUMMARY (phase5-r4 kilo LOW). A
+			// later turn.succeeded/turn.resumed/turn.failed overrides.
 			var p struct {
 				TurnID  string `json:"turn_id"`
 				Summary string `json:"summary"`
 			}
 			if json.Unmarshal(ev.Envelope.Payload, &p) == nil && p.TurnID == string(turn) && p.Summary != "" {
-				final, found = p.Summary, true
+				out, found = RecoveredOutcome{Kind: "SUSPENDED", Final: p.Summary}, true
+			}
+		case "turn.resumed":
+			// The resumed lifecycle SUPPRESSES a stale suspension
+			// candidate (tgout r12 codex MED#2): suspended -> resumed ->
+			// failed must recover the failure, not the old challenge.
+			if ev.Envelope.TurnID != nil && *ev.Envelope.TurnID == turn && out.Kind == "SUSPENDED" {
+				out, found = RecoveredOutcome{}, false
+			}
+		case "turn.failed":
+			if ev.Envelope.TurnID != nil && *ev.Envelope.TurnID == turn {
+				var p struct {
+					Code string `json:"error_code"`
+					Tool string `json:"tool"`
+				}
+				_ = json.Unmarshal(ev.Envelope.Payload, &p)
+				// A later terminal always supersedes a stale
+				// suspension, payload or not (tgout v15).
+				out, found = RecoveredOutcome{Kind: "FAILED", Code: p.Code,
+					Tool: contracts.ToolID(p.Tool)}, true
 			}
 		}
 		return nil
@@ -441,9 +503,9 @@ func (d *Daemon) completedTurnFinal(turn contracts.TurnID) (string, bool, error)
 		// replay that later fails integrity verification is not evidence —
 		// and the integrity error itself is the diagnosis, propagated,
 		// never swallowed (Phase-5-r5 codex #1).
-		return "", false, err
+		return RecoveredOutcome{}, false, err
 	}
-	return final, found, nil
+	return out, found, nil
 }
 
 // ResumeChannelTurn rehydrates a SUSPENDED channel turn after its

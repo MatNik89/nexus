@@ -25,6 +25,10 @@ type frame struct {
 	Type string `json:"type"`
 	Text string `json:"text,omitempty"`
 	Yolo bool   `json:"yolo,omitempty"`
+	// Code/Tool: typed error metadata crossing the UDS structurally
+	// (tgout plan — the edge maps codes without parsing text).
+	Code string `json:"code,omitempty"`
+	Tool string `json:"tool,omitempty"`
 }
 
 // Run drives the REPL until input ends: prompt → line → chat → render
@@ -82,7 +86,13 @@ func Run(in io.Reader, out io.Writer, sock string, yolo bool) error {
 				}
 				break reply
 			case "error":
-				fmt.Fprintf(out, "error: %s\n", f.Text)
+				if f.Code == "TOOL_SCHEMA_DRIFT" {
+					// Structural edge mapping (tgout impl codex #1):
+					// same Croatian message as the Telegram edge.
+					fmt.Fprintf(out, "Nisam uspio ispravno pozvati alat (%s). Preformuliraj zahtjev.\n", f.Tool)
+				} else {
+					fmt.Fprintf(out, "error: %s\n", f.Text)
+				}
 				break reply
 			}
 		}

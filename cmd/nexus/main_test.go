@@ -1802,3 +1802,88 @@ func TestTrustPointerNeverUnresolvableUnderConcurrentPublish(t *testing.T) {
 	default:
 	}
 }
+
+// TGOUT impl #7: the Telegram edge maps the drift code to the exact
+// Croatian message — live path, structural extraction.
+func TestTelegramEdgeMapsDriftCroatian(t *testing.T) {
+	b := hitlBundle(t, "TG_DRIFT")
+	// Force a drift by planting a durable drifted turn and colliding.
+	turn := contracts.TurnID("turn-chan-chat-42-31")
+	for i, evt := range []struct{ typ, payload string }{
+		{"turn.failed", `{"turn_id":"turn-chan-chat-42-31","error_code":"TOOL_SCHEMA_DRIFT","tool":"memory_recall"}`},
+		{"turn.created", `{"turn_id":"turn-chan-chat-42-31"}`},
+	} {
+		id := contracts.EventID(fmt.Sprintf("ev-tgd-%d", i))
+		if evt.typ == "turn.created" {
+			id = "ev-turn-chan-chat-42-31-turn.created-1"
+		}
+		if _, err := b.j.Append(context.Background(), contracts.EnvelopeParams{
+			SchemaID: "nexus.event", SchemaVersion: 1,
+			EventID: id, EventType: evt.typ,
+			RunID: "run-chan-chat-42-31", TurnID: &turn, EmittedAt: time.Now().UTC(),
+			ActorType: contracts.ActorSystem, ActorID: "loop", PrincipalID: "nexus",
+			WorkspaceID: "local", ProfileID: "private", AttemptNo: 1,
+			Payload: []byte(evt.payload), PayloadHash: "recomputed",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reply, err := telegramHandler(b)(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 31,
+		Text: "anything", Profile: "private"})
+	if err != nil {
+		t.Fatalf("edge did not map the drift: %v", err)
+	}
+	want := "Nisam uspio ispravno pozvati alat (memory_recall). Preformuliraj zahtjev."
+	if reply != want {
+		t.Fatalf("wrong Croatian mapping: %q, want %q", reply, want)
+	}
+}
+
+// IMPL r2 codex #4: the LIVE drift path — the provider returns a drift
+// dialect, the real loop journals turn.failed, and telegramHandler maps
+// the exact Croatian message with the selected tool.
+func TestTelegramEdgeMapsLiveDrift(t *testing.T) {
+	b := driftBundle(t, "TG_LIVEDRIFT")
+	reply, err := telegramHandler(b)(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 41,
+		Text: "zapamti nesto", Profile: "private"})
+	if err != nil {
+		t.Fatalf("live drift not mapped: %v", err)
+	}
+	want := "Nisam uspio ispravno pozvati alat (memory_remember). Preformuliraj zahtjev."
+	if reply != want {
+		t.Fatalf("wrong Croatian mapping: %q, want %q", reply, want)
+	}
+}
+
+// driftBundle: a real bundle whose provider ALWAYS answers with the
+// observed drift dialect (naming a registered tool with a wrong schema).
+func driftBundle(t *testing.T, name string) *daemonBundle {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reply := `{"action":"memory_remember","content":"x"}`
+		bb, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{
+			"message": map[string]string{"role": "assistant", "content": reply}}}})
+		w.Write(bb)
+	}))
+	t.Cleanup(srv.Close)
+	host := strings.TrimPrefix(srv.URL, "http://")
+	key := "NEXUS_" + name + "_KEY"
+	t.Setenv(key, "sk-x")
+	base := filepath.Join(t.TempDir(), "nexus")
+	os.MkdirAll(base, 0o700)
+	cfgJSON := fmt.Sprintf(`{"provider_base_url":%q,"provider_key_env":%q,
+		"provider_model":"m","egress_allow":[%q],"default_profile":"private"}`, srv.URL, key, host)
+	os.WriteFile(filepath.Join(base, "config.json"), []byte(cfgJSON), 0o600)
+	resolved, err := config.Resolve(filepath.Join(base, "config.json"), "", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bd, err := buildDaemon(pathx.Layout{Base: base}, resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { bd.j.Close() })
+	return bd
+}

@@ -10,6 +10,7 @@ package telegram
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -18,6 +19,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	_ "modernc.org/sqlite"
 
 	"github.com/MatNik89/nexus/internal/channel"
 	"github.com/MatNik89/nexus/internal/foundation/config"
@@ -35,6 +38,10 @@ type fakeBot struct {
 	sent    []string
 	sentTo  []int64
 	offsets []int64
+	// tgout detectors: parse_mode per send, and a scripted parse-400
+	// rejection for the first N sends carrying parse_mode.
+	parseModes     []string
+	rejectHTMLLeft int
 }
 
 func (f *fakeBot) handler() http.HandlerFunc {
@@ -57,12 +64,20 @@ func (f *fakeBot) handler() http.HandlerFunc {
 			w.Write(out)
 		case strings.HasSuffix(r.URL.Path, "/sendMessage"):
 			var req struct {
-				ChatID int64  `json:"chat_id"`
-				Text   string `json:"text"`
+				ChatID    int64  `json:"chat_id"`
+				Text      string `json:"text"`
+				ParseMode string `json:"parse_mode"`
 			}
 			json.NewDecoder(r.Body).Decode(&req)
+			if req.ParseMode != "" && f.rejectHTMLLeft > 0 {
+				f.rejectHTMLLeft--
+				w.WriteHeader(400)
+				w.Write([]byte(`{"ok":false,"error_code":400,"description":"Bad Request: can't parse entities"}`))
+				return
+			}
 			f.sent = append(f.sent, req.Text)
 			f.sentTo = append(f.sentTo, req.ChatID)
+			f.parseModes = append(f.parseModes, req.ParseMode)
 			w.Write([]byte(`{"ok":true,"result":{"message_id":1}}`))
 		case strings.HasSuffix(r.URL.Path, "/getMe"):
 			w.Write([]byte(`{"ok":true,"result":{"id":1,"is_bot":true,"username":"nexus_test_bot"}}`))
@@ -88,14 +103,20 @@ type harness struct {
 	bot  *fakeBot
 	core *channel.Core
 	got  []channel.Inbound
+	j    *journal.Journal
 }
 
 func build(t *testing.T, bindings map[int64]string) *harness {
 	t.Helper()
+	h, _ := buildAt(t, t.TempDir(), bindings)
+	return h
+}
+
+func buildAt(t *testing.T, dir string, bindings map[int64]string) (*harness, string) {
+	t.Helper()
 	bot := &fakeBot{}
 	srv := httptest.NewServer(bot.handler())
 	t.Cleanup(srv.Close)
-	dir := t.TempDir()
 	j, err := journal.Open(filepath.Join(dir, "journal.db"), "work", redact.None{}, channel.Events(), channel.NewProjection())
 	if err != nil {
 		t.Fatal(err)
@@ -120,7 +141,8 @@ func build(t *testing.T, bindings map[int64]string) *harness {
 		t.Fatal(err)
 	}
 	h.a = a
-	return h
+	h.j = j
+	return h, dir
 }
 
 // A BOUND chat's text flows: admitted once, handled, reply sent to the
@@ -403,5 +425,152 @@ func TestRedeliveredRefusalIsIdempotent(t *testing.T) {
 	}
 	if len(h.bot.sent) != 1 {
 		t.Fatalf("redelivered refusal produced %d sends, want exactly 1: %v", len(h.bot.sent), h.bot.sent)
+	}
+}
+
+// TGOUT plan detectors — first-lease formatting + delivery honesty.
+
+// A formatted reply carries parse_mode=HTML on its FIRST lease; a
+// scripted parse-400 makes the NEXT flush carry the ORIGINAL plain
+// bytes — and the row lands SENT (the detector asserts carried BYTES;
+// scheduling is exactly the existing machinery).
+func TestFirstLeaseFormattedThenPlainAfterParse400(t *testing.T) {
+	h := build(t, map[int64]string{42: "work"})
+	h.bot.rejectHTMLLeft = 1
+	if _, err := h.core.EnqueueReply(ctxT(), "telegram", "chat-42", "work", "**bold** reply"); err != nil {
+		t.Fatal(err)
+	}
+	// First flush: rendered+parse_mode -> scripted parse-400 -> re-pend.
+	_ = h.a.FlushOutbox(ctxT())
+	// Existing machinery: definite error re-pends; next tick carries plain.
+	if err := h.a.FlushOutbox(ctxT()); err != nil {
+		t.Fatal(err)
+	}
+	h.bot.mu.Lock()
+	defer h.bot.mu.Unlock()
+	if len(h.bot.sent) != 1 {
+		t.Fatalf("want exactly 1 accepted send, got %d: %v", len(h.bot.sent), h.bot.sent)
+	}
+	if h.bot.sent[0] != "**bold** reply" {
+		t.Fatalf("re-attempt did not carry the ORIGINAL plain bytes: %q", h.bot.sent[0])
+	}
+	if h.bot.parseModes[0] != "" {
+		t.Fatalf("re-attempt still carried parse_mode: %q", h.bot.parseModes[0])
+	}
+	pending, _ := h.core.Pending(ctxT())
+	if len(pending) != 0 {
+		t.Fatalf("row not SENT after plain accept: %v", pending)
+	}
+}
+
+// A formatted first lease that the wire ACCEPTS carries parse_mode=HTML
+// with the rendered body.
+func TestFirstLeaseCarriesRenderedHTML(t *testing.T) {
+	h := build(t, map[int64]string{42: "work"})
+	if _, err := h.core.EnqueueReply(ctxT(), "telegram", "chat-42", "work", "**bold** reply"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.a.FlushOutbox(ctxT()); err != nil {
+		t.Fatal(err)
+	}
+	h.bot.mu.Lock()
+	defer h.bot.mu.Unlock()
+	if len(h.bot.sent) != 1 || h.bot.parseModes[0] != "HTML" {
+		t.Fatalf("first lease not rendered: sent=%v modes=%v", h.bot.sent, h.bot.parseModes)
+	}
+	if !strings.Contains(h.bot.sent[0], "<b>bold</b>") {
+		t.Fatalf("rendered body missing: %q", h.bot.sent[0])
+	}
+}
+
+// PRE-WIRE failure degradation (plan v10, declared): a dial failure
+// consumes the first lease, so the first ACTUAL wire send is plain.
+func TestPreWireFailureConsumesLease(t *testing.T) {
+	h := build(t, map[int64]string{42: "work"})
+	if _, err := h.core.EnqueueReply(ctxT(), "telegram", "chat-42", "work", "**bold** reply"); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a pre-wire dial failure: point the adapter at a dead URL
+	// for the first flush only.
+	live := h.a.base
+	h.a.base = "http://127.0.0.1:1"
+	_ = h.a.FlushOutbox(ctxT())
+	h.a.base = live
+	// The lease was consumed pre-wire; recovery re-pends via reconcile
+	// semantics — drive the existing paths.
+	_ = h.a.FlushOutbox(ctxT())
+	if err := h.a.FlushOutbox(ctxT()); err != nil {
+		t.Fatal(err)
+	}
+	h.bot.mu.Lock()
+	defer h.bot.mu.Unlock()
+	for i, m := range h.bot.parseModes {
+		if m != "" {
+			t.Fatalf("send %d carried parse_mode after a consumed lease: %v", i, h.bot.parseModes)
+		}
+	}
+}
+
+// RESTART persistence (plan v10): the attempts count survives a journal
+// close/reopen — the re-attempt still carries plain.
+func TestAttemptsSurviveRestart(t *testing.T) {
+	dir := t.TempDir()
+	open := func() (*harness, string) { return buildAt(t, dir, map[int64]string{42: "work"}) }
+	h, jp := open()
+	h.bot.rejectHTMLLeft = 1
+	if _, err := h.core.EnqueueReply(ctxT(), "telegram", "chat-42", "work", "**bold** reply"); err != nil {
+		t.Fatal(err)
+	}
+	_ = h.a.FlushOutbox(ctxT()) // formatted attempt -> parse-400 -> re-pend
+	h.j.Close()
+	h2, _ := open()
+	_ = jp
+	if err := h2.a.FlushOutbox(ctxT()); err != nil {
+		t.Fatal(err)
+	}
+	h2.bot.mu.Lock()
+	defer h2.bot.mu.Unlock()
+	if len(h2.bot.sent) != 1 || h2.bot.parseModes[0] != "" || h2.bot.sent[0] != "**bold** reply" {
+		t.Fatalf("restart lost the lease count: sent=%v modes=%v", h2.bot.sent, h2.bot.parseModes)
+	}
+}
+
+// VERSION REBUILD (plan v10): a database folded at the OLD projection
+// version (v1 schema without attempts) refolds on open — the count is
+// reconstructed from the canonical events and the re-attempt carries
+// plain.
+func TestOldVersionDatabaseRebuildsAttempts(t *testing.T) {
+	dir := t.TempDir()
+	h, _ := buildAt(t, dir, map[int64]string{42: "work"})
+	h.bot.rejectHTMLLeft = 1
+	if _, err := h.core.EnqueueReply(ctxT(), "telegram", "chat-42", "work", "**bold** reply"); err != nil {
+		t.Fatal(err)
+	}
+	_ = h.a.FlushOutbox(ctxT()) // consumes the first lease durably
+	h.j.Close()
+	// Regress the database to the v1 shape: drop the column by table
+	// rebuild and stamp the OLD projection version.
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(dir, "journal.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		`ALTER TABLE chan_outbox DROP COLUMN attempts`,
+		`UPDATE proj_sync_offsets SET version=1 WHERE name='channel'`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	db.Close()
+	// Reopen: version mismatch -> reset + whole refold from events.
+	h2, _ := buildAt(t, dir, map[int64]string{42: "work"})
+	if err := h2.a.FlushOutbox(ctxT()); err != nil {
+		t.Fatal(err)
+	}
+	h2.bot.mu.Lock()
+	defer h2.bot.mu.Unlock()
+	if len(h2.bot.sent) != 1 || h2.bot.parseModes[0] != "" {
+		t.Fatalf("rebuilt database lost the lease count: sent=%v modes=%v", h2.bot.sent, h2.bot.parseModes)
 	}
 }

@@ -80,6 +80,10 @@ type Outbound struct {
 	AdapterID       string
 	ChannelIdentity string
 	Text            string
+	// Attempts counts prior IN-FLIGHT LEASES (folded from
+	// channel.outbound_unknown): 0 means never wire-attempted — the
+	// only state where a formatted body may be carried (tgout plan).
+	Attempts int
 }
 
 // --- payloads (closed) ---
@@ -178,7 +182,7 @@ type Projection struct{}
 func NewProjection() *Projection { return &Projection{} }
 
 func (Projection) Name() string { return "channel" }
-func (Projection) Version() int { return 1 }
+func (Projection) Version() int { return 2 } // v2: chan_outbox.attempts (tgout)
 
 func (Projection) Init(db *journal.ProjDB) error {
 	_, err := db.Exec(`
@@ -192,13 +196,18 @@ func (Projection) Init(db *journal.ProjDB) error {
 			created INTEGER NOT NULL,
 			UNIQUE(adapter_id, channel_identity, update_id)
 		);
+		-- attempts is FOLDED from the outbound_unknown event (tgout
+		-- plan: the first-lease formatting signal derives from the
+		-- canonical event stream, never a mutable side channel); the
+		-- version bump rebuilds old databases by replay.
 		CREATE TABLE IF NOT EXISTS chan_outbox (
 			delivery_id TEXT PRIMARY KEY,
 			adapter_id TEXT NOT NULL,
 			channel_identity TEXT NOT NULL,
 			text TEXT NOT NULL,
 			status TEXT NOT NULL, -- PENDING | SENT | UNKNOWN
-			created INTEGER NOT NULL
+			created INTEGER NOT NULL,
+			attempts INTEGER NOT NULL DEFAULT 0
 		);
 	`)
 	return err
@@ -271,7 +280,7 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return err
 		}
-		res, err := tx.Exec(`UPDATE chan_outbox SET status='UNKNOWN' WHERE delivery_id=? AND status='PENDING'`, p.DeliveryID)
+		res, err := tx.Exec(`UPDATE chan_outbox SET status='UNKNOWN', attempts=attempts+1 WHERE delivery_id=? AND status='PENDING'`, p.DeliveryID)
 		if err != nil {
 			return err
 		}
@@ -450,7 +459,7 @@ func (c *Core) DeliveryStatus(ctx context.Context, id string) (string, error) {
 
 func (c *Core) rowsByStatus(ctx context.Context, status string) ([]Outbound, error) {
 	rows, err := c.j.QueryProjection(ctx,
-		`SELECT delivery_id, adapter_id, channel_identity, text FROM chan_outbox WHERE status=? ORDER BY created`, status)
+		`SELECT delivery_id, adapter_id, channel_identity, text, attempts FROM chan_outbox WHERE status=? ORDER BY created`, status)
 	if err != nil {
 		return nil, err
 	}
@@ -458,7 +467,7 @@ func (c *Core) rowsByStatus(ctx context.Context, status string) ([]Outbound, err
 	var out []Outbound
 	for rows.Next() {
 		var o Outbound
-		if err := rows.Scan(&o.DeliveryID, &o.AdapterID, &o.ChannelIdentity, &o.Text); err != nil {
+		if err := rows.Scan(&o.DeliveryID, &o.AdapterID, &o.ChannelIdentity, &o.Text, &o.Attempts); err != nil {
 			return nil, err
 		}
 		out = append(out, o)
@@ -605,7 +614,7 @@ func (c *Core) ReconcileFor(ctx context.Context, deliveryID string, proved bool,
 // UnreconciledFor lists UNKNOWN deliveries FOR ONE destination chat.
 func (c *Core) UnreconciledFor(ctx context.Context, adapter, identity string) ([]Outbound, error) {
 	rows, err := c.j.QueryProjection(ctx,
-		`SELECT delivery_id, adapter_id, channel_identity, text FROM chan_outbox
+		`SELECT delivery_id, adapter_id, channel_identity, text, attempts FROM chan_outbox
 		 WHERE status='UNKNOWN' AND adapter_id=? AND channel_identity=? ORDER BY created`, adapter, identity)
 	if err != nil {
 		return nil, err
@@ -614,7 +623,7 @@ func (c *Core) UnreconciledFor(ctx context.Context, adapter, identity string) ([
 	var out []Outbound
 	for rows.Next() {
 		var o Outbound
-		if err := rows.Scan(&o.DeliveryID, &o.AdapterID, &o.ChannelIdentity, &o.Text); err != nil {
+		if err := rows.Scan(&o.DeliveryID, &o.AdapterID, &o.ChannelIdentity, &o.Text, &o.Attempts); err != nil {
 			return nil, err
 		}
 		out = append(out, o)

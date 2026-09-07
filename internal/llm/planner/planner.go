@@ -86,6 +86,8 @@ const systemPrompt = "You are NEXUS, a personal assistant. Content inside " +
 const toolProtocol = "\n\nYou may use tools. To call one, reply with EXACTLY " +
 	"one JSON object and nothing else: " +
 	`{"action":"tool","tool_id":"<id>","arguments":{...}}. ` +
+	"NEVER reply {\"action\":\"<tool name>\"} — the action field is always " +
+	"the literal \"tool\" and the tool goes in tool_id. " +
 	"Any other reply is your final answer. Available tools:\n"
 
 // ChatPlanner turns one assembled context into one final answer. When a
@@ -186,6 +188,13 @@ func (c *ChatPlanner) toolCallFromReply(reply string) (*contracts.ToolCall, bool
 		ToolID    string          `json:"tool_id"`
 		Arguments json.RawMessage `json:"arguments"`
 	}
+	// CLOSED KEY CONTRACT (tgout plan): exactly lowercase
+	// {action, tool_id, arguments}, each once, case-insensitive
+	// duplicate detection — a case alias or duplicate can never
+	// reach the last-member-wins struct decode below.
+	if !validClosedContract(trimmed) {
+		return nil, false, nil
+	}
 	dec := json.NewDecoder(strings.NewReader(trimmed))
 	if err := dec.Decode(&req); err != nil || req.Action != "tool" {
 		return nil, false, nil // not a tool request: final answer
@@ -276,6 +285,16 @@ func (c *ChatPlanner) Plan(ctx context.Context, blocks []contracts.ContextBlock)
 		}
 		if isTool {
 			return loop.Action{Call: call}, nil
+		}
+		// SCHEMA DRIFT (tgout plan): only after the strict parse says
+		// not-a-tool, classify — one wrapping fence stripped for the
+		// view; a whole JSON object whose action/tool_id/name names a
+		// registered tool NEVER ships raw (typed error, no retry, no
+		// second provider call).
+		if view, stillFenced := classifyView(out.Content); !stillFenced {
+			if tool, drifted := c.driftTool(view); drifted {
+				return loop.Action{}, driftError(tool)
+			}
 		}
 		if c.deliver != nil {
 			if derr := c.deliver(out.Content); derr != nil {

@@ -1,0 +1,249 @@
+//go:build linux
+
+// tgout plan detectors — renderer construction rules + property
+// validator (plan rounds 4-17).
+package telegram
+
+import (
+	"fmt"
+	"regexp"
+	"strings"
+	"testing"
+)
+
+// validateRendered machine-checks the constructive-validity properties
+// (plan v5/v10): only renderer tags, balanced, never nested, no empty
+// tag, all & < > outside tags escaped, span budget, UTF-16 budget.
+func validateRendered(t *testing.T, out string) {
+	t.Helper()
+	if err := renderedViolation(out); err != nil {
+		t.Fatalf("%v: %q", err, out)
+	}
+}
+
+// renderedViolation is the ORACLE itself, testable directly (impl r2
+// codex #3: a corpus entry that never reaches the validator cannot
+// lock it).
+func renderedViolation(out string) error {
+	tagRe := regexp.MustCompile(`</?(b|code|pre)>`)
+	locs := tagRe.FindAllStringIndex(out, -1)
+	depth := 0
+	open := ""
+	spans := 0
+	last := 0
+	var outside strings.Builder
+	for _, lc := range locs {
+		outside.WriteString(out[last:lc[0]])
+		last = lc[1]
+		tag := out[lc[0]:lc[1]]
+		if !strings.HasPrefix(tag, "</") {
+			if depth != 0 {
+				return fmt.Errorf("NESTED tag %s inside <%s>", tag, open)
+			}
+			depth = 1
+			open = strings.Trim(tag, "<>")
+			spans++
+		} else {
+			if depth != 1 || strings.Trim(tag, "</>") != open {
+				return fmt.Errorf("unbalanced tag %s", tag)
+			}
+			depth = 0
+		}
+	}
+	outside.WriteString(out[last:])
+	if depth != 0 {
+		return fmt.Errorf("unclosed tag <%s>", open)
+	}
+	for _, c := range []string{"<", ">"} {
+		if strings.Contains(outside.String(), c) {
+			return fmt.Errorf("unescaped %q outside renderer tags", c)
+		}
+	}
+	deent := regexp.MustCompile(`&(amp|lt|gt|quot|#[0-9]+|#x[0-9a-fA-F]+);`).ReplaceAllString(outside.String(), "")
+	if strings.Contains(deent, "&") {
+		return fmt.Errorf("raw ampersand outside entities")
+	}
+	if strings.Contains(out, "<b></b>") || strings.Contains(out, "<code></code>") || strings.Contains(out, "<pre></pre>") {
+		return fmt.Errorf("EMPTY tag emitted")
+	}
+	if spans > renderSpanBudget {
+		return fmt.Errorf("span budget exceeded: %d", spans)
+	}
+	if postParseUTF16Len(out) > renderUTF16Budget {
+		return fmt.Errorf("post-parse UTF-16 budget exceeded")
+	}
+	return nil
+}
+
+// PROPERTY VALIDATOR over an adversarial corpus (plan v10).
+func TestRenderHTMLPropertyValidator(t *testing.T) {
+	corpus := []string{
+		"plain prose only",
+		"**bold** and `code` mixed",
+		"<script>alert(1)</script> typed by the model",
+		"model-typed <pre>fake</pre> & ampersand",
+		"**unclosed bold and `unclosed code",
+		"**** empty bold and `` empty code",
+		"| A | B |\n|---|---|\n| 1 | 2 |",
+		"| Name | Role |\n|---|---|\n| x | admin |\n| | boss |",
+		"```go\nfmt.Println(\"<hi>\")\n```",
+		"```\n```",
+		"| A | B |\n|---|---|\n| a \\| b | 2 |",
+		"| A | B |\n|---|---|\n| `x|y` | 2 |",
+		"**use `ls` now** overlapping-ish spans",
+		"`code with **bold** inside` must not nest",
+		"A&B raw ampersand",
+		"| Name | Role |\n|---|---|\n| ana | ana |",
+		strings.Repeat("**b** ", 200),
+		strings.Repeat("x", 5000),
+		"| H1 | H2 |\n|---|---|\n| v1 | v2 | v3 |",
+	}
+	for _, in := range corpus {
+		out, ok := renderHTML(in)
+		if ok {
+			validateRendered(t, out)
+		}
+	}
+}
+
+// Per-rule unit tests (plan v2-v7).
+func TestRenderTableToBullets(t *testing.T) {
+	out, ok := renderHTML("| Name | Role |\n|---|---|\n| ana | admin |\n| ivo | user |")
+	if !ok {
+		t.Fatal("table did not render")
+	}
+	for _, want := range []string{"<b>ana</b>", "• Role: admin", "<b>ivo</b>", "• Role: user"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "|") {
+		t.Fatalf("pipes survived rendering:\n%s", out)
+	}
+}
+
+func TestRenderTableLossless(t *testing.T) {
+	// empty cell -> '—'; surplus cell -> (extra)
+	// 4 cells vs 2 headers: row-label consumes one, one true surplus.
+	out, ok := renderHTML("| A | B |\n|---|---|\n| x | |\n| y | 2 | 3 | 4 |")
+	if !ok {
+		t.Fatal("table did not render")
+	}
+	if !strings.Contains(out, "• B: —") {
+		t.Fatalf("empty cell not preserved as —:\n%s", out)
+	}
+	if !strings.Contains(out, "(extra): 4") {
+		t.Fatalf("surplus cell dropped:\n%s", out)
+	}
+}
+
+func TestRenderPipeInCellVerbatim(t *testing.T) {
+	for _, in := range []string{
+		"| A | B |\n|---|---|\n| a \\| b | 2 |",
+		"| A | B |\n|---|---|\n| `x|y` | 2 |",
+	} {
+		out, ok := renderHTML(in)
+		if ok && !strings.Contains(out, "|") {
+			t.Fatalf("pipe-in-cell block was split (lossy): %q -> %q", in, out)
+		}
+	}
+}
+
+func TestRenderFenceAndSpans(t *testing.T) {
+	out, ok := renderHTML("```\n<raw> & stuff\n```\nand **bold** with `c`")
+	if !ok {
+		t.Fatal("did not render")
+	}
+	for _, want := range []string{"<pre>&lt;raw&gt; &amp; stuff</pre>", "<b>bold</b>", "<code>c</code>"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in:\n%s", want, out)
+		}
+	}
+}
+
+func TestRenderEmptySpansNeverWrapped(t *testing.T) {
+	out, ok := renderHTML("**** and `` but **real** stays")
+	if !ok {
+		t.Fatal("did not render")
+	}
+	if strings.Contains(out, "<b></b>") || strings.Contains(out, "<code></code>") {
+		t.Fatalf("empty tag emitted:\n%s", out)
+	}
+	if !strings.Contains(out, "<b>real</b>") {
+		t.Fatalf("real bold lost:\n%s", out)
+	}
+}
+
+// BOUNDARIES (plan v5): span budget 90/91 and UTF-16 4096/4097 flip ok.
+func TestRenderBudgetBoundaries(t *testing.T) {
+	mk := func(n int) string { return strings.TrimSpace(strings.Repeat("**b** ", n)) }
+	if _, ok := renderHTML(mk(renderSpanBudget)); !ok {
+		t.Fatal("exactly-at-span-budget refused")
+	}
+	if _, ok := renderHTML(mk(renderSpanBudget + 1)); ok {
+		t.Fatal("span budget exceeded but rendered")
+	}
+	// The budget applies POST-PARSE (impl kilo F3): "**b**" renders as
+	// "<b>b</b>" which parses to just "b" (1 unit), so post-parse
+	// length = n + 1 + 1.
+	pad := strings.Repeat("x", renderUTF16Budget-2) + " **b**"
+	if _, ok := renderHTML(pad); !ok {
+		t.Fatal("exactly-at-utf16-budget refused")
+	}
+	if _, ok := renderHTML("x" + pad); ok {
+		t.Fatal("utf16 budget exceeded but rendered")
+	}
+}
+
+// Plain prose short-circuits to the original path.
+func TestRenderPlainProseShortCircuits(t *testing.T) {
+	if _, ok := renderHTML("nothing fancy here at all"); ok {
+		t.Fatal("plain prose should not take the formatted path")
+	}
+}
+
+// IMPL r2 codex #2: duplicate-value cells SURVIVE with correct labels
+// (content assertion, not just syntactic validity).
+func TestRenderDuplicateValueCellSurvives(t *testing.T) {
+	out, ok := renderHTML("| Name | Role |\n|---|---|\n| ana | ana |")
+	if !ok {
+		t.Fatal("did not render")
+	}
+	if !strings.Contains(out, "• Role: ana") {
+		t.Fatalf("duplicate-value data cell dropped:\n%s", out)
+	}
+}
+
+// IMPL r2 codex #1: a one-cell surplus row keeps every label aligned
+// and the surplus gets (extra) — no row-label shift.
+func TestRenderSurplusRowLabelsAligned(t *testing.T) {
+	out, ok := renderHTML("| Name | Role |\n|---|---|\n| ana | admin | extra |")
+	if !ok {
+		t.Fatal("did not render")
+	}
+	for _, want := range []string{"<b>ana</b>", "• Role: admin", "• (extra): extra"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "• Name: admin") {
+		t.Fatalf("labels shifted (row-label branch resurrected):\n%s", out)
+	}
+}
+
+// IMPL r2 codex #3: the ORACLE itself is locked — it must reject a raw
+// ampersand and accept a proper entity.
+func TestRenderedViolationOracle(t *testing.T) {
+	if err := renderedViolation("A&B"); err == nil {
+		t.Fatal("oracle accepted a raw ampersand")
+	}
+	if err := renderedViolation("A&amp;B and <b>x</b>"); err != nil {
+		t.Fatalf("oracle rejected valid output: %v", err)
+	}
+	if err := renderedViolation("<b>x</b><b></b>"); err == nil {
+		t.Fatal("oracle accepted an empty tag")
+	}
+	if err := renderedViolation("<b>a<code>b</code></b>"); err == nil {
+		t.Fatal("oracle accepted nesting")
+	}
+}
