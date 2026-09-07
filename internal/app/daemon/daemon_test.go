@@ -1047,3 +1047,66 @@ func TestMixedLifecycleRecoversDriftNotChallenge(t *testing.T) {
 		t.Fatalf("stale challenge replayed: %v", err)
 	}
 }
+
+// SUPPRESSION-ONLY lifecycle (tgout ablation gap): suspended ->
+// resumed -> CRASH (no terminal yet) -> collision must NOT replay the
+// stale challenge (the resume superseded it); with no terminal and no
+// challenge the collision surfaces the underlying duplicate error.
+func TestResumedWithoutTerminalSuppressesChallenge(t *testing.T) {
+	p := &blockCapturingPlanner{}
+	d, _, j := testDaemon(t, p, nil)
+	store, err := approval.NewStore(j, clockid.NewFake(time.Now()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	idem := "ik-so"
+	c, err := contracts.NewToolCall(contracts.ToolCallParams{
+		ToolCallID: "tc-so", ToolID: "rm_file",
+		Arguments: json.RawMessage(`{"path":"/tmp/x"}`), ArgsSchemaHash: "h1",
+		Effect: contracts.EffectIrreversible, ExecutionKind: contracts.ExecInProcess,
+		Deadline: time.Now().Add(time.Hour), AttemptNo: 1,
+		IdempotencyKey: &idem, ProfileID: "work",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := "orig"
+	blk, err := contracts.NewContextBlock(contracts.ContextBlockParams{
+		BlockID: "blk-so", Kind: "user_message", Content: &text,
+		ContentHash: "0000000000000000000000000000000000000000000000000000000000000000",
+		SourceURI:   "nexus://telegram/chat-42", Producer: "telegram",
+		Trust: contracts.TrustUser, Sensitivity: contracts.Sensitivity(1),
+		Lineage: []string{}, ObservedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Suspend(context.Background(), "turn-chan-chat-42-11",
+		"run-chan-chat-42-11", c, "tg:chat-42", []contracts.ContextBlock{blk}); err != nil {
+		t.Fatal(err)
+	}
+	soTurn := contracts.TurnID("turn-chan-chat-42-11")
+	for i, evt := range []struct{ typ, payload string }{
+		{"turn.resumed", `{"turn_id":"turn-chan-chat-42-11"}`},
+		{"turn.created", `{"turn_id":"turn-chan-chat-42-11"}`},
+	} {
+		id := contracts.EventID(fmt.Sprintf("ev-so-%d", i))
+		if evt.typ == "turn.created" {
+			id = "ev-turn-chan-chat-42-11-turn.created-1"
+		}
+		if _, err := j.Append(context.Background(), contracts.EnvelopeParams{
+			SchemaID: "nexus.event", SchemaVersion: 1,
+			EventID: id, EventType: evt.typ,
+			RunID: "run-chan-chat-42-11", TurnID: &soTurn, EmittedAt: time.Now().UTC(),
+			ActorType: contracts.ActorSystem, ActorID: "loop", PrincipalID: "nexus",
+			WorkspaceID: "local", ProfileID: "work", AttemptNo: 1,
+			Payload: []byte(evt.payload), PayloadHash: "recomputed",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out, err := d.RunChannelTurn(context.Background(), "chat-42", 11, "orig")
+	if err == nil && strings.Contains(out, "APPROVAL NEEDED") {
+		t.Fatalf("stale challenge replayed after resume: %q", out)
+	}
+}

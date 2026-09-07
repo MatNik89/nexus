@@ -80,6 +80,7 @@ func TestRenderHTMLPropertyValidator(t *testing.T) {
 		"| A | B |\n|---|---|\n| a \\| b | 2 |",
 		"| A | B |\n|---|---|\n| `x|y` | 2 |",
 		"**use `ls` now** overlapping-ish spans",
+		"`code with **bold** inside` must not nest",
 		strings.Repeat("**b** ", 200),
 		strings.Repeat("x", 5000),
 		"| H1 | H2 |\n|---|---|\n| v1 | v2 | v3 |",
