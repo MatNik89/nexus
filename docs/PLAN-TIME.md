@@ -16,29 +16,28 @@ the system message per request (stateless, no tool needed).
   the line is appended to the END of the CURRENT assembled user
   content, after the fenced/context body. The cacheable prefix
   (system + history role messages) stays byte-stable.
-- CLOCK + LOCATION SEAM (r2 codex MED#1 / kilo K1: clockid is
-  UTC-only by design — production returns .UTC() and the fake
-  reconstructs .UTC(), so the location must be its OWN injected
-  dependency): ChatPlanner gains constructor-injected
-  `clockid.Clock` AND `*time.Location`; the line renders
-  `clock.Now().In(loc)`. Production wires clockid.System + the configured IANA zone;
-  tests wire clockid.NewFake + a fixed IANA name.
-- DECLARED LIMIT (r2 codex MED#2): Go silently falls back to UTC when
-  the host zone database is missing — then the line truthfully shows
-  UTC (UTC+00:00). No degraded-state detection is attempted (out of
-  scope; the host is the owner's box).
-- FORMAT, exact Go layout (agy #2 / kilo: `TZ` was a placeholder
-  mistake): layout `"2006-01-02 15:04 Monday"` plus explicit zone
-  rendered as `<IANA-or-abbrev> (UTC+02:00)` built from
-  `t.Zone()` + `t.Format("-07:00")` — the numeric offset is included
-  so the model can compute RFC 3339 for reminder tools (kilo #5).
-  The full line: "\nCurrent date and time: 2026-09-08 04:55 Monday,
-  CEST (UTC+02:00)". The zone name comes from the runtime location —
-  no user or model bytes are ever on this path (r2 codex LOW: no
-  character-class invariant is claimed).
-- NO FALLBACK BRANCH (codex MED #3 / agy #7): `time.Time.Zone()` and
-  `Local` cannot fail in Go — the imagined "zone lookup fails" branch
-  is removed; there is exactly one code path.
+- CLOCK + TIMEZONE SEAM (v5, definitive): ChatPlanner receives
+  constructor-injected `clockid.Clock` AND the IANA zone NAME as a
+  string. The constructor calls time.LoadLocation(name) and stores
+  BOTH the *time.Location and the original name — rejecting
+  construction (fail-closed, like every planner dependency) on an
+  empty name or a LoadLocation error. There is NO time.Local use and
+  NO silent-UTC fallback anywhere in this slice: missing tzdata for
+  the configured zone REJECTS DAEMON STARTUP with a causal error
+  (r4 codex MED#2 — one unambiguous production outcome).
+- CONFIG CONTRACT (r4 codex MED#3, executable): a new closed typed
+  field `timezone` (JSON key "timezone") added to Config, keySchema,
+  defaults (default "Europe/Zagreb"), applyValue and validation in
+  internal/foundation/config/config.go — validation itself calls
+  time.LoadLocation (unloadable value = config error). runDaemon and
+  runChat pass resolved.Config.Timezone into the planner factory.
+- RENDER (r4 codex MED#1): the line prints the STORED IANA name
+  verbatim plus the instant's abbreviation and offset from
+  clock.Now().In(loc):
+  "\nCurrent date and time: 2026-09-08 05:10 Monday, Europe/Zagreb
+  (CEST, UTC+02:00)" — layout "2006-01-02 15:04 Monday", zone abbrev
+  via t.Format("MST"), offset via t.Format("-07:00"). The IANA name
+  never passes through t.Zone().
 - The line is appended to USER content, never near the toolProtocol
   grammar (agy #6 placement corruption is impossible by construction).
 
