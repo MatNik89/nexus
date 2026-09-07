@@ -45,60 +45,75 @@ result. Reviewers: challenge this if HTML mode has a hole we missed.
 
 ## Proposed changes
 
-### A. Planner: no tool-shaped JSON ever reaches the user (v3)
-NO retry (S7 owns retries; unchanged from v2). Additions from round 2:
-- FENCE-TOLERANT PARSE (agy #1): before `toolCallFromReply`, strip ONE
-  wrapping markdown code fence (``` or ```json ... ```) if the entire
-  reply is a single fenced block. A correctly-schemed tool call inside
-  a fence then EXECUTES (same reply, tolerant parse — not a retry); a
-  drifted schema inside a fence hits the same drift classifier.
-- Drift classifier (unchanged v2 core): single JSON object AND
-  (action == known tool id OR tool_id field == known tool id) ->
-  typed final, exactly one transport call/grant.
-Detectors: fenced valid tool call executes; fenced drifted JSON ->
-typed final; legitimate JSON with unrelated action delivered verbatim;
-one-transport-call + one-grant assertions; ablations for the fence
-strip and the known-tool check.
+### SCOPE CUT (v4, moderator decision after round 3)
+Multipart/chunking is REMOVED from this slice entirely. Every round-3
+HIGH (part ordering, B7 multipart transaction, reconcile grammar,
+tag-splitting, UTF-16 budget) belongs to that machinery. Messages whose
+text exceeds Telegram's limit keep TODAY'S behavior byte-for-byte (the
+send fails as it does now); a separate chunking slice with its own plan
+owns that — trigger: the first real over-limit reply observed in
+dogfood. The dogfood pain (tables, tool-JSON leak) involves short
+messages only.
 
-### B. Telegram adapter: outbound rendering (v3, the hermes shape)
-Round-2 F1/F2/F3 (all three reviewers) proved BOTH multi-send shapes —
-chunk loop and format fallback inside one Flush callback — violate the
-B2/E15 one-effect-per-attempt contract. v3 removes multi-send entirely:
+### A. Planner: no tool-shaped JSON ever reaches the user (v4)
+NO retry, NO execution of fenced payloads (codex r3 F1: the structured
+owner forbids tolerant-accept for effect payloads — a fenced valid call
+is indistinguishable from a display example and must NOT execute).
+- Classification input: the raw reply; if the ENTIRE reply is one
+  fenced block, strip exactly one fence FOR CLASSIFICATION ONLY. If the
+  result still starts with a fence, the reply is prose (delivered).
+- DRIFT (single JSON object AND (action==known tool id OR tool_id==
+  known tool id)) -> typed Croatian final: "Nisam uspio ispravno
+  pozvati alat (<tool>). Pokušaj ponovno ili preformuliraj." Exactly
+  one transport call, one grant. A FENCED valid-schema call is also
+  classified DRIFT (never executed, never delivered raw).
+- KNOWN LIMITATION, DECLARED (kilo r3 F2): a legitimate content answer
+  whose top-level action/tool_id equals a registered tool id is
+  suppressed into the typed final. This is an INTENTIONAL fail-closed
+  restriction (no soundness claim); the exact collision is a COMMITTED
+  test asserting the typed final, so the behavior is visible, not
+  hidden. Durable fix remains native function calling (deferred).
+Detectors: drift shapes (bare + single-fence + valid-schema-fenced) ->
+typed final, one call/one grant; unrelated-action JSON delivered
+verbatim; double-fenced JSON delivered as prose; collision case
+asserts the declared typed final; ablations: known-tool check, fence
+strip.
 
-- CHUNKING MOVES TO THE ENQUEUE BOUNDARY (codex F1/F2, agy F1): a long
-  reply is split BEFORE the outbox — EnqueueReply splits the rendered
-  text into N parts and enqueues N ROWS with STABLE derived ids
-  (dlv-<base>-p<i>-of-<n>); each row is one message, one wire effect,
-  one SENT — the existing Flush/UNKNOWN/RECONCILE semantics apply per
-  row untouched. A crash between parts leaves later parts PENDING
-  (normal at-least-once), an accepted part is never resent blind.
-  Split on line boundaries at <=4000 chars; a single line longer than
-  4000 hard-splits on a rune boundary (agy #3); a split inside an open
-  <pre> closes it and reopens in the next part.
-- NO FALLBACK SEND (codex F3, kilo F2/F3): the renderer emits
-  CONSTRUCTIVELY VALID Telegram HTML — the ONLY tags are <b>, <code>,
-  <pre> built by the renderer itself around fully-escaped content
-  (& < > escaped everywhere, tags always balanced by construction), so
-  the "can't parse entities" class is impossible by construction and no
-  second send path exists. Any 400 keeps today's failure semantics
-  byte-for-byte. PROOF obligation: a property-style test feeds
-  adversarial inputs (unclosed markers, model-typed <pre>, entities,
-  huge pipes) and machine-validates the output — balanced known tags
-  only, no unescaped & < > outside renderer tags.
-- Tables/fences/bold/code rules unchanged from v2 (hermes semantics,
-  lossless bullets).
-Detectors: renderer property test above; unit tests per rule; adapter
-tests: parse_mode present on every send; long reply -> N rows with the
-derived ids, each SENT independently, crash-sim between parts leaves
-later parts PENDING and resends nothing accepted; ablations: chunker
-split-at-enqueue (single-row revert) and the property validator.
+### B. Telegram adapter: outbound rendering (v4)
+`renderHTML(original) string` at the SEND boundary only — the outbox
+row and journal keep the ORIGINAL text (kilo r3 F4 resolved: journal
+truth = original, rendering is ephemeral per attempt).
+- TOKENIZER PRECEDENCE SPECIFIED (kilo r3 F1): fenced block > inline
+  code > bold; spans never overlap (first match wins, later overlapping
+  markers are literal text); inside <pre>/<code> content is escaped
+  only — NO nested tags can be emitted, by construction. Tables ->
+  hermes bullet groups (lossless rules from v2) BEFORE span parsing;
+  table cell content is escaped, cell headings bolded whole (no span
+  parsing inside cells).
+- ENTITY BUDGET (codex r3 constructive-validity residue): if the
+  rendered message would exceed 50 tags, render DEGRADES at the render
+  boundary to fully-escaped plain text (no tags at all) — one message,
+  one send, no second attempt; Telegram's documented entity limit is
+  never approached.
+- Property validator test: for adversarial inputs (overlapping
+  markers, model-typed HTML, entities, pipes, huge inputs) the output
+  machine-checks: only renderer tags, balanced, NEVER nested, all
+  & < > outside tags escaped, tag count <= 50.
+- parse_mode=HTML on every send; NO fallback path exists; any Telegram
+  400 keeps today's semantics byte-for-byte.
+Detectors: property validator; per-rule unit tests (incl. nested-marker
+overlap -> non-nested output; `<b>use <code>ls</code></b>` shape never
+emitted); adapter test asserting parse_mode and unchanged 400
+semantics; ablations: precedence rule (allow overlap -> validator RED),
+entity-budget degrade.
 
 ## Non-goals (P0)
+- Multipart/chunking (own future slice: enqueue-boundary rows, B7
+  batch, reconcile grammar, UTF-16 budget — trigger: first real
+  over-limit reply in dogfood).
 - Bot API 10.1 sendRichMessage (needs new API surface).
 - Full markdown engine; only the listed constructs.
-- Native provider function-calling (bigger provider-layer slice; noted
-  as the durable fix for A, deferred with a trigger: second schema-drift
-  class observed).
+- Native provider function-calling (durable fix for A, deferred).
 
 ## Risks / tradeoffs
 - No retry at all in P0: a drifting model yields a typed "try again"
