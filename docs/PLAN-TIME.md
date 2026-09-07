@@ -21,8 +21,8 @@ the system message per request (stateless, no tool needed).
   reconstructs .UTC(), so the location must be its OWN injected
   dependency): ChatPlanner gains constructor-injected
   `clockid.Clock` AND `*time.Location`; the line renders
-  `clock.Now().In(loc)`. Production wires clockid.Real + time.Local;
-  tests wire clockid.NewFake + time.FixedZone (CI-independent).
+  `clock.Now().In(loc)`. Production wires clockid.System + the configured IANA zone;
+  tests wire clockid.NewFake + a fixed IANA name.
 - DECLARED LIMIT (r2 codex MED#2): Go silently falls back to UTC when
   the host zone database is missing — then the line truthfully shows
   UTC (UTC+00:00). No degraded-state detection is attempted (out of
@@ -49,6 +49,8 @@ the system message per request (stateless, no tool needed).
   end of the LAST user message, in both the plain and WithTools
   planners; assert the SYSTEM message does NOT contain the line
   (placement lock).
+- Constructor fail-closed cases: empty zone name and an unloadable
+  zone name both REJECT construction (r3 codex LOW#2).
 - Ablation: remove the injection -> RED; move it into the system
   prompt -> the placement lock turns RED.
 - TestToolPromptDeterministic unchanged (system prompt is untouched).
