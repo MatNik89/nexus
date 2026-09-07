@@ -233,11 +233,33 @@ func (l *Loop) ResumeTurn(ctx context.Context, turn contracts.TurnID, run contra
 	return l.iterate(ctx, turn, run, profile, blocks, next)
 }
 
+// DriftError is the typed carrier for a model reply that NAMED a
+// registered tool but broke the tool-call schema (tgout plan v13/v14:
+// it lives in THIS package because planner already imports loop and
+// loop must never import planner). failTurn extracts it structurally
+// (errors.As) and journals code+tool; edges map the code to the user
+// message — no error-string parsing anywhere.
+type DriftError struct {
+	Typed contracts.TypedError
+	Tool  contracts.ToolID
+}
+
+func (e DriftError) Error() string { return e.Typed.SafeMessage }
+
 // iterate is the shared plan→act→observe core (turn already RUNNING).
 func (l *Loop) iterate(ctx context.Context, turn contracts.TurnID, run contracts.RunID,
 	profile contracts.ProfileID, initial []contracts.ContextBlock, next func() int) (string, error) {
 	failTurn := func(cause error) (string, error) {
-		if jerr := l.append(ctx, run, profile, turn, machine.EvTurnFailed, next(), nil); jerr != nil {
+		// A DriftError journals its code+tool STRUCTURALLY so a
+		// redelivered update can recover the exact typed outcome
+		// (tgout plan: restart-stable drift recovery).
+		payload := json.RawMessage(fmt.Sprintf(`{"turn_id":%q}`, turn))
+		var de DriftError
+		if errors.As(cause, &de) {
+			payload, _ = json.Marshal(map[string]string{
+				"turn_id": string(turn), "error_code": de.Typed.Code, "tool": string(de.Tool)})
+		}
+		if jerr := l.appendPayload(ctx, run, profile, turn, machine.EvTurnFailed, next(), nil, payload); jerr != nil {
 			return "", fmt.Errorf("%w (and journal: %v)", cause, jerr)
 		}
 		return "", cause
