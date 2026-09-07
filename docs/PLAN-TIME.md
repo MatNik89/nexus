@@ -21,7 +21,7 @@ the system message per request (stateless, no tool needed).
   string. The constructor calls time.LoadLocation(name) and stores
   BOTH the *time.Location and the original name — rejecting
   construction (fail-closed, like every planner dependency) on an
-  empty name or a LoadLocation error. There is NO time.Local use and
+  empty name, the special value "Local", or a LoadLocation error. There is NO time.Local use and
   NO silent-UTC fallback anywhere in this slice: missing tzdata for
   the configured zone REJECTS DAEMON STARTUP with a causal error
   (r4 codex MED#2 — one unambiguous production outcome).
