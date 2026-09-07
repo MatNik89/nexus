@@ -27,8 +27,11 @@ consume, with these corrections:
   lifecycle event arrives first — suspended-only and failed-only turns
   (both exist in committed detectors) get rows without an admission.
   Columns: turn_id PRIMARY KEY, identity, update_id, user_text,
-  hist_done (BOOLEAN — set by EVERY valid turn.succeeded, empty final
-  included; r2 codex HIGH / kilo F1: completion is the EVENT, the
+  hist_done (BOOLEAN — set by a valid turn.succeeded, empty final
+  included, but ONLY when the row's admission has already been
+  observed (hist_seq set): the reference discards a success that
+  precedes its admission and a later admission does NOT resurrect it
+  (r3 codex MED) — the fold mirrors that exactly; r2 codex HIGH / kilo F1: completion is the EVENT, the
   index predicates on THIS marker, never on content), hist_final
   (lossless content, may be the empty string), rec_state
   (NONE|SUCCEEDED|SUSPENDED|FAILED — recovery semantics, where
