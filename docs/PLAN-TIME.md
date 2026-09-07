@@ -16,20 +16,26 @@ the system message per request (stateless, no tool needed).
   the line is appended to the END of the CURRENT assembled user
   content, after the fenced/context body. The cacheable prefix
   (system + history role messages) stays byte-stable.
-- CLOCK OWNER (codex MED / agy #3): NO package global. ChatPlanner
-  gains a constructor-injected `clockid.Clock` (the repository's
-  canonical clock seam, same as approval.NewStore); production wires
-  clockid.Real, tests clockid.NewFake.
+- CLOCK + LOCATION SEAM (r2 codex MED#1 / kilo K1: clockid is
+  UTC-only by design — production returns .UTC() and the fake
+  reconstructs .UTC(), so the location must be its OWN injected
+  dependency): ChatPlanner gains constructor-injected
+  `clockid.Clock` AND `*time.Location`; the line renders
+  `clock.Now().In(loc)`. Production wires clockid.Real + time.Local;
+  tests wire clockid.NewFake + time.FixedZone (CI-independent).
+- DECLARED LIMIT (r2 codex MED#2): Go silently falls back to UTC when
+  the host zone database is missing — then the line truthfully shows
+  UTC (UTC+00:00). No degraded-state detection is attempted (out of
+  scope; the host is the owner's box).
 - FORMAT, exact Go layout (agy #2 / kilo: `TZ` was a placeholder
   mistake): layout `"2006-01-02 15:04 Monday"` plus explicit zone
   rendered as `<IANA-or-abbrev> (UTC+02:00)` built from
   `t.Zone()` + `t.Format("-07:00")` — the numeric offset is included
   so the model can compute RFC 3339 for reminder tools (kilo #5).
   The full line: "\nCurrent date and time: 2026-09-08 04:55 Monday,
-  CEST (UTC+02:00)". Closed grammar: layout output + zone abbrev
-  ([A-Za-z0-9+/_-]+, from the Go runtime, never user input) + fixed
-  punctuation — no injection surface (codex LOW #2 addressed by
-  construction; the string never contains model or user bytes).
+  CEST (UTC+02:00)". The zone name comes from the runtime location —
+  no user or model bytes are ever on this path (r2 codex LOW: no
+  character-class invariant is claimed).
 - NO FALLBACK BRANCH (codex MED #3 / agy #7): `time.Time.Zone()` and
   `Local` cannot fail in Go — the imagined "zone lookup fails" branch
   is removed; there is exactly one code path.
@@ -53,14 +59,6 @@ the system message per request (stateless, no tool needed).
   sub-minute precision.
 - No per-user timezone config (single-owner P0; the host zone IS the
   owner's zone).
-
-## Detectors
-- Unit: with nowFn pinned, the system message contains the exact
-  formatted line (both plain and WithTools planners); ablation removes
-  the injection -> RED.
-- Determinism guard: TestToolPromptDeterministic keeps passing (tool
-  ordering unaffected; the time line is identical within one pinned
-  nowFn).
 
 ## Risk
 - The user-content tail changes per minute; the cacheable PREFIX
