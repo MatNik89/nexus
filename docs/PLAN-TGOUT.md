@@ -77,7 +77,9 @@ a committed case and the classifier grows per dialect.)
   else prose. Values under OTHER keys are ignored — a legitimate
   answer like {"description":"memory_recall"} stays prose (committed
   case), while {"action":"memory_recall","action":"tool"} is drift,
-  never prose, never execution (committed case);
+  never prose, never execution (committed case) — and the SAME
+  duplicate/alias cases are committed AGAIN through the single-fence
+  normalization path (fenced duplicate -> drift; r10 kilo F2);
   (2) only when it says not-a-tool, build the classification view (one
   wrapping fence stripped; still-fenced-after-one -> prose); (3) DRIFT
   when the view is a single JSON object AND any of action/tool_id/name
@@ -93,6 +95,15 @@ a committed case and the classifier grows per dialect.)
   HISTORY INTERACTION (kilo F2): conversation history folds ONLY
   turn.succeeded, so a drifted turn never enters history as an
   assistant reply — declared and asserted in a committed test.
+  RESTART-STABLE RECOVERY (r9/r10 codex MED): completedTurnFinal is
+  extended to also recover a durable `turn.failed` with an
+  `error_code` — a redelivered update whose turn already FAILED with
+  TOOL_SCHEMA_DRIFT returns the same typed outcome (edge maps the same
+  Croatian message) and the planner is NOT re-invoked. Detector:
+  close/reopen (crash seam) after turn.failed but before
+  CompleteInbound, redeliver, assert the same Croatian response and
+  zero planner calls; ablation removes only failed-turn recovery ->
+  RED.
   FIELD PRECEDENCE (r5 codex F5): when several fields match known
   tools, action > tool_id > name decides the reported <tool>;
   the conflicting-fields case is a committed test. The Croatian edge
