@@ -291,6 +291,20 @@ func (a *Adapter) FlushOutbox(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("telegram: malformed channel identity %q", o.ChannelIdentity)
 		}
+		// FIRST-LEASE-ONLY FORMATTING (tgout plan): the rendered HTML
+		// body is carried only when this delivery has never been
+		// wire-attempted (attempts folds the pre-wire outbound_unknown
+		// lease, so a pre-wire failure also consumes it — declared
+		// degradation); every re-flush carries the ORIGINAL with no
+		// parse_mode, so a Telegram parse rejection self-heals on the
+		// next regular flush tick. This slice adds NO attempt and
+		// changes no scheduling — only the carried bytes.
+		if o.Attempts == 0 {
+			if rendered, ok := renderHTML(o.Text); ok {
+				return a.call(ctx, "sendMessage", map[string]any{
+					"chat_id": chat, "text": rendered, "parse_mode": "HTML"}, nil)
+			}
+		}
 		return a.call(ctx, "sendMessage", map[string]any{"chat_id": chat, "text": o.Text}, nil)
 	})
 }
