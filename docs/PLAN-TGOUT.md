@@ -245,8 +245,11 @@ tag/length budget.
 - No retry in P0: a drifting model yields the typed sentinel and a
   Croatian edge message — one bad UX beat, no contract violations.
   Native function calling remains the durable fix, deferred.
-- A render bug can only cost FORMATTING: bool=false sends the original
-  through today's path; content and delivery semantics never depend on
-  the renderer.
+- A render bug costs FORMATTING and, in the parse-400 case, DELIVERY
+  LATENCY: a rejected rendered send is re-pended and delivers PLAIN on
+  the next existing flush tick (the committed parse-400 detector is
+  the bound proving that eventual plain delivery). The durable bytes
+  (original text) never depend on the renderer; bool=false sends the
+  original through today's path unchanged (r15 codex).
 - Declared classifier limits (collision, mixed prose+JSON, unknown
   dialects) are visible in committed tests, not hidden claims.
