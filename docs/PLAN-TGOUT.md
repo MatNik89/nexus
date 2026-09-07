@@ -45,41 +45,67 @@ result. Reviewers: challenge this if HTML mode has a hole we missed.
 
 ## Proposed changes
 
-### A. Planner: no tool-shaped JSON ever reaches the user
-In `ChatPlanner.Plan` (and the tools path), after `toolCallFromReply`
-returns not-a-tool: if the reply still LOOKS tool-shaped (a single JSON
-object whose top level has an `action` field), do ONE corrective retry:
-re-issue the chat with an appended system-style correction ("your last
-reply was malformed tool JSON; either use the exact schema
-{"action":"tool","tool_id":...,"arguments":{...}} or answer the user in
-prose"). If the second reply is still tool-shaped JSON, return a typed
-final ("Nisam uspio ispravno pozvati alat — pokušaj ponovno.") — never
-the raw JSON. Detector: RED test with a scripted provider returning the
-malformed shape twice; assert the user-visible final contains no `{`
-JSON and the corrective retry happened exactly once.
+### A. Planner: no tool-shaped JSON ever reaches the user (v2)
+NO retry. P0.2/S7 owns every retry and s7-min grants ONE attempt per
+operation (review round 1, codex BLOCKER) — the planner must not issue
+a second physical provider call. Instead:
+- After `toolCallFromReply` says not-a-tool, classify the reply as
+  SCHEMA DRIFT only when it is a single JSON object AND (its top-level
+  `action` value equals a KNOWN tool id, OR it has a top-level
+  `tool_id` field whose value is a known tool id). This is the exact
+  observed drift signature (`{"action":"memory_recall",...}`) and
+  cannot fire on legitimate JSON answers the user asked for (kilo F2:
+  an `action` key alone is common in ordinary JSON content).
+- On drift: return the TYPED final "Nisam uspio ispravno pozvati alat
+  (<tool>). Pokušaj ponovno ili preformuliraj." — never the raw JSON,
+  never another provider call. The user retries by talking (HITL
+  spirit), the system never retries blind.
+- Prompt hardening in the same slice: toolProtocol gains an explicit
+  negative example ("NEVER {"action":"<tool name>"} — action is
+  always the literal "tool"").
+Detectors: scripted provider returning the drift shape -> typed final,
+EXACTLY ONE transport call and one grant consumed (transport-call
+counter + grant assertions per codex); legitimate JSON answer with an
+unrelated `action` value -> delivered verbatim (false-positive guard);
+ablation: drop the known-tool check -> RED on the false-positive case.
 
-### B. Telegram adapter: outbound rendering (the hermes shape)
-New `render.go` in internal/channel/telegram, pure function
-`renderHTML(text) (html string)`:
-- ALL markdown pipe-tables (outside code fences) -> bold-heading +
-  bullet row groups, exactly hermes' convert_table_to_bullets
-  semantics: heading = row-label cell (or first non-empty cell),
-  remaining cells "• Header: value"; malformed pipe runs pass through
-  unchanged.
-- Fenced code blocks -> `<pre>` (contents escaped, otherwise verbatim);
-  inline backticks -> `<code>`; `**bold**` -> `<b>`. Everything else
-  HTML-escaped (& < >). No full markdown engine — exactly these rules.
-- FlushOutbox sends `parse_mode:"HTML"` with the rendered text; on ANY
-  Telegram 400 it RESENDS the ORIGINAL text plain (hermes' strip
-  fallback, simpler: we still have the original — delivery honesty
-  unchanged, same delivery id row, one SENT).
-- The outbox row keeps storing the ORIGINAL text (journal truth
-  unchanged); rendering happens at the send boundary only.
-Detectors: unit tests per rule (table -> bullets incl. row-label and
-no-label shapes, fence protection, `<script>` escape, bold/code
-mapping); adapter test with the fake Bot API asserting parse_mode
-present and the 400-fallback plain resend (fake returns 400 once, one
-SENT row).
+### B. Telegram adapter: outbound rendering (v2, the hermes shape)
+`renderHTML(text) string` pure function, rules as v1 (tables ->
+bold-heading + bullet groups exactly like the owner's local
+hermes-agent convert_table_to_bullets; fences -> <pre>; `code` ->
+<code>; **bold** -> <b>; all else HTML-escaped) with these review
+corrections:
+- ESCAPE PIPELINE SPECIFIED (codex #4/kilo F1): tokenize first (fences,
+  inline code, bold spans, tables), HTML-escape every token's CONTENT,
+  then wrap in tags — tags are constructed only by the renderer, never
+  present in escaped content. Tests include `<script>` inside bold,
+  `<pre>` typed by the model, `&` in table cells, nested/unclosed
+  markers (pass through escaped).
+- LOSSLESS tables (codex #5/agy #4): empty cells render as "• Header:
+  —"; surplus cells beyond the header count are appended as "• (extra):
+  value"; any row that fails to parse keeps the whole block verbatim
+  (escaped). Nothing is dropped.
+- 4096 LIMIT owned (codex #6/agy #2): before send, split the RENDERED
+  text on line boundaries into <=4000-char chunks (each chunk closes/
+  reopens an open <pre>); every chunk sends under the SAME delivery id
+  row and the row is SENT only after the LAST chunk is accepted
+  (at-least-once honesty: a crash mid-chunks redelivers all chunks —
+  duplicates allowed, loss not).
+- NARROW fallback (codex #3/kilo F3/agy #2): plain resend ONLY when the
+  Telegram error description contains "can't parse entities" (the
+  entity-parse class). Every other 400 keeps the existing failure path
+  (PENDING/UNKNOWN per current outbox semantics) — a blocked bot or
+  dead chat is not a formatting problem. The fallback send reuses the
+  same delivery id; the outbox row becomes SENT only on wire
+  acceptance of whichever attempt succeeded; the attempt sequence is
+  journal-visible (outbound_unknown/resolved unchanged).
+Detectors: unit tests per rule incl. the lossless-table cases and the
+escape pipeline cases; adapter tests with the fake Bot API: (a)
+parse_mode present, (b) entity-parse 400 -> ONE plain resend, one SENT
+row, (c) non-entity 400 (too long simulated) -> NO plain resend, row
+not SENT, (d) >4096 rendered -> chunked sends, SENT only after last
+chunk, chunk count asserted; ablations for the fallback-narrowing and
+the chunker.
 
 ## Non-goals (P0)
 - Bot API 10.1 sendRichMessage (needs new API surface).
@@ -89,9 +115,10 @@ SENT row).
   class observed).
 
 ## Risks / tradeoffs
-- Corrective retry adds one provider round trip in the malformed case
-  only. Bounded to ONE retry (no loop risk).
-- HTML escape bugs could eat user content: the fallback-to-plain resend
-  bounds the damage to formatting, never delivery loss.
-- Row-bullet table heuristics can misfire on pathological pipes; the
-  `<pre>` fallback keeps content lossless.
+- No retry at all in P0: a drifting model yields a typed "try again"
+  final — one bad UX beat, zero contract violations. Native function
+  calling (provider layer) remains the durable fix, deferred.
+- HTML escape bugs could eat formatting, never content: the narrow
+  entity-parse fallback re-sends the original plain.
+- Table bullets are lossless by construction (empty/extra-cell rules);
+  unparseable blocks pass through escaped.
