@@ -26,6 +26,7 @@ import (
 
 	"github.com/MatNik89/nexus/internal/app/repl"
 	"github.com/MatNik89/nexus/internal/approval"
+	"github.com/MatNik89/nexus/internal/channel"
 	"github.com/MatNik89/nexus/internal/foundation/clockid"
 	"github.com/MatNik89/nexus/internal/foundation/config"
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
@@ -85,6 +86,9 @@ func testDaemon(t *testing.T, planner loop.Planner, audit effectpath.AuditSink) 
 		ev[n] = nil
 	}
 	for n, v := range approval.Events() {
+		ev[n] = v
+	}
+	for n, v := range channel.Events() {
 		ev[n] = v
 	}
 	j, err := journal.Open(filepath.Join(dir, "journal.db"), "work", redact.None{}, ev)
@@ -594,5 +598,89 @@ func TestRedeliveredSuspendedTurnRecoversChallenge(t *testing.T) {
 	}
 	if out8 != ch8.Summary {
 		t.Fatalf("recovered %q, want the challenge summary %q", out8, ch8.Summary)
+	}
+}
+
+// DOGFOOD 2026-09-07 (first live conversation): every turn claimed "no
+// prior context" — RunChannelTurn passed ONLY the current message. A
+// channel turn must carry the recent conversation history of ITS
+// identity (and never another identity's).
+func TestChannelTurnCarriesConversationHistory(t *testing.T) {
+	p := &blockCapturingPlanner{}
+	d, _, j := testDaemon(t, p, nil)
+	core, err := channel.New(j)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Mirror the production path: ADMIT (the durable user text) before
+	// running the turn — history reads the admission records.
+	send := func(identity string, uid int64, text string) {
+		t.Helper()
+		if _, err := core.Admit(context.Background(), channel.Inbound{
+			AdapterID: "telegram", ChannelIdentity: identity, UpdateID: uid,
+			Text: text, Profile: "work"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := d.RunChannelTurn(context.Background(), identity, uid, text); err != nil {
+			t.Fatal(err)
+		}
+	}
+	send("chat-42", 1, "my wifi password is banana42")
+	send("chat-42", 2, "what did I just tell you?")
+	// A DIFFERENT identity must not inherit chat-42's history (B3).
+	send("chat-99", 3, "hello")
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.blocks) != 3 {
+		t.Fatalf("want 3 planner calls, got %d", len(p.blocks))
+	}
+	flat := func(bs []contracts.ContextBlock) string {
+		var sb strings.Builder
+		for _, b := range bs {
+			if b.Content != nil {
+				sb.WriteString(*b.Content)
+				sb.WriteString("\n")
+			}
+		}
+		return sb.String()
+	}
+	second := flat(p.blocks[1])
+	if !strings.Contains(second, "banana42") {
+		t.Fatalf("turn 2 does not see turn 1's user message:\n%s", second)
+	}
+	if !strings.Contains(second, "ok") {
+		t.Fatalf("turn 2 does not see the assistant's prior reply:\n%s", second)
+	}
+	third := flat(p.blocks[2])
+	if strings.Contains(third, "banana42") {
+		t.Fatalf("chat-99 inherited chat-42's history (cross-identity leak):\n%s", third)
+	}
+}
+
+// DOGFOOD 2026-09-07: the interactive chat session must also carry its
+// own conversation history — message 2 sees message 1 and its reply.
+func TestChatSessionCarriesHistory(t *testing.T) {
+	p := &blockCapturingPlanner{}
+	_, sock, _ := testDaemon(t, p, nil)
+	c := dial(t, sock, false)
+	if out, errText := c.chat(t, "my locker code is 7714"); errText != "" || out == "" {
+		t.Fatalf("first message failed: %q err=%q", out, errText)
+	}
+	if out, errText := c.chat(t, "what code did I mention?"); errText != "" || out == "" {
+		t.Fatalf("second message failed: %q err=%q", out, errText)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.blocks) != 2 {
+		t.Fatalf("want 2 planner calls, got %d", len(p.blocks))
+	}
+	joined := ""
+	for _, b := range p.blocks[1] {
+		if b.Content != nil {
+			joined += *b.Content + "\n"
+		}
+	}
+	if !strings.Contains(joined, "7714") || !strings.Contains(joined, "ok") {
+		t.Fatalf("second turn does not carry the session history:\n%s", joined)
 	}
 }
