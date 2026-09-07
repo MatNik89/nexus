@@ -23,9 +23,11 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/MatNik89/nexus/internal/app/repl"
 	"github.com/MatNik89/nexus/internal/approval"
+	"github.com/MatNik89/nexus/internal/channel"
 	"github.com/MatNik89/nexus/internal/foundation/clockid"
 	"github.com/MatNik89/nexus/internal/foundation/config"
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
@@ -79,6 +81,11 @@ func (a *capturingAudit) Record(event string, call contracts.ToolCall) error {
 
 func testDaemon(t *testing.T, planner loop.Planner, audit effectpath.AuditSink) (*Daemon, string, *journal.Journal) {
 	t.Helper()
+	return testDaemonRedact(t, planner, audit, redact.None{})
+}
+
+func testDaemonRedact(t *testing.T, planner loop.Planner, audit effectpath.AuditSink, r redact.Redactor) (*Daemon, string, *journal.Journal) {
+	t.Helper()
 	dir := t.TempDir()
 	ev := map[string]journal.PayloadValidator{}
 	for _, n := range machine.EventTypes() {
@@ -87,7 +94,10 @@ func testDaemon(t *testing.T, planner loop.Planner, audit effectpath.AuditSink) 
 	for n, v := range approval.Events() {
 		ev[n] = v
 	}
-	j, err := journal.Open(filepath.Join(dir, "journal.db"), "work", redact.None{}, ev)
+	for n, v := range channel.Events() {
+		ev[n] = v
+	}
+	j, err := journal.Open(filepath.Join(dir, "journal.db"), "work", r, ev)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +117,7 @@ func testDaemon(t *testing.T, planner loop.Planner, audit effectpath.AuditSink) 
 					Status: contracts.ResultSucceeded, StartedAt: time.Unix(1, 0), FinishedAt: time.Unix(2, 0)}, nil
 			},
 		},
-		Audit: audit, Redactor: redact.None{},
+		Audit: audit, Redactor: r,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -595,4 +605,296 @@ func TestRedeliveredSuspendedTurnRecoversChallenge(t *testing.T) {
 	if out8 != ch8.Summary {
 		t.Fatalf("recovered %q, want the challenge summary %q", out8, ch8.Summary)
 	}
+}
+
+// DOGFOOD 2026-09-07 (first live conversation): every turn claimed "no
+// prior context" — RunChannelTurn passed ONLY the current message. A
+// channel turn must carry the recent conversation history of ITS
+// identity (and never another identity's).
+func TestChannelTurnCarriesConversationHistory(t *testing.T) {
+	p := &blockCapturingPlanner{}
+	d, _, j := testDaemon(t, p, nil)
+	core, err := channel.New(j)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Mirror the production path: ADMIT (the durable user text) before
+	// running the turn — history reads the admission records.
+	send := func(identity string, uid int64, text string) {
+		t.Helper()
+		if _, err := core.Admit(context.Background(), channel.Inbound{
+			AdapterID: "telegram", ChannelIdentity: identity, UpdateID: uid,
+			Text: text, Profile: "work"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := d.RunChannelTurn(context.Background(), identity, uid, text); err != nil {
+			t.Fatal(err)
+		}
+	}
+	send("chat-42", 1, "my wifi password is banana42")
+	send("chat-42", 2, "what did I just tell you?")
+	// A DIFFERENT identity must not inherit chat-42's history (B3).
+	send("chat-99", 3, "hello")
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.blocks) != 3 {
+		t.Fatalf("want 3 planner calls, got %d", len(p.blocks))
+	}
+	flat := func(bs []contracts.ContextBlock) string {
+		var sb strings.Builder
+		for _, b := range bs {
+			if b.Content != nil {
+				sb.WriteString(*b.Content)
+				sb.WriteString("\n")
+			}
+		}
+		return sb.String()
+	}
+	second := flat(p.blocks[1])
+	if !strings.Contains(second, "banana42") {
+		t.Fatalf("turn 2 does not see turn 1's user message:\n%s", second)
+	}
+	if !strings.Contains(second, "ok") {
+		t.Fatalf("turn 2 does not see the assistant's prior reply:\n%s", second)
+	}
+	third := flat(p.blocks[2])
+	if strings.Contains(third, "banana42") {
+		t.Fatalf("chat-99 inherited chat-42's history (cross-identity leak):\n%s", third)
+	}
+}
+
+// DOGFOOD 2026-09-07: the interactive chat session must also carry its
+// own conversation history — message 2 sees message 1 and its reply.
+func TestChatSessionCarriesHistory(t *testing.T) {
+	p := &blockCapturingPlanner{}
+	_, sock, _ := testDaemon(t, p, nil)
+	c := dial(t, sock, false)
+	if out, errText := c.chat(t, "my locker code is 7714"); errText != "" || out == "" {
+		t.Fatalf("first message failed: %q err=%q", out, errText)
+	}
+	if out, errText := c.chat(t, "what code did I mention?"); errText != "" || out == "" {
+		t.Fatalf("second message failed: %q err=%q", out, errText)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.blocks) != 2 {
+		t.Fatalf("want 2 planner calls, got %d", len(p.blocks))
+	}
+	joined := ""
+	for _, b := range p.blocks[1] {
+		if b.Content != nil {
+			joined += *b.Content + "\n"
+		}
+	}
+	if !strings.Contains(joined, "7714") || !strings.Contains(joined, "ok") {
+		t.Fatalf("second turn does not carry the session history:\n%s", joined)
+	}
+}
+
+// CONV-HIST r2 (codex #1/#2, kilo F2, agy L5): committed detectors for
+// every behavioral history rule — completed-only filtering owned by the
+// turn.succeeded EVENT (empty final still counts), cap AFTER the
+// filter, exact identity membership, rune-safe clipping, and redacted
+// session finals.
+func TestConversationHistoryRules(t *testing.T) {
+	emptyFinal := ""
+	p := &scriptedPlanner{finals: map[string]*string{"make it empty": &emptyFinal}}
+	d, _, j := testDaemon(t, p, nil)
+	core, err := channel.New(j)
+	if err != nil {
+		t.Fatal(err)
+	}
+	send := func(identity string, uid int64, text string) {
+		t.Helper()
+		if _, err := core.Admit(context.Background(), channel.Inbound{
+			AdapterID: "telegram", ChannelIdentity: identity, UpdateID: uid,
+			Text: text, Profile: "work"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := d.RunChannelTurn(context.Background(), identity, uid, text); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 14 completed turns: the 12-pair cap must keep the LAST 12 even
+	// with an ADMITTED-BUT-NEVER-RUN update in between (cap after the
+	// completed filter, suspended admissions don't consume the window).
+	for i := 1; i <= 7; i++ {
+		send("chat-42", int64(i), fmt.Sprintf("early-%d", i))
+	}
+	if _, err := core.Admit(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 100,
+		Text: "admitted but never completed", Profile: "work"}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 8; i <= 14; i++ {
+		send("chat-42", int64(i), fmt.Sprintf("late-%d", i))
+	}
+	// Identity that is a PREFIX of another (exact membership rule).
+	send("chat-42-x", 200, "other identity secret")
+	// An EMPTY final is still a completed turn.
+	send("chat-42", 300, "make it empty")
+	// A rune-heavy entry must clip without splitting UTF-8: the "a"
+	// offset + 4-byte emoji makes any BYTE-based 1500-cut fall mid-rune
+	// (conv-hist r3 kilo F1), and the output must be EXACTLY the
+	// 1500-rune budget ending in the ellipsis (codex #2).
+	send("chat-42", 301, "a"+strings.Repeat("🙂", 1500))
+
+	hist, err := d.conversationHistory("chat-42", "turn-chan-chat-42-999")
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := ""
+	userBlocks := 0
+	for _, b := range hist {
+		if b.Kind == "history_user" {
+			userBlocks++
+		}
+		joined += *b.Content + "\n"
+	}
+	if userBlocks != 12 {
+		t.Fatalf("cap after completed filter broken: %d user entries, want 12", userBlocks)
+	}
+	if strings.Contains(joined, "early-1") || strings.Contains(joined, "early-2") {
+		t.Fatalf("FIFO kept the oldest entries past the cap:\n%s", joined)
+	}
+	if !strings.Contains(joined, "late-14") {
+		t.Fatalf("newest completed entry missing:\n%s", joined)
+	}
+	if strings.Contains(joined, "never completed") {
+		t.Fatalf("incomplete admission entered history (or consumed the window):\n%s", joined)
+	}
+	if strings.Contains(joined, "other identity secret") {
+		t.Fatalf("prefix identity leaked across the B3 boundary:\n%s", joined)
+	}
+	if !strings.Contains(joined, "make it empty") {
+		t.Fatalf("empty-final turn misclassified as incomplete:\n%s", joined)
+	}
+	if !utf8.ValidString(joined) {
+		t.Fatal("clip split a UTF-8 rune")
+	}
+	var clipped string
+	for _, b := range hist {
+		if b.Kind == "history_user" && strings.HasPrefix(*b.Content, "a\U0001F642") {
+			clipped = *b.Content
+		}
+	}
+	if clipped == "" {
+		t.Fatal("clipped entry missing from history")
+	}
+	if got := len([]rune(clipped)); got != 1500 {
+		t.Fatalf("clip budget drifted: %d runes, want exactly 1500", got)
+	}
+	if !strings.HasSuffix(clipped, "…") {
+		t.Fatalf("clipped entry does not end in the ellipsis: %q", clipped[len(clipped)-8:])
+	}
+}
+
+// scriptedPlanner returns per-message finals ("ok" default).
+type scriptedPlanner struct {
+	finals map[string]*string
+}
+
+func (p *scriptedPlanner) Plan(ctx context.Context, blocks []contracts.ContextBlock) (loop.Action, error) {
+	last := blocks[len(blocks)-1]
+	if last.Content != nil {
+		if f, ok := p.finals[*last.Content]; ok {
+			return loop.Action{Final: f}, nil
+		}
+	}
+	final := "ok"
+	return loop.Action{Final: &final}, nil
+}
+
+// CONV-HIST r2 (kilo F3-follow-up): the SESSION history stores the
+// REDACTED final — a known secret ref echoed into a final must never
+// ride back to the provider on the next turn.
+func TestSessionHistoryStoresRedactedFinal(t *testing.T) {
+	secret := "the token is sk-VERYSECRET"
+	p := &capturingScriptedPlanner{finals: map[string]*string{"leak": &secret}}
+	_, sock, _ := testDaemonRedact(t, p, nil, markRedactor{})
+	c := dial(t, sock, false)
+	if _, errText := c.chat(t, "leak"); errText != "" {
+		t.Fatal(errText)
+	}
+	if _, errText := c.chat(t, "next"); errText != "" {
+		t.Fatal(errText)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	joined := ""
+	for _, b := range p.blocks[len(p.blocks)-1] {
+		if b.Kind == "history_assistant" && b.Content != nil {
+			joined += *b.Content
+		}
+	}
+	if strings.Contains(joined, "sk-VERYSECRET") {
+		t.Fatalf("raw secret re-fed to the provider via session history: %q", joined)
+	}
+	if !strings.Contains(joined, "[REDACTED]") {
+		t.Fatalf("history assistant entry missing the redacted final: %q", joined)
+	}
+}
+
+// CONV-HIST r3 (codex #1 / kilo F2): a LONG session must retain only
+// the last historyMaxPairs pairs — the next planner call carries
+// exactly 12 prior pairs and never the oldest one.
+func TestSessionHistoryBounded(t *testing.T) {
+	p := &capturingScriptedPlanner{}
+	_, sock, _ := testDaemon(t, p, nil)
+	c := dial(t, sock, false)
+	for i := 1; i <= 14; i++ {
+		if _, errText := c.chat(t, fmt.Sprintf("session-msg-%d", i)); errText != "" {
+			t.Fatal(errText)
+		}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	last := p.blocks[len(p.blocks)-1]
+	users := 0
+	joined := ""
+	for _, b := range last {
+		if b.Kind == "history_user" {
+			users++
+			joined += *b.Content + "\n"
+		}
+	}
+	if users != historyMaxPairs {
+		t.Fatalf("session history carries %d prior pairs, want exactly %d", users, historyMaxPairs)
+	}
+	if strings.Contains(joined, "session-msg-1\n") {
+		t.Fatalf("oldest pair survived the bound:\n%s", joined)
+	}
+	if !strings.Contains(joined, "session-msg-13") {
+		t.Fatalf("newest prior pair missing:\n%s", joined)
+	}
+}
+
+// markRedactor replaces the known test secret — a visible redaction seam.
+type markRedactor struct{}
+
+func (markRedactor) Redact(b []byte) ([]byte, error) {
+	return []byte(strings.ReplaceAll(string(b), "sk-VERYSECRET", "[REDACTED]")), nil
+}
+
+func (markRedactor) Touches(s string) bool { return strings.Contains(s, "sk-VERYSECRET") }
+
+type capturingScriptedPlanner struct {
+	mu     sync.Mutex
+	finals map[string]*string
+	blocks [][]contracts.ContextBlock
+}
+
+func (p *capturingScriptedPlanner) Plan(ctx context.Context, blocks []contracts.ContextBlock) (loop.Action, error) {
+	p.mu.Lock()
+	cp := append([]contracts.ContextBlock{}, blocks...)
+	p.blocks = append(p.blocks, cp)
+	p.mu.Unlock()
+	last := blocks[len(blocks)-1]
+	if last.Content != nil {
+		if f, ok := p.finals[*last.Content]; ok {
+			return loop.Action{Final: f}, nil
+		}
+	}
+	final := "ok"
+	return loop.Action{Final: &final}, nil
 }

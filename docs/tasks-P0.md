@@ -447,3 +447,16 @@ stated <16MiB/window detection ceiling. 4 review rounds (codex FAIL x3
 on attribution/hard-cap overclaims + evidence traceability -> all claims
 now measurement-bound). Verdicts: codex PASS, kilo PASS, agy PASS.
 Decision boundary: the next owner-scheduled 24h post-fix soak.
+
+### Conversation-history slice (dogfood finding #4, 2026-09-07)
+First live conversation exposed: no turn saw any prior context. Fix
+follows the STOLEN gateway pattern (karfly/chatgpt_telegram_bot,
+cross-checked vs OpenClaw/Hermes-Agent/AstrBot): per-chat history as
+alternating user/assistant ROLE messages, FIFO 12 pairs. 4 rounds:
+r1 1H (Kind-spoofing past the trust assembler -> daemon+trust+source
+gate) +1M+5L, r2 6 findings (completed bit owned by turn.succeeded,
+committed detectors for every rule, trust-leg case, bounded session),
+r3 2 convergent LOWs (mid-rune clip fixture + session-bound test).
+Croatian-output directive in the system prompt (owner order). All folds
+ablation-proven RED. Verdicts: codex FAILx3->PASS, kilo FAILx3->PASS,
+agy FAILx1->PASSx3.

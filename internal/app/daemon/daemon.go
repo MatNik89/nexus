@@ -181,6 +181,11 @@ func (d *Daemon) handle(ctx context.Context, conn net.Conn) {
 		return
 	}
 	msgN := 0
+	// Session-scoped conversation history (dogfood 2026-09-07: the chat
+	// session had the same no-prior-context hole as the channel path).
+	// In-memory is honest here: the history lives exactly as long as the
+	// interactive connection.
+	var hist []histPair
 	for {
 		line, err := r.ReadString('\n')
 		if err != nil {
@@ -199,12 +204,28 @@ func (d *Daemon) handle(ctx context.Context, conn net.Conn) {
 		}
 		turn := contracts.TurnID(fmt.Sprintf("turn-%d-%d-%d", d.nonce, session, msgN))
 		run := contracts.RunID(fmt.Sprintf("run-%d-%d-%d", d.nonce, session, msgN))
-		final, terr := l.RunTurn(ctx, turn, run, d.deps.Profile, []contracts.ContextBlock{block})
+		hb, hbErr := historyBlocks(fmt.Sprintf("repl-%d", session), "nexus://repl/history", hist)
+		if hbErr != nil {
+			writeFrame(conn, frame{Type: "error", Text: "history assembly failed"})
+			continue
+		}
+		blocks := append(hb, block)
+		final, terr := l.RunTurn(ctx, turn, run, d.deps.Profile, blocks)
 		if terr != nil {
 			// Typed sentinels keep their names (NEEDS_APPROVAL etc.);
 			// known secret references are scrubbed before the UI boundary.
 			writeFrame(conn, frame{Type: "error", Text: loop.RedactText(d.deps.Redactor, terr.Error())})
 			continue
+		}
+		// The session history stores the REDACTED final — the same
+		// bytes the journal keeps and the channel path re-feeds
+		// (conv-hist kilo F3: the raw final could re-transmit a known
+		// secret ref to the provider on the next turn).
+		hist = append(hist, histPair{user: f.Text, final: loop.RedactText(d.deps.Redactor, final)})
+		if len(hist) > historyMaxPairs {
+			// Bounded in place (conv-hist r2 codex #4): a long-lived
+			// session must not retain every pair forever.
+			hist = append(hist[:0], hist[len(hist)-historyMaxPairs:]...)
 		}
 		writeFrame(conn, frame{Type: "final", Text: final})
 	}
@@ -231,7 +252,15 @@ func (d *Daemon) RunChannelTurn(ctx context.Context, identity string, updateID i
 	if err != nil {
 		return "", err
 	}
-	final, err := l.RunTurn(ctx, turn, run, d.deps.Profile, []contracts.ContextBlock{block})
+	// CONVERSATION HISTORY (dogfood 2026-09-07): without it every turn
+	// answered "no prior context". The recent history of THIS identity
+	// rides in as chronological role blocks ahead of the current message.
+	hist, herr := d.conversationHistory(identity, turn)
+	if herr != nil {
+		return "", fmt.Errorf("conversation history: %w", herr)
+	}
+	blocks := append(hist, block)
+	final, err := l.RunTurn(ctx, turn, run, d.deps.Profile, blocks)
 	if err != nil {
 		// Crash between turn completion and channel delivery (Phase-5-r3
 		// codex #3): the redelivered update re-enters the same turn and
@@ -250,6 +279,129 @@ func (d *Daemon) RunChannelTurn(ctx context.Context, identity string, updateID i
 		return "", err
 	}
 	return final, nil
+}
+
+// conversationHistory folds this identity's COMPLETED past channel
+// turns (admitted user text + succeeded final) into history_user /
+// history_assistant blocks that the planner maps to real provider role
+// messages — the stolen gateway pattern (see historyBlocks). Finals
+// come from the journal, so they are the REDACTED delivered text.
+func (d *Daemon) conversationHistory(identity string, current contracts.TurnID) ([]contracts.ContextBlock, error) {
+	type pair struct {
+		user, final string
+		completed   bool // owned by the turn.succeeded EVENT, not final != ""
+	}
+	pairs := map[string]*pair{}
+	var order []string
+	err := d.deps.Journal.Replay(0, func(ev journal.Event) error {
+		switch ev.Envelope.EventType {
+		case "channel.inbound_admitted":
+			// The durable user text lives in the ADMISSION record (B2);
+			// its (identity, update_id) is exactly the turn id scheme.
+			var p struct {
+				ChannelIdentity string `json:"channel_identity"`
+				UpdateID        int64  `json:"update_id"`
+				Text            string `json:"text"`
+			}
+			if json.Unmarshal(ev.Envelope.Payload, &p) != nil || p.ChannelIdentity != identity {
+				return nil
+			}
+			tid := fmt.Sprintf("turn-chan-%s-%d", p.ChannelIdentity, p.UpdateID)
+			if tid == string(current) {
+				return nil
+			}
+			if _, ok := pairs[tid]; !ok {
+				pairs[tid] = &pair{}
+				order = append(order, tid)
+			}
+			if pairs[tid].user == "" {
+				pairs[tid].user = p.Text
+			}
+		case "turn.succeeded":
+			// EXACT membership in this identity's admitted set — the
+			// same boundary rule as the admission filter (conv-hist
+			// kilo F1: a prefix check over-matches identities that are
+			// prefixes of one another).
+			if ev.Envelope.TurnID == nil || *ev.Envelope.TurnID == current {
+				return nil
+			}
+			var p struct {
+				Final string `json:"final"`
+			}
+			if json.Unmarshal(ev.Envelope.Payload, &p) == nil {
+				if pr, ok := pairs[string(*ev.Envelope.TurnID)]; ok {
+					pr.final = p.Final
+					pr.completed = true // even when the final is empty
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	// Only COMPLETED pairs enter history (conv-hist codex MED): an
+	// admission without a turn.succeeded (suspended/failed turn) is not
+	// conversation yet — and the cap counts completed pairs, applied
+	// AFTER the filter. Completion is the EVENT, not a non-empty final
+	// (conv-hist r2 codex #1: an empty final is still a completed turn).
+	var entries []histPair
+	for _, id := range order {
+		if pairs[id].completed {
+			entries = append(entries, histPair{user: pairs[id].user, final: pairs[id].final})
+		}
+	}
+	if len(entries) > historyMaxPairs {
+		entries = entries[len(entries)-historyMaxPairs:]
+	}
+	return historyBlocks(identity, "nexus://telegram/"+identity+"/history", entries)
+}
+
+// historyMaxPairs is the FIFO window every history producer shares.
+const historyMaxPairs = 12
+
+type histPair struct{ user, final string }
+
+// historyBlocks emits history_user/history_assistant blocks with
+// zero-padded BlockIDs so the planner reconstructs chronology. The
+// stolen shape (karfly/chatgpt_telegram_bot and every mature Telegram
+// AI gateway): history is alternating ROLE messages, FIFO-capped —
+// past finals reach the model as the assistant role, so model output
+// is never re-minted as user-trust text.
+//
+// topknot: full-journal replay per channel turn is O(events);
+// acceptable at P0 volumes — trigger for a transcript projection:
+// replay latency visibly lagging a chat turn.
+func historyBlocks(scope, sourceURI string, entries []histPair) ([]contracts.ContextBlock, error) {
+	const entryCap = 1500 // runes, not bytes — clipping never splits UTF-8
+	clip := func(s string) string {
+		r := []rune(s)
+		if len(r) > entryCap {
+			return string(r[:entryCap-1]) + "…"
+		}
+		return s
+	}
+	var out []contracts.ContextBlock
+	for i, e := range entries {
+		user, final := e.user, e.final
+		if user != "" {
+			b, err := sourcedBlock(fmt.Sprintf("hist-%s-%06d-a-user", scope, i), clip(user), sourceURI, "daemon")
+			if err != nil {
+				return nil, err
+			}
+			b.Kind = "history_user"
+			out = append(out, b)
+		}
+		if final != "" {
+			b, err := sourcedBlock(fmt.Sprintf("hist-%s-%06d-b-nexus", scope, i), clip(final), sourceURI, "daemon")
+			if err != nil {
+				return nil, err
+			}
+			b.Kind = "history_assistant"
+			out = append(out, b)
+		}
+	}
+	return out, nil
 }
 
 // completedTurnFinal recovers the redacted final of an already-succeeded
