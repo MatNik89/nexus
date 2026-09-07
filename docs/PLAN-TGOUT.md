@@ -68,13 +68,16 @@ a committed case and the classifier grows per dialect.)
   valid closed-contract call EXECUTES exactly as today (committed
   positive control; committed case-alias and duplicate cases assert
   non-execution);
-- DUPLICATE/ALIAS ROUTING (r7 kilo F1): when the closed-contract check
-  rejects, the DRIFT decision does NOT re-decode (last-member-wins
-  would hide the earlier value): the same token-level walk collects
-  ALL top-level string values; if ANY equals a registered tool id ->
-  DRIFT (typed sentinel); else prose. Committed case:
-  {"action":"memory_recall","action":"tool"} -> drift, never prose,
-  never execution;
+- DUPLICATE/ALIAS ROUTING (r7 kilo F1, narrowed r8 kilo): when the
+  closed-contract check rejects, the DRIFT decision does NOT re-decode
+  (last-member-wins would hide the earlier value): the same
+  token-level walk collects the values of the keys action / tool_id /
+  name ONLY (key match case-insensitive), in ALL positions including
+  duplicates; if ANY such value equals a registered tool id -> DRIFT;
+  else prose. Values under OTHER keys are ignored — a legitimate
+  answer like {"description":"memory_recall"} stays prose (committed
+  case), while {"action":"memory_recall","action":"tool"} is drift,
+  never prose, never execution (committed case);
   (2) only when it says not-a-tool, build the classification view (one
   wrapping fence stripped; still-fenced-after-one -> prose); (3) DRIFT
   when the view is a single JSON object AND any of action/tool_id/name
@@ -111,20 +114,26 @@ steps 1/2 -> positive control RED), known-tool check, fence strip.
 `renderHTML(original) (string, bool)` at the SEND boundary; journal/
 outbox keep the ORIGINAL. The bool says "send rendered with
 parse_mode=HTML"; false means send the ORIGINAL exactly as today (no
-parse_mode) — ONE message either way, decided BEFORE the wire, so no
-second attempt ever exists (this replaces both the fallback and the
-degrade of earlier drafts).
-FIRST-ATTEMPT-ONLY FORMATTING (r7 codex MED — an entity-parse 400
-under today's PENDING/re-flush semantics would otherwise retry the
-SAME rejected formatting forever and the message would never arrive):
-the outbox row gains an `attempts` counter (additive projection
-change). A flush sends the rendered text with parse_mode ONLY when
-attempts==0; every re-flush of a previously attempted row sends the
-ORIGINAL with no parse_mode. A parse rejection therefore self-heals on
-the next regular flush tick (one wire attempt per tick, no second send
-within a tick, delivery converges to the plain path); the 400-handling
-code itself stays untouched, and "a render bug costs formatting only"
-becomes literally true.
+parse_mode) — ONE message either way per flush tick, decided BEFORE
+the wire (this replaces both the fallback and the degrade of earlier
+drafts; recovery across TICKS is the attempts rule below — the plan
+makes no "never a second attempt" absolute).
+FIRST-ATTEMPT-ONLY FORMATTING (r7 codex MED; ownership specified per
+r8 codex): a flush sends the rendered text with parse_mode ONLY when
+the row has never been wire-attempted; every re-flush sends the
+ORIGINAL with no parse_mode. The attempted-before signal is DERIVED
+FROM THE JOURNAL, not a mutable column: the projection folds the
+existing `channel.outbound_unknown` event (already appended when a
+send is parked before the wire) into an `attempts` count on the outbox
+row — single-write-owner untouched, no direct SQL mutation, and
+`Projection.Version()` is bumped for the schema change (old databases
+rebuild). A parse rejection therefore self-heals on the next regular
+flush tick (one wire attempt per tick, delivery converges to the plain
+path); the 400-handling code itself stays untouched. DETECTOR drives
+the guarantee end to end: the fake Bot API rejects the first formatted
+send with a parse-400 — the NEXT flush must send WITHOUT parse_mode
+and the row must land SENT; ablation (ignore the attempts count) keeps
+re-sending HTML and turns the test RED.
 Render returns false when:
 - the rendered text exceeds 4096 UTF-16 code units (the Bot API
   sendMessage bound, applied post-parse — codex F4: we do NOT claim
