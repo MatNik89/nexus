@@ -246,10 +246,14 @@ tag/length budget.
   Croatian edge message — one bad UX beat, no contract violations.
   Native function calling remains the durable fix, deferred.
 - A render bug costs FORMATTING and, in the parse-400 case, DELIVERY
-  LATENCY: a rejected rendered send is re-pended and delivers PLAIN on
-  the next existing flush tick (the committed parse-400 detector is
-  the bound proving that eventual plain delivery). The durable bytes
-  (original text) never depend on the renderer; bool=false sends the
-  original through today's path unchanged (r15 codex).
+  LATENCY: a rejected rendered send re-pends the row; the next
+  existing flush tick CARRIES the original plain bytes, and SENT
+  remains conditional on remote acceptance exactly as the at-least-
+  once boundary requires (that plain attempt can itself fail or go
+  ambiguous — no eventual-delivery guarantee is claimed). The
+  committed parse-400 detector bounds BYTE DEGRADATION (plain carried
+  on the re-attempt) plus the scripted accept-on-next-attempt case.
+  The durable bytes (original text) never depend on the renderer;
+  bool=false sends the original through today's path unchanged.
 - Declared classifier limits (collision, mixed prose+JSON, unknown
   dialects) are visible in committed tests, not hidden claims.
