@@ -95,15 +95,21 @@ a committed case and the classifier grows per dialect.)
   HISTORY INTERACTION (kilo F2): conversation history folds ONLY
   turn.succeeded, so a drifted turn never enters history as an
   assistant reply — declared and asserted in a committed test.
-  RESTART-STABLE RECOVERY (r9/r10 codex MED): completedTurnFinal is
-  extended to also recover a durable `turn.failed` with an
-  `error_code` — a redelivered update whose turn already FAILED with
-  TOOL_SCHEMA_DRIFT returns the same typed outcome (edge maps the same
-  Croatian message) and the planner is NOT re-invoked. Detector:
-  close/reopen (crash seam) after turn.failed but before
-  CompleteInbound, redeliver, assert the same Croatian response and
-  zero planner calls; ablation removes only failed-turn recovery ->
-  RED.
+  RESTART-STABLE RECOVERY (r9/r10 codex MED; contract narrowed r11):
+  `turn.failed` durably carries TWO fields — `error_code` AND `tool`
+  (the precedence winner). The promise is EXACTLY: same validated
+  error code + tool -> same edge response after restart. (No
+  field-for-field TypedError equality is claimed; Category/Origin/
+  Retryability are reconstructed constants for this code, stated as
+  such.) MECHANISM (r11 kilo): a NEW recovery helper
+  `failedTurnOutcome(turn) (code, tool, ok)` — not the string-typed
+  completedTurnFinal — is consulted on turn-collision after
+  succeeded/suspended; RunChannelTurn returns the reconstructed typed
+  error and the edge maps it exactly like the live path. Detector:
+  crash seam after turn.failed, redeliver, assert journaled code+tool
+  AND the identical Croatian string, zero planner calls; ablations:
+  drop failed-recovery entirely -> RED, drop the persisted `tool`
+  field -> the tool name vanishes from the message -> RED.
   FIELD PRECEDENCE (r5 codex F5): when several fields match known
   tools, action > tool_id > name decides the reported <tool>;
   the conflicting-fields case is a committed test. The Croatian edge
