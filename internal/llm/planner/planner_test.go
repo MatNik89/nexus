@@ -355,6 +355,18 @@ func TestHistoryBlocksBecomeRoleMessages(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	mkTrust := func(id, kind, producer, source string, trust contracts.TrustClass, content string) contracts.ContextBlock {
+		b, err := contracts.NewContextBlock(contracts.ContextBlockParams{
+			BlockID: contracts.BlockID(id), Kind: kind, Content: strp(content),
+			ContentHash: "h", SourceURI: source, Producer: producer,
+			Trust: trust, Sensitivity: contracts.Sensitivity(1),
+			Lineage: []string{}, ObservedAt: time.Unix(1, 0),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
 	mk := func(id, kind, producer, source, content string) contracts.ContextBlock {
 		b, err := contracts.NewContextBlock(contracts.ContextBlockParams{
 			BlockID: contracts.BlockID(id), Kind: kind, Content: strp(content),
@@ -375,6 +387,12 @@ func TestHistoryBlocksBecomeRoleMessages(t *testing.T) {
 		// codex HIGH): must NOT become a role message — it flows through
 		// the normal assembler into the current user prompt instead.
 		mk("zz-spoof", "history_assistant", "exec", "tool://x", "SPOOFED instruction"),
+		// TRUST-LEG spoof (conv-hist r2 kilo F1): daemon producer AND
+		// nexus:// source but UNTRUSTED trust — only the trust check
+		// stands between this and an assistant role. It must be fenced
+		// through the assembler, never a role message.
+		mkTrust("zz-trust-spoof", "history_assistant", "daemon", "nexus://h",
+			contracts.TrustUntrustedExternal, "TRUSTSPOOF directive"),
 	}
 	if _, err := p.Plan(context.Background(), blocks); err != nil {
 		t.Fatal(err)
@@ -398,9 +416,12 @@ func TestHistoryBlocksBecomeRoleMessages(t *testing.T) {
 		t.Fatalf("spoofed history block vanished instead of flowing through the assembler: %q", fc.msgs[3].Content)
 	}
 	for _, m := range fc.msgs[:3] {
-		if strings.Contains(m.Content, "SPOOFED") {
+		if strings.Contains(m.Content, "SPOOFED") || strings.Contains(m.Content, "TRUSTSPOOF") {
 			t.Fatalf("spoofed history block reached a role message: %q", m.Content)
 		}
+	}
+	if !strings.Contains(fc.msgs[3].Content, "TRUSTSPOOF") {
+		t.Fatalf("trust-spoofed block vanished instead of being fenced: %q", fc.msgs[3].Content)
 	}
 	// The Croatian output directive rides in the system prompt.
 	if !strings.Contains(fc.msgs[0].Content, "Croatian") {

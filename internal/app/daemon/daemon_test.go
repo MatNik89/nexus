@@ -23,6 +23,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/MatNik89/nexus/internal/app/repl"
 	"github.com/MatNik89/nexus/internal/approval"
@@ -80,6 +81,11 @@ func (a *capturingAudit) Record(event string, call contracts.ToolCall) error {
 
 func testDaemon(t *testing.T, planner loop.Planner, audit effectpath.AuditSink) (*Daemon, string, *journal.Journal) {
 	t.Helper()
+	return testDaemonRedact(t, planner, audit, redact.None{})
+}
+
+func testDaemonRedact(t *testing.T, planner loop.Planner, audit effectpath.AuditSink, r redact.Redactor) (*Daemon, string, *journal.Journal) {
+	t.Helper()
 	dir := t.TempDir()
 	ev := map[string]journal.PayloadValidator{}
 	for _, n := range machine.EventTypes() {
@@ -91,7 +97,7 @@ func testDaemon(t *testing.T, planner loop.Planner, audit effectpath.AuditSink) 
 	for n, v := range channel.Events() {
 		ev[n] = v
 	}
-	j, err := journal.Open(filepath.Join(dir, "journal.db"), "work", redact.None{}, ev)
+	j, err := journal.Open(filepath.Join(dir, "journal.db"), "work", r, ev)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +117,7 @@ func testDaemon(t *testing.T, planner loop.Planner, audit effectpath.AuditSink) 
 					Status: contracts.ResultSucceeded, StartedAt: time.Unix(1, 0), FinishedAt: time.Unix(2, 0)}, nil
 			},
 		},
-		Audit: audit, Redactor: redact.None{},
+		Audit: audit, Redactor: r,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -683,4 +689,160 @@ func TestChatSessionCarriesHistory(t *testing.T) {
 	if !strings.Contains(joined, "7714") || !strings.Contains(joined, "ok") {
 		t.Fatalf("second turn does not carry the session history:\n%s", joined)
 	}
+}
+
+// CONV-HIST r2 (codex #1/#2, kilo F2, agy L5): committed detectors for
+// every behavioral history rule — completed-only filtering owned by the
+// turn.succeeded EVENT (empty final still counts), cap AFTER the
+// filter, exact identity membership, rune-safe clipping, and redacted
+// session finals.
+func TestConversationHistoryRules(t *testing.T) {
+	emptyFinal := ""
+	p := &scriptedPlanner{finals: map[string]*string{"make it empty": &emptyFinal}}
+	d, _, j := testDaemon(t, p, nil)
+	core, err := channel.New(j)
+	if err != nil {
+		t.Fatal(err)
+	}
+	send := func(identity string, uid int64, text string) {
+		t.Helper()
+		if _, err := core.Admit(context.Background(), channel.Inbound{
+			AdapterID: "telegram", ChannelIdentity: identity, UpdateID: uid,
+			Text: text, Profile: "work"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := d.RunChannelTurn(context.Background(), identity, uid, text); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 14 completed turns: the 12-pair cap must keep the LAST 12 even
+	// with an ADMITTED-BUT-NEVER-RUN update in between (cap after the
+	// completed filter, suspended admissions don't consume the window).
+	for i := 1; i <= 7; i++ {
+		send("chat-42", int64(i), fmt.Sprintf("early-%d", i))
+	}
+	if _, err := core.Admit(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 100,
+		Text: "admitted but never completed", Profile: "work"}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 8; i <= 14; i++ {
+		send("chat-42", int64(i), fmt.Sprintf("late-%d", i))
+	}
+	// Identity that is a PREFIX of another (exact membership rule).
+	send("chat-42-x", 200, "other identity secret")
+	// An EMPTY final is still a completed turn.
+	send("chat-42", 300, "make it empty")
+	// A rune-heavy entry must clip without splitting UTF-8.
+	send("chat-42", 301, strings.Repeat("š", 1600))
+
+	hist, err := d.conversationHistory("chat-42", "turn-chan-chat-42-999")
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := ""
+	userBlocks := 0
+	for _, b := range hist {
+		if b.Kind == "history_user" {
+			userBlocks++
+		}
+		joined += *b.Content + "\n"
+	}
+	if userBlocks != 12 {
+		t.Fatalf("cap after completed filter broken: %d user entries, want 12", userBlocks)
+	}
+	if strings.Contains(joined, "early-1") || strings.Contains(joined, "early-2") {
+		t.Fatalf("FIFO kept the oldest entries past the cap:\n%s", joined)
+	}
+	if !strings.Contains(joined, "late-14") {
+		t.Fatalf("newest completed entry missing:\n%s", joined)
+	}
+	if strings.Contains(joined, "never completed") {
+		t.Fatalf("incomplete admission entered history (or consumed the window):\n%s", joined)
+	}
+	if strings.Contains(joined, "other identity secret") {
+		t.Fatalf("prefix identity leaked across the B3 boundary:\n%s", joined)
+	}
+	if !strings.Contains(joined, "make it empty") {
+		t.Fatalf("empty-final turn misclassified as incomplete:\n%s", joined)
+	}
+	if !utf8.ValidString(joined) || strings.Count(joined, "š") >= 1600 {
+		t.Fatalf("clip is not rune-safe (valid=%v)", utf8.ValidString(joined))
+	}
+}
+
+// scriptedPlanner returns per-message finals ("ok" default).
+type scriptedPlanner struct {
+	finals map[string]*string
+}
+
+func (p *scriptedPlanner) Plan(ctx context.Context, blocks []contracts.ContextBlock) (loop.Action, error) {
+	last := blocks[len(blocks)-1]
+	if last.Content != nil {
+		if f, ok := p.finals[*last.Content]; ok {
+			return loop.Action{Final: f}, nil
+		}
+	}
+	final := "ok"
+	return loop.Action{Final: &final}, nil
+}
+
+// CONV-HIST r2 (kilo F3-follow-up): the SESSION history stores the
+// REDACTED final — a known secret ref echoed into a final must never
+// ride back to the provider on the next turn.
+func TestSessionHistoryStoresRedactedFinal(t *testing.T) {
+	secret := "the token is sk-VERYSECRET"
+	p := &capturingScriptedPlanner{finals: map[string]*string{"leak": &secret}}
+	_, sock, _ := testDaemonRedact(t, p, nil, markRedactor{})
+	c := dial(t, sock, false)
+	if _, errText := c.chat(t, "leak"); errText != "" {
+		t.Fatal(errText)
+	}
+	if _, errText := c.chat(t, "next"); errText != "" {
+		t.Fatal(errText)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	joined := ""
+	for _, b := range p.blocks[len(p.blocks)-1] {
+		if b.Kind == "history_assistant" && b.Content != nil {
+			joined += *b.Content
+		}
+	}
+	if strings.Contains(joined, "sk-VERYSECRET") {
+		t.Fatalf("raw secret re-fed to the provider via session history: %q", joined)
+	}
+	if !strings.Contains(joined, "[REDACTED]") {
+		t.Fatalf("history assistant entry missing the redacted final: %q", joined)
+	}
+}
+
+// markRedactor replaces the known test secret — a visible redaction seam.
+type markRedactor struct{}
+
+func (markRedactor) Redact(b []byte) ([]byte, error) {
+	return []byte(strings.ReplaceAll(string(b), "sk-VERYSECRET", "[REDACTED]")), nil
+}
+
+func (markRedactor) Touches(s string) bool { return strings.Contains(s, "sk-VERYSECRET") }
+
+type capturingScriptedPlanner struct {
+	mu     sync.Mutex
+	finals map[string]*string
+	blocks [][]contracts.ContextBlock
+}
+
+func (p *capturingScriptedPlanner) Plan(ctx context.Context, blocks []contracts.ContextBlock) (loop.Action, error) {
+	p.mu.Lock()
+	cp := append([]contracts.ContextBlock{}, blocks...)
+	p.blocks = append(p.blocks, cp)
+	p.mu.Unlock()
+	last := blocks[len(blocks)-1]
+	if last.Content != nil {
+		if f, ok := p.finals[*last.Content]; ok {
+			return loop.Action{Final: f}, nil
+		}
+	}
+	final := "ok"
+	return loop.Action{Final: &final}, nil
 }
