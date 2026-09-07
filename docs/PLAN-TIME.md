@@ -10,7 +10,7 @@ the system prompt; omitted entirely when the date cannot resolve.
 General Telegram-bot practice matches: current datetime injected into
 the system message per request (stateless, no tool needed).
 
-## Change (v2 — all round-1 findings folded)
+## Change (v6 — current; rounds 1-5 folded)
 - PLACEMENT (agy HIGH: a timestamp in the SYSTEM prompt — the first
   message — invalidates the provider prompt-cache prefix every minute):
   the line is appended to the END of the CURRENT assembled user
@@ -29,8 +29,12 @@ the system message per request (stateless, no tool needed).
   field `timezone` (JSON key "timezone") added to Config, keySchema,
   defaults (default "Europe/Zagreb"), applyValue and validation in
   internal/foundation/config/config.go — validation itself calls
-  time.LoadLocation (unloadable value = config error). runDaemon and
-  runChat pass resolved.Config.Timezone into the planner factory.
+  time.LoadLocation AND explicitly REJECTS the special value "Local"
+  (r5 codex MED#1: LoadLocation("Local") succeeds and would smuggle
+  host-dependent time back in; "" also rejects; "UTC" is allowed — it
+  is a stable identifier). buildDaemon (the ONLY planner composition
+  root — chat rides the daemon UDS, r5 kilo F2) passes
+  resolved.Config.Timezone into the planner factory.
 - RENDER (r4 codex MED#1): the line prints the STORED IANA name
   verbatim plus the instant's abbreviation and offset from
   clock.Now().In(loc):
@@ -42,12 +46,25 @@ the system message per request (stateless, no tool needed).
   grammar (agy #6 placement corruption is impossible by construction).
 
 ## Detectors (kilo blocking gaps folded)
-- Unit with `clockid.NewFake` pinned at a KNOWN instant and an
-  injected fixed `*time.Location` (test uses time.FixedZone — zone-
-  independent of the host/CI, agy #4): assert the exact line at the
-  end of the LAST user message, in both the plain and WithTools
-  planners; assert the SYSTEM message does NOT contain the line
-  (placement lock).
+- Unit with `clockid.NewFake` pinned at KNOWN instants and the REAL
+  IANA name "Europe/Zagreb" through the name seam (r5 codex MED#2 /
+  kilo F1 — FixedZone cannot exercise IANA loading): a JANUARY instant
+  renders "Europe/Zagreb (CET, UTC+01:00)" and a JULY instant
+  "Europe/Zagreb (CEST, UTC+02:00)" — proving stored-name rendering
+  AND real DST rules; assert the exact line at the end of the LAST
+  user message in both planners; assert the SYSTEM message does NOT
+  contain it (placement lock). CI note: tzdata is available via the
+  Go toolchain (import time/tzdata in the test binary if the runner
+  lacks the system database — stated so the detector is portable).
+- Nil-clock rejection at construction (r5 codex MED#2).
+- COMPOSITION-ROOT wiring detector (r5 codex MED#3): the existing
+  production-spine test (cmd/nexus, captures provider requests) gains
+  a case with config timezone "America/New_York" — the captured LAST
+  user message must contain that name, proving buildDaemon really
+  forwards resolved.Config.Timezone (a hard-coded default turns it
+  RED).
+- Config validation cases: "Local" rejected, "" rejected, unloadable
+  rejected, "UTC" accepted.
 - Constructor fail-closed cases: empty zone name and an unloadable
   zone name both REJECT construction (r3 codex LOW#2).
 - Ablation: remove the injection -> RED; move it into the system
