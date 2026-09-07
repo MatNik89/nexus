@@ -15,6 +15,7 @@ package telegram
 
 import (
 	"html"
+	"regexp"
 	"strings"
 	"unicode/utf16"
 )
@@ -39,11 +40,21 @@ func renderHTML(original string) (string, bool) {
 	if spans > renderSpanBudget {
 		return "", false
 	}
-	if len(utf16.Encode([]rune(out))) > renderUTF16Budget {
+	if postParseUTF16Len(out) > renderUTF16Budget {
 		return "", false
 	}
 	return out, true
 }
+
+// postParseUTF16Len measures the POST-PARSE length (impl kilo F3): the
+// Bot API applies its 4096 bound after entity parsing, so renderer tags
+// are stripped and HTML entities decoded before counting.
+func postParseUTF16Len(s string) int {
+	stripped := tagRe.ReplaceAllString(s, "")
+	return len(utf16.Encode([]rune(html.UnescapeString(stripped))))
+}
+
+var tagRe = regexp.MustCompile(`</?(b|code|pre)>`)
 
 // renderBlocks handles fences and tables at block level, spans inside.
 func renderBlocks(src string) (string, int, bool) {

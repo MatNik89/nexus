@@ -8,7 +8,6 @@ import (
 	"regexp"
 	"strings"
 	"testing"
-	"unicode/utf16"
 )
 
 // validateRendered machine-checks the constructive-validity properties
@@ -60,8 +59,8 @@ func validateRendered(t *testing.T, out string) {
 	if spans > renderSpanBudget {
 		t.Fatalf("span budget exceeded: %d", spans)
 	}
-	if len(utf16.Encode([]rune(out))) > renderUTF16Budget {
-		t.Fatal("UTF-16 budget exceeded on ok=true output")
+	if postParseUTF16Len(out) > renderUTF16Budget {
+		t.Fatal("post-parse UTF-16 budget exceeded on ok=true output")
 	}
 }
 
@@ -173,9 +172,10 @@ func TestRenderBudgetBoundaries(t *testing.T) {
 	if _, ok := renderHTML(mk(renderSpanBudget + 1)); ok {
 		t.Fatal("span budget exceeded but rendered")
 	}
-	// The budget applies to the RENDERED output: "**b**" renders as
-	// "<b>b</b>" (8 UTF-16 units), so rendered = n + 1 + 8.
-	pad := strings.Repeat("x", renderUTF16Budget-9) + " **b**"
+	// The budget applies POST-PARSE (impl kilo F3): "**b**" renders as
+	// "<b>b</b>" which parses to just "b" (1 unit), so post-parse
+	// length = n + 1 + 1.
+	pad := strings.Repeat("x", renderUTF16Budget-2) + " **b**"
 	if _, ok := renderHTML(pad); !ok {
 		t.Fatal("exactly-at-utf16-budget refused")
 	}

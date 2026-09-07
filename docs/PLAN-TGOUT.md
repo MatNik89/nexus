@@ -151,7 +151,8 @@ a committed case and the classifier grows per dialect.)
   FIELD PRECEDENCE (r5 codex F5): when several fields match known
   tools, action > tool_id > name decides the reported <tool>;
   the conflicting-fields case is a committed test. The Croatian edge
-  message says "Preformuliraj zahtjev." only — no "pokušaj ponovno"
+  message is "Nisam uspio ispravno pozvati alat (<tool>). Preformuliraj
+  zahtjev." — naming the tool, no "pokušaj ponovno"
   (r6 kilo F1: a failed turn leaves no history pair, so "again" has no
   referent; rephrasing restates the question as the current message).
 - DECLARED LIMITS (committed tests assert each): the known-tool content
