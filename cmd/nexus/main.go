@@ -1352,6 +1352,13 @@ func telegramHandler(b *daemonBundle) telegram.Handler {
 		// legal decision source.
 		reply, err := b.d.RunChannelTurn(ctx, in.ChannelIdentity, in.UpdateID, text)
 		if err != nil {
+			// LOCALIZATION AT THE EDGE (tgout plan): the typed drift
+			// sentinel is extracted STRUCTURALLY — never by parsing
+			// error strings — and mapped to the Croatian user message.
+			var de loop.DriftError
+			if errors.As(err, &de) && de.Typed.Code == "TOOL_SCHEMA_DRIFT" {
+				return "Nisam uspio ispravno pozvati alat (" + string(de.Tool) + "). Preformuliraj zahtjev.", nil
+			}
 			return "", err
 		}
 		return reply, nil

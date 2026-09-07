@@ -13,6 +13,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -897,4 +898,152 @@ func (p *capturingScriptedPlanner) Plan(ctx context.Context, blocks []contracts.
 	}
 	final := "ok"
 	return loop.Action{Final: &final}, nil
+}
+
+// TGOUT plan detectors — restart-stable drift recovery (rounds 9-15).
+type driftingPlanner struct{ planned int }
+
+func (p *driftingPlanner) Plan(ctx context.Context, blocks []contracts.ContextBlock) (loop.Action, error) {
+	p.planned++
+	return loop.Action{}, loop.DriftError{Typed: contracts.TypedError{
+		Code: "TOOL_SCHEMA_DRIFT", Category: contracts.ErrCatValidation,
+		Retryability: contracts.RetryNever, SafeMessage: "drift", Origin: "planner",
+	}, Tool: "memory_recall"}
+}
+
+// A redelivered update whose turn already FAILED with drift recovers the
+// SAME typed outcome from the journal — planner never re-invoked.
+func TestDriftOutcomeRecoveredOnRedelivery(t *testing.T) {
+	p := &driftingPlanner{}
+	d, _, _ := testDaemon(t, p, nil)
+	_, err := d.RunChannelTurn(context.Background(), "chat-42", 1, "do it")
+	var de loop.DriftError
+	if !errors.As(err, &de) || de.Tool != "memory_recall" {
+		t.Fatalf("live drift not typed: %v", err)
+	}
+	if p.planned != 1 {
+		t.Fatalf("planner calls %d, want 1", p.planned)
+	}
+	// Redelivery (crash-seam analog: the durable turn.failed exists, the
+	// channel terminal never committed) — same typed outcome, no planner.
+	_, err2 := d.RunChannelTurn(context.Background(), "chat-42", 1, "do it")
+	var de2 loop.DriftError
+	if !errors.As(err2, &de2) || de2.Typed.Code != "TOOL_SCHEMA_DRIFT" || de2.Tool != "memory_recall" {
+		t.Fatalf("recovered outcome not the typed drift: %v", err2)
+	}
+	if p.planned != 1 {
+		t.Fatalf("planner re-invoked on redelivery: %d calls", p.planned)
+	}
+}
+
+// Ordinary (non-drift) failed collision behaves exactly like today's
+// collision-error path: an error, never a challenge replay, no invented
+// user response (plan v15).
+type failingPlanner struct{}
+
+func (failingPlanner) Plan(ctx context.Context, blocks []contracts.ContextBlock) (loop.Action, error) {
+	return loop.Action{}, fmt.Errorf("ordinary planner explosion")
+}
+
+func TestOrdinaryFailedCollisionStaysGeneric(t *testing.T) {
+	d, _, j := testDaemon(t, failingPlanner{}, nil)
+	core, err := channel.New(j)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := core.Admit(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 5,
+		Text: "boom", Profile: "work"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.RunChannelTurn(context.Background(), "chat-42", 5, "boom"); err == nil {
+		t.Fatal("want error from failing turn")
+	}
+	_, err2 := d.RunChannelTurn(context.Background(), "chat-42", 5, "boom")
+	if err2 == nil {
+		t.Fatal("ordinary failed collision invented a success")
+	}
+	var de loop.DriftError
+	if errors.As(err2, &de) {
+		t.Fatalf("ordinary failure misclassified as drift: %v", err2)
+	}
+	if strings.Contains(err2.Error(), "APPROVAL NEEDED") {
+		t.Fatalf("stale challenge replayed: %v", err2)
+	}
+}
+
+// MIXED LIFECYCLE (plan v13): suspended -> resumed -> failed -> crash ->
+// collision recovers the DRIFT outcome, never the stale challenge.
+func TestMixedLifecycleRecoversDriftNotChallenge(t *testing.T) {
+	p := &driftingPlanner{}
+	d, _, j := testDaemon(t, p, nil)
+	store, err := approval.NewStore(j, clockid.NewFake(time.Now()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	idem := "ik-mx"
+	c, err := contracts.NewToolCall(contracts.ToolCallParams{
+		ToolCallID: "tc-mx", ToolID: "rm_file",
+		Arguments: json.RawMessage(`{"path":"/tmp/x"}`), ArgsSchemaHash: "h1",
+		Effect: contracts.EffectIrreversible, ExecutionKind: contracts.ExecInProcess,
+		Deadline: time.Now().Add(time.Hour), AttemptNo: 1,
+		IdempotencyKey: &idem, ProfileID: "work",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := "orig"
+	blk, err := contracts.NewContextBlock(contracts.ContextBlockParams{
+		BlockID: "blk-mx", Kind: "user_message", Content: &text,
+		ContentHash: "0000000000000000000000000000000000000000000000000000000000000000",
+		SourceURI:   "nexus://telegram/chat-42", Producer: "telegram",
+		Trust: contracts.TrustUser, Sensitivity: contracts.Sensitivity(1),
+		Lineage: []string{}, ObservedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Suspend(context.Background(), "turn-chan-chat-42-9",
+		"run-chan-chat-42-9", c, "tg:chat-42", []contracts.ContextBlock{blk}); err != nil {
+		t.Fatal(err)
+	}
+	// resumed then failed-with-drift for the SAME turn (durable).
+	for i, evt := range []struct {
+		typ     string
+		payload string
+	}{
+		{"turn.resumed", `{"turn_id":"turn-chan-chat-42-9"}`},
+		{"turn.failed", `{"turn_id":"turn-chan-chat-42-9","error_code":"TOOL_SCHEMA_DRIFT","tool":"memory_recall"}`},
+	} {
+		mxTurn := contracts.TurnID("turn-chan-chat-42-9")
+		if _, err := j.Append(context.Background(), contracts.EnvelopeParams{
+			SchemaID: "nexus.event", SchemaVersion: 1,
+			EventID: contracts.EventID(fmt.Sprintf("ev-mx-%d", i)), EventType: evt.typ,
+			RunID: "run-chan-chat-42-9", TurnID: &mxTurn, EmittedAt: time.Now().UTC(),
+			ActorType: contracts.ActorSystem, ActorID: "loop", PrincipalID: "nexus",
+			WorkspaceID: "local", ProfileID: "work", AttemptNo: 1,
+			Payload: []byte(evt.payload), PayloadHash: "recomputed",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Pre-occupy turn.created so redelivery collides.
+	if _, err := j.Append(context.Background(), contracts.EnvelopeParams{
+		SchemaID: "nexus.event", SchemaVersion: 1,
+		EventID: "ev-turn-chan-chat-42-9-turn.created-1", EventType: "turn.created",
+		RunID: "run-chan-chat-42-9", EmittedAt: time.Now().UTC(),
+		ActorType: contracts.ActorSystem, ActorID: "loop", PrincipalID: "nexus",
+		WorkspaceID: "local", ProfileID: "work", AttemptNo: 1,
+		Payload: []byte(`{"turn_id":"turn-chan-chat-42-9"}`), PayloadHash: "recomputed",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	out9, err := d.RunChannelTurn(context.Background(), "chat-42", 9, "orig")
+	var de loop.DriftError
+	if !errors.As(err, &de) || de.Tool != "memory_recall" {
+		t.Fatalf("mixed lifecycle did not recover the drift outcome: err=%v final=%q", err, out9)
+	}
+	if err != nil && strings.Contains(err.Error(), "APPROVAL NEEDED") {
+		t.Fatalf("stale challenge replayed: %v", err)
+	}
 }
