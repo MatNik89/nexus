@@ -733,8 +733,11 @@ func TestConversationHistoryRules(t *testing.T) {
 	send("chat-42-x", 200, "other identity secret")
 	// An EMPTY final is still a completed turn.
 	send("chat-42", 300, "make it empty")
-	// A rune-heavy entry must clip without splitting UTF-8.
-	send("chat-42", 301, strings.Repeat("š", 1600))
+	// A rune-heavy entry must clip without splitting UTF-8: the "a"
+	// offset + 4-byte emoji makes any BYTE-based 1500-cut fall mid-rune
+	// (conv-hist r3 kilo F1), and the output must be EXACTLY the
+	// 1500-rune budget ending in the ellipsis (codex #2).
+	send("chat-42", 301, "a"+strings.Repeat("🙂", 1500))
 
 	hist, err := d.conversationHistory("chat-42", "turn-chan-chat-42-999")
 	if err != nil {
@@ -766,8 +769,23 @@ func TestConversationHistoryRules(t *testing.T) {
 	if !strings.Contains(joined, "make it empty") {
 		t.Fatalf("empty-final turn misclassified as incomplete:\n%s", joined)
 	}
-	if !utf8.ValidString(joined) || strings.Count(joined, "š") >= 1600 {
-		t.Fatalf("clip is not rune-safe (valid=%v)", utf8.ValidString(joined))
+	if !utf8.ValidString(joined) {
+		t.Fatal("clip split a UTF-8 rune")
+	}
+	var clipped string
+	for _, b := range hist {
+		if b.Kind == "history_user" && strings.HasPrefix(*b.Content, "a\U0001F642") {
+			clipped = *b.Content
+		}
+	}
+	if clipped == "" {
+		t.Fatal("clipped entry missing from history")
+	}
+	if got := len([]rune(clipped)); got != 1500 {
+		t.Fatalf("clip budget drifted: %d runes, want exactly 1500", got)
+	}
+	if !strings.HasSuffix(clipped, "…") {
+		t.Fatalf("clipped entry does not end in the ellipsis: %q", clipped[len(clipped)-8:])
 	}
 }
 
@@ -814,6 +832,40 @@ func TestSessionHistoryStoresRedactedFinal(t *testing.T) {
 	}
 	if !strings.Contains(joined, "[REDACTED]") {
 		t.Fatalf("history assistant entry missing the redacted final: %q", joined)
+	}
+}
+
+// CONV-HIST r3 (codex #1 / kilo F2): a LONG session must retain only
+// the last historyMaxPairs pairs — the next planner call carries
+// exactly 12 prior pairs and never the oldest one.
+func TestSessionHistoryBounded(t *testing.T) {
+	p := &capturingScriptedPlanner{}
+	_, sock, _ := testDaemon(t, p, nil)
+	c := dial(t, sock, false)
+	for i := 1; i <= 14; i++ {
+		if _, errText := c.chat(t, fmt.Sprintf("session-msg-%d", i)); errText != "" {
+			t.Fatal(errText)
+		}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	last := p.blocks[len(p.blocks)-1]
+	users := 0
+	joined := ""
+	for _, b := range last {
+		if b.Kind == "history_user" {
+			users++
+			joined += *b.Content + "\n"
+		}
+	}
+	if users != historyMaxPairs {
+		t.Fatalf("session history carries %d prior pairs, want exactly %d", users, historyMaxPairs)
+	}
+	if strings.Contains(joined, "session-msg-1\n") {
+		t.Fatalf("oldest pair survived the bound:\n%s", joined)
+	}
+	if !strings.Contains(joined, "session-msg-13") {
+		t.Fatalf("newest prior pair missing:\n%s", joined)
 	}
 }
 
