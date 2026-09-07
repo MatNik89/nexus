@@ -101,15 +101,28 @@ a committed case and the classifier grows per dialect.)
   error code + tool -> same edge response after restart. (No
   field-for-field TypedError equality is claimed; Category/Origin/
   Retryability are reconstructed constants for this code, stated as
-  such.) MECHANISM (r11 kilo): a NEW recovery helper
-  `failedTurnOutcome(turn) (code, tool, ok)` — not the string-typed
-  completedTurnFinal — is consulted on turn-collision after
-  succeeded/suspended; RunChannelTurn returns the reconstructed typed
-  error and the edge maps it exactly like the live path. Detector:
-  crash seam after turn.failed, redeliver, assert journaled code+tool
-  AND the identical Croatian string, zero planner calls; ablations:
-  drop failed-recovery entirely -> RED, drop the persisted `tool`
-  field -> the tool name vanishes from the message -> RED.
+  such.) TYPED CARRIER, PRODUCER TO JOURNAL (r12 codex MED#1): the
+  planner returns a planner-specific error type DriftError{Typed
+  contracts.TypedError; Tool contracts.ToolID}; the loop extracts it
+  STRUCTURALLY (errors.As) in failTurn and appends BOTH error_code and
+  tool to turn.failed; the live edge likewise obtains the tool via
+  errors.As — no SafeMessage or error-string parsing anywhere (live
+  and recovered edge tests assert structural extraction).
+  MECHANISM (r11 kilo; r12 codex MED#2/LOW): recovery is ONE
+  state-aware ordered fold — the suspension candidate is SUPPRESSED by
+  a later turn.resumed for the same turn (mirroring the existing
+  later-success-wins rule), so the valid lifecycle suspended ->
+  resumed -> failed recovers the DRIFT outcome, not the stale
+  challenge. The helper is `failedTurnOutcome(turn) (code, tool, ok,
+  err)` — the error return propagates replay/projection failures
+  instead of collapsing them into ok=false (r12 codex LOW).
+  Detectors: crash seam after turn.failed, redeliver, assert journaled
+  code+tool AND the identical Croatian string, zero planner calls;
+  committed MIXED-LIFECYCLE case suspended -> resumed -> failed ->
+  crash -> collision asserting the Croatian drift response; ablations:
+  drop failed-recovery -> RED, drop the persisted tool field -> tool
+  name vanishes -> RED, drop the resumed-suppression -> the mixed case
+  recovers the stale challenge -> RED.
   FIELD PRECEDENCE (r5 codex F5): when several fields match known
   tools, action > tool_id > name decides the reported <tool>;
   the conflicting-fields case is a committed test. The Croatian edge
