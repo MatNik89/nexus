@@ -73,8 +73,10 @@ the system message per request (stateless, no tool needed).
   asserts the resolved value is exactly "Europe/Zagreb" (the existing
   default-origin seam in config_test) — changing defaults() turns it
   RED.
-- Constructor fail-closed cases: empty zone name and an unloadable
-  zone name both REJECT construction (r3 codex LOW#2).
+- Constructor fail-closed cases: empty zone name, the special value
+  "Local", and an unloadable zone name ALL REJECT construction
+  (r3 codex LOW#2, r7 codex #1 — the constructor list mirrors the
+  config list exactly).
 - Ablation: remove the injection -> RED; move it into the system
   prompt -> the placement lock turns RED.
 - TestToolPromptDeterministic unchanged (system prompt is untouched).
@@ -83,9 +85,11 @@ the system message per request (stateless, no tool needed).
 - No time TOOL (a prompt line answers "koliko je sati" without an
   effect path); a clock tool is a later slice if scheduling asks need
   sub-minute precision.
-- No per-user timezone config (single-owner P0). The CONFIG field is
-  the ONE owner of civil time — the host zone is never consulted
-  (r6 codex #1: no dual ownership).
+- No per-user timezone config (single-owner P0). The CONFIG field
+  owns ONLY the conversational time line rendered here — persisted
+  reminder occurrences keep their OWN IANA zone per HARDQ B1 /
+  WallTime.TZ (S3.6 owner untouched; r7 codex #2). The host zone is
+  never consulted for the conversational line (r6 codex #1).
 
 ## Risk
 - The user-content tail changes per minute; the cacheable PREFIX
