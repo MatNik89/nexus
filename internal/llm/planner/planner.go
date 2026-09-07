@@ -46,7 +46,15 @@ func splitHistory(blocks []contracts.ContextBlock) ([]provider.ChatMessage, []co
 	var hist []contracts.ContextBlock
 	var rest []contracts.ContextBlock
 	for _, b := range blocks {
-		if b.Kind == "history_user" || b.Kind == "history_assistant" {
+		// Role authority is NOT the open Kind string alone (conv-hist
+		// codex HIGH: any producer could spoof history_* and bypass the
+		// trust assembler straight into a provider role). A history
+		// block must ALSO be daemon-minted, USER-trust and internally
+		// sourced; anything else keeps its Kind but flows through the
+		// normal assembler where the untrusted fence applies.
+		if (b.Kind == "history_user" || b.Kind == "history_assistant") &&
+			b.Producer == "daemon" && b.Trust == contracts.TrustUser &&
+			strings.HasPrefix(b.SourceURI, "nexus://") {
 			hist = append(hist, b)
 		} else {
 			rest = append(rest, b)

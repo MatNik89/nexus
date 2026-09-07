@@ -16,7 +16,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -233,7 +232,11 @@ func (d *Daemon) handle(ctx context.Context, conn net.Conn) {
 			writeFrame(conn, frame{Type: "error", Text: loop.RedactText(d.deps.Redactor, terr.Error())})
 			continue
 		}
-		hist = append(hist, histPair{user: f.Text, final: final})
+		// The session history stores the REDACTED final — the same
+		// bytes the journal keeps and the channel path re-feeds
+		// (conv-hist kilo F3: the raw final could re-transmit a known
+		// secret ref to the provider on the next turn).
+		hist = append(hist, histPair{user: f.Text, final: loop.RedactText(d.deps.Redactor, final)})
 		writeFrame(conn, frame{Type: "final", Text: final})
 	}
 }
@@ -292,27 +295,13 @@ func (d *Daemon) RunChannelTurn(ctx context.Context, identity string, updateID i
 // turn from its journaled turn.succeeded payload.
 // topknot ceiling: full-journal replay per recovery lookup — a turn-state
 // projection is the upgrade when replay latency is measurable (P1).
-// conversationHistory folds this identity's past channel turns (user
-// message + assistant final pairs, chronological) into ONE TrustUser
-// block, capped to the most recent historyMaxPairs. One block — not
-// per-message blocks — because the assembler orders by trust class then
-// BlockID, which would split a multi-trust history out of chronology.
-//
-// TRUST CEILING (deliberate, reviewed): past assistant finals ride in
-// the same USER-trust block. In P0 a final is the model's own delivered
-// text (tool output enters turns as separate fenced observation blocks,
-// never through here), and the user has both seen it and could retype
-// it verbatim — so its surface equals user input. topknot: per-entry
-// trust (fenced assistant/history lanes) is the P1 transcript owner;
-// trigger: any tool that injects EXTERNAL content into finals.
-//
-// topknot: full journal replay per turn is O(events); acceptable at P0
-// message volumes — trigger for a transcript projection: replay latency
-// visibly lagging a chat turn.
+// conversationHistory folds this identity's COMPLETED past channel
+// turns (admitted user text + succeeded final) into history_user /
+// history_assistant blocks that the planner maps to real provider role
+// messages — the stolen gateway pattern (see historyBlocks). Finals
+// come from the journal, so they are the REDACTED delivered text.
 func (d *Daemon) conversationHistory(identity string, current contracts.TurnID) ([]contracts.ContextBlock, error) {
 	const historyMaxPairs = 12
-	const entryCap = 1500
-	prefix := "turn-chan-" + identity + "-"
 	type pair struct{ user, final string }
 	pairs := map[string]*pair{}
 	var order []string
@@ -341,8 +330,11 @@ func (d *Daemon) conversationHistory(identity string, current contracts.TurnID) 
 				pairs[tid].user = p.Text
 			}
 		case "turn.succeeded":
-			if ev.Envelope.TurnID == nil || !strings.HasPrefix(string(*ev.Envelope.TurnID), prefix) ||
-				*ev.Envelope.TurnID == current {
+			// EXACT membership in this identity's admitted set — the
+			// same boundary rule as the admission filter (conv-hist
+			// kilo F1: a prefix check over-matches identities that are
+			// prefixes of one another).
+			if ev.Envelope.TurnID == nil || *ev.Envelope.TurnID == current {
 				return nil
 			}
 			var p struct {
@@ -359,10 +351,20 @@ func (d *Daemon) conversationHistory(identity string, current contracts.TurnID) 
 	if err != nil {
 		return nil, err
 	}
-	if len(order) > historyMaxPairs {
-		order = order[len(order)-historyMaxPairs:]
+	// Only COMPLETED pairs enter history (conv-hist codex MED): an
+	// admission without a final (suspended/failed turn) is not
+	// conversation yet — and the cap counts completed pairs, applied
+	// AFTER the filter.
+	var completed []string
+	for _, id := range order {
+		if pairs[id].final != "" {
+			completed = append(completed, id)
+		}
 	}
-	return historyBlocks(identity, "nexus://telegram/"+identity+"/history", order, func(id string) (string, string) {
+	if len(completed) > historyMaxPairs {
+		completed = completed[len(completed)-historyMaxPairs:]
+	}
+	return historyBlocks(identity, "nexus://telegram/"+identity+"/history", completed, func(id string) (string, string) {
 		return pairs[id].user, pairs[id].final
 	})
 }
@@ -378,10 +380,11 @@ func (d *Daemon) conversationHistory(identity string, current contracts.TurnID) 
 // acceptable at P0 volumes — trigger for a transcript projection:
 // replay latency visibly lagging a chat turn.
 func historyBlocks(scope, sourceURI string, order []string, get func(id string) (user, final string)) ([]contracts.ContextBlock, error) {
-	const entryCap = 1500
+	const entryCap = 1500 // runes, not bytes — clipping never splits UTF-8
 	clip := func(s string) string {
-		if len(s) > entryCap {
-			return s[:entryCap] + "…"
+		r := []rune(s)
+		if len(r) > entryCap {
+			return string(r[:entryCap-1]) + "…"
 		}
 		return s
 	}
