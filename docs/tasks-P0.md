@@ -460,3 +460,12 @@ r3 2 convergent LOWs (mid-rune clip fixture + session-bound test).
 Croatian-output directive in the system prompt (owner order). All folds
 ablation-proven RED. Verdicts: codex FAILx3->PASS, kilo FAILx3->PASS,
 agy FAILx1->PASSx3.
+
+### Backlog item (architectural, surfaced by tgout plan review r9)
+The outbox tick re-flush path (Adapter.Run -> FlushOutbox ->
+Core.Flush) performs physical delivery attempts WITHOUT an S7
+AttemptGrant, while ARCHITECTURE-ESSENTIALS and Annex P0.2 assign
+retry authorization/scheduling exclusively to S7. Pre-existing gap
+(not introduced by any current slice); needs its own plan: grant-per-
+flush-attempt seam through s7min, or an explicitly amended owner
+contract for the at-least-once delivery pump.

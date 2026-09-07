@@ -118,36 +118,37 @@ parse_mode) — ONE message either way per flush tick, decided BEFORE
 the wire (this replaces both the fallback and the degrade of earlier
 drafts; recovery across TICKS is the attempts rule below — the plan
 makes no "never a second attempt" absolute).
-FIRST-ATTEMPT-ONLY FORMATTING (r7 codex MED; ownership specified per
-r8 codex): a flush sends the rendered text with parse_mode ONLY when
-the row has never been wire-attempted; every re-flush sends the
-ORIGINAL with no parse_mode. The attempted-before signal is DERIVED
-FROM THE JOURNAL, not a mutable column: the projection folds the
-existing `channel.outbound_unknown` event (already appended when a
-send is parked before the wire) into an `attempts` count on the outbox
-row — single-write-owner untouched, no direct SQL mutation, and
-`Projection.Version()` is bumped for the schema change (old databases
-rebuild). A parse rejection therefore self-heals on the next regular
-flush tick (one wire attempt per tick, delivery converges to the plain
-path); the 400-handling code itself stays untouched. DETECTOR drives
-the guarantee end to end: the fake Bot API rejects the first formatted
-send with a parse-400 — the NEXT flush must send WITHOUT parse_mode
-and the row must land SENT; ablation (ignore the attempts count) keeps
-re-sending HTML and turns the test RED.
-Render returns false when:
-- the rendered text exceeds 4096 UTF-16 code units (the Bot API
-  sendMessage bound, applied post-parse — codex F4: we do NOT claim
-  byte-for-byte-today for formatted sends; over-limit RENDERED output
-  falls back to the original path, which behaves exactly as today,
-  and table expansion can no longer push a deliverable message over
-  the limit — agy #3), or
-- the rendered tag count exceeds 90 — a LOCAL renderer-complexity
-  budget, NOT a claim about any Telegram entity ceiling (the Bot API
-  does not document a per-message entity count; auto-detected entities
-  such as URLs exist and are not counted here — declared limit). The
-  budget bounds our own construction; a 10x5 table (~50 tags) renders
-  fine, or
-- rendering found nothing to format (plain prose short-circuits).
+FIRST-LEASE-ONLY FORMATTING (v10 — honest contract per r9 codex):
+THIS SLICE ADDS NO ATTEMPT AND CHANGES NO SCHEDULING. When and whether
+a send happens is exactly today's machinery; the slice changes ONLY
+WHAT BYTES an already-scheduled attempt carries. (The pre-existing
+tick re-flush path runs without an S7 grant — a real architectural
+seam gap that r9 surfaced; it is FILED as its own backlog item in
+docs/tasks-P0.md in this same commit and is out of scope here,
+unchanged byte-for-byte.)
+- Rule: the rendered text with parse_mode is carried ONLY on the FIRST
+  IN-FLIGHT LEASE of a delivery (projected count of the existing
+  `channel.outbound_unknown` events == 0 at flush time); any later
+  lease carries the ORIGINAL with no parse_mode.
+- DECLARED DEGRADATION (r9 codex #2): outbound_unknown is appended
+  BEFORE the wire, so a pre-wire failure (crash after parking, dial
+  failure, callback rejection) also consumes the first lease — the
+  first ACTUAL wire send is then already plain. Formatting-only cost,
+  stated in tradeoffs, committed as a test case (pre-wire dial-failure
+  world: message arrives plain).
+- Ownership: the count is FOLDED from the canonical event by the
+  projection (single-write-owner untouched, no mutable column path);
+  `Projection.Version()` is bumped so old databases rebuild by replay.
+Detectors (r9 codex #3 + r8/9 kilo): (a) fake-bot parse-400 world —
+the row the EXISTING machinery re-pends carries plain bytes on its
+next flush and lands SENT (the detector asserts carried BYTES, it does
+not require or authorize any additional attempt); (b) RESTART
+persistence — journal close/reopen between flushes, count survives,
+plain carried; (c) VERSION rebuild — a database folded at the old
+projection version refolds on open and the count is reconstructed from
+events; (d) pre-wire dial-failure degradation case; ablations:
+ignore-the-count (HTML re-carried -> RED) and drop-the-event-fold
+(count never rises -> RED).
 Renderer construction rules (v4 base plus):
 - tokenizer precedence fence > inline code > bold, first-match-wins,
   no overlap; inside <pre>/<code> escaped content only; tables ->
