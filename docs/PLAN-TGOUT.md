@@ -56,15 +56,25 @@ Multipart/chunking is a separate future slice. See Non-goals.
 (The v4 heading overclaimed — codex F2/kilo F4. No completeness claim:
 UNKNOWN dialects can still reach the user; every observed dialect gets
 a committed case and the classifier grows per dialect.)
-- ORDERED, MUTUALLY EXCLUSIVE (codex F1): (1) strict
-  `toolCallFromReply` on the RAW reply first — extended with a
-  TOP-LEVEL duplicate-member gate (reuse the existing
-  HasDuplicateJSONKeys owner, today applied only to arguments): any
-  duplicate top-level key means NOT a valid call (falls to the
-  classifier; r6 codex HIGH — Go's last-member-wins decode must never
-  pick an effect). A valid, duplicate-free bare protocol call EXECUTES
-  exactly as today (committed positive control; committed
-  duplicate-key case asserts drift, not execution);
+- ORDERED, MUTUALLY EXCLUSIVE: (1) strict `toolCallFromReply` on the
+  RAW reply first, hardened to a CLOSED KEY CONTRACT (r7 codex HIGH —
+  Go struct decoding matches keys case-insensitively, so a
+  case-sensitive duplicate gate alone lets {"action":"x","Action":
+  "tool"} execute): a valid call's top level must contain EXACTLY the
+  lowercase keys {action, tool_id, arguments} (arguments optional),
+  each appearing ONCE — checked by a token-level walk over the raw
+  object (case-INSENSITIVE duplicate detection; unknown or
+  non-lowercase keys reject). Anything else is not a valid call. A
+  valid closed-contract call EXECUTES exactly as today (committed
+  positive control; committed case-alias and duplicate cases assert
+  non-execution);
+- DUPLICATE/ALIAS ROUTING (r7 kilo F1): when the closed-contract check
+  rejects, the DRIFT decision does NOT re-decode (last-member-wins
+  would hide the earlier value): the same token-level walk collects
+  ALL top-level string values; if ANY equals a registered tool id ->
+  DRIFT (typed sentinel); else prose. Committed case:
+  {"action":"memory_recall","action":"tool"} -> drift, never prose,
+  never execution;
   (2) only when it says not-a-tool, build the classification view (one
   wrapping fence stripped; still-fenced-after-one -> prose); (3) DRIFT
   when the view is a single JSON object AND any of action/tool_id/name
@@ -104,6 +114,17 @@ parse_mode=HTML"; false means send the ORIGINAL exactly as today (no
 parse_mode) — ONE message either way, decided BEFORE the wire, so no
 second attempt ever exists (this replaces both the fallback and the
 degrade of earlier drafts).
+FIRST-ATTEMPT-ONLY FORMATTING (r7 codex MED — an entity-parse 400
+under today's PENDING/re-flush semantics would otherwise retry the
+SAME rejected formatting forever and the message would never arrive):
+the outbox row gains an `attempts` counter (additive projection
+change). A flush sends the rendered text with parse_mode ONLY when
+attempts==0; every re-flush of a previously attempted row sends the
+ORIGINAL with no parse_mode. A parse rejection therefore self-heals on
+the next regular flush tick (one wire attempt per tick, no second send
+within a tick, delivery converges to the plain path); the 400-handling
+code itself stays untouched, and "a render bug costs formatting only"
+becomes literally true.
 Render returns false when:
 - the rendered text exceeds 4096 UTF-16 code units (the Bot API
   sendMessage bound, applied post-parse — codex F4: we do NOT claim
