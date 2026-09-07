@@ -27,21 +27,30 @@ consume, with these corrections:
   lifecycle event arrives first — suspended-only and failed-only turns
   (both exist in committed detectors) get rows without an admission.
   Columns: turn_id PRIMARY KEY, identity, update_id, user_text,
-  hist_final (history semantics: non-empty final of turn.succeeded),
-  rec_state (NONE|SUCCEEDED|SUSPENDED|FAILED — recovery semantics,
-  where SUCCEEDED additionally requires the non-empty final exactly as
-  today), code, tool, susp_summary, seq (r1 kilo F1: history and
-  recovery finals are SEPARATE fields with today's exact rules).
-- `seq` OWNER (r1 codex #2): seq = the journal offset of the FIRST
-  event observed for the turn (for admitted turns that is the
-  admission offset — identical to today's order); it never changes on
-  later lifecycle updates, so out-of-order completion cannot reorder
-  history.
-- QUERY + INDEX (r1 codex #3): partial index ON conv_turns(identity,
-  seq) WHERE hist_final IS NOT NULL — the 12-pair query scans only
-  completed rows (true O(12) regardless of an incomplete tail); the
-  history query also excludes the CURRENT turn id (r1 kilo F2, exactly
-  as today's fold does).
+  hist_done (BOOLEAN — set by EVERY valid turn.succeeded, empty final
+  included; r2 codex HIGH / kilo F1: completion is the EVENT, the
+  index predicates on THIS marker, never on content), hist_final
+  (lossless content, may be the empty string), rec_state
+  (NONE|SUCCEEDED|SUSPENDED|FAILED — recovery semantics, where
+  SUCCEEDED additionally requires the non-empty final exactly as
+  today), code, tool, susp_summary, created_seq (immutable
+  first-observed offset), hist_seq (NULLABLE — set ONLY by the
+  admission event; r2 codex MED#1: history order is ADMISSION order,
+  so a turn first seen through a lifecycle event gets history order
+  only when/if its admission arrives), source_event_id,
+  source_offset, projection_version (per-row provenance required by
+  Annex P0.3; r2 codex MED#2 — updated on every fold touch to the
+  last contributing event).
+- SEQ OWNERSHIP (r1 codex #2, split in v3 per r2 codex MED#1):
+  created_seq = first-observed offset (row identity, immutable);
+  hist_seq = the ADMISSION event's offset (history order — exactly
+  today's semantics, including the failed-before-admitted
+  counterexample: history order follows admission, not first sight).
+- QUERY + INDEX (r1 codex #3, r2 corrected): partial index ON
+  conv_turns(identity, hist_seq) WHERE hist_done AND hist_seq IS NOT
+  NULL — membership by the completion MARKER and ADMISSION order
+  (true O(12) under an incomplete tail); the history query excludes
+  the CURRENT turn id (r1 kilo F2).
 - Incremental precedence (same rules, now stated per event): resumed
   clears susp_summary and downgrades rec_state SUSPENDED->NONE; failed
   always overwrites rec_state (payload or not); succeeded overwrites
