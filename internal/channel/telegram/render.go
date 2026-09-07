@@ -174,20 +174,20 @@ func renderTableBlock(block []string) (string, int, bool) {
 	var groups []string
 	for idx, row := range block[2:] {
 		cells := splitCells(row)
+		// ONE consistent lossless rule (impl r2 codex #1: the hermes
+		// row-label branch shifted every surplus row's labels): the
+		// heading is the first non-empty cell, skipped by INDEX; every
+		// other cell is labelled by its own position, surplus beyond
+		// the headers gets "(extra)". No out-of-band label guessing.
 		heading := ""
-		headingIdx := -1 // index INTO data of the cell promoted to heading
-		var data []string
-		if len(cells) == len(headers)+1 && cells[0] != "" {
-			heading, data = cells[0], cells[1:]
-		} else {
-			for hi, c := range cells {
-				if c != "" {
-					heading, headingIdx = c, hi
-					break
-				}
+		headingIdx := -1
+		for hi, c := range cells {
+			if c != "" {
+				heading, headingIdx = c, hi
+				break
 			}
-			data = cells
 		}
+		data := cells
 		if heading == "" {
 			heading = "Row " + itoa(idx+1)
 		}

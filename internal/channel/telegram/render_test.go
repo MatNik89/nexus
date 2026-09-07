@@ -5,6 +5,7 @@
 package telegram
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
@@ -15,6 +16,15 @@ import (
 // tag, all & < > outside tags escaped, span budget, UTF-16 budget.
 func validateRendered(t *testing.T, out string) {
 	t.Helper()
+	if err := renderedViolation(out); err != nil {
+		t.Fatalf("%v: %q", err, out)
+	}
+}
+
+// renderedViolation is the ORACLE itself, testable directly (impl r2
+// codex #3: a corpus entry that never reaches the validator cannot
+// lock it).
+func renderedViolation(out string) error {
 	tagRe := regexp.MustCompile(`</?(b|code|pre)>`)
 	locs := tagRe.FindAllStringIndex(out, -1)
 	depth := 0
@@ -28,40 +38,41 @@ func validateRendered(t *testing.T, out string) {
 		tag := out[lc[0]:lc[1]]
 		if !strings.HasPrefix(tag, "</") {
 			if depth != 0 {
-				t.Fatalf("NESTED tag %s inside <%s>: %q", tag, open, out)
+				return fmt.Errorf("NESTED tag %s inside <%s>", tag, open)
 			}
 			depth = 1
 			open = strings.Trim(tag, "<>")
 			spans++
 		} else {
 			if depth != 1 || strings.Trim(tag, "</>") != open {
-				t.Fatalf("unbalanced tag %s: %q", tag, out)
+				return fmt.Errorf("unbalanced tag %s", tag)
 			}
 			depth = 0
 		}
 	}
 	outside.WriteString(out[last:])
 	if depth != 0 {
-		t.Fatalf("unclosed tag <%s>: %q", open, out)
+		return fmt.Errorf("unclosed tag <%s>", open)
 	}
 	for _, c := range []string{"<", ">"} {
 		if strings.Contains(outside.String(), c) {
-			t.Fatalf("unescaped %q outside renderer tags: %q", c, out)
+			return fmt.Errorf("unescaped %q outside renderer tags", c)
 		}
 	}
 	deent := regexp.MustCompile(`&(amp|lt|gt|quot|#[0-9]+|#x[0-9a-fA-F]+);`).ReplaceAllString(outside.String(), "")
 	if strings.Contains(deent, "&") {
-		t.Fatalf("raw ampersand outside entities in %q", out)
+		return fmt.Errorf("raw ampersand outside entities")
 	}
 	if strings.Contains(out, "<b></b>") || strings.Contains(out, "<code></code>") || strings.Contains(out, "<pre></pre>") {
-		t.Fatalf("EMPTY tag emitted: %q", out)
+		return fmt.Errorf("EMPTY tag emitted")
 	}
 	if spans > renderSpanBudget {
-		t.Fatalf("span budget exceeded: %d", spans)
+		return fmt.Errorf("span budget exceeded: %d", spans)
 	}
 	if postParseUTF16Len(out) > renderUTF16Budget {
-		t.Fatal("post-parse UTF-16 budget exceeded on ok=true output")
+		return fmt.Errorf("post-parse UTF-16 budget exceeded")
 	}
+	return nil
 }
 
 // PROPERTY VALIDATOR over an adversarial corpus (plan v10).
@@ -188,5 +199,51 @@ func TestRenderBudgetBoundaries(t *testing.T) {
 func TestRenderPlainProseShortCircuits(t *testing.T) {
 	if _, ok := renderHTML("nothing fancy here at all"); ok {
 		t.Fatal("plain prose should not take the formatted path")
+	}
+}
+
+// IMPL r2 codex #2: duplicate-value cells SURVIVE with correct labels
+// (content assertion, not just syntactic validity).
+func TestRenderDuplicateValueCellSurvives(t *testing.T) {
+	out, ok := renderHTML("| Name | Role |\n|---|---|\n| ana | ana |")
+	if !ok {
+		t.Fatal("did not render")
+	}
+	if !strings.Contains(out, "• Role: ana") {
+		t.Fatalf("duplicate-value data cell dropped:\n%s", out)
+	}
+}
+
+// IMPL r2 codex #1: a one-cell surplus row keeps every label aligned
+// and the surplus gets (extra) — no row-label shift.
+func TestRenderSurplusRowLabelsAligned(t *testing.T) {
+	out, ok := renderHTML("| Name | Role |\n|---|---|\n| ana | admin | extra |")
+	if !ok {
+		t.Fatal("did not render")
+	}
+	for _, want := range []string{"<b>ana</b>", "• Role: admin", "• (extra): extra"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "• Name: admin") {
+		t.Fatalf("labels shifted (row-label branch resurrected):\n%s", out)
+	}
+}
+
+// IMPL r2 codex #3: the ORACLE itself is locked — it must reject a raw
+// ampersand and accept a proper entity.
+func TestRenderedViolationOracle(t *testing.T) {
+	if err := renderedViolation("A&B"); err == nil {
+		t.Fatal("oracle accepted a raw ampersand")
+	}
+	if err := renderedViolation("A&amp;B and <b>x</b>"); err != nil {
+		t.Fatalf("oracle rejected valid output: %v", err)
+	}
+	if err := renderedViolation("<b>x</b><b></b>"); err == nil {
+		t.Fatal("oracle accepted an empty tag")
+	}
+	if err := renderedViolation("<b>a<code>b</code></b>"); err == nil {
+		t.Fatal("oracle accepted nesting")
 	}
 }

@@ -1839,3 +1839,51 @@ func TestTelegramEdgeMapsDriftCroatian(t *testing.T) {
 		t.Fatalf("wrong Croatian mapping: %q, want %q", reply, want)
 	}
 }
+
+// IMPL r2 codex #4: the LIVE drift path — the provider returns a drift
+// dialect, the real loop journals turn.failed, and telegramHandler maps
+// the exact Croatian message with the selected tool.
+func TestTelegramEdgeMapsLiveDrift(t *testing.T) {
+	b := driftBundle(t, "TG_LIVEDRIFT")
+	reply, err := telegramHandler(b)(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 41,
+		Text: "zapamti nesto", Profile: "private"})
+	if err != nil {
+		t.Fatalf("live drift not mapped: %v", err)
+	}
+	want := "Nisam uspio ispravno pozvati alat (memory_remember). Preformuliraj zahtjev."
+	if reply != want {
+		t.Fatalf("wrong Croatian mapping: %q, want %q", reply, want)
+	}
+}
+
+// driftBundle: a real bundle whose provider ALWAYS answers with the
+// observed drift dialect (naming a registered tool with a wrong schema).
+func driftBundle(t *testing.T, name string) *daemonBundle {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reply := `{"action":"memory_remember","content":"x"}`
+		bb, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{
+			"message": map[string]string{"role": "assistant", "content": reply}}}})
+		w.Write(bb)
+	}))
+	t.Cleanup(srv.Close)
+	host := strings.TrimPrefix(srv.URL, "http://")
+	key := "NEXUS_" + name + "_KEY"
+	t.Setenv(key, "sk-x")
+	base := filepath.Join(t.TempDir(), "nexus")
+	os.MkdirAll(base, 0o700)
+	cfgJSON := fmt.Sprintf(`{"provider_base_url":%q,"provider_key_env":%q,
+		"provider_model":"m","egress_allow":[%q],"default_profile":"private"}`, srv.URL, key, host)
+	os.WriteFile(filepath.Join(base, "config.json"), []byte(cfgJSON), 0o600)
+	resolved, err := config.Resolve(filepath.Join(base, "config.json"), "", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bd, err := buildDaemon(pathx.Layout{Base: base}, resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { bd.j.Close() })
+	return bd
+}
