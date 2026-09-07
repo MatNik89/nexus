@@ -45,67 +45,77 @@ result. Reviewers: challenge this if HTML mode has a hole we missed.
 
 ## Proposed changes
 
-### SCOPE CUT (v4, moderator decision after round 3)
-Multipart/chunking is REMOVED from this slice entirely. Every round-3
-HIGH (part ordering, B7 multipart transaction, reconcile grammar,
-tag-splitting, UTF-16 budget) belongs to that machinery. Messages whose
-text exceeds Telegram's limit keep TODAY'S behavior byte-for-byte (the
-send fails as it does now); a separate chunking slice with its own plan
-owns that — trigger: the first real over-limit reply observed in
-dogfood. The dogfood pain (tables, tool-JSON leak) involves short
-messages only.
+### SCOPE CUT (v4, unchanged in v5)
+Multipart/chunking is a separate future slice. See Non-goals.
 
-### A. Planner: no tool-shaped JSON ever reaches the user (v4)
-NO retry, NO execution of fenced payloads (codex r3 F1: the structured
-owner forbids tolerant-accept for effect payloads — a fenced valid call
-is indistinguishable from a display example and must NOT execute).
-- Classification input: the raw reply; if the ENTIRE reply is one
-  fenced block, strip exactly one fence FOR CLASSIFICATION ONLY. If the
-  result still starts with a fence, the reply is prose (delivered).
-- DRIFT (single JSON object AND (action==known tool id OR tool_id==
-  known tool id)) -> typed Croatian final: "Nisam uspio ispravno
-  pozvati alat (<tool>). Pokušaj ponovno ili preformuliraj." Exactly
-  one transport call, one grant. A FENCED valid-schema call is also
-  classified DRIFT (never executed, never delivered raw).
-- KNOWN LIMITATION, DECLARED (kilo r3 F2): a legitimate content answer
-  whose top-level action/tool_id equals a registered tool id is
-  suppressed into the typed final. This is an INTENTIONAL fail-closed
-  restriction (no soundness claim); the exact collision is a COMMITTED
-  test asserting the typed final, so the behavior is visible, not
-  hidden. Durable fix remains native function calling (deferred).
-Detectors: drift shapes (bare + single-fence + valid-schema-fenced) ->
-typed final, one call/one grant; unrelated-action JSON delivered
-verbatim; double-fenced JSON delivered as prose; collision case
-asserts the declared typed final; ablations: known-tool check, fence
-strip.
+### A. Planner: known drift dialects never ship raw (v5)
+(The v4 heading overclaimed — codex F2/kilo F4. No completeness claim:
+UNKNOWN dialects can still reach the user; every observed dialect gets
+a committed case and the classifier grows per dialect.)
+- ORDERED, MUTUALLY EXCLUSIVE (codex F1): (1) strict
+  `toolCallFromReply` on the RAW reply first — a valid bare protocol
+  call EXECUTES exactly as today (committed positive-control test);
+  (2) only when it says not-a-tool, build the classification view (one
+  wrapping fence stripped; still-fenced-after-one -> prose); (3) DRIFT
+  when the view is a single JSON object AND any of action/tool_id/name
+  equals a registered tool id; (4) everything else is prose, delivered.
+- DRIFT OUTCOME VIA THE STRUCTURED-OUTPUT OWNER (codex F3): the
+  planner returns the TYPED sentinel error TOOL_SCHEMA_DRIFT(<tool>)
+  — the S2.3 strict-refusal outcome for an invalid effect payload; no
+  salvage, no re-ask, no S7 second attempt; the turn lands through the
+  existing typed-error path (like NEEDS_APPROVAL). LOCALIZATION AT THE
+  EDGE (kilo F2): the telegram handler (and repl edge) maps the
+  sentinel to the Croatian user message; the kernel stays
+  language-free.
+- DECLARED LIMITS (committed tests assert each): the known-tool content
+  collision suppresses a legitimate answer (fail-closed, visible);
+  prose+JSON mixed replies are delivered as prose (agy #2 — classifier
+  sees only whole-object replies; trigger to extend: first observed
+  mixed-drift in dogfood); double-fenced JSON is prose.
+Detectors: valid bare call executes once (positive control); drift
+dialects (action=/tool_id=/name=known, bare + single-fenced) -> typed
+sentinel, one transport call/grant, edge renders Croatian; collision +
+mixed + double-fence declared-limit cases; ablations: ordering (swap
+steps 1/2 -> positive control RED), known-tool check, fence strip.
 
-### B. Telegram adapter: outbound rendering (v4)
-`renderHTML(original) string` at the SEND boundary only — the outbox
-row and journal keep the ORIGINAL text (kilo r3 F4 resolved: journal
-truth = original, rendering is ephemeral per attempt).
-- TOKENIZER PRECEDENCE SPECIFIED (kilo r3 F1): fenced block > inline
-  code > bold; spans never overlap (first match wins, later overlapping
-  markers are literal text); inside <pre>/<code> content is escaped
-  only — NO nested tags can be emitted, by construction. Tables ->
-  hermes bullet groups (lossless rules from v2) BEFORE span parsing;
-  table cell content is escaped, cell headings bolded whole (no span
-  parsing inside cells).
-- ENTITY BUDGET (codex r3 constructive-validity residue): if the
-  rendered message would exceed 50 tags, render DEGRADES at the render
-  boundary to fully-escaped plain text (no tags at all) — one message,
-  one send, no second attempt; Telegram's documented entity limit is
-  never approached.
-- Property validator test: for adversarial inputs (overlapping
-  markers, model-typed HTML, entities, pipes, huge inputs) the output
-  machine-checks: only renderer tags, balanced, NEVER nested, all
-  & < > outside tags escaped, tag count <= 50.
-- parse_mode=HTML on every send; NO fallback path exists; any Telegram
-  400 keeps today's semantics byte-for-byte.
-Detectors: property validator; per-rule unit tests (incl. nested-marker
-overlap -> non-nested output; `<b>use <code>ls</code></b>` shape never
-emitted); adapter test asserting parse_mode and unchanged 400
-semantics; ablations: precedence rule (allow overlap -> validator RED),
-entity-budget degrade.
+### B. Telegram adapter: outbound rendering (v5)
+`renderHTML(original) (string, bool)` at the SEND boundary; journal/
+outbox keep the ORIGINAL. The bool says "send rendered with
+parse_mode=HTML"; false means send the ORIGINAL exactly as today (no
+parse_mode) — ONE message either way, decided BEFORE the wire, so no
+second attempt ever exists (this replaces both the fallback and the
+degrade of earlier drafts).
+Render returns false when:
+- the rendered text exceeds 4096 UTF-16 code units (the Bot API
+  sendMessage bound, applied post-parse — codex F4: we do NOT claim
+  byte-for-byte-today for formatted sends; over-limit RENDERED output
+  falls back to the original path, which behaves exactly as today,
+  and table expansion can no longer push a deliverable message over
+  the limit — agy #3), or
+- the rendered tag count exceeds 90 (Bot API allows 100 message
+  entities; 90 leaves headroom — kilo F3's 10x5 table (~50 tags) now
+  renders fine), or
+- rendering found nothing to format (plain prose short-circuits).
+Renderer construction rules (v4 base plus):
+- tokenizer precedence fence > inline code > bold, first-match-wins,
+  no overlap; inside <pre>/<code> escaped content only; tables ->
+  hermes bullet groups before span parsing;
+- EMPTY SPANS ARE NEVER WRAPPED (agy #1): `****`, empty inline code
+  and empty table cells emit no tag (markers become literal escaped
+  text; empty cells use the '—' placeholder from v2 rules);
+- property validator: only renderer tags, balanced, never nested,
+  NO EMPTY TAG, all & < > outside tags escaped, tag count <= 90,
+  rendered length <= 4096 UTF-16 units whenever bool=true.
+Contradiction cleanup (codex F5/kilo F1): the earlier reference-section
+sentence about hermes' plain-resend fallback describes HERMES ONLY; our
+design has no fallback send — the render-boundary bool is a decision,
+not a resend. The Risks section is rewritten accordingly.
+Detectors: property validator (adversarial corpus incl. empty
+markers); per-rule unit tests; boundary tests at 4096/4097 UTF-16
+units and 90/91 tags (bool flips); adapter tests: parse_mode present
+iff bool, original path byte-identical to today when bool=false,
+unchanged 400 semantics; ablations: empty-tag rule, ordering,
+tag/length budget.
 
 ## Non-goals (P0)
 - Multipart/chunking (own future slice: enqueue-boundary rows, B7
@@ -116,10 +126,11 @@ entity-budget degrade.
 - Native provider function-calling (durable fix for A, deferred).
 
 ## Risks / tradeoffs
-- No retry at all in P0: a drifting model yields a typed "try again"
-  final — one bad UX beat, zero contract violations. Native function
-  calling (provider layer) remains the durable fix, deferred.
-- HTML escape bugs could eat formatting, never content: the narrow
-  entity-parse fallback re-sends the original plain.
-- Table bullets are lossless by construction (empty/extra-cell rules);
-  unparseable blocks pass through escaped.
+- No retry in P0: a drifting model yields the typed sentinel and a
+  Croatian edge message — one bad UX beat, no contract violations.
+  Native function calling remains the durable fix, deferred.
+- A render bug can only cost FORMATTING: bool=false sends the original
+  through today's path; content and delivery semantics never depend on
+  the renderer.
+- Declared classifier limits (collision, mixed prose+JSON, unknown
+  dialects) are visible in committed tests, not hidden claims.
