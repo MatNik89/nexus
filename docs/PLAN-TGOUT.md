@@ -123,6 +123,24 @@ a committed case and the classifier grows per dialect.)
   succeeded/suspended recovery behavior is preserved through Kind
   (their current tests keep passing unchanged); the error return
   propagates replay/projection failures (r12 codex LOW).
+  NON-DRIFT FAILED CLASS (r14 codex MED): ordinary failures journal
+  turn.failed with no code — the fold returns Kind=FAILED with EMPTY
+  Code, meaning "terminal observed, no renderable payload":
+  RunChannelTurn then behaves EXACTLY as today's collision-error path
+  for that turn (no invented user response), while the stale
+  suspension stays suppressed (a later terminal always supersedes the
+  challenge, payload or not). Only Code=="TOOL_SCHEMA_DRIFT"
+  reconstructs the typed drift outcome. Committed detectors: simple
+  ordinary-failed collision (asserts today's generic behavior, no
+  challenge replay) and suspended -> resumed -> ORDINARY-failed ->
+  crash -> collision (asserts the challenge is NOT replayed).
+  WITHIN-TIER PRECEDENCE (r14 codex LOW): when duplicate members of
+  the SAME precedence field name different registered tools (e.g.
+  {"action":"memory_recall","Action":"other_tool"}), the FIRST
+  occurrence in source token order wins; committed bare and
+  single-fenced two-registered-tools cases assert the SAME selected
+  tool in the structural error, the journal payload, the live edge
+  and the recovered edge.
   Detectors: crash seam after turn.failed, redeliver, assert journaled
   code+tool AND the identical Croatian string, zero planner calls;
   committed MIXED-LIFECYCLE case suspended -> resumed -> failed ->
