@@ -30,6 +30,9 @@ the system message per request (stateless, no tool needed).
   defaults (default "Europe/Zagreb"), applyValue and validation in
   internal/foundation/config/config.go — validation itself calls
   time.LoadLocation AND explicitly REJECTS the special value "Local"
+  AT BOTH LAYERS — the config validation and the planner constructor
+  itself (r6 kilo F1: the seam must not accept what config forbids,
+  or a non-config caller reopens the hole)
   (r5 codex MED#1: LoadLocation("Local") succeeds and would smuggle
   host-dependent time back in; "" also rejects; "UTC" is allowed — it
   is a stable identifier). buildDaemon (the ONLY planner composition
@@ -64,7 +67,12 @@ the system message per request (stateless, no tool needed).
   forwards resolved.Config.Timezone (a hard-coded default turns it
   RED).
 - Config validation cases: "Local" rejected, "" rejected, unloadable
-  rejected, "UTC" accepted.
+  rejected, "UTC" accepted — at BOTH the config layer and the planner
+  constructor (kilo F1).
+- DEFAULT lock (r6 codex #2): a config-suite case with NO timezone key
+  asserts the resolved value is exactly "Europe/Zagreb" (the existing
+  default-origin seam in config_test) — changing defaults() turns it
+  RED.
 - Constructor fail-closed cases: empty zone name and an unloadable
   zone name both REJECT construction (r3 codex LOW#2).
 - Ablation: remove the injection -> RED; move it into the system
@@ -75,8 +83,9 @@ the system message per request (stateless, no tool needed).
 - No time TOOL (a prompt line answers "koliko je sati" without an
   effect path); a clock tool is a later slice if scheduling asks need
   sub-minute precision.
-- No per-user timezone config (single-owner P0; the host zone IS the
-  owner's zone).
+- No per-user timezone config (single-owner P0). The CONFIG field is
+  the ONE owner of civil time — the host zone is never consulted
+  (r6 codex #1: no dual ownership).
 
 ## Risk
 - The user-content tail changes per minute; the cacheable PREFIX
