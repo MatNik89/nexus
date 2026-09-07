@@ -27,8 +27,9 @@ B. **No formatting at all.** `telegram.go` FlushOutbox sends
   379) + `_render_table_block` (line 330): EVERY GFM pipe table becomes
   bold-heading + bullet row groups — heading = the row-label cell (or
   first non-empty cell), remaining cells as "• Header: value" bullets;
-  tables inside code fences untouched. No aligned-pre branch at all —
-  bullets always. We adopt exactly this.
+  tables inside code fences untouched. We adopt this SHAPE with the
+  lossless deviations stated below (empty -> '—', surplus -> '(extra)'
+  bullets; hermes pads/truncates).
 - Formatting: `plugins/platforms/telegram/adapter.py:format_message`
   (line 8302): markdown -> MarkdownV2 with code blocks stashed behind
   placeholders, everything else escaped.
@@ -37,11 +38,14 @@ B. **No formatting at all.** `telegram.go` FlushOutbox sends
 - karfly/chatgpt_telegram_bot: malformed model output is never shipped
   raw; retry-with-correction is standard.
 
-DELIBERATE DEVIATION (topknot): hermes uses MarkdownV2, which needs
-18-character escaping plus placeholder machinery. We keep hermes'
-SEMANTICS (tables->bullets, plain fallback) but use parse_mode=HTML —
-only 3 escapes (& < >), no placeholder engine, identical rendered
-result. Reviewers: challenge this if HTML mode has a hole we missed.
+DELIBERATE DEVIATIONS (topknot): hermes uses MarkdownV2 (18-char
+escaping + placeholders) and, on a parse failure, issues a SECOND
+plain send (adapter.py:5241-5268) — we use parse_mode=HTML (3 escapes)
+and NO second send at all: the render-boundary bool decides BEFORE the
+wire (see B). Hermes' table algorithm is the MODEL, not a byte
+contract: we deviate with '—' for empty cells and '(extra)' bullets
+for surplus cells (hermes emits empty strings and truncates surplus —
+lossy; ours is lossless).
 
 ## Proposed changes
 
@@ -59,14 +63,20 @@ a committed case and the classifier grows per dialect.)
   wrapping fence stripped; still-fenced-after-one -> prose); (3) DRIFT
   when the view is a single JSON object AND any of action/tool_id/name
   equals a registered tool id; (4) everything else is prose, delivered.
-- DRIFT OUTCOME VIA THE STRUCTURED-OUTPUT OWNER (codex F3): the
-  planner returns the TYPED sentinel error TOOL_SCHEMA_DRIFT(<tool>)
-  — the S2.3 strict-refusal outcome for an invalid effect payload; no
-  salvage, no re-ask, no S7 second attempt; the turn lands through the
-  existing typed-error path (like NEEDS_APPROVAL). LOCALIZATION AT THE
-  EDGE (kilo F2): the telegram handler (and repl edge) maps the
-  sentinel to the Croatian user message; the kernel stays
-  language-free.
+- DRIFT OUTCOME, FULLY SPECIFIED (r5 codex F2 / kilo F2): the planner
+  returns a `contracts.TypedError` — Code "TOOL_SCHEMA_DRIFT",
+  Category validation, Retryability NEVER, Origin planner, SafeMessage
+  in neutral English naming the tool. The turn lands TERMINAL-FAILED:
+  `turn.failed`'s payload gains an `error_code` field (journaled,
+  structured — additive payload change), and the UDS error frame gains
+  a `code` field so the repl edge maps WITHOUT string classification;
+  the telegram handler maps the code to the Croatian user message.
+  HISTORY INTERACTION (kilo F2): conversation history folds ONLY
+  turn.succeeded, so a drifted turn never enters history as an
+  assistant reply — declared and asserted in a committed test.
+  FIELD PRECEDENCE (r5 codex F5): when several fields match known
+  tools, action > tool_id > name decides the reported <tool>;
+  the conflicting-fields case is a committed test.
 - DECLARED LIMITS (committed tests assert each): the known-tool content
   collision suppresses a legitimate answer (fail-closed, visible);
   prose+JSON mixed replies are delivered as prose (agy #2 — classifier
@@ -92,9 +102,12 @@ Render returns false when:
   falls back to the original path, which behaves exactly as today,
   and table expansion can no longer push a deliverable message over
   the limit — agy #3), or
-- the rendered tag count exceeds 90 (Bot API allows 100 message
-  entities; 90 leaves headroom — kilo F3's 10x5 table (~50 tags) now
-  renders fine), or
+- the rendered tag count exceeds 90 — a LOCAL renderer-complexity
+  budget, NOT a claim about any Telegram entity ceiling (the Bot API
+  does not document a per-message entity count; auto-detected entities
+  such as URLs exist and are not counted here — declared limit). The
+  budget bounds our own construction; a 10x5 table (~50 tags) renders
+  fine, or
 - rendering found nothing to format (plain prose short-circuits).
 Renderer construction rules (v4 base plus):
 - tokenizer precedence fence > inline code > bold, first-match-wins,
@@ -104,7 +117,8 @@ Renderer construction rules (v4 base plus):
   and empty table cells emit no tag (markers become literal escaped
   text; empty cells use the '—' placeholder from v2 rules);
 - property validator: only renderer tags, balanced, never nested,
-  NO EMPTY TAG, all & < > outside tags escaped, tag count <= 90,
+  NO EMPTY TAG, all & < > outside tags escaped, RENDERER tag count
+  <= 90 (local budget — the validator makes no total-entity claim),
   rendered length <= 4096 UTF-16 units whenever bool=true.
 Contradiction cleanup (codex F5/kilo F1): the earlier reference-section
 sentence about hermes' plain-resend fallback describes HERMES ONLY; our
