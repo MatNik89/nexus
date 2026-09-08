@@ -1,4 +1,4 @@
-# PLAN v10: full-audit remediation (codex AUDIT-FULL-2026-09-08) — zero-defect
+# PLAN v11: full-audit remediation (codex AUDIT-FULL-2026-09-08) — zero-defect
 
 Source: `docs/AUDIT-FULL-codex-2026-09-08.md` (9 findings; bound at f135eef,
 reverified against current tree). v2 folded round 1 (`docs/REVIEW-AUDIT-PLAN-{codex,kilo,agy}.md`, 3x FAIL); v3 folds
@@ -16,7 +16,8 @@ nil-builder detector], kilo PASS [same PolicyControl note], agy PASS). v9 folds 
 (`REVIEW-AUDIT-PLAN8-*.md`: codex FAIL 1 [setMyCommands UNKNOWN blindly re-registered
 after restart], kilo PASS, agy PASS). v10 folds round 9 (`REVIEW-AUDIT-PLAN9-*.md`:
 codex FAIL 1 [reconciliation has no S7 API / atomic recipe / validator], kilo PASS,
-agy PASS). Every fix: RED-capable
+agy PASS). v11 folds round 10 (`REVIEW-AUDIT-PLAN10-*.md`: codex FAIL 1 [registration
+identity not bound to the bot], kilo PASS, agy PASS). Every fix: RED-capable
 detector at the real owner boundary, then 3-agent review to 3xPASS.
 
 ## Status
@@ -312,10 +313,15 @@ existing `test_adapter_cannot_self_retry` family stays valid).
   post-write / malformed replies carry no commit receipt and land `OutcomeUnknown`
   (E9) — no new grant, ever, without a reconciliation step that proves the remote
   state. Command registration is therefore a DURABLE operation with a STABLE identity
-  derived from the canonical desired command set: `control:tg:setMyCommands:<sha256 of
-  the sorted command list>` under `PolicyControlEffect{Durable: true}`, owner companion
-  = channel event `channel.control_effect{operation_id, method, payload_hash, state}`
-  (the adapter's durable record of the registration). On daemon start the adapter does
+  derived from the REMOTE BOT and the canonical desired payload (codex r10 #1):
+  `control:tg:<bot-id>:setMyCommands:<sha256 of the exact canonical wire payload>`
+  (the ordered command array as sent — never sorted away), target
+  `channel:tg:bot:<bot-id>:setMyCommands`, under `PolicyControlEffect{Durable: true}`.
+  The bot id comes from the governed startup `getMe` (control-read) — a replacement
+  token (bot B) is a DIFFERENT durable operation even for identical commands, so a
+  SUCCEEDED registration for bot A never suppresses bot B's. Owner companion = channel
+  event `channel.control_effect{operation_id, adapter, bot_id, method, payload_hash,
+  state}` (the adapter's durable record of the registration). On daemon start the adapter does
   NOT call setMyCommands blindly (codex r8 #1): a rehydrated `UNKNOWN` registration
   first runs an S7-governed READ-ONLY reconciliation `control:tg:getMyCommands:<n>`
   (`PolicyControlRead`; `getMyCommands` joins the call-site table) that compares the
@@ -325,11 +331,12 @@ existing `test_adapter_cannot_self_retry` family stays valid).
   replacement grant (or FAILED when the budget is spent — health stays degraded). A
   rehydrated SUCCEEDED registration for the same hash performs no call at all; a
   changed desired set is a new identity. The owner companion
-  `channel.control_effect{operation_id, method, payload_hash, state}` is validated by
-  the channel PayloadValidator and projection: `operation_id ==
-  "control:tg:setMyCommands:" + payload_hash`, `method` in the closed set, `state` in
-  the closed landing set, profile = the journal's — a foreign hash is refused at the
-  journal boundary. Until reconciliation resolves, the channel health is `degraded`. Control classification is therefore split by effect:
+  `channel.control_effect{operation_id, adapter, bot_id, method, payload_hash, state}`
+  is validated by the channel PayloadValidator and projection: `operation_id ==
+  "control:" + adapter + ":" + bot_id + ":" + method + ":" + payload_hash`, `method` in
+  the closed set, `state` in the closed landing set, profile = the journal's — a
+  foreign hash OR a foreign bot is refused at the journal boundary (a bot-A companion
+  presented for bot B never reaches the wire). Until reconciliation resolves, the channel health is `degraded`. Control classification is therefore split by effect:
   `control-read` (getMe) and `control-effect` (setMyCommands), each bound to its OWN
   closed policy constant (codex r7 #1, kilo r7 note): `PolicyPoll` and
   `PolicyControlRead` list exactly `{transport_prewire, http_429, http_5xx,
@@ -562,6 +569,11 @@ health state, not an internal counter):
    injected failure of the reconcile+companion batch leaves S7 UNKNOWN and no
    control_effect row (no torn state); ablating the reconciliation transition or
    its atomic batch turns RED.
+2c. Bot rotation (codex r10 #1): bot A registers (SUCCEEDED); a same-bot restart makes
+   ZERO setMyCommands calls; a restart from the SAME profile journal with a token for
+   bot B and the SAME command set makes exactly ONE governed setMyCommands for B;
+   ablating only the bot binding turns this RED; a bot-A companion presented for bot
+   B is refused before the wire.
 3. FlushOutbox transport failure -> health `transport` degraded.
 4. Injected journal-mark failure in FlushOutbox -> health `substrate`, `Run` returns,
    NO further poll/flush wire calls (further channel work stops).
