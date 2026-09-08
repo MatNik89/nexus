@@ -145,6 +145,12 @@ type tgUpdate struct {
 // failures. Everything else (reset/EOF/timeout after write) stays
 // ambiguous — the remote may have accepted the request.
 func isPreWire(err error) bool {
+	// An E11 egress refusal / non-durable receipt is DEFINITE pre-wire: the
+	// dialer refused before any byte left the process, so the outbox must
+	// re-pend PENDING, never strand the row UNKNOWN (codex round-2 F2).
+	if errors.Is(err, errEgressPreWire) {
+		return true
+	}
 	var dnsErr *net.DNSError
 	if errors.As(err, &dnsErr) {
 		return true

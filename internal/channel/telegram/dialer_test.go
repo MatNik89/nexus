@@ -2,11 +2,19 @@ package telegram
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/netip"
+	"net/url"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/MatNik89/nexus/internal/channel"
+	"github.com/MatNik89/nexus/internal/kernel/journal"
 )
 
 // recordDial captures the address the pinned dialer actually connects to and
@@ -134,8 +142,7 @@ func TestPinnedClientNoProxyNoRedirect(t *testing.T) {
 }
 
 func TestPinnedClientModeFromBase(t *testing.T) {
-	// A loopback API base selects loopback mode; production base selects the
-	// public floor. Proven by which resolver answer each accepts.
+	// A loopback API base selects loopback mode; a production base does not.
 	if m := egressModeForBase("http://127.0.0.1:8081"); !m {
 		t.Fatalf("loopback base must select loopback mode")
 	}
@@ -218,5 +225,88 @@ func TestPinnedClientEgressAllowDenyDefault(t *testing.T) {
 	// Loopback override does not consult egress_allow (validated local endpoint).
 	if _, err := newPinnedClient("http://127.0.0.1:8081", nil, 0, staticResolver("127.0.0.1"), nil, nil); err != nil {
 		t.Fatalf("loopback override should not require egress_allow: %v", err)
+	}
+}
+
+func TestDialerRejectsRFC8215Local(t *testing.T) {
+	// RFC8215 64:ff9b:1::/48 is explicitly local-use, not globally reachable.
+	var got string
+	var rc []egressDecision
+	d := newTestDialer(false, staticResolver("64:ff9b:1::1"), recordDial(&got), &rc)
+	if _, err := d.DialContext(context.Background(), "tcp", "api.telegram.org:443"); err == nil {
+		t.Fatalf("RFC8215 local-use prefix admitted in production")
+	}
+	if got != "" {
+		t.Fatalf("dialed RFC8215 address %q", got)
+	}
+}
+
+func TestEgressRefusalIsPreWire(t *testing.T) {
+	// A dialer refusal wrapped the way http.Client returns it (url.Error) must
+	// classify pre-wire, so the outbox re-pends PENDING and never strands the
+	// row UNKNOWN.
+	base := fmt.Errorf("telegram egress: resolved address rejected by policy: %w", errEgressPreWire)
+	wrapped := &url.Error{Op: "Post", URL: "https://api.telegram.org/botX/getUpdates", Err: base}
+	if !isPreWire(wrapped) {
+		t.Fatalf("egress refusal not classified pre-wire (would strand the outbox UNKNOWN)")
+	}
+}
+
+func TestPinnedClientTLSVerificationOn(t *testing.T) {
+	// The pinned dial must NOT downgrade TLS. Two proofs: no InsecureSkipVerify,
+	// and a handshake to a server with an UNTRUSTED cert is REJECTED (if
+	// verification were bypassed this would succeed). This is the wrong-cert
+	// detector: pinning the literal IP does not skip hostname/chain checks.
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) }))
+	defer srv.Close()
+	c, err := newPinnedClient(srv.URL, nil, 5*time.Second, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	tr := c.Transport.(*http.Transport)
+	if tr.TLSClientConfig != nil && tr.TLSClientConfig.InsecureSkipVerify {
+		t.Fatalf("InsecureSkipVerify must never be set on the egress client")
+	}
+	_, err = c.Get(srv.URL)
+	if err == nil {
+		t.Fatalf("client accepted an untrusted certificate - TLS verification is bypassed")
+	}
+	if !strings.Contains(err.Error(), "certificate") && !strings.Contains(err.Error(), "x509") {
+		t.Fatalf("expected a certificate verification error, got: %v", err)
+	}
+}
+
+func TestEgressReceiptJournaled(t *testing.T) {
+	// A real request through the pinned client must leave a durable, complete
+	// egress receipt in the journal, carrying the resolved set + pin and NEVER
+	// the bot token. Proves Adapter.egressReceipt -> Core.RecordEgress wiring.
+	h := build(t, map[int64]string{42: "work"})
+	_ = h.a.PollOnce(ctxT()) // a getUpdates dial happens regardless of the reply
+	var allowed bool
+	if err := h.j.Replay(0, func(ev journal.Event) error {
+		if ev.Envelope.EventType != channel.EvEgressAttempt {
+			return nil
+		}
+		if strings.Contains(string(ev.Envelope.Payload), "123:token") {
+			t.Fatalf("bot token leaked into an egress receipt")
+		}
+		var p struct {
+			Host     string   `json:"host"`
+			Resolved []string `json:"resolved"`
+			Pinned   string   `json:"pinned"`
+			Allowed  bool     `json:"allowed"`
+		}
+		if err := json.Unmarshal(ev.Envelope.Payload, &p); err != nil {
+			return err
+		}
+		if p.Allowed && p.Pinned != "" && len(p.Resolved) > 0 {
+			allowed = true
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if !allowed {
+		t.Fatalf("no complete allowed egress receipt journaled after a poll")
 	}
 }

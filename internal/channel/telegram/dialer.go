@@ -9,6 +9,7 @@ package telegram
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -17,6 +18,27 @@ import (
 	"strings"
 	"time"
 )
+
+// errEgressPreWire marks every egress refusal or non-durable-receipt failure:
+// NOTHING left the process, so the caller must treat it as a DEFINITE pre-wire
+// failure (isPreWire true -> outbox re-pends PENDING, never UNKNOWN). Without
+// this, http.Transport wraps the dialer error opaquely and the outbox would
+// strand the message for human reconciliation (codex round-2 F2).
+var errEgressPreWire = errors.New("telegram egress refused pre-wire")
+
+// forbiddenSpecialUse is the single reviewable table of non-public prefixes
+// that the netip class predicates do not already cover (codex round-2 F3:
+// one table, not scattered byte checks). Classes with a stdlib predicate
+// (loopback/private/link-local/multicast/ULA/...) stay in permitted().
+var forbiddenSpecialUse = []netip.Prefix{
+	netip.MustParsePrefix("100.64.0.0/10"),   // RFC6598 CGNAT
+	netip.MustParsePrefix("192.0.2.0/24"),    // RFC5737 documentation
+	netip.MustParsePrefix("198.51.100.0/24"), // RFC5737 documentation
+	netip.MustParsePrefix("203.0.113.0/24"),  // RFC5737 documentation
+	netip.MustParsePrefix("198.18.0.0/15"),   // RFC2544 benchmarking
+	netip.MustParsePrefix("2001:db8::/32"),   // RFC3849 documentation
+	netip.MustParsePrefix("64:ff9b:1::/48"),  // RFC8215 local-use translation
+}
 
 // egressDecision is the typed receipt of one dial attempt (the E11 honest
 // data-flow evidence). Refusals carry a Reason; a permitted connect carries
@@ -93,24 +115,6 @@ func embeddedV4(a netip.Addr) (netip.Addr, bool) {
 	return netip.Addr{}, false
 }
 
-// specialUseV4 reports RFC5737 documentation and RFC2544 benchmarking ranges
-// that are not public and must not be dialed in production.
-func specialUseV4(b [4]byte) bool {
-	switch {
-	case b[0] == 192 && b[1] == 0 && b[2] == 2: // 192.0.2.0/24
-		return true
-	case b[0] == 198 && b[1] == 51 && b[2] == 100: // 198.51.100.0/24
-		return true
-	case b[0] == 203 && b[1] == 0 && b[2] == 113: // 203.0.113.0/24
-		return true
-	case b[0] == 198 && (b[1] == 18 || b[1] == 19): // 198.18.0.0/15
-		return true
-	case b[0] == 100 && b[1] >= 64 && b[1] <= 127: // 100.64.0.0/10 CGNAT
-		return true
-	}
-	return false
-}
-
 // permitted applies the mode's address policy to ONE normalized address.
 func (d *pinnedDialer) permitted(a netip.Addr) bool {
 	if !a.IsValid() {
@@ -133,12 +137,8 @@ func (d *pinnedDialer) permitted(a netip.Addr) bool {
 		a.IsPrivate() { // RFC1918 v4 + ULA fc00::/7
 		return false
 	}
-	if a.Is4() && specialUseV4(a.As4()) {
-		return false
-	}
-	if a.Is6() {
-		b := a.As16()
-		if b[0] == 0x20 && b[1] == 0x01 && b[2] == 0x0d && b[3] == 0xb8 { // 2001:db8::/32 doc
+	for _, p := range forbiddenSpecialUse {
+		if p.Contains(a) {
 			return false
 		}
 	}
@@ -157,8 +157,12 @@ func (d *pinnedDialer) DialContext(ctx context.Context, network, address string)
 		return nil, fmt.Errorf("telegram egress: malformed dial address")
 	}
 	refuse := func(reason string, resolved []netip.Addr) (net.Conn, error) {
-		_ = d.emit(egressDecision{Host: host, Resolved: resolved, Reason: reason})
-		return nil, fmt.Errorf("telegram egress: %s", reason)
+		// A refusal is pre-wire (nothing dialed). The receipt-append error, if
+		// any, is joined so the audit failure is not silently dropped (F1).
+		if aerr := d.emit(egressDecision{Host: host, Resolved: resolved, Reason: reason}); aerr != nil {
+			return nil, fmt.Errorf("telegram egress: %s (receipt append failed: %v): %w", reason, aerr, errEgressPreWire)
+		}
+		return nil, fmt.Errorf("telegram egress: %s: %w", reason, errEgressPreWire)
 	}
 	if !strings.EqualFold(host, d.apiHost) {
 		return refuse("host not permitted", nil)
@@ -182,7 +186,7 @@ func (d *pinnedDialer) DialContext(ctx context.Context, network, address string)
 	pinned := norm[0]
 	// PERMITTED: the receipt must be durable BEFORE the connection happens.
 	if err := d.emit(egressDecision{Host: host, Resolved: norm, Pinned: pinned, Allowed: true}); err != nil {
-		return nil, fmt.Errorf("telegram egress: receipt not durable, refusing dial: %w", err)
+		return nil, fmt.Errorf("telegram egress: receipt not durable, refusing dial: %v: %w", err, errEgressPreWire)
 	}
 	return d.dial(ctx, network, net.JoinHostPort(pinned.String(), port))
 }
