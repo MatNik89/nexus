@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/http"
 	"net/netip"
@@ -30,7 +31,7 @@ func newTestDialer(loopback bool, resolve func(context.Context, string) ([]netip
 	return &pinnedDialer{
 		loopbackMode: loopback, apiHost: "api.telegram.org",
 		resolve: resolve, dial: dial,
-		receipt: func(d egressDecision) { *rc = append(*rc, d) },
+		receipt: func(d egressDecision) error { *rc = append(*rc, d); return nil },
 	}
 }
 
@@ -116,7 +117,7 @@ func TestDialerHostNotPermitted(t *testing.T) {
 }
 
 func TestPinnedClientNoProxyNoRedirect(t *testing.T) {
-	c, err := newPinnedClient("https://api.telegram.org", 0, staticResolver("149.154.167.220"), nil, nil)
+	c, err := newPinnedClient("https://api.telegram.org", []string{"api.telegram.org"}, 0, staticResolver("149.154.167.220"), nil, nil)
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -140,5 +141,82 @@ func TestPinnedClientModeFromBase(t *testing.T) {
 	}
 	if m := egressModeForBase("https://api.telegram.org"); m {
 		t.Fatalf("production base must not select loopback mode")
+	}
+}
+
+func TestDialerRejectsNAT64Metadata(t *testing.T) {
+	// The NAT64 well-known prefix embedding the metadata IP
+	// (64:ff9b::169.254.169.254) must be refused (E11: every encoding).
+	var got string
+	var rc []egressDecision
+	d := newTestDialer(false, staticResolver("64:ff9b::a9fe:a9fe"), recordDial(&got), &rc)
+	if _, err := d.DialContext(context.Background(), "tcp", "api.telegram.org:443"); err == nil {
+		t.Fatalf("NAT64-embedded metadata IP was not refused")
+	}
+	if got != "" {
+		t.Fatalf("dialed NAT64-embedded metadata %q", got)
+	}
+}
+
+func TestDialerReceiptFailClosed(t *testing.T) {
+	// A permitted dial whose receipt cannot be journaled must FAIL CLOSED:
+	// no connection may happen without the durable E11 receipt.
+	var got string
+	d := &pinnedDialer{
+		loopbackMode: false, apiHost: "api.telegram.org",
+		resolve: staticResolver("149.154.167.220"),
+		dial:    recordDial(&got),
+		receipt: func(egressDecision) error { return fmt.Errorf("journal down") },
+	}
+	if _, err := d.DialContext(context.Background(), "tcp", "api.telegram.org:443"); err == nil {
+		t.Fatalf("permitted dial proceeded despite a failed receipt")
+	}
+	if got != "" {
+		t.Fatalf("dialed %q despite the receipt not being durable", got)
+	}
+}
+
+func TestDialerSequentialRebind(t *testing.T) {
+	// A resolver that answers an admitted IP first and an off-policy IP on a
+	// later call: the second DialContext must refuse (each connection is
+	// re-classified, no cached admission).
+	calls := 0
+	resolve := func(context.Context, string) ([]netip.Addr, error) {
+		calls++
+		if calls == 1 {
+			return []netip.Addr{netip.MustParseAddr("149.154.167.220")}, nil
+		}
+		return []netip.Addr{netip.MustParseAddr("169.254.169.254")}, nil
+	}
+	var got string
+	var rc []egressDecision
+	d := newTestDialer(false, resolve, recordDial(&got), &rc)
+	if _, err := d.DialContext(context.Background(), "tcp", "api.telegram.org:443"); err != nil {
+		t.Fatalf("first (admitted) dial refused: %v", err)
+	}
+	got = ""
+	if _, err := d.DialContext(context.Background(), "tcp", "api.telegram.org:443"); err == nil {
+		t.Fatalf("rebind to a metadata IP on the second resolve was not refused")
+	}
+	if got != "" {
+		t.Fatalf("dialed a rebound metadata IP %q", got)
+	}
+}
+
+func TestPinnedClientEgressAllowDenyDefault(t *testing.T) {
+	// Production base whose host is NOT in egress_allow -> refuse to build
+	// (deny-default). With the host admitted -> builds.
+	if _, err := newPinnedClient("https://api.telegram.org", nil, 0, staticResolver("149.154.167.220"), nil, nil); err == nil {
+		t.Fatalf("empty egress_allow admitted the production host (must deny-default)")
+	}
+	if _, err := newPinnedClient("https://api.telegram.org", []string{"api.deepseek.com"}, 0, staticResolver("149.154.167.220"), nil, nil); err == nil {
+		t.Fatalf("egress_allow without the API host admitted it")
+	}
+	if _, err := newPinnedClient("https://api.telegram.org", []string{"api.telegram.org"}, 0, staticResolver("149.154.167.220"), nil, nil); err != nil {
+		t.Fatalf("admitted host rejected: %v", err)
+	}
+	// Loopback override does not consult egress_allow (validated local endpoint).
+	if _, err := newPinnedClient("http://127.0.0.1:8081", nil, 0, staticResolver("127.0.0.1"), nil, nil); err != nil {
+		t.Fatalf("loopback override should not require egress_allow: %v", err)
 	}
 }

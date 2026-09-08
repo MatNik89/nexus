@@ -24,7 +24,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/MatNik89/nexus/internal/channel"
@@ -44,6 +43,9 @@ type Config struct {
 	TokenEnv string
 	Bindings map[int64]string
 	Profile  contracts.ProfileID
+	// EgressAllow is the sealed egress allowlist; in production the API host
+	// must appear here (deny-default, E11). Empty in the loopback override.
+	EgressAllow []string
 }
 
 // Handler runs one admitted inbound message to a reply (the daemon wires
@@ -59,11 +61,6 @@ type Adapter struct {
 	core     *channel.Core
 	handle   Handler
 	client   *http.Client
-	// egress receipt coalescing (PLAN-TG-EGRESS-DIALER.md): last pinned IP
-	// per host, so only first-connect / IP-change is journaled, never every
-	// poll. In-memory by design — a restart simply re-records once.
-	egressMu   sync.Mutex
-	lastPinned map[string]string
 	// offset is in-memory BY DESIGN (fresh-audit kilo F3): Telegram
 	// confirms server-side via the NEXT getUpdates offset, so a restart
 	// re-fetches only the unconfirmed tail; T22 dedup + stable refusal
@@ -93,12 +90,12 @@ func New(cfg Config, core *channel.Core, h Handler) (*Adapter, error) {
 	a := &Adapter{
 		base: strings.TrimRight(cfg.APIBase, "/"), token: token,
 		bindings: b, profile: cfg.Profile, core: core, handle: h,
-		lastPinned: make(map[string]string),
 	}
 	// E11 egress boundary (PLAN-TG-EGRESS-DIALER.md): a pinned-IP,
 	// proxy-sanitized, redirect-rejecting client that talks ONLY to the
-	// configured Telegram host, with a coalesced journal receipt.
-	client, err := newPinnedClient(cfg.APIBase, 65*time.Second, nil, nil, a.egressReceipt)
+	// configured Telegram host (admitted by egress_allow in production),
+	// journaling a receipt for every dial decision.
+	client, err := newPinnedClient(cfg.APIBase, cfg.EgressAllow, 65*time.Second, nil, nil, a.egressReceipt)
 	if err != nil {
 		return nil, fmt.Errorf("telegram: egress client: %w", err)
 	}
@@ -106,26 +103,21 @@ func New(cfg Config, core *channel.Core, h Handler) (*Adapter, error) {
 	return a, nil
 }
 
-// egressReceipt journals dial decisions with coalescing: a refusal is ALWAYS
-// recorded (a security event), a permitted connect only when the pinned IP for
-// the host first appears or changes — so steady-state getUpdates polling does
-// not flood the journal. A background ctx is used: the append is a local
-// serialized write and must not be cancelled by a per-request deadline.
-func (a *Adapter) egressReceipt(d egressDecision) {
-	if !d.Allowed {
-		_ = a.core.RecordEgress(context.Background(), d.Host, "", false, d.Reason)
-		return
+// egressReceipt journals one dial decision through the single-writer journal.
+// It returns the append error so the dialer FAILS THE PERMITTED DIAL CLOSED
+// when the receipt cannot be made durable (E11 requires the receipt). A
+// background ctx is used: the append is a local serialized write that must not
+// be cancelled by a per-request deadline.
+func (a *Adapter) egressReceipt(d egressDecision) error {
+	resolved := make([]string, 0, len(d.Resolved))
+	for _, r := range d.Resolved {
+		resolved = append(resolved, r.String())
 	}
-	pin := d.Pinned.String()
-	a.egressMu.Lock()
-	changed := a.lastPinned[d.Host] != pin
-	if changed {
-		a.lastPinned[d.Host] = pin
+	pinned := ""
+	if d.Pinned.IsValid() {
+		pinned = d.Pinned.String()
 	}
-	a.egressMu.Unlock()
-	if changed {
-		_ = a.core.RecordEgress(context.Background(), d.Host, pin, true, "")
-	}
+	return a.core.RecordEgress(context.Background(), d.Host, resolved, pinned, d.Allowed, d.Reason)
 }
 
 // --- Bot API wire ---

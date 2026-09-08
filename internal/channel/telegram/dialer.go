@@ -3,7 +3,9 @@ package telegram
 // E11 egress boundary for the Telegram client (PLAN-TG-EGRESS-DIALER.md):
 // a pinned-IP, proxy-sanitized, redirect-rejecting dialer. The bot token
 // rides in the URL path, so every connection must reach ONLY the configured
-// Telegram host and never a rebind/proxy peer.
+// Telegram host and never a rebind/proxy peer. A typed receipt is journaled
+// for EVERY dial decision (DialContext fires per TCP connection, and HTTP
+// keep-alive already coalesces the 2s polls, so there is no flood to avoid).
 
 import (
 	"context"
@@ -17,8 +19,9 @@ import (
 )
 
 // egressDecision is the typed receipt of one dial attempt (the E11 honest
-// data-flow evidence). Refusals always carry a Reason; a permitted connect
-// carries the Pinned address.
+// data-flow evidence). Refusals carry a Reason; a permitted connect carries
+// the Pinned address. Resolved is the whole normalized answer set that was
+// classified.
 type egressDecision struct {
 	Host     string
 	Resolved []netip.Addr
@@ -51,19 +54,74 @@ type pinnedDialer struct {
 	apiHost      string
 	resolve      func(ctx context.Context, host string) ([]netip.Addr, error)
 	dial         func(ctx context.Context, network, addr string) (net.Conn, error)
-	receipt      func(egressDecision)
+	receipt      func(egressDecision) error
 }
 
-func (d *pinnedDialer) emit(dec egressDecision) {
+func (d *pinnedDialer) emit(dec egressDecision) error {
 	if d.receipt != nil {
-		d.receipt(dec)
+		return d.receipt(dec)
 	}
+	return nil
+}
+
+// embeddedV4 extracts a v4 address embedded in an IPv6 transition form that
+// must be classified by the v4 policy (E11: metadata blocked in EVERY
+// encoding). Covers the NAT64 well-known prefix 64:ff9b::/96 and the
+// deprecated IPv4-compatible ::/96 form.
+func embeddedV4(a netip.Addr) (netip.Addr, bool) {
+	if !a.Is6() {
+		return netip.Addr{}, false
+	}
+	b := a.As16()
+	// NAT64 well-known prefix 64:ff9b::/96.
+	if b[0] == 0x00 && b[1] == 0x64 && b[2] == 0xff && b[3] == 0x9b &&
+		b[4] == 0 && b[5] == 0 && b[6] == 0 && b[7] == 0 &&
+		b[8] == 0 && b[9] == 0 && b[10] == 0 && b[11] == 0 {
+		return netip.AddrFrom4([4]byte{b[12], b[13], b[14], b[15]}), true
+	}
+	// IPv4-compatible ::/96 (deprecated), excluding :: and ::1.
+	allZeroHigh := true
+	for i := 0; i < 12; i++ {
+		if b[i] != 0 {
+			allZeroHigh = false
+			break
+		}
+	}
+	if allZeroHigh && !(b[12] == 0 && b[13] == 0 && b[14] == 0 && (b[15] == 0 || b[15] == 1)) {
+		return netip.AddrFrom4([4]byte{b[12], b[13], b[14], b[15]}), true
+	}
+	return netip.Addr{}, false
+}
+
+// specialUseV4 reports RFC5737 documentation and RFC2544 benchmarking ranges
+// that are not public and must not be dialed in production.
+func specialUseV4(b [4]byte) bool {
+	switch {
+	case b[0] == 192 && b[1] == 0 && b[2] == 2: // 192.0.2.0/24
+		return true
+	case b[0] == 198 && b[1] == 51 && b[2] == 100: // 198.51.100.0/24
+		return true
+	case b[0] == 203 && b[1] == 0 && b[2] == 113: // 203.0.113.0/24
+		return true
+	case b[0] == 198 && (b[1] == 18 || b[1] == 19): // 198.18.0.0/15
+		return true
+	case b[0] == 100 && b[1] >= 64 && b[1] <= 127: // 100.64.0.0/10 CGNAT
+		return true
+	}
+	return false
 }
 
 // permitted applies the mode's address policy to ONE normalized address.
 func (d *pinnedDialer) permitted(a netip.Addr) bool {
 	if !a.IsValid() {
 		return false
+	}
+	a = a.Unmap()
+	// Classify any embedded-v4 transition form by the v4 policy too.
+	if a.Is6() {
+		if e, ok := embeddedV4(a); ok && !d.permitted(e) {
+			return false
+		}
 	}
 	if d.loopbackMode {
 		return a.IsLoopback()
@@ -75,10 +133,12 @@ func (d *pinnedDialer) permitted(a netip.Addr) bool {
 		a.IsPrivate() { // RFC1918 v4 + ULA fc00::/7
 		return false
 	}
-	// CGNAT 100.64.0.0/10 is not covered by IsPrivate.
-	if a.Is4() {
-		b := a.As4()
-		if b[0] == 100 && b[1] >= 64 && b[1] <= 127 {
+	if a.Is4() && specialUseV4(a.As4()) {
+		return false
+	}
+	if a.Is6() {
+		b := a.As16()
+		if b[0] == 0x20 && b[1] == 0x01 && b[2] == 0x0d && b[3] == 0xb8 { // 2001:db8::/32 doc
 			return false
 		}
 	}
@@ -87,58 +147,78 @@ func (d *pinnedDialer) permitted(a netip.Addr) bool {
 
 // DialContext resolves the host, applies the mode policy to EVERY answer,
 // refuses the whole resolution if any answer fails (no pick-the-good-one),
-// then dials one pinned literal IP. TLS (SNI + verification) is done by the
-// http.Transport against the ORIGINAL hostname, so pinning the IP never
-// downgrades certificate validation.
+// journals the decision, then dials one pinned literal IP. On the PERMITTED
+// path a receipt-append failure FAILS THE DIAL CLOSED (E11 requires the
+// receipt). TLS (SNI + verification) is done by the http.Transport against
+// the ORIGINAL hostname, so pinning the IP never downgrades verification.
 func (d *pinnedDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(address)
 	if err != nil {
 		return nil, fmt.Errorf("telegram egress: malformed dial address")
 	}
+	refuse := func(reason string, resolved []netip.Addr) (net.Conn, error) {
+		_ = d.emit(egressDecision{Host: host, Resolved: resolved, Reason: reason})
+		return nil, fmt.Errorf("telegram egress: %s", reason)
+	}
 	if !strings.EqualFold(host, d.apiHost) {
-		d.emit(egressDecision{Host: host, Reason: "host not permitted"})
-		return nil, fmt.Errorf("telegram egress: host not permitted")
+		return refuse("host not permitted", nil)
 	}
 	addrs, err := d.resolve(ctx, host)
 	if err != nil {
-		d.emit(egressDecision{Host: host, Reason: "resolve failed"})
-		return nil, fmt.Errorf("telegram egress: resolve: %w", err)
+		return refuse("resolve failed", nil)
 	}
 	norm := make([]netip.Addr, 0, len(addrs))
 	for _, a := range addrs {
 		norm = append(norm, a.Unmap())
 	}
 	if len(norm) == 0 {
-		d.emit(egressDecision{Host: host, Reason: "no addresses"})
-		return nil, fmt.Errorf("telegram egress: no addresses resolved")
+		return refuse("no addresses resolved", nil)
 	}
 	for _, a := range norm {
 		if !d.permitted(a) {
-			d.emit(egressDecision{Host: host, Resolved: norm, Reason: "policy rejected " + a.String()})
-			return nil, fmt.Errorf("telegram egress: resolved address rejected by policy")
+			return refuse("resolved address rejected by policy", norm)
 		}
 	}
 	pinned := norm[0]
-	d.emit(egressDecision{Host: host, Resolved: norm, Pinned: pinned, Allowed: true})
+	// PERMITTED: the receipt must be durable BEFORE the connection happens.
+	if err := d.emit(egressDecision{Host: host, Resolved: norm, Pinned: pinned, Allowed: true}); err != nil {
+		return nil, fmt.Errorf("telegram egress: receipt not durable, refusing dial: %w", err)
+	}
 	return d.dial(ctx, network, net.JoinHostPort(pinned.String(), port))
 }
 
 // newPinnedClient builds the E11-compliant Telegram client: Proxy:nil (ambient
-// proxy env ignored), the pinning DialContext, and reject-all redirects. A nil
-// resolve/dial defaults to the stdlib resolver/dialer; a nil receipt drops the
-// evidence (callers wire it to the journal).
-func newPinnedClient(apiBase string, timeout time.Duration,
+// proxy env ignored), the pinning DialContext, and reject-all redirects. In
+// PRODUCTION mode the API host must be admitted by egressAllow (deny-default);
+// in the validated loopback-override mode egressAllow is not consulted (the
+// loopback endpoint is the config-validated local/test override). A nil
+// resolve/dial defaults to the stdlib resolver/dialer.
+func newPinnedClient(apiBase string, egressAllow []string, timeout time.Duration,
 	resolve func(context.Context, string) ([]netip.Addr, error),
 	dial func(context.Context, string, string) (net.Conn, error),
-	receipt func(egressDecision)) (*http.Client, error) {
+	receipt func(egressDecision) error) (*http.Client, error) {
 	u, err := url.Parse(apiBase)
 	if err != nil || u.Hostname() == "" {
 		return nil, fmt.Errorf("telegram: invalid api base %q", apiBase)
 	}
+	host := u.Hostname()
+	loopback := egressModeForBase(apiBase)
+	if !loopback {
+		admitted := false
+		for _, h := range egressAllow {
+			if strings.EqualFold(strings.TrimSpace(h), host) {
+				admitted = true
+				break
+			}
+		}
+		if !admitted {
+			return nil, fmt.Errorf("telegram: api host %q is not in egress_allow (deny-default)", host)
+		}
+	}
 	if resolve == nil {
 		r := net.DefaultResolver
-		resolve = func(ctx context.Context, host string) ([]netip.Addr, error) {
-			return r.LookupNetIP(ctx, "ip", host)
+		resolve = func(ctx context.Context, h string) ([]netip.Addr, error) {
+			return r.LookupNetIP(ctx, "ip", h)
 		}
 	}
 	if dial == nil {
@@ -146,9 +226,8 @@ func newPinnedClient(apiBase string, timeout time.Duration,
 		dial = nd.DialContext
 	}
 	d := &pinnedDialer{
-		loopbackMode: egressModeForBase(apiBase),
-		apiHost:      u.Hostname(),
-		resolve:      resolve, dial: dial, receipt: receipt,
+		loopbackMode: loopback, apiHost: host,
+		resolve: resolve, dial: dial, receipt: receipt,
 	}
 	tr := &http.Transport{
 		Proxy:                 nil,
