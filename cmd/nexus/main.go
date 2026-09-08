@@ -1335,15 +1335,15 @@ func telegramHandler(b *daemonBundle) telegram.Handler {
 			}
 			return "Novi razgovor — zaboravio sam prethodni kontekst. 🧹", nil
 		case lower == "help" || lower == "start":
-			return "NEXUS — tvoj osobni asistent.\n\n" +
-				"Samo mi piši normalno i razgovaramo (pamtim razgovor).\n\n" +
-				"Komande:\n" +
-				"/help — ovaj popis\n" +
-				"/new — novi razgovor (zaboravi kontekst)\n" +
+			return "**NEXUS** — tvoj osobni asistent.\n\n" +
+				"Samo mi piši normalno i razgovaramo — pamtim razgovor.\n\n" +
+				"**Razgovor**\n" +
+				"/new — novi razgovor (zaboravi kontekst)\n\n" +
+				"**Stanje**\n" +
 				"/pending — čekaju li odobrenja\n" +
-				"/outbox — poruke s neizvjesnom isporukom\n" +
-				"approve <ch-...> — odobri zahtjev\n" +
-				"deny <ch-...> — odbij\n" +
+				"/outbox — poruke s neizvjesnom isporukom\n\n" +
+				"**Odobrenja i podsjetnici**\n" +
+				"approve <ch-...> — odobri  ·  deny <ch-...> — odbij\n" +
 				"retry <ch-...> — ponovi odobrenje\n" +
 				"ack <occ-...> — potvrdi podsjetnik\n" +
 				"redeliver <dlv-...> — ponovno pošalji poruku\n\n" +
