@@ -12,7 +12,6 @@ import (
 	"database/sql"
 	"fmt"
 	"math/rand"
-	"strings"
 	"testing"
 	"time"
 
@@ -86,7 +85,7 @@ func blocksEqual(a, b []contracts.ContextBlock) bool {
 
 func TestConvProjectionMatchesReferenceOnEveryPrefix(t *testing.T) {
 	rng := rand.New(rand.NewSource(1))
-	kinds := []string{"admit", "succeed", "empty-succeed", "suspend", "resume", "fail", "ordinary-fail"}
+	kinds := []string{"admit", "succeed", "empty-succeed", "malformed-succeed", "suspend", "resume", "fail", "ordinary-fail"}
 	for seq := 0; seq < 200; seq++ {
 		d, j := diffJournal(t)
 		// A small pool of identities and update ids for interleaving.
@@ -109,6 +108,10 @@ func TestConvProjectionMatchesReferenceOnEveryPrefix(t *testing.T) {
 				appendEv(t, j, id, "turn.succeeded", run, &turn, fmt.Sprintf(`{"final":%q}`, "f-"+id))
 			case "empty-succeed":
 				appendEv(t, j, id, "turn.succeeded", run, &turn, `{"final":""}`)
+			case "malformed-succeed":
+				// Non-string final: the reference discards it (decode
+				// error), the projection must too (impl codex #1/#2).
+				appendEv(t, j, id, "turn.succeeded", run, &turn, `{"final":123}`)
 			case "suspend":
 				appendEv(t, j, id, "approval.turn_suspended", run, &turn,
 					fmt.Sprintf(`{"turn_id":%q,"summary":%q,"expires_unix":9999999999,"call":{},"context":[],"challenge_id":"ch","run_id":%q,"effect_hash":"h","expected_source":"tg:x"}`, turnStr, "S-"+id, run))
@@ -253,22 +256,24 @@ func TestConvProjectionRebuild(t *testing.T) {
 // IMPL2 codex #3: an ordinary first-run failure returns directly and
 // NEVER runs recovery/VerifyChain (only a redelivery collision does).
 func TestOrdinaryFailureSkipsRecovery(t *testing.T) {
-	// A planner that always fails on first run; the turn has NO durable
-	// turn.failed recovery path and is not a redelivery — recovery must
-	// not be consulted (it would otherwise VerifyChain-scan every msg).
+	verifyCount := 0
+	testRecoveryVerifyHook = func() { verifyCount++ }
+	t.Cleanup(func() { testRecoveryVerifyHook = nil })
 	d, _, _ := testDaemon(t, failingPlanner{}, nil)
-	// A fresh (non-colliding) failing turn returns the raw error, not a
-	// recovery outcome, and does not panic on the projection.
-	_, err := d.RunChannelTurn(context.Background(), "chat-77", 1, "boom")
-	if err == nil {
+	// A fresh ordinary failure: NO VerifyChain scan (recovery gated to
+	// the redelivery-collision branch — impl3 codex #3).
+	if _, err := d.RunChannelTurn(context.Background(), "chat-77", 1, "boom"); err == nil {
 		t.Fatal("want the ordinary failure surfaced")
 	}
-	if strings.Contains(err.Error(), "recovery refused") {
-		t.Fatalf("ordinary failure went down the recovery path: %v", err)
+	if verifyCount != 0 {
+		t.Fatalf("ordinary first-run failure ran recovery/VerifyChain %d times", verifyCount)
 	}
-	// Re-running the SAME update is a redelivery collision -> recovery
-	// path (the turn.failed is durable), and it must NOT crash.
+	// The SAME update again is a redelivery collision -> recovery path
+	// DOES run (VerifyChain fires exactly once).
 	if _, err := d.RunChannelTurn(context.Background(), "chat-77", 1, "boom"); err == nil {
 		t.Fatal("redelivery of a failed turn should still surface an error")
+	}
+	if verifyCount != 1 {
+		t.Fatalf("redelivery collision did not take the recovery path exactly once: count=%d", verifyCount)
 	}
 }

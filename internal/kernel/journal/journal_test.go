@@ -744,13 +744,37 @@ func TestDuplicateEventSignalIsEventIDOnly(t *testing.T) {
 	if !errors.Is(err, ErrDuplicateEvent) {
 		t.Fatalf("duplicate event id not signalled as collision: %v", err)
 	}
-	// A DIFFERENT event id that collides on UNIQUE(run_id,sequence) must
-	// NOT be a collision signal (params reuses run seq deterministically
-	// only via event id; force a raw sequence clash through a second
-	// append sharing run+sequence is driver-internal, so we assert the
-	// negative on an unrelated failure surrogate: a fresh unique id
-	// succeeds and is never ErrDuplicateEvent).
-	if _, err := j.Append(ctx, params("run-b", "other")); errors.Is(err, ErrDuplicateEvent) {
-		t.Fatalf("a fresh append was misclassified as a collision: %v", err)
+	// A non-event-id constraint failure must NOT be a collision (impl3
+	// codex #1): append e1 (sequence 1), then via a RAW handle on the
+	// same db shadow-insert a row at (run-seq, sequence 2) so the next
+	// append — a FRESH event id — fails on UNIQUE(run_id,sequence), not
+	// on event_id. The exact pre-check must classify it as an ordinary
+	// failure, never ErrDuplicateEvent.
+	dbdir := t.TempDir()
+	j2, err := Open(filepath.Join(dbdir, "journal.db"), "work", redact.None{}, manyEvents())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j2.Close()
+	if _, err := j2.Append(ctx, params("run-seq", "e1")); err != nil {
+		t.Fatal(err) // this takes journal_offset 1
+	}
+	// Shadow a row at journal_offset 2 with a FRESH event id — the next
+	// append computes offset 2 and fails on PRIMARY KEY(journal_offset),
+	// a NON-event-id constraint. Deterministic on any sqlite.
+	raw, err := sql.Open("sqlite", "file:"+filepath.Join(dbdir, "journal.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`INSERT INTO events(journal_offset,event_id,run_id,sequence,envelope,redaction_policy_version,integrity_prev_hash,integrity_hash,sealed_payload_ref) VALUES(2,'shadow-uniq-id','run-shadow',1,'{}',0,'','x',NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	raw.Close()
+	_, serr := j2.Append(ctx, params("run-seq2", "e2"))
+	if serr == nil {
+		t.Fatal("expected a journal_offset PRIMARY KEY clash")
+	}
+	if errors.Is(serr, ErrDuplicateEvent) {
+		t.Fatalf("a non-event-id constraint failure was misclassified as a collision: %v", serr)
 	}
 }
