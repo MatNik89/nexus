@@ -1,9 +1,10 @@
-# PLAN v3: full-audit remediation (codex AUDIT-FULL-2026-09-08) — zero-defect
+# PLAN v4: full-audit remediation (codex AUDIT-FULL-2026-09-08) — zero-defect
 
 Source: `docs/AUDIT-FULL-codex-2026-09-08.md` (9 findings; bound at f135eef,
 reverified against current tree). v2 folded round 1 (`docs/REVIEW-AUDIT-PLAN-{codex,kilo,agy}.md`, 3x FAIL); v3 folds
 round 2 (`docs/REVIEW-AUDIT-PLAN2-*.md`: codex FAIL 7, kilo FAIL 1, agy PASS) and the
-OWNER decision (final): full S7 engine now. Every fix: RED-capable
+OWNER decision (final): full S7 engine now. v4 folds round 3 (`REVIEW-AUDIT-PLAN3-*.md`:
+codex FAIL 5 [B/D lifecycle], kilo PASS, agy PASS). Every fix: RED-capable
 detector at the real owner boundary, then 3-agent review to 3xPASS.
 
 ## Status
@@ -131,17 +132,53 @@ existing `test_adapter_cannot_self_retry` family stays valid).
     Durable false (turn-scoped).
   - `PolicyDelivery`: MaxAttempts 8, Deadline 24h, Backoff 5s..30min jitter,
     RetryableCodes {`transport_prewire`, `http_429`}, Durable true.
-- API: `Begin(op, target, Policy) error` (idempotent: an existing record is a no-op);
+- State-name mapping (one vocabulary, stated once — codex r3 note): code
+  `PLANNED`=SPEC `PENDING`, `AUTHORIZED`=`GRANTED`, `RUNNING`, `FAILED_RETRYABLE`,
+  `FAILED`=`FAILED_TERMINAL`, `CANCELLED`, `UNKNOWN`. `Policy` + the `op` key together
+  ARE the SPEC `ExecutionPolicy` (`operation_id` = the key, `cancel_token_id` = the key;
+  a doc comment on `Policy` states the field mapping — kilo r3 note 1).
+- API: `Begin(op, target, Policy) error` (idempotent: an existing record — including
+  one rehydrated from the projection with its attempts/next_attempt_at — is a strict
+  no-op; agy r3 note 2);
   `Next(op) (Grant, error)` issues attempt N+1 ONLY from PENDING (first) or
   FAILED_RETRYABLE, only when `now >= next_attempt_at`, `attempts < MaxAttempts`,
   `now < deadline`; otherwise `ErrNotDue` / `ErrExhausted` (exhaustion is a durable
   transition to FAILED). `Issue(op,target)` remains as `Begin(PolicyTool)+Next` for
-  the loop. `Consume(g)` unchanged except `AttemptNo` must equal the record's
-  current attempt. `Report(op, Outcome, code string)`: the adapter's outcome is a
-  PROPOSAL; S7 decides retryability from `Policy.RetryableCodes` — a code not in the
+  the loop. `Consume(g, siblings ...contracts.EnvelopeParams)`: field checks as today
+  plus `AttemptNo` must equal the record's current attempt; for a Durable operation the
+  `s7.attempt_started` event is appended durably BEFORE Consume returns (no wire
+  without a durable STARTED — mirrors the loop's STARTED-before-dispatch discipline),
+  in ONE `journal.AppendBatch` together with any caller-supplied sibling events
+  (codex r3 #2: S7 is the atomic committer of every paired S7+owner transition; the
+  channel passes its outbox `outbound_unknown` park params as the sibling). A
+  non-durable operation refuses siblings (no half-durable pairs).
+  `Report(op, Outcome, code string, siblings ...contracts.EnvelopeParams)` and
+  `Cancel(op, siblings...)`: same one-batch rule — the S7 transition and the sibling
+  outbox transition (`SENT`/`PENDING`/`FAILED`) commit atomically or not at all; there
+  is no window in which S7 says "retry is safe" while the row is stranded `UNKNOWN`.
+  The adapter's outcome is a PROPOSAL; S7 decides retryability from `Policy.RetryableCodes` — a code not in the
   list is terminal even if the adapter said retryable; `OutcomeUnknown` parks UNKNOWN
   and is NEVER retried (`IRREVERSIBLE+UNKNOWN` needs reconciliation, SPEC P0.2).
   `AttemptContext` unchanged (deadline = min(call, grant expiry, operation deadline)).
+- Authorization-lease recovery (codex r3 #1): an issued-but-unconsumed grant is a
+  LEASE with `nonce` + `expires_at`, persisted in `s7.attempt_authorized` for durable
+  operations. `Next(op)` on an `AUTHORIZED` record whose lease has expired (or that was
+  rehydrated with no `attempt_started` for it) durably appends
+  `s7.lease_revoked{op, attempt_no, nonce_hash}` (transition
+  `attempt.lease_revoked`: AUTHORIZED -> PLANNED) and then issues a FRESH grant (new
+  nonce; `attempt_no` unchanged because no physical attempt was consumed; `attempts`
+  counts CONSUMED attempts only). The old nonce is dead: it is not in memory and the
+  projection marks it revoked. A rehydrated record WITH `attempt_started` and no
+  report is RUNNING -> UNKNOWN (the wire may have been touched; never re-granted — E9;
+  kilo r3 note 2 wording fixed: the distinction is made by the durable STARTED event,
+  not by guessing).
+- `Execute(ctx, op, target, Policy, attempt func(ctx, Grant) (Outcome, string, error)) error`
+  (codex r3 #4): the S7-OWNED synchronous driver — Begin, Next, callback, Report,
+  backoff wait under ctx, repeat until terminal; the CALLER submits one operation and
+  never sleeps, loops, or calls `Next`. Delivery keeps the tick-polled `Next` style
+  (S7 still decides due-ness; `Flush` neither waits nor loops). Both entry styles are
+  S7 code; adapters/loops/planner contain no retry logic.
+- `policy_json` rehydration fails closed on corrupt/unknown fields (agy r3 note 1).
 - State machine (`contracts.AttemptState` + `machine.AttemptTable`): new state
   `AttemptFailedRetryable` APPENDED to the enum (existing numeric values unchanged),
   name `FAILED_RETRYABLE`; new events `attempt.failed_retryable` (RUNNING ->
@@ -152,12 +189,15 @@ existing `test_adapter_cannot_self_retry` family stays valid).
   interactive turn cannot be asked for a grant after restart, so it is honestly
   in-memory; the loop already journals its turn-narrative `attempt.*` events):
   journal events `s7.operation_begun{op,target,policy}`, `s7.attempt_authorized{op,
-  attempt_no,expires_at}`, `s7.attempt_reported{op,attempt_no,outcome,code,
-  next_attempt_at}`, `s7.operation_terminal{op,state}`; projection `s7_operations`
-  (`op PRIMARY KEY, target, state, attempts, max_attempts, deadline, next_attempt_at,
-  policy_json`). `s7.New(j, clock)` rehydrates every non-terminal durable operation;
-  a rehydrated RUNNING record (consumed, unreported = crash mid-attempt) transitions to
-  UNKNOWN (never re-granted). An append failure on `attempt_authorized` refuses the
+  attempt_no,nonce_hash,expires_at}`, `s7.attempt_started{op,attempt_no}`,
+  `s7.lease_revoked{op,attempt_no,nonce_hash}`, `s7.attempt_reported{op,attempt_no,
+  outcome,code,next_attempt_at}`, `s7.operation_terminal{op,state}`; projection
+  `s7_operations` (`op PRIMARY KEY, target, state, attempts, max_attempts, deadline,
+  next_attempt_at, lease_nonce_hash, lease_expires_at, policy_json`). The nonce itself
+  is never journaled (bearer secret); a SHA-256 of it identifies the lease. `s7.New(j, clock)` rehydrates every non-terminal durable operation;
+  a rehydrated RUNNING record (durable STARTED, no report = crash mid-attempt)
+  transitions to UNKNOWN (never re-granted); a rehydrated AUTHORIZED record (lease, no
+  STARTED) is recovered through `lease_revoked` -> fresh grant (see lease recovery). An append failure on `attempt_authorized` refuses the
   grant (fail closed: no wire without a durable authorization).
 - Invariants (tests): attempts never exceed MaxAttempts across restart; no grant
   before `next_attempt_at`; no grant after deadline; CANCELLED terminal from every
@@ -179,25 +219,34 @@ existing `test_adapter_cannot_self_retry` family stays valid).
   `Core.Flush(ctx, send func(Outbound, s7.Grant) error)`: for each `PENDING` row:
   `s7.Begin(delivery:<id>, target, PolicyDelivery)`; `g, err := s7.Next(op)`;
   `ErrNotDue` -> skip this tick; `ErrExhausted`/terminal -> mark `FAILED`; grant ->
-  mark UNKNOWN (in-flight lease, as today; if THIS park fails -> `s7.Cancel(op)` the
-  unused grant, abort the flush) -> `send(o, g)`:
+  `send(o, g)`, inside which the adapter recomputes identity and calls
+  `s7.Consume(g, outboxUnknownParams)` — the S7 STARTED and the outbox UNKNOWN park
+  commit in ONE batch immediately before `client.Do` (if that batch fails: no wire,
+  lease stays and is recovered by `Next` on the next tick) -> outcomes:
   - any LOCAL pre-consume refusal (marshal, request build, identity mismatch) ->
-    `s7.Cancel(op)`; row back to `PENDING` is NOT allowed (the operation is CANCELLED,
-    terminal) -> row `FAILED` with code `local_refused`;
-  - nil -> `Report(Succeeded)` THEN sent-mark -> `SENT`; if `Report` or the sent-mark
-    fails after a remotely accepted send the row STAYS `UNKNOWN` (never claims `SENT`)
-    and the error surfaces;
+    `s7.Cancel(op, outboxFailedParams)` in ONE batch (operation CANCELLED, row
+    `FAILED` code `local_refused`);
+  - nil -> `Report(Succeeded, "", outboxSentParams)` — one batch -> `SENT`; if that
+    batch fails after a remotely accepted send the row STAYS `UNKNOWN` (never claims
+    `SENT`), S7 stays RUNNING -> rehydrates UNKNOWN, and the error surfaces;
   - `ErrAmbiguousSend` (HTTP 5xx after POST, post-write timeout/reset, accepted-but-
     malformed reply) -> `Report(Unknown)` -> stays `UNKNOWN` (reconciliation, NO
     resend — E9); a 5xx is NEVER a definite failure (codex r2 #3);
   - `channel.DefiniteFailure{Code, Retryable}` (new typed error; nothing committed
-    remotely) -> `Report(FailedRetryable|FailedTerminal, Code)`; S7 lands
-    FAILED_RETRYABLE -> row back to `PENDING` (S7-authorized, `next_attempt_at`
-    recorded); S7 lands FAILED (terminal code or exhausted) -> row `FAILED`.
+    remotely) -> `Report(outcome, Code, siblingParams)` where S7 first DECIDES the
+    landing (retryable -> sibling = outbox `PENDING` re-pend with `next_attempt_at`;
+    terminal/exhausted -> sibling = outbox `FAILED`) and commits both in one batch. The
+    channel supplies both candidate sibling params; S7 picks by its decision.
   The old unconditional `Reconcile(id,false)` self-repend is deleted.
-- Telegram `sendOutbound` consumes the grant IMMEDIATELY before `client.Do` (mirrors
-  `provider.go:163-180`); `call` for reads (getUpdates/setMyCommands) is unchanged —
-  polls are scheduled iterations, not retries of a failed operation (HARDQ C3).
+- Telegram: EVERY physical Bot API call carries a grant (codex r3 #3 — no ungoverned
+  `client.Do` remains): `call(ctx, method, req, out, g s7.Grant, kind)` recomputes the
+  expected operation/target for its kind (`delivery:<id>` /
+  `channel:tg:delivery:<id>`; `poll:tg:<n>` / `channel:tg:getUpdates`;
+  `control:tg:setMyCommands` / `channel:tg:setMyCommands`) and calls `Consume`
+  IMMEDIATELY before `client.Do` (mirrors `provider.go:163-180`). Polling and command
+  registration are governed operations under `PolicyPoll` / `PolicyControl`
+  (Slice D); a poll iteration is a scheduled operation (HARDQ C3), a failed one is
+  re-attempted only through S7.
   Classification: pre-wire (egress refusal / DNS / dial) -> `DefiniteFailure{
   transport_prewire, Retryable}`; HTTP 429 -> `{http_429, Retryable}`; other 4xx ->
   `{http_4xx, Terminal}`; 5xx / post-write errors -> `ErrAmbiguousSend` (unchanged).
@@ -212,11 +261,13 @@ existing `test_adapter_cannot_self_retry` family stays valid).
   attempts/deadline/next_attempt_at, so a restart cannot reset the cap.
 
 ### B3 — provider retry through the same engine
-Planner: after `Chat` fails with a provider `DefiniteFailure{code}` (provider
-classifies: `http_429`, `http_5xx` with NO body consumed, dial/DNS ->
-`transport_prewire`; anything after the body started is terminal), `Report(op,
-FailedRetryable, code)`, then `Next(op)` -> wait `next_attempt_at` under the turn ctx
--> re-`Chat` with the new grant; `ErrExhausted` -> the turn fails with the causal
+Planner submits ONE operation: `s7.Execute(ctx, op, target, PolicyProvider,
+func(ctx, g) { out, err := Chat(ctx, msgs, g); return classify(err) })` — S7 runs
+Next/callback/Report/backoff (codex r3 #4: the planner never sleeps, loops, or calls
+`Next`). The provider classifies: `http_429`, `http_5xx` with NO body consumed,
+dial/DNS -> `transport_prewire` (retryable proposals; a chat completion is
+`EffectReadOnly` — re-issuing it has no remote side effect beyond cost); anything
+after the body started is terminal; `ErrExhausted` -> the turn fails with the causal
 error. `Stream` failures after the first delivered byte are TERMINAL (partial output
 already reached the user). Tool attempts keep `PolicyTool` (MaxAttempts 1).
 
@@ -243,7 +294,21 @@ Detectors (RED against current code):
    UNKNOWN, ZERO re-grants.
 8. Provider 429 -> retried once after backoff with a NEW grant, succeeds; provider
    HTTP 400 -> no retry, turn fails; stream mid-way failure -> no retry.
-9. `attempt_authorized` append failure -> no grant, no wire.
+8b. Ownership ablation: S7's second-grant path disabled (MaxAttempts forced to 1)
+   while planner/provider code is untouched -> the second transport call is ZERO
+   (proves the planner holds no retry loop of its own).
+9. `attempt_authorized` append failure -> no grant, no wire; `attempt_started`+park
+   batch failure -> no wire, lease recovered on the next tick.
+9b. Lease recovery: crash after `attempt_authorized` and before the STARTED+park batch
+   -> restart -> exactly ONE fresh grant, the old nonce refused, consumed attempts
+   never exceed MaxAttempts; an expired never-consumed lease at runtime -> same.
+9c. Pair atomicity ablation: split the Report+sibling batch into two appends with an
+   injected failure between -> a definitely-unsent row stranded `UNKNOWN` is DETECTED
+   (RED), the batched recipe leaves no such state (GREEN); same for cancel+FAILED and
+   terminal-report+FAILED.
+9d. Poll/control grants: the same poll grant presented twice -> second `client.Do`
+   never happens (`ATTEMPT_NOT_AUTHORIZED`, transport count unchanged); a missing or
+   swapped (delivery-for-poll) grant -> zero wire calls.
 10. Egress refusal on delivery -> `DefiniteFailure{transport_prewire}` -> S7 retry
     path (not `UNKNOWN`) + distinct redacted security line (ties to Slice A #5).
 
@@ -314,14 +379,21 @@ Fix:
   2s..5min jitter, RetryableCodes {`transport`, `http_5xx`, `http_429`}); a SUCCESSFUL
   poll completes the operation and the next tick begins `poll:<adapter>:<n+1>` (a
   scheduled iteration, HARDQ C3); a FAILED poll is retried ONLY when S7 issues the
-  next grant (backoff), the ticker merely asks `Next`. Terminal codes (401/403 =
+  next grant (backoff), the ticker merely asks `Next`; the grant is PASSED INTO `PollOnce` and consumed by
+  `call` immediately before `client.Do` (codex r3 #3 — D6 is the backoff detector,
+  B 9d the authorization detector). `registerCommands` (an effectful POST) runs under
+  `control:tg:setMyCommands` with `PolicyControl` (MaxAttempts 3, backoff 2s..30s).
+  Terminal codes (401/403 =
   `remote_rejected`, exhausted retryable) -> `Run` returns; health records the class;
   the capability stays OFF/degraded until config/token repair AND daemon restart (the
   token is sealed at construction, `telegram.go:75-96`; a running process cannot
   observe a shell change — no "keeps polling so a token fix recovers").
   `substrate` -> `Run` returns immediately (no retry of a broken journal).
-- `Adapter.Run` returns `error`; the composition root supervises: on return it
-  records `substrate` health, logs redacted, cancels the adapter context (prompt
+- `Adapter.Run` returns the typed `ClassifiedError`; the composition root supervises:
+  on return it persists THAT class unchanged (`remote_rejected` stays
+  `remote_rejected` — codex r3 #5), defaulting to `substrate` ONLY for an unclassified
+  return, a recovered panic, or a failure of the health substrate itself; logs
+  redacted, cancels the adapter context (prompt
   teardown of poll/flush goroutines — agy r2 note), and marks the runtime capability
   state degraded/OFF in the health projection. Sealed-capability rule preserved: we
   REPORT runtime health, never activate a fallback (`AGENTS.md:53-57`).
@@ -375,7 +447,9 @@ variable at the top of the script. `govulncheck` is installed on the dev box via
 `go install golang.org/x/vuln/cmd/govulncheck@latest` (dev tool, not a module dep).
 - Deploy gating (codex r2 #7): the SAME gate runs inside the autodeploy step
   (`scripts/deploy.sh`, new: build -> version floor -> govulncheck -> install ->
-  restart -> verify capability ON). No slice's binary is installed unless the gate is
+  restart -> verify capability ON). Both scripts source ONE helper
+  `scripts/lib/release-gate.sh` (`release_gate "$BIN"`) so the acceptance and deploy
+  checks cannot drift (agy r3 note 3). No slice's binary is installed unless the gate is
   GREEN. Slice F is therefore built FIRST (see Order).
 Detectors (whole-script shim tests with an ISOLATED release key + publication target,
 `PATH`-shimmed `go`/`govulncheck`):
