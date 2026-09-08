@@ -63,22 +63,36 @@ Every redraw edits the one message; on any edit failure the session still holds
 state and the next tap re-renders — or the TTL expires and the owner re-runs.
 
 ### 4. Description -> reminder via the EXISTING turn recipe (durable, idempotent)
-The description arrives as an ordinary text update. `processUpdate` runs today's
-path: `Admit` -> `handle`. The handler checks: does this source own an
-`await_description` session? If yes, it is the description:
+Fresh-process replay path FIRST (r3 codex+kilo F1 — the routing fact that must
+survive is the DURABLE reminder, not the in-memory session). The description
+arrives as an ordinary text update; `processUpdate` runs today's `Admit` ->
+`handle`. The handler's FIRST step, for EVERY admitted text (before any session
+check):
+- Derive the deterministic reminder id `rem-<hash(adapter|identity|update_id)>`.
+- Durable lookup via a NEW obligation-owned typed method
+  `Manager.ReminderIntent(id) -> (state {NotFound|Found|StorageError}, body,
+  wall)`, distinguishing not-found from a storage failure.
+- `Found` -> reconstruct the confirmation from the PERSISTED body+wall and
+  return it as the reply (session-independent — this is what makes the
+  confirmation durable across a crash that lost the session). If a session
+  exists whose current intent's body/wall MISMATCH the persisted reminder ->
+  fail closed (never treat a different intent as a replay).
+- `StorageError` -> fail closed (do NOT fall through to normal-turn routing).
+- `NotFound` -> proceed to routing below.
+
+Routing (only on NotFound): if this source owns an `await_description` session,
+it is the description:
 - Build `WallTime` from the picked date/time + configured TZ.
-- Reminder id is DETERMINISTIC from the admitted update identity
-  (`rem-<hash(adapter|identity|update_id)>`), so a re-run creates the SAME id.
-- `CreateReminder(id, body, w)` is made IDEMPOTENT: if a reminder with that id
-  already exists (projection lookup), skip the create and just re-confirm — so a
-  crash between create and inbound-terminal cannot double-create on replay.
-- Return the confirmation string ("Podsjetnik postavljen za <local time>.") as
-  the turn reply; the existing recipe appends the inbound TERMINAL + outbox
-  confirmation. Clear the in-memory session.
-If the source has NO active session, the text is a normal turn (today's path).
-A TERMINAL replay of the description update skips the handler (today's
-processUpdate rule); a non-terminal replay re-runs it, and the deterministic-id
-idempotency makes that a no-op create + same confirmation.
+- `CreateReminder(id, body, w)` with the deterministic id (the durable obligation
+  pair). A crash between create and inbound-terminal is now safe: the replay's
+  front lookup finds the reminder and reconfirms, regardless of the (lost)
+  session.
+- Return "Podsjetnik postavljen za <local time>."; the existing recipe appends
+  the inbound TERMINAL + outbox confirmation. Best-effort clear the in-memory
+  session (correctness does NOT depend on this clear — the front lookup is
+  authoritative).
+If the source has NO active session and NotFound, the text is a normal turn
+(today's path).
 
 ### 5. callback_data grammar (<= 64 bytes, strict per-action + legal-in-state)
 `pk:v1:<sid>:<act>:<arg>`, fixed 5 fields:
@@ -100,7 +114,15 @@ cross-source control.
   description; confirmation delivered via the outbox (RED against a schedule-only
   create).
 - idempotent create: running the description handler twice for the same update
-  (replay) yields ONE reminder, same confirmation (RED against double-create).
+  yields ONE reminder, same confirmation (RED against double-create).
+- FRESH-PROCESS replay (the r3 F1 case): create the reminder, then DROP all
+  in-memory session state (simulate a restart), then replay the same admitted
+  description update -> the front durable lookup reconfirms from persisted data
+  (one reminder, the "Podsjetnik postavljen" confirmation delivered), and it is
+  NOT mis-routed as a normal turn. RED against putting the lookup behind the
+  session gate.
+- storage-error fail-closed: a ReminderIntent storage error does NOT fall
+  through to normal-turn routing.
 - normal turn unaffected: a text message with no active session is handled as a
   normal turn (no reminder, no session).
 - callback validation: malformed / unknown-act / bad-sid / out-of-range /
