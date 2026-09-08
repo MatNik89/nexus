@@ -1,4 +1,4 @@
-# PLAN v8: full-audit remediation (codex AUDIT-FULL-2026-09-08) — zero-defect
+# PLAN v9: full-audit remediation (codex AUDIT-FULL-2026-09-08) — zero-defect
 
 Source: `docs/AUDIT-FULL-codex-2026-09-08.md` (9 findings; bound at f135eef,
 reverified against current tree). v2 folded round 1 (`docs/REVIEW-AUDIT-PLAN-{codex,kilo,agy}.md`, 3x FAIL); v3 folds
@@ -12,7 +12,9 @@ accounting, poll code vocabulary], kilo PASS, agy PASS). v7 folds round 6
 (`REVIEW-AUDIT-PLAN6-*.md`: codex FAIL 2 [salvage after terminalization, setMyCommands
 effect class], kilo PASS, agy PASS + stale-wording notes). v8 folds round 7
 (`REVIEW-AUDIT-PLAN7-*.md`: codex FAIL 2 [one PolicyControl for two contracts, no
-nil-builder detector], kilo PASS [same PolicyControl note], agy PASS). Every fix: RED-capable
+nil-builder detector], kilo PASS [same PolicyControl note], agy PASS). v9 folds round 8
+(`REVIEW-AUDIT-PLAN8-*.md`: codex FAIL 1 [setMyCommands UNKNOWN blindly re-registered
+after restart], kilo PASS, agy PASS). Every fix: RED-capable
 detector at the real owner boundary, then 3-agent review to 3xPASS.
 
 ## Status
@@ -281,8 +283,9 @@ existing `test_adapter_cannot_self_retry` family stays valid).
   | sendMessage, sendRichMessage (outbox `Flush`) | delivery | `delivery:<id>` / `channel:tg:delivery:<id>` | `PolicyDelivery` (durable) |
   | getUpdates | poll | `poll:tg:<n>` / `channel:tg:getUpdates` | `PolicyPoll` (RetryableCodes {`transport_prewire`, `http_429`, `http_5xx`, `transport_postwrite`, `malformed_reply`}) |
   | getMe | control-read | `control:tg:getMe:<n>` / `channel:tg:getMe` | `PolicyControlRead` (MaxAttempts 3, backoff 2s..30s, RetryableCodes {`transport_prewire`, `http_429`, `http_5xx`, `transport_postwrite`, `malformed_reply`}) |
-  | setMyCommands | control-effect | `control:tg:setMyCommands:<n>` / `channel:tg:setMyCommands` | `PolicyControlEffect` (MaxAttempts 3, backoff 2s..30s, RetryableCodes {`transport_prewire`, `http_429`} ONLY; 5xx/post-write/malformed -> UNKNOWN, E9) |
-  | sendChatAction (typing) | ui | `ui:tg:<chat>:typing:<n>` / `channel:tg:chat:<chat>` | `PolicyUI` (MaxAttempts 1, EffectReversible, terminal on failure, outcome landed, in-memory) |
+  | getMyCommands (reconciliation) | control-read | `control:tg:getMyCommands:<n>` / `channel:tg:getMyCommands` | `PolicyControlRead` |
+  | setMyCommands | control-effect | `control:tg:setMyCommands:<sha256(desired set)>` / `channel:tg:setMyCommands` (DURABLE) | `PolicyControlEffect` (MaxAttempts 3, backoff 2s..30s, RetryableCodes {`transport_prewire`, `http_429`} ONLY; 5xx/post-write/malformed -> UNKNOWN, E9) |
+  | sendChatAction (typing) | ui | `ui:tg:<chat>:typing:<n>` / `channel:tg:chat:<chat>` | `PolicyUI` (MaxAttempts 1, EffectReversible, in-memory; DEFINITE failures terminal, 5xx/post-write/malformed -> UNKNOWN per E9 — codex r8 note) |
   | picker sendMessage, answerCallbackQuery, editMessageReplyMarkup, editMessageText | ui | `ui:tg:<callback_or_message_id>:<method>` / `channel:tg:chat:<chat>` | `PolicyUI` |
   Classification is KIND/EFFECT-aware with ONE closed code vocabulary (codex r5 #3):
   `transport_prewire` (egress refusal / DNS / dial), `http_429`, `http_4xx`,
@@ -295,8 +298,20 @@ existing `test_adapter_cannot_self_retry` family stays valid).
   menu — codex r6 #2): pre-wire refusal and 429 follow `PolicyControlEffect`, but 5xx /
   post-write / malformed replies carry no commit receipt and land `OutcomeUnknown`
   (E9) — no new grant, ever, without a reconciliation step that proves the remote
-  state (none exists in this slice; the menu is re-registered on the next daemon
-  start as a NEW operation). Control classification is therefore split by effect:
+  state. Command registration is therefore a DURABLE operation with a STABLE identity
+  derived from the canonical desired command set: `control:tg:setMyCommands:<sha256 of
+  the sorted command list>` under `PolicyControlEffect{Durable: true}`, owner companion
+  = channel event `channel.control_effect{operation_id, method, payload_hash, state}`
+  (the adapter's durable record of the registration). On daemon start the adapter does
+  NOT call setMyCommands blindly (codex r8 #1): a rehydrated `UNKNOWN` registration
+  first runs an S7-governed READ-ONLY reconciliation `control:tg:getMyCommands:<n>`
+  (`PolicyControlRead`; `getMyCommands` joins the call-site table) that compares the
+  remote menu with the exact desired payload — equal -> the UNKNOWN operation is
+  reconciled SUCCEEDED (`attempt.reconciled_ok`); different -> a NEW effect operation
+  (new hash-bound identity only if the desired set changed; otherwise the same
+  identity reconciled FAILED and re-begun) is authorized. A rehydrated SUCCEEDED
+  registration for the same hash performs no call at all; a changed desired set is a
+  new identity. Until reconciliation resolves, the channel health is `degraded`. Control classification is therefore split by effect:
   `control-read` (getMe) and `control-effect` (setMyCommands), each bound to its OWN
   closed policy constant (codex r7 #1, kilo r7 note): `PolicyPoll` and
   `PolicyControlRead` list exactly `{transport_prewire, http_429, http_5xx,
@@ -517,6 +532,12 @@ health state, not an internal counter):
    `UNKNOWN`: advancing past every backoff interval observes ZERO further
    setMyCommands calls (E9 — codex r6 #2); a setMyCommands pre-wire refusal IS retried
    once due (control).
+2b. Restart (codex r8 #1): ambiguous registration -> persisted UNKNOWN -> a NEW daemon/S7
+   built from the SAME journal -> ZERO setMyCommands calls before reconciliation; a
+   scripted getMyCommands equal to the desired set -> reconciled SUCCEEDED, still zero
+   setMyCommands; a scripted different menu -> exactly ONE new setMyCommands under a
+   fresh grant; a rehydrated SUCCEEDED registration for the same hash -> zero calls.
+   Ablating the durable recovery guard (blind re-register on start) turns this RED.
 3. FlushOutbox transport failure -> health `transport` degraded.
 4. Injected journal-mark failure in FlushOutbox -> health `substrate`, `Run` returns,
    NO further poll/flush wire calls (further channel work stops).
