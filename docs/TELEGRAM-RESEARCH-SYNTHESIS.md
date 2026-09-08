@@ -79,3 +79,53 @@ every item above is its own reviewed slice.
 - convproj slice (soak backlog fix) is in impl review now.
 - R1+R2 are the direct answer to the owner's live table complaint and
   should lead once convproj lands.
+
+## Media branch (from hermes QA + subagents C & D, all cross-cited)
+
+### Image (R8 unblocked, hardcode hermes' shape)
+- Pipeline (hermes' real code): getFile → download to LOCAL cache
+  IMMEDIATELY (Telegram file URLs expire ~1h) → resize DOWN before
+  vision → base64 data-URL → vision model.
+- CRITICAL for us: a vision result is baked into history and re-sent
+  every later turn — hermes resizes to EMBED_TARGET 256KB / 1568px max.
+  With our conv projection this matters doubly (history is now cheap to
+  read, but a fat image blob per turn would bloat the provider request).
+  => store a SHORT text description in history, NOT the raw image.
+- Provider: DeepSeek has no vision. Cheapest verified: Gemini 2.5
+  Flash-Lite ($0.10/1M); OpenRouter most flexible; moondream2 local on
+  8GB Pi ~25s/image (too slow for interactive). Recommend a vision-only
+  auxiliary provider on the image path (config field), main provider
+  stays DeepSeek.
+
+### Voice (R5, easiest)
+- ffmpeg `-ar 16000 -ac 1 -c:a pcm_s16le` → whisper.cpp (already on Pi;
+  realistically tiny/base model on ARM) OR Groq API ~$0.04/hr.
+
+### Video
+- ffmpeg audio extract → whisper (transcript >> frames for quality) +
+  optional I-frame keyframes to vision. MUST be an async job (Pi is
+  slow); never block the turn.
+
+### Social links (FB/IG/TikTok)
+- Cheap first pass: Open Graph meta tags via curl (~500 tokens, no
+  login). Then yt-dlp `--dump-json`/`-J` for public reels; gallery-dl
+  for TikTok/IG carousels. HONEST: on Pi ARM64 headless Chromium for
+  FB/TikTok times out ~100% — use meta-tags, skip the browser. Instagram
+  private/stories need cookies + a burner account (account-lock risk) —
+  do NOT auto-login.
+
+### Web pages
+- Go-native: go-readability / readeck (go-shiori original archived);
+  chromedp/rod only where JS is required (ARM caveats); screenshot →
+  vision as the last-resort fallback.
+
+### Engineering rule (all sources agree)
+- Shell out to yt-dlp/ffmpeg/whisper.cpp binaries with single-arg
+  exec.Command + hard timeouts; run slow media work ASYNC off the turn
+  path; fail gracefully to a cheaper tier; never reimplement these.
+
+## Correction logged (evidence beats claims)
+- `draft_id` does NOT exist in the official Bot API (subagent D verified
+  on the raw docs). sendRichMessageDraft streaming is tracked by the
+  returned message_id, continued via the rich editMessageText path.
+  State to keep: {chat_id, message_id, cancelFunc}.
