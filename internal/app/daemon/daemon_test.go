@@ -99,6 +99,9 @@ func testDaemonRedact(t *testing.T, planner loop.Planner, audit effectpath.Audit
 	for n, v := range channel.Events() {
 		ev[n] = v
 	}
+	for n, v := range conv.Events() {
+		ev[n] = v
+	}
 	j, err := journal.Open(filepath.Join(dir, "journal.db"), "work", r, ev, conv.NewProjection())
 	if err != nil {
 		t.Fatal(err)

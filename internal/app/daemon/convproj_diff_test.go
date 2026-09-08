@@ -12,6 +12,7 @@ import (
 	"database/sql"
 	"fmt"
 	"math/rand"
+	"strings"
 	"testing"
 	"time"
 
@@ -40,6 +41,9 @@ func diffJournal(t *testing.T) (*Daemon, *journal.Journal) {
 		ev[n] = v
 	}
 	for n, v := range channel.Events() {
+		ev[n] = v
+	}
+	for n, v := range conv.Events() {
 		ev[n] = v
 	}
 	j, err := journal.Open(filepath.Join(dir, "j.db"), "work", redact.None{}, ev, conv.NewProjection())
@@ -203,6 +207,9 @@ func TestConvProjectionRebuild(t *testing.T) {
 	for n, v := range channel.Events() {
 		ev[n] = v
 	}
+	for n, v := range conv.Events() {
+		ev[n] = v
+	}
 	open := func() *journal.Journal {
 		j, err := journal.Open(dbp, "work", redact.None{}, ev, conv.NewProjection())
 		if err != nil {
@@ -275,5 +282,34 @@ func TestOrdinaryFailureSkipsRecovery(t *testing.T) {
 	}
 	if verifyCount != 1 {
 		t.Fatalf("redelivery collision did not take the recovery path exactly once: count=%d", verifyCount)
+	}
+}
+
+// /new boundary: a conversation.reset event forgets prior history.
+func TestConvResetForgetsHistory(t *testing.T) {
+	d, j := diffJournal(t)
+	admit := func(uid int64, text string) {
+		appendEv(t, j, fmt.Sprintf("a%d", uid), "channel.inbound_admitted", fmt.Sprintf("r%d", uid), nil,
+			fmt.Sprintf(`{"message_id":"a%d","adapter_id":"telegram","channel_identity":"chat-1","update_id":%d,"text":%q}`, uid, uid, text))
+		turn := contracts.TurnID(fmt.Sprintf("turn-chan-chat-1-%d", uid))
+		appendEv(t, j, fmt.Sprintf("s%d", uid), "turn.succeeded", fmt.Sprintf("r%d", uid), &turn, `{"final":"ok"}`)
+	}
+	admit(1, "prije reseta")
+	// reset
+	appendEv(t, j, "reset-1", "conversation.reset", "run-reset", nil, `{"identity":"chat-1"}`)
+	admit(2, "poslije reseta")
+	hist, err := d.conversationHistory("chat-1", "turn-chan-chat-1-99")
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := ""
+	for _, b := range hist {
+		joined += *b.Content + "\n"
+	}
+	if strings.Contains(joined, "prije reseta") {
+		t.Fatalf("history survived /new reset:\n%s", joined)
+	}
+	if !strings.Contains(joined, "poslije reseta") {
+		t.Fatalf("post-reset turn missing:\n%s", joined)
 	}
 }

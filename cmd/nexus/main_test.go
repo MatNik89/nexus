@@ -1912,3 +1912,26 @@ func TestSlashCommandsRoute(t *testing.T) {
 		t.Fatalf("/outbox did not reach the outbox command: %q", out)
 	}
 }
+
+// /new clears conversation history for this chat (hermes boundary).
+func TestNewCommandResetsHistory(t *testing.T) {
+	b := hitlBundle(t, "TG_NEW")
+	h := telegramHandler(b)
+	// two turns build history
+	if _, err := h(context.Background(), channel.Inbound{AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 1, Text: "zapamti: banana", Profile: "private"}); err != nil {
+		t.Fatal(err)
+	}
+	// /new resets
+	reply, err := h(context.Background(), channel.Inbound{AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 2, Text: "/new", Profile: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(reply, "Novi razgovor") {
+		t.Fatalf("/new did not confirm: %q", reply)
+	}
+	// a redelivered /new is idempotent (same reply, no error)
+	reply2, err := h(context.Background(), channel.Inbound{AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 2, Text: "/new", Profile: "private"})
+	if err != nil || !strings.Contains(reply2, "Novi razgovor") {
+		t.Fatalf("redelivered /new not idempotent: %q err=%v", reply2, err)
+	}
+}

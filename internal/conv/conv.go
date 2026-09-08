@@ -24,7 +24,7 @@ func NewProjection() *Projection { return &Projection{} }
 func (Projection) Name() string { return "conv" }
 
 // Version 1: initial conv_turns schema.
-func (Projection) Version() int { return 1 }
+func (Projection) Version() int { return 2 } // v2: conv_resets (/new boundary)
 
 func (Projection) Init(db *journal.ProjDB) error {
 	// hist_done is the completion MARKER (set by turn.succeeded only
@@ -52,13 +52,25 @@ func (Projection) Init(db *journal.ProjDB) error {
 		);
 		CREATE INDEX IF NOT EXISTS conv_hist ON conv_turns(identity, hist_seq)
 			WHERE hist_done=1 AND hist_seq IS NOT NULL;
+		CREATE TABLE IF NOT EXISTS conv_resets (
+			identity TEXT PRIMARY KEY,
+			reset_seq INTEGER NOT NULL
+		);
 	`)
 	return err
 }
 
 func (Projection) Reset(db *journal.ProjDB) error {
-	_, err := db.Exec(`DROP TABLE IF EXISTS conv_turns`)
+	if _, err := db.Exec(`DROP TABLE IF EXISTS conv_turns`); err != nil {
+		return err
+	}
+	_, err := db.Exec(`DROP TABLE IF EXISTS conv_resets`)
 	return err
+}
+
+// Events registers the conversation.reset validator (payload = identity).
+func Events() map[string]journal.PayloadValidator {
+	return map[string]journal.PayloadValidator{"conversation.reset": nil}
 }
 
 // upsert creates the row on first sight (created_seq immutable) and
@@ -74,6 +86,18 @@ func upsert(tx *journal.ProjTx, turnID string, ev journal.Event) error {
 
 func (p Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 	switch ev.Envelope.EventType {
+	case "conversation.reset":
+		var pl struct {
+			Identity string `json:"identity"`
+		}
+		if json.Unmarshal(ev.Envelope.Payload, &pl) != nil || pl.Identity == "" {
+			return nil
+		}
+		// A /new boundary: history before this offset is forgotten.
+		_, err := tx.Exec(`INSERT INTO conv_resets(identity, reset_seq) VALUES(?1,?2)
+			ON CONFLICT(identity) DO UPDATE SET reset_seq=MAX(reset_seq, ?2)`,
+			pl.Identity, ev.JournalOffset)
+		return err
 	case "channel.inbound_admitted":
 		var pl struct {
 			ChannelIdentity string `json:"channel_identity"`
@@ -185,7 +209,8 @@ func (Projection) History(ctx context.Context, j *journal.Journal, identity, cur
 	rows, err := j.QueryProjection(ctx,
 		`SELECT user_text, hist_final FROM conv_turns
 		 WHERE identity=? AND hist_done=1 AND hist_seq IS NOT NULL AND turn_id<>?
-		 ORDER BY hist_seq DESC LIMIT ?`, identity, current, n)
+		   AND hist_seq > COALESCE((SELECT reset_seq FROM conv_resets WHERE identity=?),0)
+		 ORDER BY hist_seq DESC LIMIT ?`, identity, current, identity, n)
 	if err != nil {
 		return nil, err
 	}
