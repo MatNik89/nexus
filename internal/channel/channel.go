@@ -172,7 +172,43 @@ func Events() map[string]journal.PayloadValidator {
 			}
 			return nil
 		},
+		EvEgressAttempt: func(raw json.RawMessage) error {
+			var p egressPayload
+			if err := json.Unmarshal(raw, &p); err != nil {
+				return err
+			}
+			if p.Host == "" {
+				return fmt.Errorf("channel: an egress receipt requires a host")
+			}
+			return nil
+		},
 	}
+}
+
+// EvEgressAttempt is the E11 egress receipt: an auditable record of a dial
+// decision (PLAN-TG-EGRESS-DIALER.md). Refusals are always recorded; permitted
+// connects are coalesced by the adapter (first connect / pinned-IP change) so
+// steady-state polling does not flood the journal.
+const EvEgressAttempt = "channel.egress_attempt"
+
+type egressPayload struct {
+	Host    string `json:"host"`
+	Pinned  string `json:"pinned,omitempty"`
+	Allowed bool   `json:"allowed"`
+	Reason  string `json:"reason,omitempty"`
+}
+
+// RecordEgress appends one egress receipt through the profile's journal (the
+// single canonical writer). The token never appears in the payload.
+func (c *Core) RecordEgress(ctx context.Context, host, pinned string, allowed bool, reason string) error {
+	p, err := c.params(EvEgressAttempt, egressPayload{
+		Host: host, Pinned: pinned, Allowed: allowed, Reason: reason,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = c.j.Append(ctx, p)
+	return err
 }
 
 // Projection folds channel events into the durable inbox/outbox tables in

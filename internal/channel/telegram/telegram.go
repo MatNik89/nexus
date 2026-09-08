@@ -24,6 +24,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/MatNik89/nexus/internal/channel"
@@ -58,6 +59,11 @@ type Adapter struct {
 	core     *channel.Core
 	handle   Handler
 	client   *http.Client
+	// egress receipt coalescing (PLAN-TG-EGRESS-DIALER.md): last pinned IP
+	// per host, so only first-connect / IP-change is journaled, never every
+	// poll. In-memory by design — a restart simply re-records once.
+	egressMu   sync.Mutex
+	lastPinned map[string]string
 	// offset is in-memory BY DESIGN (fresh-audit kilo F3): Telegram
 	// confirms server-side via the NEXT getUpdates offset, so a restart
 	// re-fetches only the unconfirmed tail; T22 dedup + stable refusal
@@ -84,11 +90,42 @@ func New(cfg Config, core *channel.Core, h Handler) (*Adapter, error) {
 		}
 		b[chat] = pid
 	}
-	return &Adapter{
+	a := &Adapter{
 		base: strings.TrimRight(cfg.APIBase, "/"), token: token,
 		bindings: b, profile: cfg.Profile, core: core, handle: h,
-		client: &http.Client{Timeout: 65 * time.Second},
-	}, nil
+		lastPinned: make(map[string]string),
+	}
+	// E11 egress boundary (PLAN-TG-EGRESS-DIALER.md): a pinned-IP,
+	// proxy-sanitized, redirect-rejecting client that talks ONLY to the
+	// configured Telegram host, with a coalesced journal receipt.
+	client, err := newPinnedClient(cfg.APIBase, 65*time.Second, nil, nil, a.egressReceipt)
+	if err != nil {
+		return nil, fmt.Errorf("telegram: egress client: %w", err)
+	}
+	a.client = client
+	return a, nil
+}
+
+// egressReceipt journals dial decisions with coalescing: a refusal is ALWAYS
+// recorded (a security event), a permitted connect only when the pinned IP for
+// the host first appears or changes — so steady-state getUpdates polling does
+// not flood the journal. A background ctx is used: the append is a local
+// serialized write and must not be cancelled by a per-request deadline.
+func (a *Adapter) egressReceipt(d egressDecision) {
+	if !d.Allowed {
+		_ = a.core.RecordEgress(context.Background(), d.Host, "", false, d.Reason)
+		return
+	}
+	pin := d.Pinned.String()
+	a.egressMu.Lock()
+	changed := a.lastPinned[d.Host] != pin
+	if changed {
+		a.lastPinned[d.Host] = pin
+	}
+	a.egressMu.Unlock()
+	if changed {
+		_ = a.core.RecordEgress(context.Background(), d.Host, pin, true, "")
+	}
 }
 
 // --- Bot API wire ---
