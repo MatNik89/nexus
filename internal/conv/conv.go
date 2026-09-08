@@ -103,7 +103,12 @@ func (p Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 		var pl struct {
 			Final string `json:"final"`
 		}
-		json.Unmarshal(ev.Envelope.Payload, &pl)
+		// A malformed final is NOT a completion (parity with the
+		// reference, which only completes on a successful decode —
+		// impl codex #1).
+		if json.Unmarshal(ev.Envelope.Payload, &pl) != nil {
+			return nil
+		}
 		if err := upsert(tx, turnID, ev); err != nil {
 			return err
 		}

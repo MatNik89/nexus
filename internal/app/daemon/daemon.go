@@ -277,10 +277,14 @@ func (d *Daemon) RunChannelTurn(ctx context.Context, identity string, updateID i
 	blocks := append(hist, block)
 	final, err := l.RunTurn(ctx, turn, run, d.deps.Profile, blocks)
 	if err != nil {
-		// Crash between turn completion and channel delivery (Phase-5-r3
-		// codex #3): the redelivered update re-enters the same turn and
-		// collides on its event ids — recover the DURABLE final from the
-		// journal instead of reporting a false failure.
+		// Recovery runs ONLY on a REDELIVERY COLLISION (a deterministic
+		// event id already present), never on an ordinary first-run
+		// failure (convproj impl codex #2): otherwise a provider/planner
+		// outage would pay VerifyChain's full scan on every message and
+		// recreate a backlog-growth mode.
+		if !errors.Is(err, journal.ErrDuplicateEvent) {
+			return "", err
+		}
 		rec, ok, rerr := d.recoveredTurnOutcome(turn)
 		if rerr != nil {
 			// The DECISIVE failure is the broken canonical stream — never

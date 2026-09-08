@@ -507,6 +507,13 @@ func (j *Journal) insertInTx(tx *sql.Tx, p contracts.EnvelopeParams, offset uint
 		int64(offset), string(env.EventID), string(env.RunID), int64(env.Sequence),
 		string(raw), redactionPolicyVersion, prevHash, integrity,
 	); err != nil {
+		// A deterministic event id that already exists is a REDELIVERY
+		// collision, not a fresh failure (convproj impl codex #2): the
+		// caller uses this to run recovery only on the cold collision
+		// path, never on an ordinary first-run failure.
+		if strings.Contains(err.Error(), "UNIQUE constraint") || strings.Contains(err.Error(), "constraint failed") {
+			return Event{}, fmt.Errorf("%w: %v", ErrDuplicateEvent, err)
+		}
 		return Event{}, fmt.Errorf("journal append: %w", err)
 	}
 	// Core-state projections fold IN THIS transaction (B7): event and
@@ -631,6 +638,10 @@ func (j *Journal) RedactorRewrites(raw []byte) (bool, error) {
 	}
 	return !reflect.DeepEqual(a, b), nil
 }
+
+// ErrDuplicateEvent marks an append rejected because its (deterministic)
+// event id already exists — the REDELIVERY collision signal.
+var ErrDuplicateEvent = errors.New("journal: duplicate event id (redelivery collision)")
 
 func (j *Journal) Replay(from uint64, fn func(Event) error) error {
 	if fn == nil {

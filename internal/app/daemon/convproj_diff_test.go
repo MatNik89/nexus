@@ -211,11 +211,18 @@ func TestConvProjectionRebuild(t *testing.T) {
 		id := fmt.Sprintf("c%d", i)
 		appendEv(t, j, "a"+id, "channel.inbound_admitted", "r"+id, nil,
 			fmt.Sprintf(`{"message_id":%q,"adapter_id":"telegram","channel_identity":"chat-1","update_id":%d,"text":%q}`, "a"+id, i, "u"+id))
-		turn := contracts.TurnID(fmt.Sprintf("turn-chan-chat-1-%d", i+1))
+		turn := contracts.TurnID(fmt.Sprintf("turn-chan-chat-1-%d", i))
 		appendEv(t, j, "s"+id, "turn.succeeded", "r"+id, &turn, fmt.Sprintf(`{"final":%q}`, "f"+id))
 	}
 	d0 := &Daemon{deps: Deps{Journal: j, Profile: "work"}}
 	before, _ := d0.conversationHistory("chat-1", "turn-chan-chat-1-99")
+	ref0, _ := d0.referenceConversationHistory("chat-1", "turn-chan-chat-1-99")
+	if len(before) == 0 {
+		t.Fatal("rebuild fixture vacuous: empty pre-rebuild history")
+	}
+	if !blocksEqual(before, ref0) {
+		t.Fatalf("projection != reference before rebuild:\nproj=%v\nref=%v", before, ref0)
+	}
 	j.Close()
 	// Regress the projection version so reopen triggers a full refold.
 	db, err := openSQL(dbp)
@@ -234,6 +241,10 @@ func TestConvProjectionRebuild(t *testing.T) {
 	}
 	if !blocksEqual(before, after) {
 		t.Fatalf("rebuild changed history:\nbefore=%v\nafter=%v", before, after)
+	}
+	refAfter, _ := d1.referenceConversationHistory("chat-1", "turn-chan-chat-1-99")
+	if !blocksEqual(after, refAfter) {
+		t.Fatalf("rebuilt projection != reference:\nproj=%v\nref=%v", after, refAfter)
 	}
 	_ = context.Background
 }
