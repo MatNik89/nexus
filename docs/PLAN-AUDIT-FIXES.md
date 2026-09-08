@@ -1,4 +1,4 @@
-# PLAN v11: full-audit remediation (codex AUDIT-FULL-2026-09-08) — zero-defect
+# PLAN v12: full-audit remediation (codex AUDIT-FULL-2026-09-08) — zero-defect
 
 Source: `docs/AUDIT-FULL-codex-2026-09-08.md` (9 findings; bound at f135eef,
 reverified against current tree). v2 folded round 1 (`docs/REVIEW-AUDIT-PLAN-{codex,kilo,agy}.md`, 3x FAIL); v3 folds
@@ -17,7 +17,9 @@ nil-builder detector], kilo PASS [same PolicyControl note], agy PASS). v9 folds 
 after restart], kilo PASS, agy PASS). v10 folds round 9 (`REVIEW-AUDIT-PLAN9-*.md`:
 codex FAIL 1 [reconciliation has no S7 API / atomic recipe / validator], kilo PASS,
 agy PASS). v11 folds round 10 (`REVIEW-AUDIT-PLAN10-*.md`: codex FAIL 1 [registration
-identity not bound to the bot], kilo PASS, agy PASS). Every fix: RED-capable
+identity not bound to the bot], kilo PASS, agy PASS). v12 folds round 11
+(`REVIEW-AUDIT-PLAN11-*.md`: codex FAIL 1 [reconciliation proof not bound to the bot],
+kilo PASS, agy PASS + stale-row notes). Every fix: RED-capable
 detector at the real owner boundary, then 3-agent review to 3xPASS.
 
 ## Status
@@ -297,8 +299,8 @@ existing `test_adapter_cannot_self_retry` family stays valid).
   | sendMessage, sendRichMessage (outbox `Flush`) | delivery | `delivery:<id>` / `channel:tg:delivery:<id>` | `PolicyDelivery` (durable) |
   | getUpdates | poll | `poll:tg:<n>` / `channel:tg:getUpdates` | `PolicyPoll` (RetryableCodes {`transport_prewire`, `http_429`, `http_5xx`, `transport_postwrite`, `malformed_reply`}) |
   | getMe | control-read | `control:tg:getMe:<n>` / `channel:tg:getMe` | `PolicyControlRead` (MaxAttempts 3, backoff 2s..30s, RetryableCodes {`transport_prewire`, `http_429`, `http_5xx`, `transport_postwrite`, `malformed_reply`}) |
-  | getMyCommands (reconciliation) | control-read | `control:tg:getMyCommands:<n>` / `channel:tg:getMyCommands` | `PolicyControlRead` |
-  | setMyCommands | control-effect | `control:tg:setMyCommands:<sha256(desired set)>` / `channel:tg:setMyCommands` (DURABLE) | `PolicyControlEffect` (MaxAttempts 3, backoff 2s..30s, RetryableCodes {`transport_prewire`, `http_429`} ONLY; 5xx/post-write/malformed -> UNKNOWN, E9) |
+  | getMyCommands (reconciliation) | control-read | `control:tg:<bot-id>:getMyCommands:<n>` / `channel:tg:bot:<bot-id>:getMyCommands` | `PolicyControlRead` |
+  | setMyCommands | control-effect | `control:tg:<bot-id>:setMyCommands:<sha256(canonical wire payload)>` / `channel:tg:bot:<bot-id>:setMyCommands` (DURABLE) | `PolicyControlEffect` (MaxAttempts 3, backoff 2s..30s, RetryableCodes {`transport_prewire`, `http_429`} ONLY; 5xx/post-write/malformed -> UNKNOWN, E9) |
   | sendChatAction (typing) | ui | `ui:tg:<chat>:typing:<n>` / `channel:tg:chat:<chat>` | `PolicyUI` (MaxAttempts 1, EffectReversible, in-memory; DEFINITE failures terminal, 5xx/post-write/malformed -> UNKNOWN per E9 — codex r8 note) |
   | picker sendMessage, answerCallbackQuery, editMessageReplyMarkup, editMessageText | ui | `ui:tg:<callback_or_message_id>:<method>` / `channel:tg:chat:<chat>` | `PolicyUI` |
   Classification is KIND/EFFECT-aware with ONE closed code vocabulary (codex r5 #3):
@@ -323,9 +325,15 @@ existing `test_adapter_cannot_self_retry` family stays valid).
   event `channel.control_effect{operation_id, adapter, bot_id, method, payload_hash,
   state}` (the adapter's durable record of the registration). On daemon start the adapter does
   NOT call setMyCommands blindly (codex r8 #1): a rehydrated `UNKNOWN` registration
-  first runs an S7-governed READ-ONLY reconciliation `control:tg:getMyCommands:<n>`
-  (`PolicyControlRead`; `getMyCommands` joins the call-site table) that compares the
-  remote menu with the exact desired payload and hands the proof to
+  first runs an S7-governed READ-ONLY reconciliation BOUND TO THE SAME BOT —
+  `control:tg:<bot-id>:getMyCommands:<n>` / `channel:tg:bot:<bot-id>:getMyCommands`
+  (`PolicyControlRead`; `getMyCommands` joins the call-site table) — and only for an
+  UNKNOWN registration whose embedded bot id EQUALS the current bot id from the
+  governed `getMe` (codex r11 #1): an UNKNOWN operation of an OLD bot stays UNKNOWN
+  (bot B never supplies proof for bot A); the current bot begins its own distinct
+  effect operation. The channel owner verifies a TYPED proof
+  `channel.ControlProof{BotID, PayloadHash, RemoteEqual}` against the operation's
+  embedded bot id + hash BEFORE reducing it to the boolean handed to
   `s7.Reconcile(op, equal, build)` (codex r9 #1): equal -> SUCCEEDED; different ->
   the SAME operation lands FAILED_RETRYABLE within its budget and `Next` issues the
   replacement grant (or FAILED when the budget is spent — health stays degraded). A
@@ -529,8 +537,9 @@ Fix:
   next grant (backoff), the ticker merely asks `Next`; the grant is PASSED INTO `PollOnce` and consumed by
   `call` immediately before `client.Do` (codex r3 #3 — D6 is the backoff detector,
   B 9d the authorization detector). `registerCommands` (an effectful POST) runs under
-  `control:tg:setMyCommands` with `PolicyControlEffect`; `getMe` under
-  `control:tg:getMe:<n>` with `PolicyControlRead` (both MaxAttempts 3, backoff 2s..30s).
+  `control:tg:<bot-id>:setMyCommands:<hash>` with `PolicyControlEffect` (durable);
+  `getMe` under `control:tg:getMe:<n>` with `PolicyControlRead` (both MaxAttempts 3,
+  backoff 2s..30s).
   Terminal codes (401/403 =
   `remote_rejected`, exhausted retryable) -> `Run` returns; health records the class;
   the capability stays OFF/degraded until config/token repair AND daemon restart (the
@@ -574,6 +583,12 @@ health state, not an internal counter):
    bot B and the SAME command set makes exactly ONE governed setMyCommands for B;
    ablating only the bot binding turns this RED; a bot-A companion presented for bot
    B is refused before the wire.
+2d. Proof provenance (codex r11 #1): bot A's registration lands UNKNOWN; restart the
+   same journal as bot B whose remote menu EQUALS the desired set -> A stays UNKNOWN
+   and receives NO Reconcile, B performs exactly ONE governed setMyCommands (its own
+   operation); a ControlProof for bot A presented against bot B's operation (and vice
+   versa) is refused before reconciliation; ablating only the proof-to-bot check turns
+   this RED.
 3. FlushOutbox transport failure -> health `transport` degraded.
 4. Injected journal-mark failure in FlushOutbox -> health `substrate`, `Run` returns,
    NO further poll/flush wire calls (further channel work stops).
