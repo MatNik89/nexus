@@ -10,7 +10,7 @@ import (
 	"io"
 
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
-	"github.com/MatNik89/nexus/internal/kernel/s7min"
+	"github.com/MatNik89/nexus/internal/kernel/s7"
 )
 
 // PayloadClass drives the tolerance ladder (SPEC P0.7): GENERAL payloads
@@ -31,14 +31,14 @@ const (
 // grant dies with ATTEMPT_NOT_AUTHORIZED before any bytes leave the
 // process (Phase-2 codex #2: consumption outside the transport was
 // decorative). Adapters never retry on their own.
-type ReAsk func(ctx context.Context, g s7min.Grant) ([]byte, error)
+type ReAsk func(ctx context.Context, g s7.Grant) ([]byte, error)
 
 // Extractor is the S2.3-min structured-output owner.
 type Extractor struct {
-	auth *s7min.Authority
+	auth *s7.Authority
 }
 
-func NewExtractor(auth *s7min.Authority) *Extractor { return &Extractor{auth: auth} }
+func NewExtractor(auth *s7.Authority) *Extractor { return &Extractor{auth: auth} }
 
 // decodeStrict is the ONLY acceptance path: strict JSON (unknown fields
 // rejected, one value, no trailing data) + the caller's validator.
@@ -139,27 +139,27 @@ func Extract[T any](ctx context.Context, e *Extractor, class PayloadClass, raw [
 					reaskRaw = rr
 				}
 			} else {
-				e.auth.Cancel(op) // ungoverned callback: nothing ran
+				e.auth.Cancel(op, nil) // ungoverned callback: nothing ran
 			}
 		}
 	}
-	land := func(outcome s7min.Outcome) error {
+	land := func(outcome s7.Outcome) error {
 		if !reaskLive {
 			return nil
 		}
 		reaskLive = false
-		return e.auth.Report(op, outcome)
+		return e.auth.Report(op, outcome, "", nil)
 	}
 	if len(reaskRaw) > 0 {
 		if out, err := decodeStrict(reaskRaw, validate); err == nil {
-			if rerr := land(s7min.OutcomeSucceeded); rerr != nil {
+			if rerr := land(s7.OutcomeSucceeded); rerr != nil {
 				return zero, fmt.Errorf("structured: S7 outcome not recorded — value refused (fail closed): %w", rerr)
 			}
 			return out, nil
 		}
 		if obj, ok := salvageJSON(reaskRaw); ok {
 			if out, err := decodeStrict(obj, validate); err == nil {
-				if rerr := land(s7min.OutcomeSucceeded); rerr != nil {
+				if rerr := land(s7.OutcomeSucceeded); rerr != nil {
 					return zero, fmt.Errorf("structured: S7 outcome not recorded — value refused (fail closed): %w", rerr)
 				}
 				return out, nil
@@ -167,7 +167,7 @@ func Extract[T any](ctx context.Context, e *Extractor, class PayloadClass, raw [
 		}
 	}
 	// The governed re-ask (if any) produced no accepted value: terminal.
-	if rerr := land(s7min.OutcomeFailedTerminal); rerr != nil {
+	if rerr := land(s7.OutcomeFailedTerminal); rerr != nil {
 		return zero, fmt.Errorf("structured: S7 outcome not recorded (fail closed): %w", rerr)
 	}
 	// Salvage from the ORIGINAL raw as the last rung.

@@ -25,19 +25,19 @@ import (
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
 	"github.com/MatNik89/nexus/internal/kernel/effectpath"
 	"github.com/MatNik89/nexus/internal/kernel/loop"
-	"github.com/MatNik89/nexus/internal/kernel/s7min"
+	"github.com/MatNik89/nexus/internal/kernel/s7"
 	"github.com/MatNik89/nexus/internal/llm/provider"
 )
 
 // ChatProvider is the minimal provider surface the planner consumes; the
 // grant parameter is consumed by the TRANSPORT.
 type ChatProvider interface {
-	Chat(ctx context.Context, msgs []provider.ChatMessage, g s7min.Grant) (provider.ChatOutput, error)
+	Chat(ctx context.Context, msgs []provider.ChatMessage, g s7.Grant) (provider.ChatOutput, error)
 }
 
 // StreamProvider streams deltas under the same governed-transport rule.
 type StreamProvider interface {
-	Stream(ctx context.Context, msgs []provider.ChatMessage, g s7min.Grant, deliver func(string) error) error
+	Stream(ctx context.Context, msgs []provider.ChatMessage, g s7.Grant, deliver func(string) error) error
 }
 
 // splitHistory extracts history_user/history_assistant blocks (ordered
@@ -101,7 +101,7 @@ const toolProtocol = "\n\nYou may use tools. To call one, reply with EXACTLY " +
 type ChatPlanner struct {
 	chat    ChatProvider
 	stream  StreamProvider
-	auth    *s7min.Authority
+	auth    *s7.Authority
 	target  contracts.TargetID
 	deliver func(string) error
 	specs   map[contracts.ToolID]effectpath.ToolSpec
@@ -156,7 +156,7 @@ func (c *ChatPlanner) WithTools(specs map[contracts.ToolID]effectpath.ToolSpec, 
 // New builds the planner FAIL-CLOSED: provider, S7 authority, target and a
 // POSITIVE context hard limit (tokens) are all required — a zero limit is
 // not "unlimited", it is a misconfiguration.
-func New(p ChatProvider, auth *s7min.Authority, target contracts.TargetID, contextHardLimit int) (*ChatPlanner, error) {
+func New(p ChatProvider, auth *s7.Authority, target contracts.TargetID, contextHardLimit int) (*ChatPlanner, error) {
 	if p == nil || auth == nil || !target.Valid() {
 		return nil, fmt.Errorf("planner: provider, S7 authority and target are required (fail closed)")
 	}
@@ -167,7 +167,7 @@ func New(p ChatProvider, auth *s7min.Authority, target contracts.TargetID, conte
 }
 
 // NewStreaming wires the delta sink; sp and deliver must both be present.
-func NewStreaming(p ChatProvider, sp StreamProvider, auth *s7min.Authority,
+func NewStreaming(p ChatProvider, sp StreamProvider, auth *s7.Authority,
 	target contracts.TargetID, deliver func(string) error, contextHardLimit int) (*ChatPlanner, error) {
 	base, err := New(p, auth, target, contextHardLimit)
 	if err != nil {
@@ -188,9 +188,9 @@ func NewStreaming(p ChatProvider, sp StreamProvider, auth *s7min.Authority,
 // forever).
 func (c *ChatPlanner) landFailure(op contracts.OperationID) error {
 	if st, _ := c.auth.State(op); st == contracts.AttemptAuthorized {
-		return c.auth.Cancel(op)
+		return c.auth.Cancel(op, nil)
 	}
-	return c.auth.Report(op, s7min.OutcomeFailedTerminal)
+	return c.auth.Report(op, s7.OutcomeFailedTerminal, "", nil)
 }
 
 func errorsJoin(cause, landing error) error {
@@ -327,7 +327,7 @@ func (c *ChatPlanner) Plan(ctx context.Context, blocks []contracts.ContextBlock)
 		if err != nil {
 			return loop.Action{}, errorsJoin(fmt.Errorf("planner: %w", err), c.landFailure(op))
 		}
-		if rerr := c.auth.Report(op, s7min.OutcomeSucceeded); rerr != nil {
+		if rerr := c.auth.Report(op, s7.OutcomeSucceeded, "", nil); rerr != nil {
 			return loop.Action{}, fmt.Errorf("planner: transport did not consume its grant — reply refused (fail closed): %w", rerr)
 		}
 		call, isTool, terr := c.toolCallFromReply(out.Content)
@@ -371,7 +371,7 @@ func (c *ChatPlanner) Plan(ctx context.Context, blocks []contracts.ContextBlock)
 		// A success the S7 authority refuses to record is a claim from an
 		// UNGOVERNED transport — the answer is rejected (Phase-2-r2 codex
 		// #2: a provider that skipped grant consumption returned content).
-		if rerr := c.auth.Report(op, s7min.OutcomeSucceeded); rerr != nil {
+		if rerr := c.auth.Report(op, s7.OutcomeSucceeded, "", nil); rerr != nil {
 			return loop.Action{}, fmt.Errorf("planner: transport did not consume its grant — reply refused (fail closed): %w", rerr)
 		}
 		final := b.String()
@@ -381,7 +381,7 @@ func (c *ChatPlanner) Plan(ctx context.Context, blocks []contracts.ContextBlock)
 	if err != nil {
 		return loop.Action{}, errorsJoin(fmt.Errorf("planner: %w", err), c.landFailure(op))
 	}
-	if rerr := c.auth.Report(op, s7min.OutcomeSucceeded); rerr != nil {
+	if rerr := c.auth.Report(op, s7.OutcomeSucceeded, "", nil); rerr != nil {
 		return loop.Action{}, fmt.Errorf("planner: transport did not consume its grant — reply refused (fail closed): %w", rerr)
 	}
 	return loop.Action{Final: &out.Content}, nil

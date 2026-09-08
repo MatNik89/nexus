@@ -39,7 +39,7 @@ import (
 	"github.com/MatNik89/nexus/internal/kernel/journal"
 	"github.com/MatNik89/nexus/internal/kernel/loop"
 	"github.com/MatNik89/nexus/internal/kernel/machine"
-	"github.com/MatNik89/nexus/internal/kernel/s7min"
+	"github.com/MatNik89/nexus/internal/kernel/s7"
 	"github.com/MatNik89/nexus/internal/llm/planner"
 	"github.com/MatNik89/nexus/internal/llm/provider"
 	"github.com/MatNik89/nexus/internal/security/redact"
@@ -115,7 +115,7 @@ func testDaemonRedact(t *testing.T, planner loop.Planner, audit effectpath.Audit
 	d, err := New(Deps{
 		Journal:        j,
 		PlannerFactory: func(deliver func(string) error) (loop.Planner, error) { return planner, nil },
-		Authority:      s7min.NewAuthority(nil, time.Minute),
+		Authority:      s7.NewAuthority(nil, time.Minute),
 		Profile:        "work",
 		Rules:          map[contracts.ToolID]effectpath.Decision{"asker": effectpath.DecisionAsk},
 		Tools: map[contracts.ToolID]effectpath.InProcFunc{
@@ -308,7 +308,7 @@ func TestLiveProviderSmoke(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	auth := s7min.NewAuthority(nil, time.Minute)
+	auth := s7.NewAuthority(nil, time.Minute)
 	p, err := provider.NewAPIKey(res.Config, auth, func(egress.Decision) error { return nil })
 	if err != nil {
 		t.Fatal(err)
@@ -353,7 +353,7 @@ func TestFullSpineDeterministicTransport(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { j.Close() })
-	authority := s7min.NewAuthority(nil, time.Minute)
+	authority := s7.NewAuthority(nil, time.Minute)
 	prov, err := provider.NewAPIKey(cfg, authority, func(egress.Decision) error { return nil })
 	if err != nil {
 		t.Fatal(err)
@@ -493,7 +493,7 @@ func TestRecoveryFailsClosedOnCorruptJournal(t *testing.T) {
 	d, err := New(Deps{
 		Journal:        j,
 		PlannerFactory: func(deliver func(string) error) (loop.Planner, error) { return p, nil },
-		Authority:      s7min.NewAuthority(nil, time.Minute),
+		Authority:      s7.NewAuthority(nil, time.Minute),
 		Profile:        "work",
 		Rules:          map[contracts.ToolID]effectpath.Decision{},
 		Tools:          map[contracts.ToolID]effectpath.InProcFunc{},

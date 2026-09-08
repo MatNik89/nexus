@@ -40,7 +40,7 @@ import (
 	"github.com/MatNik89/nexus/internal/kernel/journal"
 	"github.com/MatNik89/nexus/internal/kernel/loop"
 	"github.com/MatNik89/nexus/internal/kernel/machine"
-	"github.com/MatNik89/nexus/internal/kernel/s7min"
+	"github.com/MatNik89/nexus/internal/kernel/s7"
 	"github.com/MatNik89/nexus/internal/llm/planner"
 	"github.com/MatNik89/nexus/internal/llm/provider"
 	"github.com/MatNik89/nexus/internal/memory"
@@ -322,7 +322,7 @@ type daemonBundle struct {
 	profile    contracts.ProfileID
 	cfg        config.Config
 	sysPath    *effectpath.EffectPath
-	authority  *s7min.Authority
+	authority  *s7.Authority
 	prov       *provider.APIKey
 	sandboxOK  bool
 	// picker is the shared /cronjob calendar store: the adapter drives the
@@ -515,17 +515,27 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 	for n, v := range approval.Events() {
 		events[n] = v
 	}
+	for n, v := range s7.Events() {
+		events[n] = v
+	}
 
 	journalPath, _ := layout.ProfileJournal(profile)
 	redactor := redact.NewKnownRefs(knownSecretRefs(resolved.Config))
 	// The ONE profile database: journal + memory projection together
 	// (Annex P0.3 — facts are journal events folded in the same
 	// transaction; no second SQLite file exists).
-	j, err := journal.Open(journalPath, profile, redactor, events, memory.NewProjection(), schedule.NewProjection(), obligation.NewProjection(), channel.NewProjection(), approval.NewProjection(), conv.NewProjection())
+	j, err := journal.Open(journalPath, profile, redactor, events, memory.NewProjection(), schedule.NewProjection(), obligation.NewProjection(), channel.NewProjection(), approval.NewProjection(), conv.NewProjection(), s7.NewProjection())
 	if err != nil {
 		return nil, fmt.Errorf("journal: %w", err)
 	}
-	authority := s7min.NewAuthority(nil, 5*time.Minute)
+	// Full S7 (Slice B1): the durable-capable authority bound to the profile
+	// journal — it rehydrates every non-terminal durable operation
+	// (deliveries, command registration) before anything can ask for a grant.
+	authority, err := s7.New(j, nil, 5*time.Minute)
+	if err != nil {
+		j.Close()
+		return nil, fmt.Errorf("s7: %w", err)
+	}
 	// ONE E11 receipt sink for every outbound component (Slice A): built
 	// right after the journal, BEFORE the provider or any adapter exists.
 	egressSink := channel.EgressSink(j)
@@ -793,7 +803,7 @@ func runDoctorP0() int {
 	probeCore, probeSink, probeCleanup := mustProbeCore(layout, resolved)
 	defer probeCleanup()
 	// 1. conversation — LIVE provider round trip.
-	authority := s7min.NewAuthority(nil, 5*time.Minute)
+	authority := s7.NewAuthority(nil, 5*time.Minute)
 	if prov, perr := provider.NewAPIKey(resolved.Config, authority, probeSink); perr != nil {
 		add("conversation", false, perr.Error())
 	} else if pr := prov.Probe(ctx, resolved); !pr.Passed {

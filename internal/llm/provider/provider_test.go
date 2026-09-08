@@ -21,7 +21,7 @@ import (
 	"github.com/MatNik89/nexus/internal/foundation/config"
 	"github.com/MatNik89/nexus/internal/foundation/egress"
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
-	"github.com/MatNik89/nexus/internal/kernel/s7min"
+	"github.com/MatNik89/nexus/internal/kernel/s7"
 )
 
 // testSink is the tests' receipt sink: it accepts every decision. Production
@@ -160,7 +160,7 @@ func TestTransportConsumesGrantExactlyOnce(t *testing.T) {
 	if _, err := p.Chat(context.Background(), msgs, g); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := p.Chat(context.Background(), msgs, g); !errors.Is(err, s7min.ErrAttemptNotAuthorized) {
+	if _, err := p.Chat(context.Background(), msgs, g); !errors.Is(err, s7.ErrAttemptNotAuthorized) {
 		t.Fatalf("second physical call on one grant must fail ATTEMPT_NOT_AUTHORIZED: %v", err)
 	}
 	if *calls != 1 {
@@ -170,8 +170,8 @@ func TestTransportConsumesGrantExactlyOnce(t *testing.T) {
 		t.Fatalf("S7 attempt counter %d, must stay 1", n)
 	}
 	// A forged grant never reaches the wire at all.
-	forged := s7min.Grant{OperationID: "op-x", AttemptNo: 1, TargetID: p.Target(), Nonce: "deadbeef"}
-	if _, err := p.Chat(context.Background(), msgs, forged); !errors.Is(err, s7min.ErrAttemptNotAuthorized) {
+	forged := s7.Grant{OperationID: "op-x", AttemptNo: 1, TargetID: p.Target(), Nonce: "deadbeef"}
+	if _, err := p.Chat(context.Background(), msgs, forged); !errors.Is(err, s7.ErrAttemptNotAuthorized) {
 		t.Fatalf("forged grant: %v", err)
 	}
 	if *calls != 1 {
@@ -215,17 +215,17 @@ func validPlan(p plan) error {
 	return nil
 }
 
-func extractor(t *testing.T) (*Extractor, *s7min.Authority) {
+func extractor(t *testing.T) (*Extractor, *s7.Authority) {
 	t.Helper()
-	auth := s7min.NewAuthority(func() time.Time { return time.Unix(1000, 0) }, time.Minute)
+	auth := s7.NewAuthority(func() time.Time { return time.Unix(1000, 0) }, time.Minute)
 	return NewExtractor(auth), auth
 }
 
-func newAuth() *s7min.Authority {
-	return s7min.NewAuthority(func() time.Time { return time.Unix(1000, 0) }, time.Minute)
+func newAuth() *s7.Authority {
+	return s7.NewAuthority(func() time.Time { return time.Unix(1000, 0) }, time.Minute)
 }
 
-func issue(t *testing.T, a *s7min.Authority, op string, target contracts.TargetID) s7min.Grant {
+func issue(t *testing.T, a *s7.Authority, op string, target contracts.TargetID) s7.Grant {
 	t.Helper()
 	g, err := a.Issue(contracts.OperationID(op), target)
 	if err != nil {
@@ -239,7 +239,7 @@ func issue(t *testing.T, a *s7min.Authority, op string, target contracts.TargetI
 func TestStructuredOutputNeverSilentAccept(t *testing.T) {
 	e, auth := extractor(t)
 	reasks := 0
-	badReask := func(ctx context.Context, g s7min.Grant) ([]byte, error) {
+	badReask := func(ctx context.Context, g s7.Grant) ([]byte, error) {
 		reasks++
 		auth.Consume(g)
 		return []byte(`still not json`), nil
@@ -267,7 +267,7 @@ func TestStructuredOutputNeverSilentAccept(t *testing.T) {
 func TestStructuredHappyAndReask(t *testing.T) {
 	e, auth := extractor(t)
 	reasks := 0
-	goodReask := func(ctx context.Context, g s7min.Grant) ([]byte, error) {
+	goodReask := func(ctx context.Context, g s7.Grant) ([]byte, error) {
 		reasks++
 		if err := auth.Consume(g); err != nil {
 			t.Fatalf("re-ask ran without a consumable AttemptGrant (P0.2): %v", err)
@@ -294,7 +294,7 @@ func TestStructuredHappyAndReask(t *testing.T) {
 // prose — the extracted object still validates.
 func TestSalvageFromProseStillValidates(t *testing.T) {
 	e, _ := extractor(t)
-	badReask := func(ctx context.Context, g s7min.Grant) ([]byte, error) {
+	badReask := func(ctx context.Context, g s7.Grant) ([]byte, error) {
 		return []byte(`nope`), nil
 	}
 	got, err := Extract[plan](context.Background(), e, ClassGeneral,
@@ -316,7 +316,7 @@ func TestSalvageFromProseStillValidates(t *testing.T) {
 func TestSecurityEffectClassStrictNoRepair(t *testing.T) {
 	e, _ := extractor(t)
 	reasks := 0
-	reask := func(ctx context.Context, g s7min.Grant) ([]byte, error) {
+	reask := func(ctx context.Context, g s7.Grant) ([]byte, error) {
 		reasks++
 		return []byte(`{"steps":1}`), nil
 	}
@@ -338,7 +338,7 @@ func TestNilValidatorRefused(t *testing.T) {
 	e, _ := extractor(t)
 	_, err := Extract[plan](context.Background(), e, ClassGeneral,
 		[]byte(`{"steps":1}`), nil, "op-1", "provider-a",
-		func(ctx context.Context, g s7min.Grant) ([]byte, error) { return nil, nil })
+		func(ctx context.Context, g s7.Grant) ([]byte, error) { return nil, nil })
 	if err == nil {
 		t.Fatal("nil validator accepted (silent-accept hole)")
 	}
@@ -412,14 +412,14 @@ func TestStreamOrderAndTruncationHonesty(t *testing.T) {
 func TestReaskCallbackCannotSelfRetry(t *testing.T) {
 	e, auth := extractor(t)
 	transport := 0
-	fakeTransport := func(g s7min.Grant) ([]byte, error) {
+	fakeTransport := func(g s7.Grant) ([]byte, error) {
 		if err := auth.Consume(g); err != nil {
 			return nil, err
 		}
 		transport++
 		return []byte(`not json either`), nil
 	}
-	rogue := func(ctx context.Context, g s7min.Grant) ([]byte, error) {
+	rogue := func(ctx context.Context, g s7.Grant) ([]byte, error) {
 		out, _ := fakeTransport(g)
 		if _, err := fakeTransport(g); err == nil {
 			t.Fatal("second physical call on one grant authorized")
@@ -457,7 +457,7 @@ func TestUnknownEffectDiscriminatorReachesNoSink(t *testing.T) {
 	}
 	e, auth := extractor(t)
 	reasks := 0
-	reask := func(ctx context.Context, g s7min.Grant) ([]byte, error) {
+	reask := func(ctx context.Context, g s7.Grant) ([]byte, error) {
 		reasks++
 		auth.Consume(g)
 		return []byte(`{"kind":"send_message"}`), nil
@@ -491,7 +491,7 @@ func TestProviderTargetBindingAndLoopbackClass(t *testing.T) {
 		t.Fatal(err)
 	}
 	foreign := issue(t, auth, "op-f", "provider:somewhere-else")
-	if _, err := p.Chat(context.Background(), []ChatMessage{{Role: "user", Content: "x"}}, foreign); !errors.Is(err, s7min.ErrAttemptNotAuthorized) {
+	if _, err := p.Chat(context.Background(), []ChatMessage{{Role: "user", Content: "x"}}, foreign); !errors.Is(err, s7.ErrAttemptNotAuthorized) {
 		t.Fatalf("foreign-target grant reached the wire: %v", err)
 	}
 	if *calls != 0 {
@@ -513,7 +513,7 @@ func TestProviderTargetBindingAndLoopbackClass(t *testing.T) {
 func TestReaskStateNeverLeaks(t *testing.T) {
 	// (a) consumed, then network error.
 	e, auth := extractor(t)
-	consumedThenError := func(ctx context.Context, g s7min.Grant) ([]byte, error) {
+	consumedThenError := func(ctx context.Context, g s7.Grant) ([]byte, error) {
 		if err := auth.Consume(g); err != nil {
 			t.Fatal(err)
 		}
@@ -529,7 +529,7 @@ func TestReaskStateNeverLeaks(t *testing.T) {
 	}
 	// (b) callback returns VALID bytes without consuming the grant.
 	e2, auth2 := extractor(t)
-	ungoverned := func(ctx context.Context, g s7min.Grant) ([]byte, error) {
+	ungoverned := func(ctx context.Context, g s7.Grant) ([]byte, error) {
 		return []byte(`{"steps":7}`), nil // never touched the transport
 	}
 	_, err = Extract[plan](context.Background(), e2, ClassGeneral,

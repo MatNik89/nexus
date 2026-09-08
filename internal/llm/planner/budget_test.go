@@ -10,7 +10,7 @@ import (
 	"github.com/MatNik89/nexus/internal/kernel/budget"
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
 	"github.com/MatNik89/nexus/internal/kernel/effectpath"
-	"github.com/MatNik89/nexus/internal/kernel/s7min"
+	"github.com/MatNik89/nexus/internal/kernel/s7"
 	"github.com/MatNik89/nexus/internal/llm/provider"
 )
 
@@ -19,7 +19,7 @@ import (
 // over it -> the turn is refused with ZERO grants consumed and ZERO provider
 // calls. RED against a block-level (or absent) budget check.
 func TestPlanRefusesOverBudgetWireBeforeAnyGrant(t *testing.T) {
-	auth := s7min.NewAuthority(func() time.Time { return time.Unix(1000, 0) }, time.Minute)
+	auth := s7.NewAuthority(func() time.Time { return time.Unix(1000, 0) }, time.Minute)
 	fc := &fakeChat{auth: auth, reply: "unreachable"}
 	blocks := []contracts.ContextBlock{userBlockT(t, "hello")}
 	blockTokens := budget.Measure(blocks).Tokens
@@ -70,16 +70,16 @@ func userBlockT(t *testing.T, text string) contracts.ContextBlock {
 
 // endlessStream never sends [DONE]: it delivers deltas until the sink refuses.
 type endlessStream struct {
-	auth  *s7min.Authority
+	auth  *s7.Authority
 	sent  int
 	chunk string
 }
 
-func (e *endlessStream) Chat(ctx context.Context, msgs []provider.ChatMessage, g s7min.Grant) (provider.ChatOutput, error) {
+func (e *endlessStream) Chat(ctx context.Context, msgs []provider.ChatMessage, g s7.Grant) (provider.ChatOutput, error) {
 	return provider.ChatOutput{}, errors.New("not used")
 }
 
-func (e *endlessStream) Stream(ctx context.Context, msgs []provider.ChatMessage, g s7min.Grant, deliver func(string) error) error {
+func (e *endlessStream) Stream(ctx context.Context, msgs []provider.ChatMessage, g s7.Grant, deliver func(string) error) error {
 	if err := e.auth.Consume(g); err != nil {
 		return err
 	}
@@ -95,7 +95,7 @@ func (e *endlessStream) Stream(ctx context.Context, msgs []provider.ChatMessage,
 // accumulator ceiling — the builder never exceeds it and the turn fails with
 // the ceiling named, never a partial "final".
 func TestStreamCutAtAccumulatorCeiling(t *testing.T) {
-	auth := s7min.NewAuthority(func() time.Time { return time.Unix(1000, 0) }, time.Minute)
+	auth := s7.NewAuthority(func() time.Time { return time.Unix(1000, 0) }, time.Minute)
 	es := &endlessStream{auth: auth, chunk: strings.Repeat("x", 64*1024)}
 	var delivered int
 	p, err := NewStreaming(es, es, auth, "provider:test", func(d string) error { delivered += len(d); return nil }, 64000)

@@ -29,7 +29,7 @@ import (
 	"github.com/MatNik89/nexus/internal/foundation/egress"
 	"github.com/MatNik89/nexus/internal/kernel/closure"
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
-	"github.com/MatNik89/nexus/internal/kernel/s7min"
+	"github.com/MatNik89/nexus/internal/kernel/s7"
 )
 
 // ChatMessage is the provider-local wire shape (the T16 loop adapts
@@ -71,7 +71,7 @@ type APIKey struct {
 	host   string
 	model  string
 	key    string
-	auth   *s7min.Authority
+	auth   *s7.Authority
 	client *http.Client
 	// egressOpts is the test seam for the resolver/dialer (empty in
 	// production); set by newAPIKeyWithEgress before the client is built.
@@ -83,11 +83,11 @@ type APIKey struct {
 // the egress allowlist (config only narrows the kernel floor), key env
 // var must be set and non-empty, model is required, and an S7 authority
 // is mandatory — there is no ungoverned transport.
-func NewAPIKey(cfg config.Config, auth *s7min.Authority, sink egress.ReceiptSink) (*APIKey, error) {
+func NewAPIKey(cfg config.Config, auth *s7.Authority, sink egress.ReceiptSink) (*APIKey, error) {
 	return (&APIKey{}).build(cfg, auth, sink)
 }
 
-func (p *APIKey) build(cfg config.Config, auth *s7min.Authority, sink egress.ReceiptSink) (*APIKey, error) {
+func (p *APIKey) build(cfg config.Config, auth *s7.Authority, sink egress.ReceiptSink) (*APIKey, error) {
 	if auth == nil {
 		return nil, fmt.Errorf("provider: an S7 authority is required — no ungoverned transport (fail closed)")
 	}
@@ -188,9 +188,9 @@ func (p *APIKey) Target() contracts.TargetID {
 // transport performs ONE governed HTTP attempt: the grant is consumed
 // HERE, immediately before the wire — a second call on the same grant
 // fails ATTEMPT_NOT_AUTHORIZED before any bytes leave the process.
-func (p *APIKey) transport(ctx context.Context, g s7min.Grant, body []byte) (*http.Response, error) {
+func (p *APIKey) transport(ctx context.Context, g s7.Grant, body []byte) (*http.Response, error) {
 	if g.TargetID != p.Target() {
-		return nil, fmt.Errorf("provider: grant is not bound to this provider target: %w", s7min.ErrAttemptNotAuthorized)
+		return nil, fmt.Errorf("provider: grant is not bound to this provider target: %w", s7.ErrAttemptNotAuthorized)
 	}
 	if err := p.auth.Consume(g); err != nil {
 		return nil, fmt.Errorf("provider: %w", err)
@@ -215,7 +215,7 @@ func (p *APIKey) transport(ctx context.Context, g s7min.Grant, body []byte) (*ht
 }
 
 // Chat performs one OpenAI-compatible completion call under grant g.
-func (p *APIKey) Chat(ctx context.Context, msgs []ChatMessage, g s7min.Grant) (ChatOutput, error) {
+func (p *APIKey) Chat(ctx context.Context, msgs []ChatMessage, g s7.Grant) (ChatOutput, error) {
 	if len(msgs) == 0 {
 		return ChatOutput{}, fmt.Errorf("provider: empty message list (fail closed)")
 	}
@@ -266,11 +266,11 @@ func (p *APIKey) Probe(ctx context.Context, resolved config.Resolved) closure.Pr
 		return pr
 	}
 	if _, err := p.Chat(ctx, []ChatMessage{{Role: "user", Content: "ping"}}, g); err != nil {
-		p.auth.Report(op, s7min.OutcomeFailedTerminal)
+		p.auth.Report(op, s7.OutcomeFailedTerminal, "", nil)
 		pr.Detail = err.Error()
 		return pr
 	}
-	p.auth.Report(op, s7min.OutcomeSucceeded)
+	p.auth.Report(op, s7.OutcomeSucceeded, "", nil)
 	pr.Passed = true
 	return pr
 }
@@ -279,7 +279,7 @@ func (p *APIKey) Probe(ctx context.Context, resolved config.Resolved) closure.Pr
 // content deltas in order. A non-nil return after partial deltas means
 // the stream BROKE — the caller must treat received content as
 // incomplete, never as a full reply.
-func (p *APIKey) Stream(ctx context.Context, msgs []ChatMessage, g s7min.Grant, deliver func(delta string) error) error {
+func (p *APIKey) Stream(ctx context.Context, msgs []ChatMessage, g s7.Grant, deliver func(delta string) error) error {
 	if deliver == nil {
 		return fmt.Errorf("provider: a delivery sink is required (fail closed)")
 	}
@@ -348,7 +348,7 @@ func (p *APIKey) Stream(ctx context.Context, msgs []ChatMessage, g s7min.Grant, 
 // the provider exactly like NewAPIKey but with an injected resolver/dialer so a
 // detector can present a poisoned resolution (metadata/RFC1918/rebind) and
 // prove ZERO sockets are dialed. Production never sets opts.
-func newAPIKeyWithEgress(cfg config.Config, auth *s7min.Authority, sink egress.ReceiptSink, opts egress.Options) (*APIKey, error) {
+func newAPIKeyWithEgress(cfg config.Config, auth *s7.Authority, sink egress.ReceiptSink, opts egress.Options) (*APIKey, error) {
 	p := &APIKey{egressOpts: opts}
 	built, err := p.build(cfg, auth, sink)
 	if err != nil {

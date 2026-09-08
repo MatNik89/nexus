@@ -225,12 +225,19 @@ const (
 	AttemptCancelled
 	AttemptUnknown
 	AttemptManualRecovery
+	// AttemptFailedRetryable (SPEC P0.2 FAILED_RETRYABLE) is the full-S7
+	// state from which ONLY S7 may issue the next AttemptGrant (Slice B1).
+	// Appended so existing numeric values stay stable.
+	AttemptFailedRetryable
 )
 
+// Name mapping to SPEC P0.2: PLANNED=PENDING, AUTHORIZED=GRANTED, RUNNING,
+// FAILED_RETRYABLE, FAILED=FAILED_TERMINAL, CANCELLED, UNKNOWN.
 var attemptStateNames = map[AttemptState]string{
 	AttemptPlanned: "PLANNED", AttemptAuthorized: "AUTHORIZED", AttemptRunning: "RUNNING",
 	AttemptSucceeded: "SUCCEEDED", AttemptFailed: "FAILED", AttemptCancelled: "CANCELLED",
 	AttemptUnknown: "UNKNOWN", AttemptManualRecovery: "MANUAL_RECOVERY",
+	AttemptFailedRetryable: "FAILED_RETRYABLE",
 }
 
 // ActorType is the closed set of event emitters (Phase-1A r2 codex #7:

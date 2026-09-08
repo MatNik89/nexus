@@ -26,7 +26,7 @@ import (
 	"github.com/MatNik89/nexus/internal/kernel/effectpath"
 	"github.com/MatNik89/nexus/internal/kernel/journal"
 	"github.com/MatNik89/nexus/internal/kernel/loop"
-	"github.com/MatNik89/nexus/internal/kernel/s7min"
+	"github.com/MatNik89/nexus/internal/kernel/s7"
 	"github.com/MatNik89/nexus/internal/security/redact"
 )
 
@@ -38,7 +38,7 @@ import (
 type Deps struct {
 	Journal        *journal.Journal
 	PlannerFactory func(deliver func(delta string) error) (loop.Planner, error)
-	Authority      *s7min.Authority
+	Authority      *s7.Authority
 	Profile        contracts.ProfileID
 	Rules          map[contracts.ToolID]effectpath.Decision
 	Tools          map[contracts.ToolID]effectpath.InProcFunc

@@ -14,20 +14,20 @@ import (
 
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
 	"github.com/MatNik89/nexus/internal/kernel/effectpath"
-	"github.com/MatNik89/nexus/internal/kernel/s7min"
+	"github.com/MatNik89/nexus/internal/kernel/s7"
 	"github.com/MatNik89/nexus/internal/llm/provider"
 )
 
 // fakeChat emulates the GOVERNED transport: it consumes the grant exactly
 // as provider.Chat does — an unconsumable grant is a refusal.
 type fakeChat struct {
-	auth     *s7min.Authority
+	auth     *s7.Authority
 	lastUser string
 	reply    string
 	calls    int
 }
 
-func (f *fakeChat) Chat(ctx context.Context, msgs []provider.ChatMessage, g s7min.Grant) (provider.ChatOutput, error) {
+func (f *fakeChat) Chat(ctx context.Context, msgs []provider.ChatMessage, g s7.Grant) (provider.ChatOutput, error) {
 	if err := f.auth.Consume(g); err != nil {
 		return provider.ChatOutput{}, err
 	}
@@ -40,7 +40,7 @@ func (f *fakeChat) Chat(ctx context.Context, msgs []provider.ChatMessage, g s7mi
 	return provider.ChatOutput{Content: f.reply}, nil
 }
 
-func (f *fakeChat) Stream(ctx context.Context, msgs []provider.ChatMessage, g s7min.Grant, deliver func(string) error) error {
+func (f *fakeChat) Stream(ctx context.Context, msgs []provider.ChatMessage, g s7.Grant, deliver func(string) error) error {
 	if err := f.auth.Consume(g); err != nil {
 		return err
 	}
@@ -61,7 +61,7 @@ func (f *fakeChat) Stream(ctx context.Context, msgs []provider.ChatMessage, g s7
 func strp(s string) *string { return &s }
 
 func TestPlanSendsFencedContextAndReturnsFinal(t *testing.T) {
-	auth := s7min.NewAuthority(func() time.Time { return time.Unix(1000, 0) }, time.Minute)
+	auth := s7.NewAuthority(func() time.Time { return time.Unix(1000, 0) }, time.Minute)
 	fc := &fakeChat{auth: auth, reply: "the answer"}
 	p, err := New(fc, auth, "provider:test", 64000)
 	if err != nil {
@@ -108,7 +108,7 @@ func TestPlanSendsFencedContextAndReturnsFinal(t *testing.T) {
 // planner, consumed by the transport); a streaming planner delivers
 // deltas as produced and the final equals the accumulated stream.
 func TestPlanGovernedAndStreaming(t *testing.T) {
-	auth := s7min.NewAuthority(func() time.Time { return time.Unix(1000, 0) }, time.Minute)
+	auth := s7.NewAuthority(func() time.Time { return time.Unix(1000, 0) }, time.Minute)
 	fc := &fakeChat{auth: auth, reply: "streamed reply"}
 	var deltas []string
 	p, err := NewStreaming(fc, fc, auth, "provider:test", func(d string) error {
@@ -155,13 +155,13 @@ func TestPlanGovernedAndStreaming(t *testing.T) {
 // #2 / r4 codex #3): every leg observes the CAPTURED operation id — the
 // fakes record g.OperationID so the authority state is asserted directly.
 type failingChat struct {
-	auth       *s7min.Authority
+	auth       *s7.Authority
 	consume    bool
 	preReport  bool // adversarial: consume AND self-report before failing
 	capturedOp contracts.OperationID
 }
 
-func (f *failingChat) Chat(ctx context.Context, msgs []provider.ChatMessage, g s7min.Grant) (provider.ChatOutput, error) {
+func (f *failingChat) Chat(ctx context.Context, msgs []provider.ChatMessage, g s7.Grant) (provider.ChatOutput, error) {
 	f.capturedOp = g.OperationID
 	if f.consume {
 		if err := f.auth.Consume(g); err != nil {
@@ -169,7 +169,7 @@ func (f *failingChat) Chat(ctx context.Context, msgs []provider.ChatMessage, g s
 		}
 	}
 	if f.preReport {
-		f.auth.Report(g.OperationID, s7min.OutcomeSucceeded)
+		f.auth.Report(g.OperationID, s7.OutcomeSucceeded, "", nil)
 	}
 	return provider.ChatOutput{}, fmt.Errorf("provider failure")
 }
@@ -190,7 +190,7 @@ func userBlockForPlan(t *testing.T) contracts.ContextBlock {
 func TestFailedPlanLandsHonestS7State(t *testing.T) {
 	b := userBlockForPlan(t)
 	// (a) LOCAL refusal — grant never consumed → CANCELLED, no leak.
-	auth := s7min.NewAuthority(nil, time.Minute)
+	auth := s7.NewAuthority(nil, time.Minute)
 	fc := &failingChat{auth: auth}
 	p, err := New(fc, auth, "provider:test", 64000)
 	if err != nil {
@@ -227,7 +227,7 @@ func TestFailedPlanLandsHonestS7State(t *testing.T) {
 // registry, the profile from the session; an unknown tool_id is an ERROR;
 // prose replies stay finals.
 func TestToolPlanningSealedSpecs(t *testing.T) {
-	auth := s7min.NewAuthority(nil, time.Minute)
+	auth := s7.NewAuthority(nil, time.Minute)
 	fc := &fakeChat{auth: auth, reply: `{"action":"tool","tool_id":"memory_remember","arguments":{"content":"x"}}`}
 	p, err := New(fc, auth, "provider:test", 64000)
 	if err != nil {
@@ -281,11 +281,11 @@ func TestToolPlanningSealedSpecs(t *testing.T) {
 // Tool prompts are BYTE-DETERMINISTIC across fresh spec maps (Phase-3-r3
 // codex #10 literal): map iteration order never changes the plan input.
 type promptCapturingChat struct {
-	auth   *s7min.Authority
+	auth   *s7.Authority
 	system string
 }
 
-func (f *promptCapturingChat) Chat(ctx context.Context, msgs []provider.ChatMessage, g s7min.Grant) (provider.ChatOutput, error) {
+func (f *promptCapturingChat) Chat(ctx context.Context, msgs []provider.ChatMessage, g s7.Grant) (provider.ChatOutput, error) {
 	if err := f.auth.Consume(g); err != nil {
 		return provider.ChatOutput{}, err
 	}
@@ -298,7 +298,7 @@ func (f *promptCapturingChat) Chat(ctx context.Context, msgs []provider.ChatMess
 }
 
 func TestToolPromptDeterministic(t *testing.T) {
-	auth := s7min.NewAuthority(nil, time.Minute)
+	auth := s7.NewAuthority(nil, time.Minute)
 	b := userBlockForPlan(t)
 	prompts := map[string]bool{}
 	for i := 0; i < 8; i++ {
@@ -336,11 +336,11 @@ func TestToolPromptDeterministic(t *testing.T) {
 // history as "user", past finals as "assistant" (never re-minted into
 // the current user prompt), current message last.
 type msgsCapturingChat struct {
-	auth *s7min.Authority
+	auth *s7.Authority
 	msgs []provider.ChatMessage
 }
 
-func (f *msgsCapturingChat) Chat(ctx context.Context, msgs []provider.ChatMessage, g s7min.Grant) (provider.ChatOutput, error) {
+func (f *msgsCapturingChat) Chat(ctx context.Context, msgs []provider.ChatMessage, g s7.Grant) (provider.ChatOutput, error) {
 	if err := f.auth.Consume(g); err != nil {
 		return provider.ChatOutput{}, err
 	}
@@ -349,7 +349,7 @@ func (f *msgsCapturingChat) Chat(ctx context.Context, msgs []provider.ChatMessag
 }
 
 func TestHistoryBlocksBecomeRoleMessages(t *testing.T) {
-	auth := s7min.NewAuthority(nil, time.Minute)
+	auth := s7.NewAuthority(nil, time.Minute)
 	fc := &msgsCapturingChat{auth: auth}
 	p, err := New(fc, auth, "provider:test", 64000)
 	if err != nil {
@@ -432,7 +432,7 @@ func TestHistoryBlocksBecomeRoleMessages(t *testing.T) {
 // TIME: SetClock appends the current-time line to the CURRENT user
 // message (not the system prompt), with the configured zone + offset.
 func TestClockLineInUserMessage(t *testing.T) {
-	auth := s7min.NewAuthority(nil, time.Minute)
+	auth := s7.NewAuthority(nil, time.Minute)
 	fc := &msgsCapturingChat{auth: auth}
 	p, err := New(fc, auth, "provider:test", 64000)
 	if err != nil {

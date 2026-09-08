@@ -21,7 +21,7 @@ import (
 	"github.com/MatNik89/nexus/internal/kernel/effectpath"
 	"github.com/MatNik89/nexus/internal/kernel/journal"
 	"github.com/MatNik89/nexus/internal/kernel/machine"
-	"github.com/MatNik89/nexus/internal/kernel/s7min"
+	"github.com/MatNik89/nexus/internal/kernel/s7"
 	"github.com/MatNik89/nexus/internal/schedule"
 	"github.com/MatNik89/nexus/internal/security/redact"
 )
@@ -79,7 +79,7 @@ func build(t *testing.T) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	auth := s7min.NewAuthority(nil, time.Minute)
+	auth := s7.NewAuthority(nil, time.Minute)
 	lazy := &LazyRunner{}
 	m, err := NewManager(j, sched, reg, clock, lazy, auth, dir, gate)
 	if err != nil {
@@ -263,7 +263,7 @@ func TestLifecycleSurvivesRestart(t *testing.T) {
 	}
 	defer j.Close()
 	sched, _ := schedule.New(j, h.clock)
-	auth2 := s7min.NewAuthority(nil, time.Minute)
+	auth2 := s7.NewAuthority(nil, time.Minute)
 	m2, err := NewManager(j, sched, reg, h.clock, &LazyRunner{}, auth2, h.dir, gate2)
 	if err != nil {
 		t.Fatal(err)
@@ -544,7 +544,7 @@ func buildWithKind(t *testing.T, dir, kindName string, k Kind) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	auth := s7min.NewAuthority(nil, time.Minute)
+	auth := s7.NewAuthority(nil, time.Minute)
 	lazy := &LazyRunner{}
 	m, err := NewManager(j, sched, reg, clock, lazy, auth, dir, gate)
 	if err != nil {
