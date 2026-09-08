@@ -1,10 +1,12 @@
-# PLAN v4: full-audit remediation (codex AUDIT-FULL-2026-09-08) — zero-defect
+# PLAN v5: full-audit remediation (codex AUDIT-FULL-2026-09-08) — zero-defect
 
 Source: `docs/AUDIT-FULL-codex-2026-09-08.md` (9 findings; bound at f135eef,
 reverified against current tree). v2 folded round 1 (`docs/REVIEW-AUDIT-PLAN-{codex,kilo,agy}.md`, 3x FAIL); v3 folds
 round 2 (`docs/REVIEW-AUDIT-PLAN2-*.md`: codex FAIL 7, kilo FAIL 1, agy PASS) and the
 OWNER decision (final): full S7 engine now. v4 folds round 3 (`REVIEW-AUDIT-PLAN3-*.md`:
-codex FAIL 5 [B/D lifecycle], kilo PASS, agy PASS). Every fix: RED-capable
+codex FAIL 5 [B/D lifecycle], kilo PASS, agy PASS). v5 folds round 4
+(`REVIEW-AUDIT-PLAN4-*.md`: codex FAIL 3 [companion binding, ungoverned Bot API
+siblings, structured re-ask], kilo PASS, agy PASS). Every fix: RED-capable
 detector at the real owner boundary, then 3-agent review to 3xPASS.
 
 ## Status
@@ -144,19 +146,25 @@ existing `test_adapter_cannot_self_retry` family stays valid).
   FAILED_RETRYABLE, only when `now >= next_attempt_at`, `attempts < MaxAttempts`,
   `now < deadline`; otherwise `ErrNotDue` / `ErrExhausted` (exhaustion is a durable
   transition to FAILED). `Issue(op,target)` remains as `Begin(PolicyTool)+Next` for
-  the loop. `Consume(g, siblings ...contracts.EnvelopeParams)`: field checks as today
-  plus `AttemptNo` must equal the record's current attempt; for a Durable operation the
-  `s7.attempt_started` event is appended durably BEFORE Consume returns (no wire
-  without a durable STARTED — mirrors the loop's STARTED-before-dispatch discipline),
-  in ONE `journal.AppendBatch` together with any caller-supplied sibling events
-  (codex r3 #2: S7 is the atomic committer of every paired S7+owner transition; the
-  channel passes its outbox `outbound_unknown` park params as the sibling). A
-  non-durable operation refuses siblings (no half-durable pairs).
-  `Report(op, Outcome, code string, siblings ...contracts.EnvelopeParams)` and
-  `Cancel(op, siblings...)`: same one-batch rule — the S7 transition and the sibling
-  outbox transition (`SENT`/`PENDING`/`FAILED`) commit atomically or not at all; there
-  is no window in which S7 says "retry is safe" while the row is stranded `UNKNOWN`.
-  The adapter's outcome is a PROPOSAL; S7 decides retryability from `Policy.RetryableCodes` — a code not in the
+  the loop. Paired transitions use a TYPED, MANDATORY companion (codex r4 #1 — not an
+  unconstrained variadic list): `type Companion struct{ Key contracts.OperationID;
+  Params contracts.EnvelopeParams }`. `Consume(g, c Companion)`: field checks as
+  today plus `AttemptNo` must equal the record's current attempt; for a Durable
+  operation exactly ONE companion is REQUIRED and `c.Key == g.OperationID` is
+  verified (a missing or foreign companion is `ErrAttemptNotAuthorized`, zero wire);
+  the `s7.attempt_started` event and the companion are appended in ONE
+  `journal.AppendBatch` BEFORE Consume returns (no wire without a durable STARTED —
+  mirrors the loop's STARTED-before-dispatch discipline; codex r3 #2: S7 is the
+  atomic committer of every paired S7+owner transition). A non-durable operation
+  refuses a companion (no half-durable pairs). S7 validates only the opaque key and
+  cardinality; it never interprets channel semantics.
+  `Report(op, Outcome, code string, build func(Landing) Companion)` and
+  `Cancel(op, build func(Landing) Companion)`: S7 first computes the typed `Landing`
+  (`Retry{NextAt}` | `Terminal` | `Unknown` | `Succeeded` | `Cancelled`), the OWNER's
+  builder returns the ONE companion for that landing (bound by `Key == op`), and both
+  commit in one batch or not at all — there is no window in which S7 says "retry is
+  safe" while the row is stranded `UNKNOWN`, and S7 never chooses between unlabeled
+  candidates. The adapter's outcome is a PROPOSAL; S7 decides retryability from `Policy.RetryableCodes` — a code not in the
   list is terminal even if the adapter said retryable; `OutcomeUnknown` parks UNKNOWN
   and is NEVER retried (`IRREVERSIBLE+UNKNOWN` needs reconciliation, SPEC P0.2).
   `AttemptContext` unchanged (deadline = min(call, grant expiry, operation deadline)).
@@ -210,7 +218,11 @@ existing `test_adapter_cannot_self_retry` family stays valid).
   replay). `UNKNOWN` stays reserved for a possibly-committed remote effect.
 - Identity binding (codex r2 #2): operation `delivery:<delivery_id>`, target
   `channel:<adapter_id>:delivery:<delivery_id>` — the grant is bound to the immutable
-  delivery resource, not the adapter. The adapter RECOMPUTES the expected operation and
+  delivery resource, not the adapter. Companion binding (codex r4 #1): every outbox
+  transition payload (`deliveryMark`, `outbound_failed`) gains `operation_id`; the
+  channel PayloadValidator and projection fold REJECT a mark whose
+  `operation_id != "delivery:"+delivery_id`, so a companion for row B can never ride
+  A's grant even inside a valid batch. The adapter RECOMPUTES the expected operation and
   target from the `Outbound` it is about to send and compares them with the presented
   grant BEFORE `Consume` (mirrors `provider.go:156-172`); a mismatch is
   `ErrAttemptNotAuthorized` with zero wire calls.
@@ -220,33 +232,41 @@ existing `test_adapter_cannot_self_retry` family stays valid).
   `s7.Begin(delivery:<id>, target, PolicyDelivery)`; `g, err := s7.Next(op)`;
   `ErrNotDue` -> skip this tick; `ErrExhausted`/terminal -> mark `FAILED`; grant ->
   `send(o, g)`, inside which the adapter recomputes identity and calls
-  `s7.Consume(g, outboxUnknownParams)` — the S7 STARTED and the outbox UNKNOWN park
-  commit in ONE batch immediately before `client.Do` (if that batch fails: no wire,
+  `s7.Consume(g, Companion{Key: op, Params: outboxUnknownParams(op)})` — the S7
+  STARTED and the outbox UNKNOWN park commit in ONE batch immediately before `client.Do` (if that batch fails: no wire,
   lease stays and is recovered by `Next` on the next tick) -> outcomes:
   - any LOCAL pre-consume refusal (marshal, request build, identity mismatch) ->
-    `s7.Cancel(op, outboxFailedParams)` in ONE batch (operation CANCELLED, row
-    `FAILED` code `local_refused`);
-  - nil -> `Report(Succeeded, "", outboxSentParams)` — one batch -> `SENT`; if that
+    `s7.Cancel(op, build)` where the builder returns the outbox `FAILED`
+    (`local_refused`) companion — ONE batch (operation CANCELLED, row `FAILED`);
+  - nil -> `Report(Succeeded, "", build)` (builder: `SENT` companion) — one batch -> `SENT`; if that
     batch fails after a remotely accepted send the row STAYS `UNKNOWN` (never claims
     `SENT`), S7 stays RUNNING -> rehydrates UNKNOWN, and the error surfaces;
   - `ErrAmbiguousSend` (HTTP 5xx after POST, post-write timeout/reset, accepted-but-
     malformed reply) -> `Report(Unknown)` -> stays `UNKNOWN` (reconciliation, NO
     resend — E9); a 5xx is NEVER a definite failure (codex r2 #3);
   - `channel.DefiniteFailure{Code, Retryable}` (new typed error; nothing committed
-    remotely) -> `Report(outcome, Code, siblingParams)` where S7 first DECIDES the
-    landing (retryable -> sibling = outbox `PENDING` re-pend with `next_attempt_at`;
-    terminal/exhausted -> sibling = outbox `FAILED`) and commits both in one batch. The
-    channel supplies both candidate sibling params; S7 picks by its decision.
+    remotely) -> `Report(outcome, Code, build)`: S7 DECIDES the `Landing`
+    (`Retry{NextAt}` -> the builder returns the outbox `PENDING` re-pend companion;
+    `Terminal` -> the `FAILED` companion) and commits S7 + companion in one batch.
   The old unconditional `Reconcile(id,false)` self-repend is deleted.
-- Telegram: EVERY physical Bot API call carries a grant (codex r3 #3 — no ungoverned
-  `client.Do` remains): `call(ctx, method, req, out, g s7.Grant, kind)` recomputes the
-  expected operation/target for its kind (`delivery:<id>` /
-  `channel:tg:delivery:<id>`; `poll:tg:<n>` / `channel:tg:getUpdates`;
-  `control:tg:setMyCommands` / `channel:tg:setMyCommands`) and calls `Consume`
-  IMMEDIATELY before `client.Do` (mirrors `provider.go:163-180`). Polling and command
-  registration are governed operations under `PolicyPoll` / `PolicyControl`
-  (Slice D); a poll iteration is a scheduled operation (HARDQ C3), a failed one is
-  re-attempted only through S7.
+- Telegram: EVERY physical Bot API call carries a grant (codex r3 #3, r4 #2 — no
+  ungoverned `client.Do` remains). `call(ctx, method, req, out, g s7.Grant, kind)`
+  recomputes the expected operation/target for its kind and calls `Consume`
+  IMMEDIATELY before `client.Do` (mirrors `provider.go:163-180`). The COMPLETE current
+  call-site table (`telegram.go:249,347,392,396,400,463,475`;
+  `telegram_picker.go:33,49,158,171`) and its governed paths:
+  | method(s) | kind | operation / target | policy |
+  | sendMessage, sendRichMessage (outbox `Flush`) | delivery | `delivery:<id>` / `channel:tg:delivery:<id>` | `PolicyDelivery` (durable) |
+  | getUpdates | poll | `poll:tg:<n>` / `channel:tg:getUpdates` | `PolicyPoll` |
+  | setMyCommands, getMe | control | `control:tg:<method>:<n>` / `channel:tg:<method>` | `PolicyControl` (MaxAttempts 3, backoff 2s..30s) |
+  | sendChatAction (typing) | ui | `ui:tg:<chat>:typing:<n>` / `channel:tg:chat:<chat>` | `PolicyUI` (MaxAttempts 1, EffectReversible, terminal on failure, outcome landed, in-memory) |
+  | picker sendMessage, answerCallbackQuery, editMessageReplyMarkup, editMessageText | ui | `ui:tg:<callback_or_message_id>:<method>` / `channel:tg:chat:<chat>` | `PolicyUI` |
+  The picker chrome is the owner-accepted EPHEMERAL boundary (cronjob plan; not a
+  durable delivery) — it is governed one-shot, never retried, never routed through the
+  outbox. A grant added "merely to compile" is impossible: `call` refuses a kind whose
+  recomputed identity does not match the presented grant. Polling and command
+  registration are governed operations (Slice D); a poll iteration is a scheduled
+  operation (HARDQ C3), a failed one is re-attempted only through S7.
   Classification: pre-wire (egress refusal / DNS / dial) -> `DefiniteFailure{
   transport_prewire, Retryable}`; HTTP 429 -> `{http_429, Retryable}`; other 4xx ->
   `{http_4xx, Terminal}`; 5xx / post-write errors -> `ErrAmbiguousSend` (unchanged).
@@ -268,7 +288,16 @@ Next/callback/Report/backoff (codex r3 #4: the planner never sleeps, loops, or c
 dial/DNS -> `transport_prewire` (retryable proposals; a chat completion is
 `EffectReadOnly` — re-issuing it has no remote side effect beyond cost); anything
 after the body started is terminal; `ErrExhausted` -> the turn fails with the causal
-error. `Stream` failures after the first delivered byte are TERMINAL (partial output
+error.
+Structured re-ask (codex r4 #3): `provider.Extract`'s GENERAL-class re-ask
+(`structured.go:102-151`) today decides AND issues its own second physical attempt.
+It migrates to the same driver: `s7.Execute(ctx, op, target, PolicyStructured,
+attempt)` with `PolicyStructured{MaxAttempts 2 /*one re-ask*/, RetryableCodes
+{`invalid_general`}}`; the extractor VALIDATES and PROPOSES
+(`OutcomeFailedRetryable, "invalid_general"` for GENERAL; SECURITY/EFFECT classes
+return `OutcomeFailedTerminal` — no repair) and keeps its salvage ladder over the
+values S7 handed back; it never calls `Issue`/`Next`. A nil `reask` callback means
+`MaxAttempts 1`. `Stream` failures after the first delivered byte are TERMINAL (partial output
 already reached the user). Tool attempts keep `PolicyTool` (MaxAttempts 1).
 
 Detectors (RED against current code):
@@ -306,9 +335,17 @@ Detectors (RED against current code):
    injected failure between -> a definitely-unsent row stranded `UNKNOWN` is DETECTED
    (RED), the batched recipe leaves no such state (GREEN); same for cancel+FAILED and
    terminal-report+FAILED.
-9d. Poll/control grants: the same poll grant presented twice -> second `client.Do`
-   never happens (`ATTEMPT_NOT_AUTHORIZED`, transport count unchanged); a missing or
-   swapped (delivery-for-poll) grant -> zero wire calls.
+9d. Bot API method TABLE (every method in the call-site table): the same grant
+   presented twice -> second `client.Do` never happens (`ATTEMPT_NOT_AUTHORIZED`,
+   transport count unchanged); a missing grant or a cross-kind swap (delivery-for-poll,
+   ui-for-control) -> zero wire calls.
+9e. Companion binding: `Consume` with NO companion for a `PolicyDelivery` grant ->
+   refused, zero wire, no outbox change; a companion built for row B presented with
+   A's grant -> refused by S7 (`Key != op`) AND, if forged past S7, by the channel
+   validator (`operation_id` mismatch) — zero wire, neither row changes.
+9f. Structured re-ask ownership ablation: S7 refuses the re-ask (`PolicyStructured`
+   forced to MaxAttempts 1) while extractor/provider code is untouched -> the re-ask
+   transport count stays ZERO; SECURITY/EFFECT invalid payloads never re-ask.
 10. Egress refusal on delivery -> `DefiniteFailure{transport_prewire}` -> S7 retry
     path (not `UNKNOWN`) + distinct redacted security line (ties to Slice A #5).
 
