@@ -306,9 +306,13 @@ func (a *Adapter) FlushOutbox(ctx context.Context) error {
 			// pre-10.1 client 400), the row re-pends and the next tick
 			// (attempts>0) carries plain — same first-lease discipline
 			// as the HTML path, no double-send.
-			if hasPipeTable(o.Text) {
+			// Only when the WHOLE reply fits the sendRichMessage limit —
+			// never clip (a clipped body that earns SENT would silently
+			// drop the suffix, codex #1). An over-limit table falls to
+			// today's path; multipart is its own deferred slice.
+			if hasPipeTable(o.Text) && fitsRich(o.Text) {
 				return a.call(ctx, "sendRichMessage", map[string]any{
-					"chat_id": chat, "rich_message": map[string]any{"markdown": clip32k(o.Text)}}, nil)
+					"chat_id": chat, "rich_message": map[string]any{"markdown": o.Text}}, nil)
 			}
 			if rendered, ok := renderHTML(o.Text); ok {
 				return a.call(ctx, "sendMessage", map[string]any{
@@ -332,14 +336,12 @@ func hasPipeTable(text string) bool {
 	return false
 }
 
-// clip32k bounds the payload to the sendRichMessage character limit.
-func clip32k(s string) string {
+// fitsRich reports whether the WHOLE text is within the
+// sendRichMessage character limit (no clipping — lossless or not at
+// all).
+func fitsRich(s string) bool {
 	const max = 32768
-	r := []rune(s)
-	if len(r) > max {
-		return string(r[:max])
-	}
-	return s
+	return len([]rune(s)) <= max
 }
 
 // Outbound aliases the core row (keeps the Flush signature readable).

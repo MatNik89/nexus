@@ -610,6 +610,25 @@ func TestPipeTableUsesRichMessage(t *testing.T) {
 	}
 }
 
+// R1 codex #1: an OVER-LIMIT table must NOT use sendRichMessage (no
+// silent clip earning SENT) — it falls through to today's path.
+func TestOverLimitTableSkipsRich(t *testing.T) {
+	h := build(t, map[int64]string{42: "work"})
+	big := "| a | b |\n|---|---|\n" + strings.Repeat("| x | "+strings.Repeat("y", 100)+" |\n", 400)
+	if len([]rune(big)) <= 32768 {
+		t.Fatalf("fixture not over-limit: %d", len([]rune(big)))
+	}
+	if _, err := h.core.EnqueueReply(ctxT(), "telegram", "chat-42", "work", big); err != nil {
+		t.Fatal(err)
+	}
+	_ = h.a.FlushOutbox(ctxT())
+	h.bot.mu.Lock()
+	defer h.bot.mu.Unlock()
+	if h.bot.lastMethod == "sendRichMessage" {
+		t.Fatal("over-limit table clipped into sendRichMessage")
+	}
+}
+
 // A non-table reply keeps the plain/HTML path (no rich).
 func TestNonTableSkipsRichMessage(t *testing.T) {
 	h := build(t, map[int64]string{42: "work"})
