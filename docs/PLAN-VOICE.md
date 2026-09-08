@@ -9,35 +9,36 @@ pcm_s16le out.wav` → `whisper-cli -m <model> -f out.wav -nt` → transcript
 becomes the turn's user text. Multiple sources agree on these exact
 ffmpeg flags.
 
-## Change
-- New `internal/media` package: `Transcribe(ctx, ogg []byte) (string,
-  error)` — writes ogg to a temp file, shells ffmpeg then whisper-cli
-  with SINGLE-arg exec.Command + a hard timeout, returns trimmed text.
-  Binary + model paths come from config (defaults:
-  whisper-cli=~/whisper.cpp/build/bin/whisper-cli,
-  model=~/whisper.cpp/models/ggml-base.bin, ffmpeg=ffmpeg on PATH).
-  Everything runs in a per-call temp dir, cleaned up.
-- Telegram adapter: when `Message.Voice` is present (and the chat is
-  bound), parse its file_id, getFile → download the file, Transcribe,
-  and admit the TRANSCRIPT as the turn text (prefixed "[glasovna
-  poruka] " so the model knows it was spoken). The current C2 non-text
-  refusal is lifted FOR VOICE only; photo/doc still refuse for now
-  (their own slices).
-- getFile 20MB cap enforced; a transcription failure returns a typed
-  Croatian reply ("Nisam uspio pretvoriti glasovnu poruku u tekst."),
-  never a silent drop; the message still closes TERMINAL.
-
-## Security / honesty
-- exec.Command with a fixed binary path + explicit args (NEVER a shell
-  string) — no injection surface from the audio.
-- Downloaded bytes are audio, never executed; temp files are 0600 in a
-  per-call mkdtemp, removed on return.
-- Egress: getFile downloads from the Telegram file host (already an
-  allowed egress target for the bot). No new external host.
-- Synchronous in the turn for the first cut (a single-user bot; one
-  voice blocks one flush tick). topknot ceiling: async job queue when
-  a real backlog appears (subagent C's note) — trigger: a voice longer
-  than the flush interback causes a visible stall.
+## Change (v2 — round-1 HIGH findings folded)
+- EXECUTION THROUGH THE SANDBOX, not raw exec (r1 codex #2): ffmpeg and
+  whisper-cli run as ExecProcess through internal/sandbox (the bwrap
+  boundary that already contains host FS/net and kills the whole process
+  tree on cancel) — NEVER a bare exec.Command. Channel-controlled bytes
+  are decoded inside containment, not under the daemon identity. The
+  temp dir is the only writable mount; net is denied (transcription is
+  offline).
+- ADMIT-THEN-HANDLE, refusal on failure (r1 codex #1): the flow mirrors
+  today's text path exactly. On a voice message, transcribe FIRST; on
+  SUCCESS, admit the transcript as the turn text (existing Admit ->
+  handle -> terminal+outbox recipe, transcript is the canonical durable
+  input). On FAILURE, enqueue a typed Croatian refusal via the SAME
+  path the current non-text C2 refusal uses (EnqueueReplyID + offset
+  advance, NO inbox row) — there is no "admit then TERMINAL on failure"
+  claim. (This means a voice that fails to transcribe is never admitted,
+  identical in shape to today's photo/doc refusal.)
+- BOUNDED DOWNLOAD (r1 codex #3): the getFile file GET goes through the
+  token-sanitizing request path (no token in diagnostics), reads through
+  an io.LimitReader capped at 20 MiB (never io.ReadAll first), and
+  rejects a body that hits the cap. Same egress target as the existing
+  Bot API calls (Telegram host) — no new host. URL built by the adapter,
+  no redirects followed (default disabled).
+- RESOURCE BOUNDS (r1 codex #4): the sandbox invocation carries a hard
+  wall-clock timeout (kills the tree), the temp dir is size-checked
+  after ffmpeg (reject a decoded WAV over a fixed cap), and the whisper
+  transcript output is length-capped before it becomes turn text.
+- internal/media: Transcribe(ctx, ogg []byte) shells the two binaries
+  THROUGH the sandbox with structured argv, per-call 0700 mkdtemp,
+  cleaned on return. Binary/model paths from config with Pi defaults.
 
 ## Detectors
 - media.Transcribe unit: with a stub whisper/ffmpeg (a fake binary in
