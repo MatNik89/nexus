@@ -494,6 +494,9 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 	for n, v := range channel.Events() {
 		events[n] = v
 	}
+	for n, v := range conv.Events() {
+		events[n] = v
+	}
 	for n, v := range approval.Events() {
 		events[n] = v
 	}
@@ -1314,11 +1317,29 @@ func telegramHandler(b *daemonBundle) telegram.Handler {
 				return "Ack failed: " + err.Error(), nil
 			}
 			return "Acknowledged " + occ + ".", nil
+		case lower == "new" || lower == "reset" || lower == "clear":
+			// Conversation boundary (hermes /new): forget prior context.
+			payload, _ := json.Marshal(map[string]string{"identity": in.ChannelIdentity})
+			_, aerr := b.j.Append(ctx, contracts.EnvelopeParams{
+				SchemaID: "nexus.event", SchemaVersion: 1,
+				EventID:   contracts.EventID(fmt.Sprintf("ev-convreset-%s-%d", in.ChannelIdentity, in.UpdateID)),
+				EventType: "conversation.reset", RunID: contracts.RunID("run-convreset-" + in.ChannelIdentity),
+				EmittedAt: time.Now().UTC(), ActorType: contracts.ActorUser, ActorID: "owner",
+				PrincipalID: "nexus", WorkspaceID: "local", ProfileID: b.profile, AttemptNo: 1,
+				Payload: payload, PayloadHash: "recomputed",
+			})
+			// A redelivered /new collides on the id — already done,
+			// still confirm (idempotent).
+			if aerr != nil && !errors.Is(aerr, journal.ErrDuplicateEvent) {
+				return "", aerr
+			}
+			return "Novi razgovor — zaboravio sam prethodni kontekst. 🧹", nil
 		case lower == "help" || lower == "start":
 			return "NEXUS — tvoj osobni asistent.\n\n" +
 				"Samo mi piši normalno i razgovaramo (pamtim razgovor).\n\n" +
 				"Komande:\n" +
 				"/help — ovaj popis\n" +
+				"/new — novi razgovor (zaboravi kontekst)\n" +
 				"/pending — čekaju li odobrenja\n" +
 				"/outbox — poruke s neizvjesnom isporukom\n" +
 				"approve <ch-...> — odobri zahtjev\n" +

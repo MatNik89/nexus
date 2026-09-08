@@ -375,6 +375,7 @@ func (a *Adapter) Run(ctx context.Context, interval time.Duration) {
 func (a *Adapter) registerCommands(ctx context.Context) {
 	cmds := []map[string]string{
 		{"command": "help", "description": "Što NEXUS zna i popis komandi"},
+		{"command": "new", "description": "Novi razgovor (zaboravi kontekst)"},
 		{"command": "pending", "description": "Čekaju li odobrenja"},
 		{"command": "outbox", "description": "Poruke s neizvjesnom isporukom"},
 		{"command": "approve", "description": "Odobri zahtjev (approve ch-...)"},
