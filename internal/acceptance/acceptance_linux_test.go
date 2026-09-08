@@ -142,7 +142,11 @@ func (w *world) env() []string {
 }
 
 // daemon starts `nexus daemon` and waits for the socket; returns stop().
-func (w *world) daemon() (func(), string) {
+// Output is captured to a sink but never read back (F4: reading out.String()
+// while the subprocess still writes was a data race / nil panic; all callers
+// discarded it). os/exec serializes writes when Stdout==Stderr, so the sink
+// itself is race-free; we simply never read it during the run.
+func (w *world) daemon() func() {
 	w.t.Helper()
 	cmd := exec.Command(nexusBin(w.t), "daemon")
 	cmd.Env = w.env()
@@ -175,7 +179,7 @@ func (w *world) daemon() (func(), string) {
 		}
 	}
 	w.t.Cleanup(stop)
-	return stop, out.String()
+	return stop
 }
 
 // chat runs `nexus chat` (optionally --yolo) feeding input lines.
@@ -356,13 +360,13 @@ func TestCriterion3ReminderDeliversAfterRestart(t *testing.T) {
 		}
 		return "reminder placed"
 	}
-	stop, _ := w.daemon()
+	stop := w.daemon()
 	out, err := w.chat("remind me to water the plants", true)
 	if err != nil || !strings.Contains(out, "reminder placed") {
 		t.Fatalf("reminder_set failed: %v %q", err, out)
 	}
 	stop() // full shutdown BEFORE the due time is honored on restart
-	stop2, _ := w.daemon()
+	stop2 := w.daemon()
 	defer stop2()
 	// The restarted daemon sweeps the overdue occurrence, the delivery
 	// loop pushes it to the owner chat, and the ack closes it.
@@ -386,14 +390,14 @@ func TestCriterion3SensitivityNoChannel(t *testing.T) {
 		}
 		return "reminder placed"
 	}
-	stop, _ := w.daemon()
+	stop := w.daemon()
 	if out, err := w.chat("remind me", true); err != nil || !strings.Contains(out, "reminder placed") {
 		t.Fatalf("set failed: %v %q", err, out)
 	}
 	stop()
 	// Incarnation 2: NO channel. The occurrence fires and must stay
 	// DELIVERY_PENDING — no fake receipt without a wire (fail closed).
-	stop2, _ := w.daemon()
+	stop2 := w.daemon()
 	time.Sleep(3 * time.Second)
 	stop2()
 	// Incarnation 3: NOW wire a channel. If the channel-less incarnation
@@ -401,7 +405,7 @@ func TestCriterion3SensitivityNoChannel(t *testing.T) {
 	// occurrence arriving proves it stayed durably PENDING (black-box
 	// proof of the no-channel fail-closed hold — codex #6).
 	bot := w.withTelegram(t)
-	stop3, _ := w.daemon()
+	stop3 := w.daemon()
 	defer stop3()
 	late := bot.waitSent(t, "silent reminder", 25*time.Second)
 	if !strings.Contains(late, "occ-rem-silent#1") {
@@ -424,7 +428,7 @@ func TestCriterion4TelegramHITL(t *testing.T) {
 		}
 		return "done from phone"
 	}
-	_, _ = w.daemon()
+	w.daemon()
 	bot.push("remember the telegram fact")
 	challenge := bot.waitSent(t, "APPROVAL NEEDED", 20*time.Second)
 	id := challenge[strings.Index(challenge, "[ch-")+1:]
@@ -443,7 +447,7 @@ func TestCriterion4SensitivityUnboundChat(t *testing.T) {
 			w.extraEnv[i] = "NEXUS_TELEGRAM_BINDINGS=999=private"
 		}
 	}
-	_, _ = w.daemon()
+	w.daemon()
 	bot.push("hello from an unbound chat")
 	refusal := bot.waitSent(t, "not bound", 20*time.Second)
 	if strings.Contains(refusal, "echo:") {
@@ -470,14 +474,14 @@ func TestCriterion5ProfileIsolation(t *testing.T) {
 		}
 	}
 	w.rewriteConfig(t, func(cfg map[string]any) { cfg["default_profile"] = "work" })
-	stop, _ := w.daemon()
+	stop := w.daemon()
 	if out, err := w.chat("remember the WORKSECRET", true); err != nil || !strings.Contains(out, "saved in work") {
 		t.Fatalf("work remember failed: %v %q", err, out)
 	}
 	stop()
 	// Switch the daemon to the PRIVATE profile over the SAME install.
 	w.rewriteConfig(t, func(cfg map[string]any) { cfg["default_profile"] = "private" })
-	stop2, _ := w.daemon()
+	stop2 := w.daemon()
 	defer stop2()
 	out2, err := w.chat("what is the WORKSECRET?", false)
 	if err != nil {
@@ -506,12 +510,12 @@ func TestCriterion5SensitivitySameProfile(t *testing.T) {
 			return "recalled: " + last
 		}
 	}
-	stop, _ := w.daemon()
+	stop := w.daemon()
 	if out, err := w.chat("remember it", true); err != nil || !strings.Contains(out, "saved") {
 		t.Fatalf("remember failed: %v %q", err, out)
 	}
 	stop()
-	stop2, _ := w.daemon() // SAME profile — the switch
+	stop2 := w.daemon() // SAME profile — the switch
 	defer stop2()
 	out2, _ := w.chat("what is the SHAREDSECRET?", false)
 	if !strings.Contains(out2, "Z1") {
@@ -523,7 +527,7 @@ func TestCriterion5SensitivitySameProfile(t *testing.T) {
 
 func TestCriterion1Conversation(t *testing.T) {
 	w := newWorld(t, nil)
-	stop, _ := w.daemon()
+	stop := w.daemon()
 	defer stop()
 	out, err := w.chat("hello nexus", false)
 	if err != nil {
@@ -538,7 +542,7 @@ func TestCriterion1Conversation(t *testing.T) {
 func TestCriterion1SensitivityProviderDown(t *testing.T) {
 	w := newWorld(t, nil)
 	w.provider.Close() // the switch: no provider
-	stop, _ := w.daemon()
+	stop := w.daemon()
 	defer stop()
 	out, _ := w.chat("hello", false)
 	if strings.Contains(out, "echo:") && strings.Contains(out, "hello") {
@@ -564,13 +568,13 @@ func TestCriterion2MemoryAcrossRestart(t *testing.T) {
 			return "recalled: " + last
 		}
 	}
-	stop, _ := w.daemon()
+	stop := w.daemon()
 	out, err := w.chat("remember the ACCEPTFACT", true) // yolo: ASK auto-allows
 	if err != nil || !strings.Contains(out, "saved") {
 		t.Fatalf("remember failed: %v %q", err, out)
 	}
 	stop() // FULL restart
-	stop2, _ := w.daemon()
+	stop2 := w.daemon()
 	defer stop2()
 	out2, err := w.chat("what is the ACCEPTFACT?", false)
 	if err != nil {
@@ -598,14 +602,14 @@ func TestCriterion2SensitivityFreshStore(t *testing.T) {
 			return "recalled: " + last
 		}
 	}
-	stop, _ := w.daemon()
+	stop := w.daemon()
 	if out, err := w.chat("remember the LOSTFACT", true); err != nil || !strings.Contains(out, "saved") {
 		t.Fatalf("remember failed: %v %q", err, out)
 	}
 	stop()
 	// THE SWITCH: destroy the profile store (simulates no durable memory).
 	os.RemoveAll(filepath.Join(w.base, "nexus", "profiles"))
-	stop2, _ := w.daemon()
+	stop2 := w.daemon()
 	defer stop2()
 	out2, _ := w.chat("what is the LOSTFACT?", false)
 	if strings.Contains(out2, "LOSTFACT is 7") {
@@ -627,7 +631,7 @@ func TestCriterion6SandboxedExec(t *testing.T) {
 		}
 		return "ran: " + last
 	}
-	stop, _ := w.daemon()
+	stop := w.daemon()
 	defer stop()
 	out, err := w.chat("list root", true) // yolo confirms the ASK
 	if err != nil {
@@ -659,7 +663,7 @@ func TestCriterion6HostileUnchangedUnderYolo(t *testing.T) {
 		}
 		return "result: " + last
 	}
-	stop, _ := w.daemon()
+	stop := w.daemon()
 	defer stop()
 	out, err := w.chat("read the canary", true) // YOLO — containment must hold
 	if err != nil {
@@ -679,7 +683,7 @@ func TestCriterion6HostileUnchangedUnderYolo(t *testing.T) {
 		}
 		return "result: " + last
 	}
-	stop2, _ := w2.daemon()
+	stop2 := w2.daemon()
 	defer stop2()
 	out2, _ := w2.chat("run a shell", true)
 	if strings.Contains(out2, "PWNED") {
@@ -702,7 +706,7 @@ func TestCriterion6SensitivityNoSandbox(t *testing.T) {
 	w.extraEnv = []string{"PATH=/nonexistent-path-for-acceptance"}
 	// The daemon needs core utils on PATH? It execs bwrap by probed path;
 	// with PATH empty Detect fails -> exec capability OFF.
-	stop, _ := w.daemon()
+	stop := w.daemon()
 	defer stop()
 	out, _ := w.chat("list root", true)
 	if strings.Contains(out, "exit status: 0") {
@@ -1148,7 +1152,7 @@ func TestSealedOffCapabilityNeverServes(t *testing.T) {
 		}
 		handler.ServeHTTP(rw, r)
 	})
-	_, _ = w.daemon()
+	w.daemon()
 	// The daemon must have refused to serve: the chat gets no reply.
 	out, _ := w.chat("hello after recovery", false)
 	if strings.Contains(out, "echo:") && strings.Contains(out, "hello after recovery") {
@@ -1173,7 +1177,7 @@ func TestSealedOffStartupRunsNoConsumers(t *testing.T) {
 		}
 		return "echo: " + last
 	}
-	stop, _ := w.daemon()
+	stop := w.daemon()
 	if out, err := w.chat("remind me", true); err != nil || !strings.Contains(out, "reminder placed") {
 		t.Fatalf("set failed: %v %q", err, out)
 	}
@@ -1191,7 +1195,7 @@ func TestSealedOffStartupRunsNoConsumers(t *testing.T) {
 	w.rewriteConfig(t, func(cfg map[string]any) {
 		cfg["egress_allow"] = []any{strings.TrimPrefix(broken.URL, "http://"), strings.TrimPrefix(deadProv.URL, "http://")}
 	})
-	stop2, _ := w.daemon()
+	stop2 := w.daemon()
 	time.Sleep(4 * time.Second)
 	stop2()
 	bot.mu.Lock()
@@ -1214,7 +1218,7 @@ func TestSealedOffStartupRunsNoConsumers(t *testing.T) {
 		cfg["egress_allow"] = []any{strings.TrimPrefix(deadProv.URL, "http://")}
 	})
 	w.provider = deadProv
-	stop3, _ := w.daemon()
+	stop3 := w.daemon()
 	defer stop3()
 	bot.waitSent(t, "sealed reminder", 25*time.Second)
 }

@@ -52,6 +52,17 @@ func TestPrecedenceTable(t *testing.T) {
 	}
 }
 
+// F9: duplicate JSON member names are ambiguous (last-value-wins) and must be
+// rejected before decoding — a second, security-sensitive value must never
+// silently win.
+func TestDuplicateJSONKeysRejected(t *testing.T) {
+	dir := t.TempDir()
+	g := write(t, dir, "dup.json", `{"provider_base_url":"https://a","provider_base_url":"https://b"}`)
+	if _, err := Resolve(g, filepath.Join(dir, "missing.json"), noEnv, map[string]string{"default_profile": "work"}); err == nil {
+		t.Fatalf("duplicate JSON keys accepted (ambiguous config)")
+	}
+}
+
 func TestUnknownKeyRefusedBeforeMerge(t *testing.T) {
 	dir := t.TempDir()
 	global := write(t, dir, "g.json", `{"totally_new_knob": true}`)

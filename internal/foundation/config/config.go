@@ -168,6 +168,12 @@ func parseFileLayer(path string, origin Origin) (layer, error) {
 	if err != nil {
 		return l, fmt.Errorf("config %s: %w", origin, err)
 	}
+	// Reject duplicate JSON member names BEFORE decoding into the map (F9):
+	// Go's map unmarshal is silently last-value-wins, which makes a
+	// security-sensitive config key ambiguous. Reuse the kernel detector.
+	if contracts.HasDuplicateJSONKeys(b) {
+		return l, fmt.Errorf("config %s: duplicate JSON keys (ambiguous, fail closed)", origin)
+	}
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(b, &raw); err != nil {
 		return l, fmt.Errorf("config %s: invalid JSON: %w", origin, err)

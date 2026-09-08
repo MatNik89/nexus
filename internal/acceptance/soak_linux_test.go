@@ -421,7 +421,7 @@ func TestSoakSurvival(t *testing.T) {
 	}
 	// S6 HARD: drain with an explicit timeout FAILURE + independent
 	// non-SENT assertion (prep4 codex #1).
-	stopF, _ := w.daemon()
+	stopF := w.daemon()
 	drained := false
 	drainDeadline := time.Now().Add(90 * time.Second)
 	for time.Now().Before(drainDeadline) {
