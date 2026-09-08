@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -360,7 +361,7 @@ func TestFullSpineDeterministicTransport(t *testing.T) {
 	d, err := New(Deps{
 		Journal: j,
 		PlannerFactory: func(deliver func(string) error) (loop.Planner, error) {
-			return planner.NewStreaming(prov, prov, authority, prov.Target(), deliver)
+			return planner.NewStreaming(prov, prov, authority, prov.Target(), deliver, 64000)
 		},
 		Authority: authority, Profile: "work",
 		Rules: map[contracts.ToolID]effectpath.Decision{},
@@ -1201,5 +1202,51 @@ func TestOtherFailureCodeStaysGeneric(t *testing.T) {
 	var de loop.DriftError
 	if errors.As(err, &de) {
 		t.Fatalf("OTHER_FAILURE reconstructed as DriftError: %v", err)
+	}
+}
+
+// Slice C detector 3 (AUDIT-FULL F8): an over-long UDS frame is refused and the
+// connection CLOSED — for the hello frame and for a chat frame whose tail is an
+// aligned, valid-looking second frame that must never run.
+func TestOversizedFramesRefusedAndConnectionClosed(t *testing.T) {
+	_, sock, _ := testDaemon(t, &echoPlanner{}, nil)
+	readOne := func(t *testing.T, r *bufio.Reader) (string, string) {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			t.Fatalf("no reply frame: %v", err)
+		}
+		var f struct{ Type, Text string }
+		json.Unmarshal([]byte(line), &f)
+		return f.Type, f.Text
+	}
+	pad := strings.Repeat("a", maxFrameBytes+16)
+	// 1. hello too large.
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.Write([]byte(`{"type":"hello","junk":"` + pad + `"}` + "\n"))
+	if typ, text := readOne(t, bufio.NewReader(conn)); typ != "error" || !strings.Contains(text, "too large") {
+		t.Fatalf("oversized hello: got %s %q", typ, text)
+	}
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("connection stayed open after an oversized hello")
+	}
+	// 2. chat too large with an aligned valid suffix: refused, closed, and
+	// the suffix NEVER echoed as a second turn.
+	c := dial(t, sock, false)
+	c.conn.Write([]byte(`{"type":"chat","text":"` + pad + `"}` + "\n" + `{"type":"chat","text":"smuggled"}` + "\n"))
+	if typ, text := readOne(t, c.r); typ != "error" || !strings.Contains(text, "too large") {
+		t.Fatalf("oversized chat: got %s %q", typ, text)
+	}
+	rest, _ := io.ReadAll(c.r) // connection must be closed by the daemon
+	if strings.Contains(string(rest), "smuggled") {
+		t.Fatalf("aligned suffix ran as a second frame: %q", rest)
+	}
+	// Control: a normal-sized chat still round-trips on a fresh connection.
+	c2 := dial(t, sock, false)
+	if out, e := c2.chat(t, "hello nexus"); e != "" || out != "echo: hello nexus" {
+		t.Fatalf("control turn broken: %q %q", out, e)
 	}
 }

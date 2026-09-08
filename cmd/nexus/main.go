@@ -606,7 +606,7 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 			// incomplete stream). With tools enabled the planner buffers
 			// (a tool-call JSON never streams raw) and delivers finals in
 			// one piece.
-			pl, err := planner.NewStreaming(prov, prov, authority, target, deliver)
+			pl, err := planner.NewStreaming(prov, prov, authority, target, deliver, resolved.Config.ContextHardLimitTokens)
 			if err != nil {
 				return nil, err
 			}

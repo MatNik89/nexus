@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/MatNik89/nexus/internal/kernel/assembler"
+	"github.com/MatNik89/nexus/internal/kernel/budget"
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
 	"github.com/MatNik89/nexus/internal/kernel/effectpath"
 	"github.com/MatNik89/nexus/internal/kernel/loop"
@@ -110,7 +111,16 @@ type ChatPlanner struct {
 	// SetClock so New keeps its signature.
 	loc   *time.Location
 	nowFn func() time.Time
+	// budget is the ONE configured hard ContextBudget (Slice C, F5),
+	// enforced on the FINAL wire messages immediately before every grant
+	// is issued: over budget = the turn is refused, never trimmed.
+	budget budget.Budget
 }
+
+// maxStreamTotal bounds the planner's accumulated streamed final (Slice C,
+// F8): a never-ending stream is cut here with an error. It sits BELOW the
+// provider's transport ceiling so this boundary is observable on its own.
+const maxStreamTotal = 8 << 20
 
 // SetClock enables the current-time line: loc is the IANA zone, now the
 // clock (defaults to time.Now if nil). The line is appended to the
@@ -143,17 +153,23 @@ func (c *ChatPlanner) WithTools(specs map[contracts.ToolID]effectpath.ToolSpec, 
 	return c, nil
 }
 
-func New(p ChatProvider, auth *s7min.Authority, target contracts.TargetID) (*ChatPlanner, error) {
+// New builds the planner FAIL-CLOSED: provider, S7 authority, target and a
+// POSITIVE context hard limit (tokens) are all required — a zero limit is
+// not "unlimited", it is a misconfiguration.
+func New(p ChatProvider, auth *s7min.Authority, target contracts.TargetID, contextHardLimit int) (*ChatPlanner, error) {
 	if p == nil || auth == nil || !target.Valid() {
 		return nil, fmt.Errorf("planner: provider, S7 authority and target are required (fail closed)")
 	}
-	return &ChatPlanner{chat: p, auth: auth, target: target}, nil
+	if contextHardLimit <= 0 {
+		return nil, fmt.Errorf("planner: a positive context hard limit is required (got %d; fail closed)", contextHardLimit)
+	}
+	return &ChatPlanner{chat: p, auth: auth, target: target, budget: budget.Budget{HardLimit: contextHardLimit}}, nil
 }
 
 // NewStreaming wires the delta sink; sp and deliver must both be present.
 func NewStreaming(p ChatProvider, sp StreamProvider, auth *s7min.Authority,
-	target contracts.TargetID, deliver func(string) error) (*ChatPlanner, error) {
-	base, err := New(p, auth, target)
+	target contracts.TargetID, deliver func(string) error, contextHardLimit int) (*ChatPlanner, error) {
+	base, err := New(p, auth, target, contextHardLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -285,6 +301,17 @@ func (c *ChatPlanner) Plan(ctx context.Context, blocks []contracts.ContextBlock)
 			t.Format("MST"), t.Format("-07:00"))
 	}
 	msgs = append(msgs, provider.ChatMessage{Role: "user", Content: assembled})
+	// ContextBudget at the WIRE (F5): the FINAL messages — system prompt,
+	// tool protocol, history and the time line included — are measured
+	// BEFORE any grant is issued; over budget refuses the turn (never
+	// trims): zero grants, zero provider calls.
+	wire := make([]budget.WireMessage, 0, len(msgs))
+	for _, m := range msgs {
+		wire = append(wire, budget.WireMessage{Role: m.Role, Content: m.Content})
+	}
+	if _, err := c.budget.EnforceWire(wire); err != nil {
+		return loop.Action{}, fmt.Errorf("planner: %w", err)
+	}
 	op, err := opID()
 	if err != nil {
 		return loop.Action{}, fmt.Errorf("planner: %w", err)
@@ -330,6 +357,12 @@ func (c *ChatPlanner) Plan(ctx context.Context, blocks []contracts.ContextBlock)
 	if c.stream != nil && c.deliver != nil {
 		var b strings.Builder
 		if err := c.stream.Stream(ctx, msgs, g, func(d string) error {
+			// Accumulator ceiling (F8): refuse growth beyond the total,
+			// which cancels the stream through the provider's delivery
+			// error path; the partial content is never a final.
+			if b.Len()+len(d) > maxStreamTotal {
+				return fmt.Errorf("streamed reply exceeds the %d-byte ceiling — cut (fail closed)", maxStreamTotal)
+			}
 			b.WriteString(d)
 			return c.deliver(d)
 		}); err != nil {

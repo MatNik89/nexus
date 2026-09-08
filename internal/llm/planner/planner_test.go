@@ -63,7 +63,7 @@ func strp(s string) *string { return &s }
 func TestPlanSendsFencedContextAndReturnsFinal(t *testing.T) {
 	auth := s7min.NewAuthority(func() time.Time { return time.Unix(1000, 0) }, time.Minute)
 	fc := &fakeChat{auth: auth, reply: "the answer"}
-	p, err := New(fc, auth, "provider:test")
+	p, err := New(fc, auth, "provider:test", 64000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +114,7 @@ func TestPlanGovernedAndStreaming(t *testing.T) {
 	p, err := NewStreaming(fc, fc, auth, "provider:test", func(d string) error {
 		deltas = append(deltas, d)
 		return nil
-	})
+	}, 64000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,7 +192,7 @@ func TestFailedPlanLandsHonestS7State(t *testing.T) {
 	// (a) LOCAL refusal — grant never consumed → CANCELLED, no leak.
 	auth := s7min.NewAuthority(nil, time.Minute)
 	fc := &failingChat{auth: auth}
-	p, err := New(fc, auth, "provider:test")
+	p, err := New(fc, auth, "provider:test", 64000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,7 +204,7 @@ func TestFailedPlanLandsHonestS7State(t *testing.T) {
 	}
 	// (b) CONSUMED failure → FAILED_TERMINAL.
 	fc2 := &failingChat{auth: auth, consume: true}
-	p2, _ := New(fc2, auth, "provider:test")
+	p2, _ := New(fc2, auth, "provider:test", 64000)
 	if _, err := p2.Plan(context.Background(), []contracts.ContextBlock{b}); err == nil {
 		t.Fatal("consumed-failure provider returned a plan")
 	}
@@ -215,7 +215,7 @@ func TestFailedPlanLandsHonestS7State(t *testing.T) {
 	// self-reports SUCCEEDED then errors forces an illegal FAILED
 	// transition — the landing rejection must reach the caller.
 	fc3 := &failingChat{auth: auth, consume: true, preReport: true}
-	p3, _ := New(fc3, auth, "provider:test")
+	p3, _ := New(fc3, auth, "provider:test", 64000)
 	_, perr := p3.Plan(context.Background(), []contracts.ContextBlock{b})
 	if perr == nil || !strings.Contains(perr.Error(), "S7 landing") {
 		t.Fatalf("landing failure not surfaced: %v", perr)
@@ -229,7 +229,7 @@ func TestFailedPlanLandsHonestS7State(t *testing.T) {
 func TestToolPlanningSealedSpecs(t *testing.T) {
 	auth := s7min.NewAuthority(nil, time.Minute)
 	fc := &fakeChat{auth: auth, reply: `{"action":"tool","tool_id":"memory_remember","arguments":{"content":"x"}}`}
-	p, err := New(fc, auth, "provider:test")
+	p, err := New(fc, auth, "provider:test", 64000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -262,7 +262,7 @@ func TestToolPlanningSealedSpecs(t *testing.T) {
 	}
 	// Prose replies stay FINAL and are delivered in one piece.
 	delivered := ""
-	p2, _ := New(&fakeChat{auth: auth, reply: "just an answer"}, auth, "provider:test")
+	p2, _ := New(&fakeChat{auth: auth, reply: "just an answer"}, auth, "provider:test", 64000)
 	p2.deliver = func(d string) error { delivered = d; return nil }
 	if _, err := p2.WithTools(map[contracts.ToolID]effectpath.ToolSpec{
 		"t": {Effect: contracts.EffectReadOnly, ExecutionKind: contracts.ExecInProcess, ArgsSchemaHash: "v1"},
@@ -303,7 +303,7 @@ func TestToolPromptDeterministic(t *testing.T) {
 	prompts := map[string]bool{}
 	for i := 0; i < 8; i++ {
 		fc := &promptCapturingChat{auth: auth}
-		p, err := New(fc, auth, "provider:test")
+		p, err := New(fc, auth, "provider:test", 64000)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -351,7 +351,7 @@ func (f *msgsCapturingChat) Chat(ctx context.Context, msgs []provider.ChatMessag
 func TestHistoryBlocksBecomeRoleMessages(t *testing.T) {
 	auth := s7min.NewAuthority(nil, time.Minute)
 	fc := &msgsCapturingChat{auth: auth}
-	p, err := New(fc, auth, "provider:test")
+	p, err := New(fc, auth, "provider:test", 64000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -434,7 +434,7 @@ func TestHistoryBlocksBecomeRoleMessages(t *testing.T) {
 func TestClockLineInUserMessage(t *testing.T) {
 	auth := s7min.NewAuthority(nil, time.Minute)
 	fc := &msgsCapturingChat{auth: auth}
-	p, err := New(fc, auth, "provider:test")
+	p, err := New(fc, auth, "provider:test", 64000)
 	if err != nil {
 		t.Fatal(err)
 	}

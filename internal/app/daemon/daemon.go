@@ -137,6 +137,39 @@ func sameUID(conn net.Conn) bool {
 	return same
 }
 
+// maxFrameBytes bounds ONE UDS frame (hello or chat) BEFORE allocation
+// (Slice C, AUDIT-FULL F8): a same-UID peer writing an endless line must not
+// exhaust daemon memory. topknot ceiling: constant, not config — upgrade
+// trigger: a legitimate single message above it.
+const maxFrameBytes = 1 << 20
+
+// errFrameTooLarge marks an over-long frame; the connection is CLOSED
+// (never kept open: the residual bytes of the oversized line would
+// desynchronize the next frame read — plan-review r2).
+var errFrameTooLarge = errors.New("frame exceeds the size limit")
+
+// readFrame reads one newline-terminated frame of at most max bytes without
+// ever holding more than max+1 bytes of it.
+func readFrame(r *bufio.Reader, max int) ([]byte, error) {
+	var buf []byte
+	for {
+		chunk, err := r.ReadSlice('\n')
+		if len(buf)+len(chunk) > max+1 {
+			return nil, errFrameTooLarge
+		}
+		buf = append(buf, chunk...)
+		if err == nil {
+			if len(buf) > max {
+				return nil, errFrameTooLarge
+			}
+			return buf, nil
+		}
+		if err != bufio.ErrBufferFull {
+			return nil, err
+		}
+	}
+}
+
 func writeFrame(conn net.Conn, f frame) error {
 	b, err := json.Marshal(f)
 	if err != nil {
@@ -154,8 +187,12 @@ func (d *Daemon) handle(ctx context.Context, conn net.Conn) {
 	}
 	r := bufio.NewReader(conn)
 	var hello frame
-	line, err := r.ReadString('\n')
-	if err != nil || json.Unmarshal([]byte(line), &hello) != nil || hello.Type != "hello" {
+	line, err := readFrame(r, maxFrameBytes)
+	if errors.Is(err, errFrameTooLarge) {
+		writeFrame(conn, frame{Type: "error", Text: "frame too large"})
+		return // closed: no residual bytes may be parsed as the next frame
+	}
+	if err != nil || json.Unmarshal(line, &hello) != nil || hello.Type != "hello" {
 		writeFrame(conn, frame{Type: "error", Text: "expected hello"})
 		return
 	}
@@ -199,12 +236,16 @@ func (d *Daemon) handle(ctx context.Context, conn net.Conn) {
 	// interactive connection.
 	var hist []histPair
 	for {
-		line, err := r.ReadString('\n')
+		line, err := readFrame(r, maxFrameBytes)
+		if errors.Is(err, errFrameTooLarge) {
+			writeFrame(conn, frame{Type: "error", Text: "frame too large"})
+			return // closed: an aligned suffix must never run as a second frame
+		}
 		if err != nil {
 			return // client gone
 		}
 		var f frame
-		if json.Unmarshal([]byte(line), &f) != nil || f.Type != "chat" {
+		if json.Unmarshal(line, &f) != nil || f.Type != "chat" {
 			writeFrame(conn, frame{Type: "error", Text: "expected chat frame"})
 			continue
 		}

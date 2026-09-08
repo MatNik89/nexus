@@ -33,7 +33,7 @@ func driftPlanner(t *testing.T, reply string) (*ChatPlanner, *replyChat) {
 	t.Helper()
 	auth := s7min.NewAuthority(nil, time.Minute)
 	fc := &replyChat{auth: auth, reply: reply}
-	p, err := New(fc, auth, "provider:test")
+	p, err := New(fc, auth, "provider:test", 64000)
 	if err != nil {
 		t.Fatal(err)
 	}
