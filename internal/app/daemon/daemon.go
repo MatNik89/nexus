@@ -67,6 +67,11 @@ type Daemon struct {
 	nonce int64
 }
 
+// testRecoveryVerifyHook fires just before the recovery-path
+// VerifyChain scan; tests prove the scan is gated to the
+// redelivery-collision branch (convproj impl3 codex #3).
+var testRecoveryVerifyHook func()
+
 func New(d Deps) (*Daemon, error) {
 	if d.Journal == nil || d.PlannerFactory == nil || d.Audit == nil || d.Authority == nil || d.Redactor == nil {
 		return nil, fmt.Errorf("daemon: journal, planner factory, S7 authority, audit sink and redactor are required (fail closed)")
@@ -481,6 +486,9 @@ func (d *Daemon) recoveredTurnOutcome(turn contracts.TurnID) (RecoveredOutcome, 
 	// redelivery/collision path, so a full chain verification here is
 	// affordable and preserves "a projected final from a journal that
 	// fails integrity is not evidence". The hot history path stays O(12).
+	if testRecoveryVerifyHook != nil {
+		testRecoveryVerifyHook()
+	}
 	if verr := d.deps.Journal.VerifyChain(); verr != nil {
 		return RecoveredOutcome{}, false, verr
 	}
