@@ -374,12 +374,14 @@ func (a *Adapter) Run(ctx context.Context, interval time.Duration) {
 // logged by the caller's next tick, never fatal.
 func (a *Adapter) registerCommands(ctx context.Context) {
 	cmds := []map[string]string{
-		{"command": "help", "description": "Što NEXUS zna raditi"},
+		{"command": "help", "description": "Što NEXUS zna i popis komandi"},
+		{"command": "pending", "description": "Čekaju li odobrenja"},
+		{"command": "outbox", "description": "Poruke s neizvjesnom isporukom"},
 		{"command": "approve", "description": "Odobri zahtjev (approve ch-...)"},
 		{"command": "deny", "description": "Odbij zahtjev (deny ch-...)"},
 		{"command": "retry", "description": "Ponovi odobrenje (retry ch-...)"},
 		{"command": "ack", "description": "Potvrdi podsjetnik (ack occ-...)"},
-		{"command": "outbox", "description": "Stanje neisporučenih poruka"},
+		{"command": "redeliver", "description": "Ponovno pošalji poruku (redeliver dlv-...)"},
 	}
 	a.call(ctx, "setMyCommands", map[string]any{"commands": cmds}, nil)
 }

@@ -1251,6 +1251,10 @@ var (
 func telegramHandler(b *daemonBundle) telegram.Handler {
 	return func(ctx context.Context, in channel.Inbound) (string, error) {
 		text := strings.TrimSpace(in.Text)
+		// A menu-issued command arrives with a leading slash ("/outbox");
+		// strip ONE so the command words below match. Ordinary text that
+		// merely starts with "/" (rare) loses one slash — harmless.
+		text = strings.TrimPrefix(text, "/")
 		lower := strings.ToLower(text)
 		source := "tg:" + in.ChannelIdentity
 		// Command words route ONLY with an exact well-formed id — an
@@ -1310,6 +1314,19 @@ func telegramHandler(b *daemonBundle) telegram.Handler {
 				return "Ack failed: " + err.Error(), nil
 			}
 			return "Acknowledged " + occ + ".", nil
+		case lower == "help" || lower == "start":
+			return "NEXUS — tvoj osobni asistent.\n\n" +
+				"Samo mi piši normalno i razgovaramo (pamtim razgovor).\n\n" +
+				"Komande:\n" +
+				"/help — ovaj popis\n" +
+				"/pending — čekaju li odobrenja\n" +
+				"/outbox — poruke s neizvjesnom isporukom\n" +
+				"approve <ch-...> — odobri zahtjev\n" +
+				"deny <ch-...> — odbij\n" +
+				"retry <ch-...> — ponovi odobrenje\n" +
+				"ack <occ-...> — potvrdi podsjetnik\n" +
+				"redeliver <dlv-...> — ponovno pošalji poruku\n\n" +
+				"Znam koliko je sati i renderiram tablice.", nil
 		case lower == "outbox":
 			// UNKNOWN rows await HUMAN reconciliation (E9/B2): list them
 			// so the owner can decide (P0-prep #1 — a wire failure no
