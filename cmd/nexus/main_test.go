@@ -1887,3 +1887,28 @@ func driftBundle(t *testing.T, name string) *daemonBundle {
 	t.Cleanup(func() { bd.j.Close() })
 	return bd
 }
+
+// TG commands: a menu-issued "/help" (leading slash) returns the help
+// text, not a conversation turn; "/outbox" reaches the outbox command.
+func TestSlashCommandsRoute(t *testing.T) {
+	b := hitlBundle(t, "TG_CMDS")
+	h := telegramHandler(b)
+	help, err := h(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 1,
+		Text: "/help", Profile: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(help, "/pending") || !strings.Contains(help, "NEXUS") {
+		t.Fatalf("/help did not return the command list: %q", help)
+	}
+	out, err := h(context.Background(), channel.Inbound{
+		AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 2,
+		Text: "/outbox", Profile: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "Outbox") {
+		t.Fatalf("/outbox did not reach the outbox command: %q", out)
+	}
+}
