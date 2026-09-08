@@ -30,7 +30,7 @@ prerequisite grant, not a host path.
    Voice reuses that compliant client rather than waiving E11 (r3 codex F4).
 Voice is not buildable until both land.
 
-## Change (v4 — round-3 findings folded; all verified against the code)
+## Change (v5 — round-3+4 findings folded; all verified against the code)
 - EXECUTION THROUGH THE SANDBOX (r1 codex #2): ffmpeg and whisper-cli run
   as ExecProcess through internal/sandbox — NEVER a bare exec.Command.
   Channel-controlled bytes are decoded inside containment (no net, no host

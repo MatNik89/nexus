@@ -63,7 +63,12 @@ NOT claim content-pinned execution:
 `filepath.Clean(Dest) == Dest`, absolute, a direct single-segment child of the
 reserved `/inputs` dir. Reject equality with — or being an ancestor/descendant
 of — ANY built-in mount (`/tmp`, `/work`, `/nexus-target`, every closure dest)
-AFTER normalization (closes `/inputs/../nexus-target` shadowing).
+AFTER normalization (closes `/inputs/../nexus-target` shadowing). Reject two
+`InputRef`s whose normalized `Dest` collide (r4 codex F2): a duplicate dest
+would append two ro-binds to the same path (`probe.go:637-647`) — one overmounts
+the other while `policyHash`/attestation name BOTH identities. Fail closed at
+Compile, backend-independent, never rely on a bwrap version rejecting the dup.
+The canonical sort key is the full `(ID, normalizedDest)` so it stays total.
 
 ### Launch (bind the held fd)
 - Re-`fstat` each HELD fd; if inode-identity/size differs from the startup
@@ -91,6 +96,8 @@ AFTER normalization (closes `/inputs/../nexus-target` shadowing).
   `policyHash` and DIFFERENT attestation digests.
 - DEST-COLLISION: `/inputs/../nexus-target`, a `/work` descendant, and a
   non-`/inputs` dest each fail with a typed error.
+- DEST-DUPLICATE: two registered IDs mapped to the same normalized `Dest` fail
+  at Compile (RED against an overmount-shadowing implementation).
 - REJECT-AT-STARTUP: a symlink source, device node, FIFO, `nlink>1`,
   group-writable, and over-MaxSize input each fail registry construction.
 - EMPTY-UNCHANGED: `Inputs == nil` yields byte-identical bwrap argv to the
