@@ -172,7 +172,52 @@ func Events() map[string]journal.PayloadValidator {
 			}
 			return nil
 		},
+		EvEgressAttempt: func(raw json.RawMessage) error {
+			var p egressPayload
+			if err := json.Unmarshal(raw, &p); err != nil {
+				return err
+			}
+			if p.Host == "" {
+				return fmt.Errorf("channel: an egress receipt requires a host")
+			}
+			// Field invariants (codex F4): an allowed receipt names its
+			// pinned IP; a refusal names its reason.
+			if p.Allowed && p.Pinned == "" {
+				return fmt.Errorf("channel: an allowed egress receipt requires a pinned address")
+			}
+			if !p.Allowed && p.Reason == "" {
+				return fmt.Errorf("channel: a refused egress receipt requires a reason")
+			}
+			return nil
+		},
 	}
+}
+
+// EvEgressAttempt is the E11 egress receipt: an auditable record of EVERY dial
+// decision (PLAN-TG-EGRESS-DIALER.md). DialContext fires per TCP connection and
+// HTTP keep-alive already coalesces polling, so every decision is journaled
+// (no adapter-side coalescing that would hide same-IP reconnects).
+const EvEgressAttempt = "channel.egress_attempt"
+
+type egressPayload struct {
+	Host     string   `json:"host"`
+	Resolved []string `json:"resolved,omitempty"`
+	Pinned   string   `json:"pinned,omitempty"`
+	Allowed  bool     `json:"allowed"`
+	Reason   string   `json:"reason,omitempty"`
+}
+
+// RecordEgress appends one egress receipt through the profile's journal (the
+// single canonical writer). The token never appears in the payload.
+func (c *Core) RecordEgress(ctx context.Context, host string, resolved []string, pinned string, allowed bool, reason string) error {
+	p, err := c.params(EvEgressAttempt, egressPayload{
+		Host: host, Resolved: resolved, Pinned: pinned, Allowed: allowed, Reason: reason,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = c.j.Append(ctx, p)
+	return err
 }
 
 // Projection folds channel events into the durable inbox/outbox tables in

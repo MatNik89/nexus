@@ -411,19 +411,18 @@ func TestPreWireFailureRepends(t *testing.T) {
 // an invalid URL escape renders Go's parser error WITH the full bot URL.
 func TestRequestConstructionSanitized(t *testing.T) {
 	h := build(t, map[int64]string{42: "work"})
-	bad, err := New(Config{
+	// A malformed API base can no longer build the E11 egress client, so it
+	// is rejected FAIL-CLOSED at New() (stronger than deferring to request
+	// construction). The rejection must still never leak the bot token.
+	_, err := New(Config{
 		APIBase: "http://x/%zz", TokenEnv: "NEXUS_TEST_TG",
 		Bindings: map[int64]string{42: "work"}, Profile: "work",
 	}, h.core, h.a.handle)
-	if err != nil {
-		t.Fatal(err)
+	if err == nil {
+		t.Fatal("malformed api base accepted (must fail closed)")
 	}
-	perr := bad.PollOnce(ctxT())
-	if perr == nil {
-		t.Fatal("invalid URL accepted")
-	}
-	if strings.Contains(perr.Error(), "123:token") {
-		t.Fatalf("token leaked from request construction: %v", perr)
+	if strings.Contains(err.Error(), "123:token") {
+		t.Fatalf("token leaked from api-base rejection: %v", err)
 	}
 }
 

@@ -156,10 +156,11 @@ func runDaemon() int {
 			fmt.Fprintln(os.Stderr, "nexus daemon: telegram token set but no chat bindings (NEXUS_TELEGRAM_BINDINGS=\"chatid=profile,...\") — adapter stays OFF (deny-default)")
 		default:
 			adapter, aerr := telegram.New(telegram.Config{
-				APIBase:  resolved.Config.TelegramAPIBase,
-				TokenEnv: resolved.Config.TelegramTokenEnv,
-				Bindings: bindings,
-				Profile:  b.profile,
+				APIBase:     resolved.Config.TelegramAPIBase,
+				TokenEnv:    resolved.Config.TelegramTokenEnv,
+				Bindings:    bindings,
+				Profile:     b.profile,
+				EgressAllow: resolved.Config.EgressAllow,
 			}, b.chanCore, telegramHandler(b))
 			if aerr != nil {
 				fmt.Fprintf(os.Stderr, "nexus daemon: telegram: %v\n", aerr)
@@ -844,6 +845,7 @@ func runDoctorP0() int {
 	} else if adapter, aerr := telegram.New(telegram.Config{
 		APIBase: resolved.Config.TelegramAPIBase, TokenEnv: resolved.Config.TelegramTokenEnv,
 		Bindings: bindings, Profile: resolved.Config.DefaultProfile,
+		EgressAllow: resolved.Config.EgressAllow,
 	}, probeCore, func(context.Context, channel.Inbound) (string, error) { return "", nil }); aerr != nil {
 		tgWhy = aerr.Error()
 	} else if pr := adapter.Probe(ctx, resolved); !pr.Passed {
