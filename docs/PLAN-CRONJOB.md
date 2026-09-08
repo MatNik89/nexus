@@ -15,10 +15,17 @@ timezone); no natural-language date parsing.
   carrying `ExpiresUnix` + `ExpectedSource` (approval.go:67-84), a Projection
   table (approval.go:145-173), single-use consume. The picker session is the
   same shape.
-- Reminder create: `internal/schedule` — `WallTime{Year,Month,Day,Hour,Minute,
-  TZ}` (schedule.go:49-59), `Scheduler.CreatedParams(id, body, w)`
-  (schedule.go:319) / `CreateReminder` (schedule.go:333); the Scheduler already
-  fires occurrences and delivers.
+- Reminder create is the OBLIGATION PAIR, not a bare schedule (r1 codex F1,
+  verified): `obligation.Manager.CreateReminder` (obligation.go:702-712)
+  appends BOTH `schedule.CreatedParams(id,body,w)` AND an `obligation.created`
+  envelope in ONE `AppendBatch` — a schedule alone would never be tracked or
+  delivered as an obligation. So the picker MUST emit the pair, and it appends
+  internally today, so this slice adds a NON-appending seam
+  `Manager.ReminderParams(id, body, w) ([]EnvelopeParams, error)` returning
+  `[schedP, oblP]` (refactor `CreateReminder` to call it), so the picker commit
+  can batch the pair together with its own commit event. No obligation payload
+  is duplicated in the picker.
+  `WallTime{Year,Month,Day,Hour,Minute,TZ}` = schedule.go:49-59.
 - Update path: `internal/channel/telegram` — `PollOnce` loops updates,
   `processUpdate` currently handles only `u.Message` (`if u.Message == nil {
   return nil }`); it must also branch on a new `u.CallbackQuery`.
@@ -27,12 +34,20 @@ timezone); no natural-language date parsing.
   claim, resolve-before-render, 64-byte callback_data limit.
 
 ## Mechanism
-### 1. Receive button taps (callback_query)
-Extend `tgUpdate` with `CallbackQuery *{ ID string; From *{ID}; Message *{
-Chat{ID} }; Data string }`. `processUpdate`: if `u.CallbackQuery != nil`, route
-to the picker handler and ALWAYS call `answerCallbackQuery` (clears the client
-spinner) — best-effort, never blocks. The same single-user + deny-default
-profile gate as messages (private chat, bound profile) applies BEFORE acting.
+### 1. Receive button taps (callback_query) — one owner, typed seams (r1 codex F3)
+Extend `tgUpdate` with `CallbackQuery *{ ID string; From *{ID int64}; Message *{
+MessageID int64; Chat{ID int64; Type string} }; Data string }`, and VALIDATE all
+of `From`, `Message`, `Message.Chat.ID`, `Message.Chat.Type`, `Message.MessageID`
+are present — an inaccessible/unsupported callback form is answered benignly
+with NO state change. `processUpdate` routes `u.CallbackQuery != nil` to the
+picker interaction owner (the adapter, holding the picker store + typed
+Telegram ops). The SAME single-user + deny-default gate as messages
+(`Chat.Type=="private"`, bound profile, `From!=nil`) applies BEFORE acting.
+Delivery-honesty split (explicit): `answerCallbackQuery` and the calendar
+render/`editMessageReplyMarkup` are EPHEMERAL interaction chrome (best-effort,
+like the existing `sendChatAction`), NOT outbox-tracked. Only the durable
+user-visible CONFIRMATION goes through the T22 outbox (below). No unjournaled
+durable message is sent.
 
 ### 2. `/cronjob` command (text) -> open a picker
 `cmd/nexus/main.go` telegramHandler: on `cronjob`, create a durable picker
@@ -49,19 +64,40 @@ opened it) and `expires_unix` (TTL, e.g. 15 min like approval).
   local datetime and edits the message to "Send the reminder text as a message."
 - Every redraw edits the one message in place; no new messages per tap.
 
-### 4. Description -> schedule the reminder
-While a session is in `await_description`, the NEXT text message from the SAME
-`ExpectedSource` becomes the reminder body (mirrors hermes' clarify "type the
-answer"). Build `WallTime` from the picked date/time + configured TZ, call
-`Scheduler.CreatedParams(id, body, w)` in ONE journal recipe, mark the session
-committed (single-use), and confirm ("Podsjetnik postavljen za <local time>.").
-A plain text message with NO active session is handled as today (normal turn).
+### 4. Description -> schedule the reminder (one durable batch; replay-safe, r1 codex F2)
+The description arrives as an ordinary admitted Telegram update. Routing rule:
+if `Admit` succeeds for that update AND its `ExpectedSource` owns an
+`await_description` picker session, it is the description; otherwise it is a
+normal turn (today's path). Ownership is unambiguous: the session is keyed to
+`ExpectedSource` and is single-use, so at most one open session per source.
+COMMIT is ONE `AppendBatch` sharing a single journal recipe:
+`[picker.committed(sid), schedP, oblP, channel inbound-terminal(for THIS
+update), outbox confirmation]` — the reminder pair from `Manager.ReminderParams`
+(F1) plus the picker commit plus the message's terminal plus the confirmation,
+all durable together or not at all.
+Replay-safety: the batch is keyed to the admitted update id; a NON-terminal
+replay of that update returns the SAME confirmation and does NOT re-interpret
+the text or create a second reminder (the session is already committed ->
+single-use short-circuit). Simultaneous descriptions cannot both win: the first
+commit marks the session committed; a second observes committed and answers
+"already set". Confirm: "Podsjetnik postavljen za <local time>." A crash AFTER
+the batch commits is a no-op on replay (terminal); a crash BEFORE leaves the
+session `await_description` and the update non-terminal -> re-processed once.
 
-### 5. callback_data grammar (<= 64 bytes, strict)
-`pk:v1:<sid>:<act>:<arg>` where `act` in the CLOSED set {`d`(day),`h`(hour),
-`m`(minute),`nav`(month +/-),`x`(cancel)}; `arg` numeric/short. Parse with a
-fixed-field split and REJECT any deviation (unknown act, wrong field count, bad
-sid) as a benign "expired" answer — never act on malformed input.
+### 5. callback_data grammar (<= 64 bytes, strict per-action, r1 codex F4)
+`pk:v1:<sid>:<act>:<arg>`, fixed 5 fields. Closed per-action validation, each
+also checked LEGAL for the session's current state:
+- `sid`: exactly the generated alphabet/length (e.g. 22 url-safe base64 chars).
+- `nav`: `arg` in {`-1`,`+1`}, a bounded one-step month change; legal only in
+  the month view.
+- `d`(day): `arg` = `YYYY-MM-DD` within the shown month's valid range; legal in
+  month view.
+- `h`(hour): `arg` integer `0..23`; legal only after a day is set.
+- `m`(minute): `arg` in exactly {`0`,`15`,`30`,`45`}; legal only after an hour.
+- `x`(cancel): empty `arg`; legal in any non-terminal state.
+Any deviation (unknown act, wrong field count, bad sid, out-of-range arg, or an
+action illegal in the current state) is answered benignly ("isteklo") with NO
+journal mutation and NO reminder.
 
 ## Security (callback_data is UNTRUSTED input)
 - Strict parse; unknown/extra fields -> reject.
@@ -86,10 +122,20 @@ sid) as a benign "expired" answer — never act on malformed input.
 - single-use: a second commit callback on a committed session creates NO second
   reminder.
 - full flow: open -> pick day -> pick hour -> pick minute -> send description
-  produces exactly one `schedule.created` with the WallTime matching the taps
-  and the body = the description; confirmation delivered.
+  produces exactly one reminder PAIR (`schedule.created` AND `obligation.created`
+  with matching id) whose WallTime matches the taps and body = the description;
+  confirmation delivered. RED against emitting the schedule half only (F1).
+- one batch / replay: the commit is a single AppendBatch; a non-terminal replay
+  of the description update returns the same confirmation and creates NO second
+  reminder (F2).
+- simultaneous description: two description messages for one session -> exactly
+  one reminder; the second is answered "already set".
+- crash windows: crash after the batch = no-op replay (terminal); crash before =
+  session stays await_description and the update is re-processed once.
 - durability: a session persisted then reloaded (fresh Scheduler/journal)
-  still commits the correct reminder; replay is idempotent.
+  still commits the correct reminder pair.
+- illegal-in-state callback (e.g. `h` before a day is set) is answered benignly
+  with no state change.
 - answerCallbackQuery is always called (spinner cleared) even on refusal.
 
 ## Non-goals (later slices)
