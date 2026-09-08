@@ -21,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/MatNik89/nexus/internal/conv"
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
 	"github.com/MatNik89/nexus/internal/kernel/effectpath"
 	"github.com/MatNik89/nexus/internal/kernel/journal"
@@ -317,7 +318,23 @@ func (d *Daemon) RunChannelTurn(ctx context.Context, identity string, updateID i
 // history_assistant blocks that the planner maps to real provider role
 // messages — the stolen gateway pattern (see historyBlocks). Finals
 // come from the journal, so they are the REDACTED delivered text.
+// conversationHistory reads the conv projection (O(historyMaxPairs)),
+// replacing the per-turn Replay(0) that caused the soak backlog
+// explosion. Observationally identical to referenceConversationHistory
+// (differential oracle). Emits history_user/history_assistant blocks.
 func (d *Daemon) conversationHistory(identity string, current contracts.TurnID) ([]contracts.ContextBlock, error) {
+	pairs, err := conv.Projection{}.History(context.Background(), d.deps.Journal, identity, string(current), historyMaxPairs)
+	if err != nil {
+		return nil, err
+	}
+	entries := make([]histPair, len(pairs))
+	for i, p := range pairs {
+		entries[i] = histPair{user: p.User, final: p.Final}
+	}
+	return historyBlocks(identity, "nexus://telegram/"+identity+"/history", entries)
+}
+
+func (d *Daemon) referenceConversationHistory(identity string, current contracts.TurnID) ([]contracts.ContextBlock, error) {
 	type pair struct {
 		user, final string
 		completed   bool // owned by the turn.succeeded EVENT, not final != ""
@@ -452,7 +469,35 @@ type RecoveredOutcome struct {
 	Tool  contracts.ToolID
 }
 
+// recoveredTurnOutcome reads the conv projection (O(1)) instead of
+// Replay(0). Same RecoveredOutcome sum as the reference.
 func (d *Daemon) recoveredTurnOutcome(turn contracts.TurnID) (RecoveredOutcome, bool, error) {
+	// FAIL-CLOSED on a corrupt chain (parity with the reference replay,
+	// conv-hist Phase-5-r4 codex #3): recovery runs ONLY on the cold
+	// redelivery/collision path, so a full chain verification here is
+	// affordable and preserves "a projected final from a journal that
+	// fails integrity is not evidence". The hot history path stays O(12).
+	if verr := d.deps.Journal.VerifyChain(); verr != nil {
+		return RecoveredOutcome{}, false, verr
+	}
+	r, ok, err := conv.Projection{}.Recovery(context.Background(), d.deps.Journal, string(turn))
+	if err != nil {
+		return RecoveredOutcome{}, false, err
+	}
+	if !ok {
+		return RecoveredOutcome{}, false, nil
+	}
+	out := RecoveredOutcome{Kind: r.State, Code: r.Code, Tool: contracts.ToolID(r.Tool)}
+	switch r.State {
+	case "SUCCEEDED":
+		out.Final = r.Final
+	case "SUSPENDED":
+		out.Final = r.Summ
+	}
+	return out, true, nil
+}
+
+func (d *Daemon) referenceRecoveredTurnOutcome(turn contracts.TurnID) (RecoveredOutcome, bool, error) {
 	out, found := RecoveredOutcome{}, false
 	err := d.deps.Journal.Replay(0, func(ev journal.Event) error {
 		switch ev.Envelope.EventType {

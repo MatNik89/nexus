@@ -26,6 +26,7 @@ import (
 	"github.com/MatNik89/nexus/internal/app/repl"
 	"github.com/MatNik89/nexus/internal/approval"
 	"github.com/MatNik89/nexus/internal/channel"
+	"github.com/MatNik89/nexus/internal/conv"
 	"github.com/MatNik89/nexus/internal/channel/telegram"
 	"github.com/MatNik89/nexus/internal/exectool"
 	"github.com/MatNik89/nexus/internal/foundation/atomicwrite"
@@ -495,7 +496,7 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 	// The ONE profile database: journal + memory projection together
 	// (Annex P0.3 — facts are journal events folded in the same
 	// transaction; no second SQLite file exists).
-	j, err := journal.Open(journalPath, profile, redactor, events, memory.NewProjection(), schedule.NewProjection(), obligation.NewProjection(), channel.NewProjection(), approval.NewProjection())
+	j, err := journal.Open(journalPath, profile, redactor, events, memory.NewProjection(), schedule.NewProjection(), obligation.NewProjection(), channel.NewProjection(), approval.NewProjection(), conv.NewProjection())
 	if err != nil {
 		return nil, fmt.Errorf("journal: %w", err)
 	}

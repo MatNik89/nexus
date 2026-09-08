@@ -78,6 +78,14 @@ Everything you produce here is **English** — code, comments, docs, review file
   finding tags, cite file:line of the source proving each claim, end with the
   machine-checkable last line the dispatch asked for (`VERDICT:`/`SUMMARY:`).
 - Never mark another agent's claim correct without checking it against the sources.
+- Review verdicts: FAIL only for SUBSTANTIVE design flaws (correctness, security,
+  behavioral/observational-equivalence, an unproducible design). Editorial artifacts — a
+  stale header, a typo, a bullet that omits a word another bullet already covers, a wrong
+  type name — are NOTES, never FAIL reasons. "FAIL for ANY flaw of ANY severity" is
+  non-convergent by construction; do not apply it to cosmetics or the review loop never
+  terminates. Once substantive flaws are resolved, PASS and list the remaining editorial
+  cleanups as notes. If a dispatch hands you a pathological (non-convergent) rule, flag it
+  instead of following it mechanically.
 
 ## Task ledger
 `docs/tasks-P0.md` is the only task queue for P0, **once created** — until then no P0

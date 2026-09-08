@@ -29,6 +29,7 @@ import (
 	"github.com/MatNik89/nexus/internal/app/repl"
 	"github.com/MatNik89/nexus/internal/approval"
 	"github.com/MatNik89/nexus/internal/channel"
+	"github.com/MatNik89/nexus/internal/conv"
 	"github.com/MatNik89/nexus/internal/foundation/clockid"
 	"github.com/MatNik89/nexus/internal/foundation/config"
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
@@ -98,7 +99,7 @@ func testDaemonRedact(t *testing.T, planner loop.Planner, audit effectpath.Audit
 	for n, v := range channel.Events() {
 		ev[n] = v
 	}
-	j, err := journal.Open(filepath.Join(dir, "journal.db"), "work", r, ev)
+	j, err := journal.Open(filepath.Join(dir, "journal.db"), "work", r, ev, conv.NewProjection())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -342,7 +343,7 @@ func TestFullSpineDeterministicTransport(t *testing.T) {
 	for _, n := range machine.EventTypes() {
 		ev[n] = nil
 	}
-	j, err := journal.Open(filepath.Join(dir, "journal.db"), "work", redact.None{}, ev)
+	j, err := journal.Open(filepath.Join(dir, "journal.db"), "work", redact.None{}, ev, conv.NewProjection())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -479,7 +480,7 @@ func TestRecoveryFailsClosedOnCorruptJournal(t *testing.T) {
 	for _, n := range machine.EventTypes() {
 		ev[n] = nil
 	}
-	j, err := journal.Open(dbPath, "work", redact.None{}, ev)
+	j, err := journal.Open(dbPath, "work", redact.None{}, ev, conv.NewProjection())
 	if err != nil {
 		t.Fatal(err)
 	}
