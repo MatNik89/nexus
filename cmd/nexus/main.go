@@ -32,6 +32,7 @@ import (
 	"github.com/MatNik89/nexus/internal/foundation/atomicwrite"
 	"github.com/MatNik89/nexus/internal/foundation/clockid"
 	"github.com/MatNik89/nexus/internal/foundation/config"
+	"github.com/MatNik89/nexus/internal/foundation/egress"
 	"github.com/MatNik89/nexus/internal/foundation/pathx"
 	"github.com/MatNik89/nexus/internal/kernel/closure"
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
@@ -168,6 +169,7 @@ func runDaemon() int {
 				Bindings:    bindings,
 				Profile:     b.profile,
 				EgressAllow: resolved.Config.EgressAllow,
+				Receipt:     b.egressSink,
 			}, b.chanCore, telegramHandler(b))
 			if aerr != nil {
 				fmt.Fprintf(os.Stderr, "nexus daemon: telegram: %v\n", aerr)
@@ -310,18 +312,19 @@ func runDaemon() int {
 // against a custom layout (Phase-2-r2 codex #13).
 // daemonBundle is everything the composition root wires together.
 type daemonBundle struct {
-	d         *daemon.Daemon
-	j         *journal.Journal
-	sched     *schedule.Scheduler
-	obl       *obligation.Manager
-	chanCore  *channel.Core
-	approvals *approval.Store
-	profile   contracts.ProfileID
-	cfg       config.Config
-	sysPath   *effectpath.EffectPath
-	authority *s7min.Authority
-	prov      *provider.APIKey
-	sandboxOK bool
+	d          *daemon.Daemon
+	j          *journal.Journal
+	sched      *schedule.Scheduler
+	obl        *obligation.Manager
+	chanCore   *channel.Core
+	egressSink egress.ReceiptSink
+	approvals  *approval.Store
+	profile    contracts.ProfileID
+	cfg        config.Config
+	sysPath    *effectpath.EffectPath
+	authority  *s7min.Authority
+	prov       *provider.APIKey
+	sandboxOK  bool
 	// picker is the shared /cronjob calendar store: the adapter drives the
 	// ephemeral UI, the handler turns a completed pick into a durable reminder.
 	picker *telegram.PickerStore
@@ -523,7 +526,10 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 		return nil, fmt.Errorf("journal: %w", err)
 	}
 	authority := s7min.NewAuthority(nil, 5*time.Minute)
-	prov, err := provider.NewAPIKey(resolved.Config, authority)
+	// ONE E11 receipt sink for every outbound component (Slice A): built
+	// right after the journal, BEFORE the provider or any adapter exists.
+	egressSink := channel.EgressSink(j)
+	prov, err := provider.NewAPIKey(resolved.Config, authority, egressSink)
 	if err != nil {
 		j.Close()
 		return nil, fmt.Errorf("provider: %w (conversation is a P0 core capability — fix the config and restart)", err)
@@ -642,7 +648,7 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 		return nil, err
 	}
 	return &daemonBundle{d: d, j: j, sched: sched, obl: oblManager,
-		chanCore: chanCore, approvals: approvals, profile: profile, cfg: resolved.Config,
+		chanCore: chanCore, egressSink: egressSink, approvals: approvals, profile: profile, cfg: resolved.Config,
 		sysPath: sysPath, authority: authority,
 		prov: prov, sandboxOK: execAdapter != nil}, nil
 }
@@ -763,9 +769,13 @@ func runDoctorP0() int {
 	add := func(name string, ok bool, why string) { criteria = append(criteria, crit{name, ok, "LIVE", why}) }
 	addReady := func(name string, ok bool, why string) { criteria = append(criteria, crit{name, ok, "READY", why}) }
 
+	// Probe substrate (throwaway journal) — also the E11 receipt sink for the
+	// doctor's live provider/telegram probes.
+	probeCore, probeSink, probeCleanup := mustProbeCore(layout, resolved)
+	defer probeCleanup()
 	// 1. conversation — LIVE provider round trip.
 	authority := s7min.NewAuthority(nil, 5*time.Minute)
-	if prov, perr := provider.NewAPIKey(resolved.Config, authority); perr != nil {
+	if prov, perr := provider.NewAPIKey(resolved.Config, authority, probeSink); perr != nil {
 		add("conversation", false, perr.Error())
 	} else if pr := prov.Probe(ctx, resolved); !pr.Passed {
 		add("conversation", false, pr.Detail)
@@ -844,8 +854,6 @@ func runDoctorP0() int {
 	rOK, rState, rWhy := reminderReadiness(health, hbAge, hbExists, profilesOK)
 	criteria = append(criteria, crit{"reminders", rOK, rState, rWhy})
 	// 4. telegram — token + strict bindings + LIVE getMe.
-	probeCore, probeCleanup := mustProbeCore(layout, resolved)
-	defer probeCleanup()
 	tgOK, tgWhy := false, ""
 	if tok := os.Getenv(resolved.Config.TelegramTokenEnv); tok == "" {
 		tgWhy = "no bot token in " + resolved.Config.TelegramTokenEnv
@@ -856,7 +864,7 @@ func runDoctorP0() int {
 	} else if adapter, aerr := telegram.New(telegram.Config{
 		APIBase: resolved.Config.TelegramAPIBase, TokenEnv: resolved.Config.TelegramTokenEnv,
 		Bindings: bindings, Profile: resolved.Config.DefaultProfile,
-		EgressAllow: resolved.Config.EgressAllow,
+		EgressAllow: resolved.Config.EgressAllow, Receipt: probeSink,
 	}, probeCore, func(context.Context, channel.Inbound) (string, error) { return "", nil }); aerr != nil {
 		tgWhy = aerr.Error()
 	} else if pr := adapter.Probe(ctx, resolved); !pr.Passed {
@@ -1127,25 +1135,25 @@ func validateMachineID(id string) error {
 
 // mustProbeCore opens a throwaway channel core for the doctor's live
 // telegram probe (never the production journal).
-func mustProbeCore(layout pathx.Layout, resolved config.Resolved) (*channel.Core, func()) {
+func mustProbeCore(layout pathx.Layout, resolved config.Resolved) (*channel.Core, egress.ReceiptSink, func()) {
 	dir, err := os.MkdirTemp("", "nexus-doctor-")
 	if err != nil {
-		return nil, func() {}
+		return nil, nil, func() {}
 	}
 	cleanup := func() { os.RemoveAll(dir) }
 	j, err := journal.Open(filepath.Join(dir, "probe.db"), resolved.Config.DefaultProfile,
 		redact.None{}, channel.Events(), channel.NewProjection())
 	if err != nil {
 		cleanup()
-		return nil, func() {}
+		return nil, nil, func() {}
 	}
 	c, err := channel.New(j)
 	if err != nil {
 		j.Close()
 		cleanup()
-		return nil, func() {}
+		return nil, nil, func() {}
 	}
-	return c, func() { j.Close(); cleanup() }
+	return c, channel.EgressSink(j), func() { j.Close(); cleanup() }
 }
 
 // deliverPendingReminders is ONE pass of the reminder delivery loop:

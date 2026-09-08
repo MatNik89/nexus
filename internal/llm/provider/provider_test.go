@@ -19,9 +19,14 @@ import (
 	"time"
 
 	"github.com/MatNik89/nexus/internal/foundation/config"
+	"github.com/MatNik89/nexus/internal/foundation/egress"
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
 	"github.com/MatNik89/nexus/internal/kernel/s7min"
 )
+
+// testSink is the tests' receipt sink: it accepts every decision. Production
+// wires channel.EgressSink; a nil sink is refused by the constructor.
+func testSink(egress.Decision) error { return nil }
 
 func testConfig(t *testing.T, baseURL string) config.Config {
 	t.Helper()
@@ -62,37 +67,37 @@ func TestConstructorFailClosed(t *testing.T) {
 	srv, _ := fakeOpenAI(t, "hi")
 	cfg := testConfig(t, srv.URL)
 	t.Setenv("NEXUS_TEST_KEY", "sk-test")
-	if _, err := NewAPIKey(cfg, newAuth()); err != nil {
+	if _, err := NewAPIKey(cfg, newAuth(), testSink); err != nil {
 		t.Fatalf("valid construction refused: %v", err)
 	}
-	if _, err := NewAPIKey(cfg, nil); err == nil {
+	if _, err := NewAPIKey(cfg, nil, testSink); err == nil {
 		t.Fatal("provider without an S7 authority accepted (ungoverned transport)")
 	}
 	t.Setenv("NEXUS_TEST_KEY", "")
-	if _, err := NewAPIKey(cfg, newAuth()); err == nil {
+	if _, err := NewAPIKey(cfg, newAuth(), testSink); err == nil {
 		t.Fatal("empty API key accepted")
 	}
 	t.Setenv("NEXUS_TEST_KEY", "sk-test")
 	noModel := cfg
 	noModel.ProviderModel = ""
-	if _, err := NewAPIKey(noModel, newAuth()); err == nil {
+	if _, err := NewAPIKey(noModel, newAuth(), testSink); err == nil {
 		t.Fatal("empty model accepted")
 	}
 	offList := cfg
 	offList.EgressAllow = []string{"api.other.example"}
-	if _, err := NewAPIKey(offList, newAuth()); err == nil {
+	if _, err := NewAPIKey(offList, newAuth(), testSink); err == nil {
 		t.Fatal("provider host outside the egress allowlist accepted (kernel floor)")
 	}
 	badScheme := cfg
 	badScheme.ProviderBaseURL = "ftp://x.example"
-	if _, err := NewAPIKey(badScheme, newAuth()); err == nil {
+	if _, err := NewAPIKey(badScheme, newAuth(), testSink); err == nil {
 		t.Fatal("non-http scheme accepted")
 	}
 	// Bearer key over plaintext http to a NON-loopback host is exposure.
 	cleartext := cfg
 	cleartext.ProviderBaseURL = "http://api.example.com"
 	cleartext.EgressAllow = []string{"api.example.com"}
-	if _, err := NewAPIKey(cleartext, newAuth()); err == nil {
+	if _, err := NewAPIKey(cleartext, newAuth(), testSink); err == nil {
 		t.Fatal("plaintext http to a non-loopback host accepted")
 	}
 }
@@ -102,7 +107,7 @@ func TestChatRoundTrip(t *testing.T) {
 	srv, calls := fakeOpenAI(t, "pong")
 	t.Setenv("NEXUS_TEST_KEY", "sk-test")
 	auth := newAuth()
-	p, err := NewAPIKey(testConfig(t, srv.URL), auth)
+	p, err := NewAPIKey(testConfig(t, srv.URL), auth, testSink)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +134,7 @@ func TestProviderErrorsSurface(t *testing.T) {
 	t.Cleanup(srv.Close)
 	t.Setenv("NEXUS_TEST_KEY", "sk-test")
 	auth := newAuth()
-	p, err := NewAPIKey(testConfig(t, srv.URL), auth)
+	p, err := NewAPIKey(testConfig(t, srv.URL), auth, testSink)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +151,7 @@ func TestTransportConsumesGrantExactlyOnce(t *testing.T) {
 	srv, calls := fakeOpenAI(t, "ok")
 	t.Setenv("NEXUS_TEST_KEY", "sk-test")
 	auth := newAuth()
-	p, err := NewAPIKey(testConfig(t, srv.URL), auth)
+	p, err := NewAPIKey(testConfig(t, srv.URL), auth, testSink)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +192,7 @@ func TestRedirectOffAllowlistRefused(t *testing.T) {
 	t.Cleanup(bouncer.Close)
 	t.Setenv("NEXUS_TEST_KEY", "sk-test")
 	auth := newAuth()
-	p, err := NewAPIKey(testConfig(t, bouncer.URL), auth) // allowlist holds ONLY the bouncer
+	p, err := NewAPIKey(testConfig(t, bouncer.URL), auth, testSink) // allowlist holds ONLY the bouncer
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -346,7 +351,7 @@ func TestProbeBindsResolvedConfig(t *testing.T) {
 	srv, _ := fakeOpenAI(t, "ok")
 	t.Setenv("NEXUS_TEST_KEY", "sk-test")
 	cfg := testConfig(t, srv.URL)
-	p, err := NewAPIKey(cfg, newAuth())
+	p, err := NewAPIKey(cfg, newAuth(), testSink)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -374,7 +379,7 @@ func TestStreamOrderAndTruncationHonesty(t *testing.T) {
 	t.Cleanup(full.Close)
 	t.Setenv("NEXUS_TEST_KEY", "sk-test")
 	auth := newAuth()
-	p, err := NewAPIKey(testConfig(t, full.URL), auth)
+	p, err := NewAPIKey(testConfig(t, full.URL), auth, testSink)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -391,7 +396,7 @@ func TestStreamOrderAndTruncationHonesty(t *testing.T) {
 		// connection closes WITHOUT [DONE]
 	}))
 	t.Cleanup(truncated.Close)
-	p2, err := NewAPIKey(testConfig(t, truncated.URL), auth)
+	p2, err := NewAPIKey(testConfig(t, truncated.URL), auth, testSink)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -481,7 +486,7 @@ func TestProviderTargetBindingAndLoopbackClass(t *testing.T) {
 	srv, calls := fakeOpenAI(t, "ok")
 	t.Setenv("NEXUS_TEST_KEY", "sk-test")
 	auth := newAuth()
-	p, err := NewAPIKey(testConfig(t, srv.URL), auth)
+	p, err := NewAPIKey(testConfig(t, srv.URL), auth, testSink)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -496,7 +501,7 @@ func TestProviderTargetBindingAndLoopbackClass(t *testing.T) {
 		ProviderBaseURL: "http://127.attacker.example", ProviderKeyEnv: "NEXUS_TEST_KEY",
 		ProviderModel: "m", EgressAllow: []string{"127.attacker.example"},
 	}
-	if _, err := NewAPIKey(fake127, newAuth()); err == nil {
+	if _, err := NewAPIKey(fake127, newAuth(), testSink); err == nil {
 		t.Fatal("hostname with a 127. prefix accepted as loopback (bearer key over cleartext)")
 	}
 }
@@ -554,7 +559,7 @@ func TestAllowlistedRedirectStillRefused(t *testing.T) {
 	auth := newAuth()
 	cfg := testConfig(t, bouncer.URL)
 	cfg.EgressAllow = append(cfg.EgressAllow, strings.TrimPrefix(backend.URL, "http://")) // BOTH allowlisted
-	p, err := NewAPIKey(cfg, auth)
+	p, err := NewAPIKey(cfg, auth, testSink)
 	if err != nil {
 		t.Fatal(err)
 	}

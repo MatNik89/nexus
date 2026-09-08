@@ -32,6 +32,7 @@ import (
 	"github.com/MatNik89/nexus/internal/conv"
 	"github.com/MatNik89/nexus/internal/foundation/clockid"
 	"github.com/MatNik89/nexus/internal/foundation/config"
+	"github.com/MatNik89/nexus/internal/foundation/egress"
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
 	"github.com/MatNik89/nexus/internal/kernel/effectpath"
 	"github.com/MatNik89/nexus/internal/kernel/journal"
@@ -307,7 +308,7 @@ func TestLiveProviderSmoke(t *testing.T) {
 		t.Fatal(err)
 	}
 	auth := s7min.NewAuthority(nil, time.Minute)
-	p, err := provider.NewAPIKey(res.Config, auth)
+	p, err := provider.NewAPIKey(res.Config, auth, func(egress.Decision) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -352,7 +353,7 @@ func TestFullSpineDeterministicTransport(t *testing.T) {
 	}
 	t.Cleanup(func() { j.Close() })
 	authority := s7min.NewAuthority(nil, time.Minute)
-	prov, err := provider.NewAPIKey(cfg, authority)
+	prov, err := provider.NewAPIKey(cfg, authority, func(egress.Decision) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -171,6 +171,7 @@ func buildAt(t *testing.T, dir string, bindings map[int64]string) (*harness, str
 		TokenEnv: "NEXUS_TEST_TG",
 		Bindings: bindings,
 		Profile:  "work",
+		Receipt:  channel.EgressSink(j),
 	}, core, func(ctx context.Context, in channel.Inbound) (string, error) {
 		h.got = append(h.got, in)
 		return "reply to: " + in.Text, nil
@@ -307,7 +308,7 @@ func TestHandlerErrorTypedReply(t *testing.T) {
 func TestConstructionAndProbe(t *testing.T) {
 	h := build(t, map[int64]string{42: "work"})
 	if _, err := New(Config{APIBase: "http://x", TokenEnv: "NEXUS_MISSING_TG",
-		Bindings: map[int64]string{}, Profile: "work"}, h.core, h.a.handle); err == nil {
+		Bindings: map[int64]string{}, Profile: "work", Receipt: channel.EgressSink(h.j)}, h.core, h.a.handle); err == nil {
 		t.Fatal("empty token accepted")
 	}
 	resolved := config.Resolved{}
@@ -374,6 +375,7 @@ func TestTokenNeverInErrors(t *testing.T) {
 	dead, err := New(Config{
 		APIBase: "http://127.0.0.1:1", TokenEnv: "NEXUS_TEST_TG",
 		Bindings: map[int64]string{42: "work"}, Profile: "work",
+		Receipt: channel.EgressSink(h.j),
 	}, h.core, h.a.handle)
 	if err != nil {
 		t.Fatal(err)
@@ -401,6 +403,7 @@ func TestPreWireFailureRepends(t *testing.T) {
 	dead, err := New(Config{
 		APIBase: "http://127.0.0.1:1", TokenEnv: "NEXUS_TEST_TG",
 		Bindings: map[int64]string{42: "work"}, Profile: "work",
+		Receipt: channel.EgressSink(h.j),
 	}, h.core, h.a.handle)
 	if err != nil {
 		t.Fatal(err)

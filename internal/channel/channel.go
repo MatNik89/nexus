@@ -29,6 +29,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/MatNik89/nexus/internal/foundation/egress"
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
 	"github.com/MatNik89/nexus/internal/kernel/journal"
 )
@@ -180,6 +181,9 @@ func Events() map[string]journal.PayloadValidator {
 			if p.Host == "" {
 				return fmt.Errorf("channel: an egress receipt requires a host")
 			}
+			if p.Component == "" {
+				return fmt.Errorf("channel: an egress receipt requires the emitting component")
+			}
 			// Field invariants (codex F4): an allowed receipt names its
 			// pinned IP; a refusal names its reason.
 			if p.Allowed && p.Pinned == "" {
@@ -194,30 +198,59 @@ func Events() map[string]journal.PayloadValidator {
 }
 
 // EvEgressAttempt is the E11 egress receipt: an auditable record of EVERY dial
-// decision (PLAN-TG-EGRESS-DIALER.md). DialContext fires per TCP connection and
-// HTTP keep-alive already coalesces polling, so every decision is journaled
-// (no adapter-side coalescing that would hide same-IP reconnects).
+// decision of EVERY outbound component (provider, telegram — Slice A shared
+// owner). DialContext fires per TCP connection and HTTP keep-alive already
+// coalesces polling, so every decision is journaled (no adapter-side
+// coalescing that would hide same-IP reconnects).
 const EvEgressAttempt = "channel.egress_attempt"
 
 type egressPayload struct {
-	Host     string   `json:"host"`
-	Resolved []string `json:"resolved,omitempty"`
-	Pinned   string   `json:"pinned,omitempty"`
-	Allowed  bool     `json:"allowed"`
-	Reason   string   `json:"reason,omitempty"`
+	Component string   `json:"component"`
+	Host      string   `json:"host"`
+	Port      int      `json:"port,omitempty"`
+	Resolved  []string `json:"resolved,omitempty"`
+	Pinned    string   `json:"pinned,omitempty"`
+	Allowed   bool     `json:"allowed"`
+	Reason    string   `json:"reason,omitempty"`
 }
 
-// RecordEgress appends one egress receipt through the profile's journal (the
-// single canonical writer). The token never appears in the payload.
-func (c *Core) RecordEgress(ctx context.Context, host string, resolved []string, pinned string, allowed bool, reason string) error {
-	p, err := c.params(EvEgressAttempt, egressPayload{
-		Host: host, Resolved: resolved, Pinned: pinned, Allowed: allowed, Reason: reason,
-	})
-	if err != nil {
+var egressSeq atomic.Int64
+
+// EgressSink returns the ONE journal-backed egress.ReceiptSink the composition
+// root hands to every outbound component (built right after journal.Open,
+// BEFORE the provider or any adapter exists). It appends through the profile's
+// journal (the single canonical writer); no secret ever enters the payload.
+// The append error is returned so the dialer FAILS THE PERMITTED DIAL CLOSED
+// when the receipt cannot be made durable (E11 requires the receipt). A
+// background ctx is used: the append is a local serialized write that must
+// not be cancelled by a per-request deadline.
+func EgressSink(j *journal.Journal) egress.ReceiptSink {
+	return func(d egress.Decision) error {
+		resolved := make([]string, 0, len(d.Resolved))
+		for _, r := range d.Resolved {
+			resolved = append(resolved, r.String())
+		}
+		pinned := ""
+		if d.Pinned.IsValid() {
+			pinned = d.Pinned.String()
+		}
+		raw, err := json.Marshal(egressPayload{
+			Component: d.Component, Host: d.Host, Port: d.Port, Resolved: resolved,
+			Pinned: pinned, Allowed: d.Allowed, Reason: d.Reason,
+		})
+		if err != nil {
+			return err
+		}
+		_, err = j.Append(context.Background(), contracts.EnvelopeParams{
+			SchemaID: "nexus.event", SchemaVersion: 1,
+			EventID:   contracts.EventID(fmt.Sprintf("ev-egress-%d-%d-%d", os.Getpid(), time.Now().UnixNano(), egressSeq.Add(1))),
+			EventType: EvEgressAttempt, RunID: "run-channel", EmittedAt: time.Now().UTC(),
+			ActorType: contracts.ActorSystem, ActorID: "egress", PrincipalID: "nexus",
+			WorkspaceID: "local", ProfileID: j.Profile(), AttemptNo: 1,
+			Payload: raw, PayloadHash: "recomputed",
+		})
 		return err
 	}
-	_, err = c.j.Append(ctx, p)
-	return err
 }
 
 // Projection folds channel events into the durable inbox/outbox tables in

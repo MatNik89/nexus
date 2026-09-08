@@ -19,14 +19,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net"
+	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/MatNik89/nexus/internal/foundation/config"
+	"github.com/MatNik89/nexus/internal/foundation/egress"
 	"github.com/MatNik89/nexus/internal/kernel/closure"
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
 	"github.com/MatNik89/nexus/internal/kernel/s7min"
@@ -59,37 +59,23 @@ type DataDescriptor struct {
 // The key value lives ONLY in the private field, read once from the
 // configured env var; it never appears in errors or descriptors.
 //
-// topknot ceiling (Phase-2 kilo #3): the egress boundary here is a
-// host-string allowlist enforced at construction, with EVERY redirect
-// categorically refused (one grant = one physical request) — resolved-IP
-// pinning / DNS-rebinding defense (E11) is owned by the S6.3 dialer when
-// it lands; until then this provider talks only to allowlisted hosts over
-// TLS (or explicit loopback for tests). Upgrade trigger: S6.3.
+// Egress (E11, Slice A): the client is built ONLY through the shared
+// pinned-IP owner (internal/foundation/egress) — allowlisted canonical
+// endpoint, resolved-IP policy on EVERY answer, Proxy:nil, reject-all
+// redirects (one grant = one physical request), durable receipt before
+// every permitted dial. There is no default-transport fallback.
 type APIKey struct {
 	baseURL string
-	host    string
-	model   string
-	key     string
-	allowed map[string]bool
-	auth    *s7min.Authority
-	client  *http.Client
-}
-
-// loopbackHost reports whether the host part names the local machine —
-// the only place plaintext HTTP is tolerated (test/local providers). The
-// address CLASS is decided by parsing an IP literal, never by hostname
-// prefix (Phase-2-r2 codex #11: "127.attacker.example" is a remote DNS
-// name, not loopback).
-func loopbackHost(host string) bool {
-	h := host
-	if hp, _, err := net.SplitHostPort(host); err == nil {
-		h = hp
-	}
-	if h == "localhost" {
-		return true
-	}
-	ip := net.ParseIP(strings.Trim(h, "[]"))
-	return ip != nil && ip.IsLoopback()
+	// host is the canonical endpoint unit "host:port" (egress.Endpoint) —
+	// the S7 target and the data descriptor use the same string.
+	host   string
+	model  string
+	key    string
+	auth   *s7min.Authority
+	client *http.Client
+	// egressOpts is the test seam for the resolver/dialer (empty in
+	// production); set by newAPIKeyWithEgress before the client is built.
+	egressOpts egress.Options
 }
 
 // NewAPIKey builds the provider FAIL-CLOSED: https only (plaintext only
@@ -97,23 +83,26 @@ func loopbackHost(host string) bool {
 // the egress allowlist (config only narrows the kernel floor), key env
 // var must be set and non-empty, model is required, and an S7 authority
 // is mandatory — there is no ungoverned transport.
-func NewAPIKey(cfg config.Config, auth *s7min.Authority) (*APIKey, error) {
+func NewAPIKey(cfg config.Config, auth *s7min.Authority, sink egress.ReceiptSink) (*APIKey, error) {
+	return (&APIKey{}).build(cfg, auth, sink)
+}
+
+func (p *APIKey) build(cfg config.Config, auth *s7min.Authority, sink egress.ReceiptSink) (*APIKey, error) {
 	if auth == nil {
 		return nil, fmt.Errorf("provider: an S7 authority is required — no ungoverned transport (fail closed)")
 	}
-	u, err := url.Parse(cfg.ProviderBaseURL)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return nil, fmt.Errorf("provider: base URL must be http(s) with a host (fail closed)")
+	if sink == nil {
+		return nil, fmt.Errorf("provider: an egress receipt sink is required — no unreceipted transport (fail closed)")
 	}
-	if u.Scheme == "http" && !loopbackHost(u.Host) {
+	ep, err := egress.ParseEndpoint(cfg.ProviderBaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("provider: %w", err)
+	}
+	if ep.Scheme == "http" && !ep.Loopback() {
 		return nil, fmt.Errorf("provider: plaintext http to a non-loopback host would expose the bearer key (fail closed)")
 	}
-	allowed := map[string]bool{}
-	for _, h := range cfg.EgressAllow {
-		allowed[h] = true
-	}
-	if !allowed[u.Host] {
-		return nil, fmt.Errorf("provider: host %q is not on the egress allowlist (kernel floor, fail closed)", u.Host)
+	if !egress.Admitted(ep, cfg.EgressAllow) {
+		return nil, fmt.Errorf("provider: endpoint %q is not on the egress allowlist (kernel floor, fail closed)", ep.Canonical())
 	}
 	if cfg.ProviderKeyEnv == "" {
 		return nil, fmt.Errorf("provider: no key env var configured (fail closed)")
@@ -125,21 +114,57 @@ func NewAPIKey(cfg config.Config, auth *s7min.Authority) (*APIKey, error) {
 	if cfg.ProviderModel == "" {
 		return nil, fmt.Errorf("provider: a model is required (fail closed)")
 	}
-	p := &APIKey{
-		baseURL: cfg.ProviderBaseURL, host: u.Host, model: cfg.ProviderModel, key: key,
-		allowed: allowed, auth: auth,
+	p.baseURL, p.host, p.model, p.key, p.auth = strings.TrimRight(cfg.ProviderBaseURL, "/"), ep.Canonical(), cfg.ProviderModel, key, auth
+	// The shared E11 owner: pinned dial, Proxy:nil, reject-all redirects
+	// (one grant authorizes exactly one physical request — an in-client
+	// redirect would be a second request under the same consumed grant),
+	// receipt before every permitted dial. opts is empty in production;
+	// newAPIKeyWithEgress injects resolver/dialer seams for tests.
+	client, err := egress.NewPinnedClient("provider", cfg.ProviderBaseURL, cfg.EgressAllow, 120*time.Second, p.egressOpts, sink)
+	if err != nil {
+		return nil, fmt.Errorf("provider: %w", err)
 	}
-	p.client = &http.Client{
-		Timeout: 120 * time.Second,
-		// P0 refuses EVERY redirect (Phase-2-r3 codex #2): one grant
-		// authorizes exactly one physical request — an in-client redirect
-		// would be a second, differently-targeted request under the same
-		// consumed grant, even to an allowlisted host.
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return fmt.Errorf("provider: redirects refused — one grant, one physical request (fail closed)")
-		},
-	}
+	p.client = client
 	return p, nil
+}
+
+// maxBodyBytes bounds a buffered (non-streaming) upstream reply BEFORE any
+// allocation-then-decode (AUDIT-FULL F8). maxStreamBytes bounds the total
+// bytes a streaming reply may deliver at the TRANSPORT layer; it sits above
+// the planner's own accumulation ceiling so that ceiling is observable
+// independently. topknot ceiling: constants, not config — upgrade trigger: a
+// real provider reply that exceeds them.
+const (
+	maxBodyBytes   = 8 << 20
+	maxStreamBytes = 32 << 20
+)
+
+// readBounded reads at most max+1 bytes and REFUSES when more than max were
+// present. Reading max+1 (not max) is what makes an oversized body
+// detectable: a plain io.LimitReader(max) would hand a truncated-but-valid
+// prefix to the decoder (plan-review r1 codex #4).
+func readBounded(r io.Reader, max int64) ([]byte, error) {
+	b, err := io.ReadAll(io.LimitReader(r, max+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > max {
+		return nil, fmt.Errorf("provider: upstream body exceeds %d bytes (refusing, fail closed)", max)
+	}
+	return b, nil
+}
+
+// decodeSingle strictly decodes exactly ONE JSON value and requires EOF after
+// it (trailing bytes — even whitespace-padded garbage — are refused).
+func decodeSingle(b []byte, out any) error {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	if err := dec.Decode(out); err != nil {
+		return err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return fmt.Errorf("trailing data after the JSON value")
+	}
+	return nil
 }
 
 type chatRequest struct {
@@ -203,8 +228,12 @@ func (p *APIKey) Chat(ctx context.Context, msgs []ChatMessage, g s7min.Grant) (C
 		return ChatOutput{}, err
 	}
 	defer resp.Body.Close()
+	raw, err := readBounded(resp.Body, maxBodyBytes)
+	if err != nil {
+		return ChatOutput{}, err
+	}
 	var out chatResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := decodeSingle(raw, &out); err != nil {
 		return ChatOutput{}, fmt.Errorf("provider: malformed upstream reply: %w", err)
 	}
 	if len(out.Choices) == 0 {
@@ -269,7 +298,10 @@ func (p *APIKey) Stream(ctx context.Context, msgs []ChatMessage, g s7min.Grant, 
 		return err
 	}
 	defer resp.Body.Close()
-	sc := bufio.NewScanner(resp.Body)
+	// Transport-layer total ceiling (F8): a never-ending stream is cut here;
+	// the planner's accumulator has its own, lower, ceiling.
+	lim := &io.LimitedReader{R: resp.Body, N: maxStreamBytes}
+	sc := bufio.NewScanner(lim)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	sawDone := false
 	for sc.Scan() {
@@ -304,7 +336,23 @@ func (p *APIKey) Stream(ctx context.Context, msgs []ChatMessage, g s7min.Grant, 
 		return fmt.Errorf("provider: stream broke: %w", err)
 	}
 	if !sawDone {
+		if lim.N <= 0 {
+			return fmt.Errorf("provider: stream exceeded the %d-byte ceiling without [DONE] — cut, content is INCOMPLETE (fail closed)", maxStreamBytes)
+		}
 		return fmt.Errorf("provider: stream ended without [DONE] — content is INCOMPLETE")
 	}
 	return nil
+}
+
+// newAPIKeyWithEgress is the TEST seam for the shared egress owner: it builds
+// the provider exactly like NewAPIKey but with an injected resolver/dialer so a
+// detector can present a poisoned resolution (metadata/RFC1918/rebind) and
+// prove ZERO sockets are dialed. Production never sets opts.
+func newAPIKeyWithEgress(cfg config.Config, auth *s7min.Authority, sink egress.ReceiptSink, opts egress.Options) (*APIKey, error) {
+	p := &APIKey{egressOpts: opts}
+	built, err := p.build(cfg, auth, sink)
+	if err != nil {
+		return nil, err
+	}
+	return built, nil
 }

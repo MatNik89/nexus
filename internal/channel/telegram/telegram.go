@@ -28,6 +28,7 @@ import (
 
 	"github.com/MatNik89/nexus/internal/channel"
 	"github.com/MatNik89/nexus/internal/foundation/config"
+	"github.com/MatNik89/nexus/internal/foundation/egress"
 	"github.com/MatNik89/nexus/internal/kernel/closure"
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
 )
@@ -46,6 +47,9 @@ type Config struct {
 	// EgressAllow is the sealed egress allowlist; in production the API host
 	// must appear here (deny-default, E11). Empty in the loopback override.
 	EgressAllow []string
+	// Receipt is the shared E11 receipt sink (channel.EgressSink at the
+	// composition root). MANDATORY: the shared egress owner refuses a nil sink.
+	Receipt egress.ReceiptSink
 }
 
 // Handler runs one admitted inbound message to a reply (the daemon wires
@@ -95,33 +99,17 @@ func New(cfg Config, core *channel.Core, h Handler) (*Adapter, error) {
 		base: strings.TrimRight(cfg.APIBase, "/"), token: token,
 		bindings: b, profile: cfg.Profile, core: core, handle: h,
 	}
-	// E11 egress boundary (PLAN-TG-EGRESS-DIALER.md): a pinned-IP,
-	// proxy-sanitized, redirect-rejecting client that talks ONLY to the
-	// configured Telegram host (admitted by egress_allow in production),
-	// journaling a receipt for every dial decision.
-	client, err := newPinnedClient(cfg.APIBase, cfg.EgressAllow, 65*time.Second, nil, nil, a.egressReceipt)
+	// E11 egress boundary: the SHARED pinned-IP, proxy-sanitized,
+	// redirect-rejecting owner (internal/foundation/egress, Slice A) that talks
+	// ONLY to the configured Telegram endpoint (admitted by egress_allow in
+	// production), journaling a receipt for every dial decision through the
+	// composition root's sink.
+	client, err := egress.NewPinnedClient("telegram", cfg.APIBase, cfg.EgressAllow, 65*time.Second, egress.Options{}, cfg.Receipt)
 	if err != nil {
 		return nil, fmt.Errorf("telegram: egress client: %w", err)
 	}
 	a.client = client
 	return a, nil
-}
-
-// egressReceipt journals one dial decision through the single-writer journal.
-// It returns the append error so the dialer FAILS THE PERMITTED DIAL CLOSED
-// when the receipt cannot be made durable (E11 requires the receipt). A
-// background ctx is used: the append is a local serialized write that must not
-// be cancelled by a per-request deadline.
-func (a *Adapter) egressReceipt(d egressDecision) error {
-	resolved := make([]string, 0, len(d.Resolved))
-	for _, r := range d.Resolved {
-		resolved = append(resolved, r.String())
-	}
-	pinned := ""
-	if d.Pinned.IsValid() {
-		pinned = d.Pinned.String()
-	}
-	return a.core.RecordEgress(context.Background(), d.Host, resolved, pinned, d.Allowed, d.Reason)
 }
 
 // --- Bot API wire ---
@@ -168,9 +156,9 @@ type tgCallbackQuery struct {
 // ambiguous — the remote may have accepted the request.
 func isPreWire(err error) bool {
 	// An E11 egress refusal / non-durable receipt is DEFINITE pre-wire: the
-	// dialer refused before any byte left the process, so the outbox must
-	// re-pend PENDING, never strand the row UNKNOWN (codex round-2 F2).
-	if errors.Is(err, errEgressPreWire) {
+	// shared dialer refused before any byte left the process, so the outbox
+	// must re-pend PENDING, never strand the row UNKNOWN (codex round-2 F2).
+	if errors.Is(err, egress.ErrPreWire) {
 		return true
 	}
 	var dnsErr *net.DNSError

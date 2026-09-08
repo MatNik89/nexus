@@ -29,6 +29,7 @@ import (
 	"github.com/MatNik89/nexus/internal/channel"
 	"github.com/MatNik89/nexus/internal/channel/telegram"
 	"github.com/MatNik89/nexus/internal/foundation/config"
+	"github.com/MatNik89/nexus/internal/foundation/egress"
 	"github.com/MatNik89/nexus/internal/foundation/pathx"
 	"github.com/MatNik89/nexus/internal/kernel/closure"
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
@@ -374,6 +375,7 @@ func TestTelegramSpineEndToEnd(t *testing.T) {
 	adapter, err := telegram.New(telegram.Config{
 		APIBase: bot.URL, TokenEnv: "NEXUS_TG_SPINE_TOKEN",
 		Bindings: map[int64]string{42: "private"}, Profile: "private",
+		Receipt: b.egressSink,
 	}, b.chanCore, telegramHandler(b))
 	if err != nil {
 		t.Fatal(err)
@@ -642,8 +644,9 @@ func TestTelegramProbeGate(t *testing.T) {
 		w.Write([]byte(`{"ok":true,"result":{"is_bot":true}}`))
 	}))
 	t.Cleanup(bot.Close)
+	sink := func(egress.Decision) error { return nil }
 	live, err := telegram.New(telegram.Config{APIBase: bot.URL, TokenEnv: "NEXUS_TG_PROBE_TOKEN",
-		Bindings: map[int64]string{42: "private"}, Profile: "private"}, core, h)
+		Bindings: map[int64]string{42: "private"}, Profile: "private", Receipt: sink}, core, h)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -660,7 +663,7 @@ func TestTelegramProbeGate(t *testing.T) {
 		t.Fatalf("healthy channel sealed OFF: %s", snapLive.Status("telegram").Reason)
 	}
 	dead, err := telegram.New(telegram.Config{APIBase: "http://127.0.0.1:1", TokenEnv: "NEXUS_TG_PROBE_TOKEN",
-		Bindings: map[int64]string{42: "private"}, Profile: "private"}, core, h)
+		Bindings: map[int64]string{42: "private"}, Profile: "private", Receipt: sink}, core, h)
 	if err != nil {
 		t.Fatal(err)
 	}
