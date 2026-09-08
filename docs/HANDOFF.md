@@ -1,5 +1,56 @@
 # HANDOFF — NEXUS resume point (READ FIRST) — updated 2026-09-08
 
+## RESUME 2026-09-09 (audit remediation in flight) — start here
+
+**Owner decision (2026-09-08 night):** work the WHOLE audit plan autonomously in a
+loop; at every decision pick the variant that fixes the thing NOW and completely (no
+minimal-then-later). Slice B therefore builds the FULL S7 retry engine (P2 pulled
+forward). Telegram surface is PARKED. Autodeploy after 3xPASS + merge (gated).
+
+**Plan:** `docs/PLAN-AUDIT-FIXES.md` v8 on `slice/p1-audit`. Plan-review rounds 1-7 in
+`docs/REVIEW-AUDIT-PLAN{,2..7}-{codex,kilo,agy}.md`; round 8 dispatched. kilo+agy PASS
+since r3; codex FAILs each round on 2-3 B/D details (all folded). Order:
+F -> A -> B1 -> B2 -> B3 -> C -> D -> E.
+
+**Code so far — STACKED worktrees (each branch on top of the previous), all suites
+green (vet + go test ./...), each with RED-before/GREEN-after + one ablation RED:**
+- `slice/audit-f` @ 9cb335b (`/home/matej/HARNESS/nexus-f`): F3 release gate —
+  `go.mod toolchain go1.26.6` (GOTOOLCHAIN=auto downloads it; NO host Go upgrade
+  needed), `scripts/lib/release-gate.sh` (binary Go version >= 1.26.6 + `govulncheck
+  -mode=binary`, fail closed), `p0-accept.sh` gated before grade/sign, new
+  `scripts/deploy.sh` (build -> gate -> stop -> install -> start -> verify "sealed
+  capability ON"). govulncheck at ~/go/bin. Real binary under 1.26.6: clean.
+- `slice/audit-a` @ 32ae84f (`/home/matej/HARNESS/nexus-a`): F1+F8(provider) —
+  `internal/foundation/egress` shared E11 owner (canonical Endpoint host:port,
+  mandatory ReceiptSink, ErrPreWire), provider + telegram rewired (telegram/dialer.go
+  deleted), `channel.EgressSink(j)` at the composition root, Chat body cap (max+1 +
+  strict single JSON value), Stream transport ceiling.
+- `slice/audit-c` @ ccd2d79 (`/home/matej/HARNESS/nexus-c`): F5+F8(reads) — config
+  `context_hard_limit_tokens` (default 64000; 0/neg/float rejected), budget EnforceWire
+  on the FINAL messages before any grant, planner New/NewStreaming require a positive
+  limit, stream accumulator ceiling, daemon bounded frames (close on breach).
+- `slice/audit-e` @ 68bdd88 (`/home/matej/HARNESS/nexus-e`): F7 — doctor.Secrets from
+  the resolved config, doctorChecks() in main (unresolvable config = finding).
+- F4 + F9 landed earlier on `slice/p1-audit` (96b0c49).
+
+**NEXT (in order):** (1) fold round 8 -> re-dispatch until codex+kilo PASS; (2)
+CODE review of F+A+C+E by the 3 agents (revision 68bdd88, diff base fdb39dc, read at
+`/home/matej/HARNESS/nexus-e`) -> fold -> 3xPASS; (3) build Slice B (B1 engine
+`internal/kernel/s7`, B2 delivery wiring, B3 provider + structured via Execute) then
+D on top of B; each 3xPASS; (4) merge the chain to main, autodeploy via
+`scripts/deploy.sh`; (5) continue core improvement (coding USP, web research,
+memory, steal-worthy patterns).
+
+**Gotchas learned this session:** python heredoc folds MUST be `&&`-chained with
+commit AND dispatch and anchors grep-verified (three times agents reviewed a stale
+plan); herdr `agent_prompt_stalled` can still mean the agent started — check `agent
+list` before retrying; interrupt an agent with `herdr agent send-keys w8:pN Escape`;
+never `git checkout`/merge in the shared main checkout while agents review — use
+worktrees; RFC5737 doc ranges (203.0.113.x) are in the egress deny floor (tests need
+real public IPs, e.g. 149.154.167.220).
+
+---
+
 ## RESUME 2026-09-08 (P1 in progress) — start here
 
 **Phase status:** P0 DONE (27/27, on `main`, `P0-capable` attested). P1 IN PROGRESS.

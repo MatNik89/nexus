@@ -1,4 +1,4 @@
-# PLAN v7: full-audit remediation (codex AUDIT-FULL-2026-09-08) — zero-defect
+# PLAN v8: full-audit remediation (codex AUDIT-FULL-2026-09-08) — zero-defect
 
 Source: `docs/AUDIT-FULL-codex-2026-09-08.md` (9 findings; bound at f135eef,
 reverified against current tree). v2 folded round 1 (`docs/REVIEW-AUDIT-PLAN-{codex,kilo,agy}.md`, 3x FAIL); v3 folds
@@ -10,7 +10,9 @@ siblings, structured re-ask], kilo PASS, agy PASS). v6 folds round 5
 (`REVIEW-AUDIT-PLAN5-*.md`: codex FAIL 3 [Next exhaustion unpaired, structured attempt
 accounting, poll code vocabulary], kilo PASS, agy PASS). v7 folds round 6
 (`REVIEW-AUDIT-PLAN6-*.md`: codex FAIL 2 [salvage after terminalization, setMyCommands
-effect class], kilo PASS, agy PASS + stale-wording notes). Every fix: RED-capable
+effect class], kilo PASS, agy PASS + stale-wording notes). v8 folds round 7
+(`REVIEW-AUDIT-PLAN7-*.md`: codex FAIL 2 [one PolicyControl for two contracts, no
+nil-builder detector], kilo PASS [same PolicyControl note], agy PASS). Every fix: RED-capable
 detector at the real owner boundary, then 3-agent review to 3xPASS.
 
 ## Status
@@ -184,7 +186,7 @@ existing `test_adapter_cannot_self_retry` family stays valid).
   `AttemptContext` unchanged (deadline = min(call, grant expiry, operation deadline)).
 - Authorization-lease recovery (codex r3 #1): an issued-but-unconsumed grant is a
   LEASE with `nonce` + `expires_at`, persisted in `s7.attempt_authorized` for durable
-  operations. `Next(op)` on an `AUTHORIZED` record whose lease has expired (or that was
+  operations. `Next(op, build)` on an `AUTHORIZED` record whose lease has expired (or that was
   rehydrated with no `attempt_started` for it) durably appends
   `s7.lease_revoked{op, attempt_no, nonce_hash}` (transition
   `attempt.lease_revoked`: AUTHORIZED -> PLANNED) and then issues a FRESH grant (new
@@ -278,8 +280,8 @@ existing `test_adapter_cannot_self_retry` family stays valid).
   | method(s) | kind | operation / target | policy |
   | sendMessage, sendRichMessage (outbox `Flush`) | delivery | `delivery:<id>` / `channel:tg:delivery:<id>` | `PolicyDelivery` (durable) |
   | getUpdates | poll | `poll:tg:<n>` / `channel:tg:getUpdates` | `PolicyPoll` (RetryableCodes {`transport_prewire`, `http_429`, `http_5xx`, `transport_postwrite`, `malformed_reply`}) |
-  | getMe | control-read | `control:tg:getMe:<n>` / `channel:tg:getMe` | `PolicyControl` (MaxAttempts 3, backoff 2s..30s; 5xx/post-write retryable) |
-  | setMyCommands | control-effect | `control:tg:setMyCommands:<n>` / `channel:tg:setMyCommands` | `PolicyControl` (RetryableCodes {`transport_prewire`, `http_429`} ONLY; 5xx/post-write/malformed -> UNKNOWN, E9) |
+  | getMe | control-read | `control:tg:getMe:<n>` / `channel:tg:getMe` | `PolicyControlRead` (MaxAttempts 3, backoff 2s..30s, RetryableCodes {`transport_prewire`, `http_429`, `http_5xx`, `transport_postwrite`, `malformed_reply`}) |
+  | setMyCommands | control-effect | `control:tg:setMyCommands:<n>` / `channel:tg:setMyCommands` | `PolicyControlEffect` (MaxAttempts 3, backoff 2s..30s, RetryableCodes {`transport_prewire`, `http_429`} ONLY; 5xx/post-write/malformed -> UNKNOWN, E9) |
   | sendChatAction (typing) | ui | `ui:tg:<chat>:typing:<n>` / `channel:tg:chat:<chat>` | `PolicyUI` (MaxAttempts 1, EffectReversible, terminal on failure, outcome landed, in-memory) |
   | picker sendMessage, answerCallbackQuery, editMessageReplyMarkup, editMessageText | ui | `ui:tg:<callback_or_message_id>:<method>` / `channel:tg:chat:<chat>` | `PolicyUI` |
   Classification is KIND/EFFECT-aware with ONE closed code vocabulary (codex r5 #3):
@@ -290,15 +292,17 @@ existing `test_adapter_cannot_self_retry` family stays valid).
   processed it). For READ-ONLY kinds (getUpdates re-reads the same durable offset and advances
   no admission; getMe) those same failures are `DefiniteFailure{code, Retryable}`
   proposals — S7's policy decides. `setMyCommands` is EFFECTFUL (it mutates the remote
-  menu — codex r6 #2): pre-wire refusal and 429 follow `PolicyControl`, but 5xx /
+  menu — codex r6 #2): pre-wire refusal and 429 follow `PolicyControlEffect`, but 5xx /
   post-write / malformed replies carry no commit receipt and land `OutcomeUnknown`
   (E9) — no new grant, ever, without a reconciliation step that proves the remote
   state (none exists in this slice; the menu is re-registered on the next daemon
   start as a NEW operation). Control classification is therefore split by effect:
-  `control-read` (getMe) and `control-effect` (setMyCommands). `PolicyPoll` and
-  `PolicyControl` list exactly `{transport_prewire, http_429, http_5xx,
-  transport_postwrite, malformed_reply}` and `{transport_prewire, http_429}`
-  respectively; a code not in a policy is terminal.
+  `control-read` (getMe) and `control-effect` (setMyCommands), each bound to its OWN
+  closed policy constant (codex r7 #1, kilo r7 note): `PolicyPoll` and
+  `PolicyControlRead` list exactly `{transport_prewire, http_429, http_5xx,
+  transport_postwrite, malformed_reply}`; `PolicyControlEffect` lists exactly
+  `{transport_prewire, http_429}`. There is no shared `PolicyControl`. A code not in a
+  policy is terminal.
   The picker chrome is the owner-accepted EPHEMERAL boundary (cronjob plan; not a
   durable delivery) — it is governed one-shot, never retried, never routed through the
   outbox. A grant added "merely to compile" is impossible: `call` refuses a kind whose
@@ -390,6 +394,10 @@ Detectors (RED against current code):
    injected failure between -> a definitely-unsent row stranded `UNKNOWN` is DETECTED
    (RED), the batched recipe leaves no such state (GREEN); same for cancel+FAILED and
    terminal-report+FAILED.
+9g. Durable `Next` refuses a nil builder (codex r7 #2): a durable operation begun,
+   then `Next(op, nil)` BOTH while grant-eligible AND after cap/deadline exhaustion ->
+   fail-closed error, no grant, no S7 transition, no journal event; ablating only the
+   nil-builder check turns this RED.
 9d. Bot API method TABLE (every method in the call-site table): the same grant
    presented twice -> second `client.Do` never happens (`ATTEMPT_NOT_AUTHORIZED`,
    transport count unchanged); a missing grant or a cross-kind swap (delivery-for-poll,
@@ -481,7 +489,8 @@ Fix:
   next grant (backoff), the ticker merely asks `Next`; the grant is PASSED INTO `PollOnce` and consumed by
   `call` immediately before `client.Do` (codex r3 #3 — D6 is the backoff detector,
   B 9d the authorization detector). `registerCommands` (an effectful POST) runs under
-  `control:tg:setMyCommands` with `PolicyControl` (MaxAttempts 3, backoff 2s..30s).
+  `control:tg:setMyCommands` with `PolicyControlEffect`; `getMe` under
+  `control:tg:getMe:<n>` with `PolicyControlRead` (both MaxAttempts 3, backoff 2s..30s).
   Terminal codes (401/403 =
   `remote_rejected`, exhausted retryable) -> `Run` returns; health records the class;
   the capability stays OFF/degraded until config/token repair AND daemon restart (the
@@ -519,6 +528,9 @@ health state, not an internal counter):
    new-grant poll when due; a success starts a fresh poll operation on the normal
    interval. (A code missing from `PolicyPoll` would turn the pre-wire or 5xx row
    terminal — RED.)
+7. getMe (control-read) TABLE (codex r7 #1): 5xx and post-write reset -> zero wire
+   calls before `next_attempt_at`, then exactly one fresh-grant getMe when due; the SAME
+   failures on setMyCommands (control-effect) -> S7 `UNKNOWN`, zero retries (D2).
 
 ## Slice E — F7: config-aware doctor (three-case table)
 Root: doctor hardcodes `NEXUS_API_KEY`/`NEXUS_TELEGRAM_TOKEN`
