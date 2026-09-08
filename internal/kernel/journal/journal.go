@@ -511,7 +511,12 @@ func (j *Journal) insertInTx(tx *sql.Tx, p contracts.EnvelopeParams, offset uint
 		// collision, not a fresh failure (convproj impl codex #2): the
 		// caller uses this to run recovery only on the cold collision
 		// path, never on an ordinary first-run failure.
-		if strings.Contains(err.Error(), "UNIQUE constraint") || strings.Contains(err.Error(), "constraint failed") {
+		// Narrow to the EVENT_ID uniqueness specifically (impl2 codex
+		// #1: a broad "constraint failed" would also match
+		// UNIQUE(run_id,sequence) and other constraints, misclassifying
+		// a genuine failure as a redelivery). Pre-check by event id so
+		// the signal is exact and driver-string-independent.
+		if j.eventIDExists(tx, string(env.EventID)) {
 			return Event{}, fmt.Errorf("%w: %v", ErrDuplicateEvent, err)
 		}
 		return Event{}, fmt.Errorf("journal append: %w", err)
@@ -637,6 +642,14 @@ func (j *Journal) RedactorRewrites(raw []byte) (bool, error) {
 		return true, nil // non-JSON that changed: treat as rewritten
 	}
 	return !reflect.DeepEqual(a, b), nil
+}
+
+func (j *Journal) eventIDExists(tx *sql.Tx, id string) bool {
+	var n int
+	if err := tx.QueryRow(`SELECT 1 FROM events WHERE event_id=? LIMIT 1`, id).Scan(&n); err == nil {
+		return true
+	}
+	return false
 }
 
 // ErrDuplicateEvent marks an append rejected because its (deterministic)

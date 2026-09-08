@@ -12,6 +12,7 @@ import (
 	"database/sql"
 	"fmt"
 	"math/rand"
+	"strings"
 	"testing"
 	"time"
 
@@ -247,4 +248,27 @@ func TestConvProjectionRebuild(t *testing.T) {
 		t.Fatalf("rebuilt projection != reference:\nproj=%v\nref=%v", after, refAfter)
 	}
 	_ = context.Background
+}
+
+// IMPL2 codex #3: an ordinary first-run failure returns directly and
+// NEVER runs recovery/VerifyChain (only a redelivery collision does).
+func TestOrdinaryFailureSkipsRecovery(t *testing.T) {
+	// A planner that always fails on first run; the turn has NO durable
+	// turn.failed recovery path and is not a redelivery — recovery must
+	// not be consulted (it would otherwise VerifyChain-scan every msg).
+	d, _, _ := testDaemon(t, failingPlanner{}, nil)
+	// A fresh (non-colliding) failing turn returns the raw error, not a
+	// recovery outcome, and does not panic on the projection.
+	_, err := d.RunChannelTurn(context.Background(), "chat-77", 1, "boom")
+	if err == nil {
+		t.Fatal("want the ordinary failure surfaced")
+	}
+	if strings.Contains(err.Error(), "recovery refused") {
+		t.Fatalf("ordinary failure went down the recovery path: %v", err)
+	}
+	// Re-running the SAME update is a redelivery collision -> recovery
+	// path (the turn.failed is durable), and it must NOT crash.
+	if _, err := d.RunChannelTurn(context.Background(), "chat-77", 1, "boom"); err == nil {
+		t.Fatal("redelivery of a failed turn should still surface an error")
+	}
 }
