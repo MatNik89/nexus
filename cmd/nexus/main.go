@@ -155,6 +155,13 @@ func runDaemon() int {
 		case len(bindings) == 0:
 			fmt.Fprintln(os.Stderr, "nexus daemon: telegram token set but no chat bindings (NEXUS_TELEGRAM_BINDINGS=\"chatid=profile,...\") — adapter stays OFF (deny-default)")
 		default:
+			// /cronjob shared calendar store (ephemeral, 15-min TTL) — wired
+			// into both the adapter (UI) and the handler (durable commit).
+			b.picker = telegram.NewPickerStore(15 * time.Minute)
+			pickerLoc, plerr := time.LoadLocation(resolved.Config.Timezone)
+			if plerr != nil {
+				pickerLoc = time.UTC
+			}
 			adapter, aerr := telegram.New(telegram.Config{
 				APIBase:     resolved.Config.TelegramAPIBase,
 				TokenEnv:    resolved.Config.TelegramTokenEnv,
@@ -165,6 +172,7 @@ func runDaemon() int {
 			if aerr != nil {
 				fmt.Fprintf(os.Stderr, "nexus daemon: telegram: %v\n", aerr)
 			} else {
+				adapter.SetPicker(b.picker, pickerLoc)
 				pr := adapter.Probe(ctx, resolved)
 				chanProbe = &pr
 				tgAdapter = adapter // start decision belongs to the SEALED snapshot
@@ -314,6 +322,9 @@ type daemonBundle struct {
 	authority *s7min.Authority
 	prov      *provider.APIKey
 	sandboxOK bool
+	// picker is the shared /cronjob calendar store: the adapter drives the
+	// ephemeral UI, the handler turns a completed pick into a durable reminder.
+	picker *telegram.PickerStore
 }
 
 // resumeApproved is the T24 resume: it executes the EXACT approved call
@@ -1253,8 +1264,76 @@ var (
 // "deny <id>" hit the durable HITL store; anything else is a normal
 // conversation turn through the same production planner spine
 // (ModeDefault ALWAYS — a channel message can never enable yolo, F2).
+// reminderIDFor derives the deterministic reminder id for an admitted update,
+// so a description replay maps to the SAME reminder (front reconfirm +
+// idempotent create in cronjobDescription).
+func reminderIDFor(in channel.Inbound) string {
+	h := sha256.Sum256([]byte(in.AdapterID + "|" + in.ChannelIdentity + "|" + strconv.FormatInt(in.UpdateID, 10)))
+	return "rem-" + hex.EncodeToString(h[:8])
+}
+
+// chatIDFromIdentity reverses the "chat-<id>" channel identity.
+func chatIDFromIdentity(identity string) (int64, bool) {
+	id, err := strconv.ParseInt(strings.TrimPrefix(identity, "chat-"), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return id, true
+}
+
+func cronjobConfirm(w schedule.WallTime) string {
+	return fmt.Sprintf("Podsjetnik postavljen za %04d-%02d-%02d %02d:%02d.",
+		w.Year, int(w.Month), w.Day, w.Hour, w.Minute)
+}
+
+// cronjobDescription is the /cronjob durable commit + replay guard (plan v4).
+// handled=false means "not a picker description — route this text normally".
+func (b *daemonBundle) cronjobDescription(ctx context.Context, in channel.Inbound) (string, bool, error) {
+	remID := reminderIDFor(in)
+	st, _, wall, err := b.obl.ReminderIntent(ctx, remID)
+	switch st {
+	case obligation.ReminderFound:
+		return cronjobConfirm(wall), true, nil // replay: reconfirm from persisted intent
+	case obligation.ReminderStorageError:
+		return "", true, fmt.Errorf("cronjob: reminder lookup failed: %w", err) // fail closed
+	}
+	// NotFound: only a completed pick awaiting its description is a commit.
+	chatID, ok := chatIDFromIdentity(in.ChannelIdentity)
+	if !ok {
+		return "", false, nil
+	}
+	y, mo, d, h, mi, ok := b.picker.AwaitingPick(chatID)
+	if !ok {
+		return "", false, nil // no pick in progress -> normal turn
+	}
+	descr := strings.TrimSpace(in.Text)
+	low := strings.ToLower(strings.TrimPrefix(descr, "/"))
+	if descr == "" || low == "cancel" || low == "odustani" {
+		b.picker.DropSource(chatID)
+		return "Otkazano.", true, nil
+	}
+	w := schedule.WallTime{Year: y, Month: mo, Day: d, Hour: h, Minute: mi, TZ: b.cfg.Timezone}
+	if err := b.obl.CreateReminder(ctx, remID, descr, w); err != nil {
+		return "", true, fmt.Errorf("cronjob: create reminder failed: %w", err)
+	}
+	b.picker.DropSource(chatID)
+	return cronjobConfirm(w), true, nil
+}
+
 func telegramHandler(b *daemonBundle) telegram.Handler {
 	return func(ctx context.Context, in channel.Inbound) (string, error) {
+		// /cronjob durable path FIRST (PLAN-CRONJOB.md): the deterministic
+		// reminder id for THIS update is looked up durably before any command
+		// parsing or the ephemeral session gate, so a replay after a crash
+		// that lost the picker session still reconfirms rather than
+		// mis-routing the description as a normal turn.
+		if b.picker != nil {
+			if reply, handled, err := b.cronjobDescription(ctx, in); err != nil {
+				return "", err
+			} else if handled {
+				return reply, nil
+			}
+		}
 		text := strings.TrimSpace(in.Text)
 		// A menu-issued command arrives with a leading slash ("/outbox");
 		// strip ONE so the command words below match. Ordinary text that
@@ -1340,7 +1419,8 @@ func telegramHandler(b *daemonBundle) telegram.Handler {
 			return "**NEXUS** — tvoj osobni asistent.\n\n" +
 				"Samo mi piši normalno i razgovaramo — pamtim razgovor.\n\n" +
 				"**Razgovor**\n" +
-				"/new — novi razgovor (zaboravim prošli kontekst)\n\n" +
+				"/new — novi razgovor (zaboravim prošli kontekst)\n" +
+				"/cronjob — zakaži podsjetnik (klikni datum i sat, pa upiši tekst)\n\n" +
 				"**Stanje**\n" +
 				"/pending — čeka li nešto tvoje odobrenje\n" +
 				"/outbox — poruke koje možda nisu stigle\n\n" +

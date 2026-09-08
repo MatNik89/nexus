@@ -61,6 +61,10 @@ type Adapter struct {
 	core     *channel.Core
 	handle   Handler
 	client   *http.Client
+	// picker + loc drive the /cronjob inline calendar (ephemeral UI). nil
+	// until SetPicker wires them; a nil picker disables /cronjob (fail-safe).
+	picker *PickerStore
+	loc    *time.Location
 	// offset is in-memory BY DESIGN (fresh-audit kilo F3): Telegram
 	// confirms server-side via the NEXT getUpdates offset, so a restart
 	// re-fetches only the unconfirmed tail; T22 dedup + stable refusal
@@ -138,6 +142,24 @@ type tgUpdate struct {
 		Voice json.RawMessage `json:"voice"`
 		Doc   json.RawMessage `json:"document"`
 	} `json:"message"`
+	CallbackQuery *tgCallbackQuery `json:"callback_query"`
+}
+
+// tgCallbackQuery is a button tap. Message is optional/inaccessible per Bot API
+// (validated before use); From is authoritative for owner binding.
+type tgCallbackQuery struct {
+	ID   string `json:"id"`
+	From *struct {
+		ID int64 `json:"id"`
+	} `json:"from"`
+	Message *struct {
+		MessageID int64 `json:"message_id"`
+		Chat      struct {
+			ID   int64  `json:"id"`
+			Type string `json:"type"`
+		} `json:"chat"`
+	} `json:"message"`
+	Data string `json:"data"`
 }
 
 // isPreWire reports whether a client.Do error happened before anything
@@ -251,7 +273,19 @@ func refusalID(identity string, updateID int64) string {
 	return "dlv-" + hex.EncodeToString(sum[:12])
 }
 
+// SetPicker wires the shared /cronjob calendar store + the owner's timezone.
+// Called once by the composition root after New; the same store is shared with
+// the daemon handler that turns a completed pick into a durable reminder.
+func (a *Adapter) SetPicker(p *PickerStore, loc *time.Location) {
+	a.picker = p
+	a.loc = loc
+}
+
 func (a *Adapter) processUpdate(ctx context.Context, u tgUpdate) error {
+	// Button taps: ephemeral /cronjob calendar interaction (not admitted).
+	if u.CallbackQuery != nil {
+		return a.handlePickerCallback(ctx, u.CallbackQuery)
+	}
 	if u.Message == nil {
 		return nil // non-message update classes are ignored in P0
 	}
@@ -280,6 +314,12 @@ func (a *Adapter) processUpdate(ctx context.Context, u tgUpdate) error {
 		_, err := a.core.EnqueueReplyID(ctx, refusalID(identity, u.UpdateID), adapterID, identity, a.profile,
 			"I can handle only text messages for now (photos, voice and files are not supported yet).")
 		return err
+	}
+	// /cronjob opens the ephemeral inline-calendar picker (best-effort UI,
+	// NOT admitted). The durable reminder is created later, when the owner
+	// sends the description (an ordinary admitted turn), by the daemon handler.
+	if a.picker != nil && isCronjobCmd(u.Message.Text) {
+		return a.openPicker(ctx, chat)
 	}
 	in := channel.Inbound{
 		AdapterID: adapterID, ChannelIdentity: identity,
@@ -411,6 +451,7 @@ func (a *Adapter) registerCommands(ctx context.Context) {
 	cmds := []map[string]string{
 		{"command": "help", "description": "Što NEXUS zna i popis komandi"},
 		{"command": "new", "description": "Novi razgovor (zaboravi kontekst)"},
+		{"command": "cronjob", "description": "Zakaži podsjetnik (kalendar)"},
 		{"command": "pending", "description": "Čekaju li odobrenja"},
 		{"command": "outbox", "description": "Poruke s neizvjesnom isporukom"},
 		{"command": "approve", "description": "Odobri zahtjev (approve ch-...)"},
