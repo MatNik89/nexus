@@ -1,104 +1,105 @@
-# PLAN: sandbox read-only input grant (kernel slice, prerequisite for media)
+# PLAN: sandbox read-only input registry (kernel slice, prerequisite for media)
 
 ## Why
-The sandbox (`internal/sandbox`) mounts only the promoted executable's
-memfd-pinned ELF closure + one writable WorkDir (`sandbox.go:301-324`,
-`probe.Prepare`). A tool that must READ a trusted data file it does not
-carry in its closure — the whisper model (`ggml-base.bin`, ~140 MB), later
-image/video weights — has no way to open it inside the namespace. This
-slice adds the missing primitive: a **held-fd**, digest-pinned, read-only
-bind of a fixed host file, using the SAME sealed-fd discipline the closure
-already uses (`--ro-bind-data <fd>`, `probe.go:645`), so a post-verify path
-swap cannot change the bytes the sandbox reads.
+The sandbox mounts only the executable's memfd-pinned ELF closure + one
+writable WorkDir (`sandbox.go:301-324`). A tool that must READ a trusted data
+file it does not carry in its closure — the whisper model (`ggml-base.bin`,
+~140 MB), later image/video weights — cannot open it inside the namespace.
+This slice adds that primitive. HARD-RULED area (S6.2); lands and passes the
+three-agent review BEFORE the voice slice builds on it.
 
-HARD-RULED area (S6.2). Lands and passes the three-agent review BEFORE the
-voice slice builds on it.
+## Design — a startup-owned registry, NOT a per-call open (r3 codex F2)
+`CompiledPolicy` is a copyable value compiled PER CALL (WorkDir is in
+`policyHash`, `sandbox.go:227-235`, and voice makes a fresh WorkDir per
+transcription). Opening a model fd inside per-call Compile and holding it
+"for the daemon lifetime" would LEAK one fd per call → `EMFILE`. So the
+immutable inputs get their OWN lifecycle, independent of the per-call policy:
 
-## Contract
-Extend `sandbox.Spec` (additive; empty = today's behavior byte-for-byte):
+- `InputRegistry`, built ONCE at daemon startup from config. For each
+  configured input it opens `HostPath` with `O_NOFOLLOW|O_CLOEXEC`, `fstat`s
+  the fd (REGULAR; owner = daemon uid OR root; NOT group/other-writable;
+  `nlink == 1`; size ≤ MaxSize), reads the bytes from that fd once and records
+  a startup SHA-256, and HOLDS the fd for the daemon lifetime. Opened once,
+  bound many times — no per-call open, no leak.
+- A per-call `Spec` does not open anything; it REFERENCES a registered input
+  by id + `Dest`:
 
 ```go
-type InputGrant struct {
-    HostPath string // absolute host path of a regular file, opened O_NOFOLLOW
-    Dest     string // in-sandbox path; MUST be a single-file child of /inputs
-    MaxSize  int64  // reject at Compile if the file exceeds this
+type InputRef struct {
+    ID   string // key into the InputRegistry
+    Dest string // in-sandbox path; a single-file child of /inputs
 }
 type Spec struct {
     Target   string
     Args     []string
     WorkDir  string
     Timeout  time.Duration
-    ReadOnly []InputGrant // NEW
+    Inputs   []InputRef // NEW; empty = today's behavior byte-for-byte
 }
 ```
 
-### Compile (pin, once)
-For each grant:
-- Open `HostPath` with `O_NOFOLLOW|O_CLOEXEC` and HOLD the fd for the daemon
-  lifetime (a swap/rename of the pathname afterwards cannot change the inode
-  this fd points to — this is the property the pathname re-check lacked in
-  v3, and it mirrors the closure's held-fd binding, not a re-`--ro-bind` of a
-  pathname).
-- `fstat` the fd: REGULAR file; owner is the daemon uid OR root (a packaged,
-  root-owned, non-writable model is allowed — an intentional install choice);
-  NOT group/other-writable; `nlink == 1`; size ≤ MaxSize.
-- Read the bytes from THAT fd (bounded by MaxSize) and SHA-256 them.
-- Normalize `Dest`: `filepath.Clean(Dest) == Dest`, absolute, and a direct
-  single-segment child of the reserved `/inputs` dir (e.g. `/inputs/model.bin`).
-  Reject equality with, or being an ancestor/descendant of, ANY built-in mount
-  (`/tmp`, `/work`, `/nexus-target`, every closure dest) after normalization —
-  closes the `/inputs/../nexus-target` shadowing class.
-- Pin `{normalizedDest, digest, size}` into `CompiledPolicy`.
+## What is pinned — IDENTITY, not content-execution (r3 codex F3)
+`--ro-bind` of a held fd defeats a pathname SWAP (the fd names a fixed inode),
+but the inode is still a live file: a same-uid in-place rewrite (same inode,
+same size) changes bytes the child reads without changing path/inode/size.
+Sealing 140 MB into a memfd per the closure discipline would make content
+attestation TRUE but costs 140 MB resident RAM. For a single-owner box the
+model is our own trusted config artifact, so this slice pins IDENTITY and does
+NOT claim content-pinned execution:
 
-### Policy + attestation identity (v3 gap #2)
-The canonical, dest-sorted grant set (`normalizedDest, digest, size` per grant)
-enters BOTH `policyHash` (`sandbox.go:227-235`) and the launch `Attestation`
-(`sandbox.go:352-375`). Two policies that differ only in a model grant MUST
-have different `policyHash` and different attestation digests — no grant may
-execute under an identity that does not name it.
+- The registry's startup digest is TAMPER-EVIDENCE (logged, surfaced by
+  `nexus doctor`), NOT an execution guarantee.
+- `policyHash` and the launch `Attestation` carry, per input, `{ID,
+  normalizedDest, inode-identity (dev,ino), startup-digest}` — sorted,
+  canonical. Two policies that differ in an input differ in identity. The
+  attestation explicitly names this as INPUT-IDENTITY pinning, never "these
+  exact bytes executed".
+- Residual, stated: a same-uid in-place rewrite of the very inode between
+  startup and a launch is not closed; it is a single-owner trusted-artifact
+  ceiling, honestly scoped. A future memfd-seal variant can upgrade to
+  content-pinned execution if a multi-user deployment ever needs it.
 
-### Launch (bind the held bytes)
-- Re-`fstat` each HELD fd (not the pathname); if size/inode identity differs
-  from the Compile pin → refuse fail-closed (identical shape to the closure
-  refusal at `sandbox.go:319-323`).
-- Bind each into the namespace read-only from the inherited fd:
-  `--ro-bind /proc/self/fd/<N> <Dest>` (the fd is passed via `ExtraFiles`,
-  as the closure already does). bwrap resolves the magic-symlink to the held
-  inode; the original pathname is never re-opened at launch.
-- Nothing else in the host FS becomes visible: the grant is an allowlist of
-  exactly the pinned inodes.
+### Dest normalization (r3 codex #2)
+`filepath.Clean(Dest) == Dest`, absolute, a direct single-segment child of the
+reserved `/inputs` dir. Reject equality with — or being an ancestor/descendant
+of — ANY built-in mount (`/tmp`, `/work`, `/nexus-target`, every closure dest)
+AFTER normalization (closes `/inputs/../nexus-target` shadowing).
 
-The caller's argv references `Dest`, never the host path.
+### Launch (bind the held fd)
+- Re-`fstat` each HELD fd; if inode-identity/size differs from the startup
+  record → refuse fail-closed (shape identical to the closure refusal at
+  `sandbox.go:319-323`).
+- Bind read-only from the inherited fd: prefer bwrap `--ro-bind-fd <N> <Dest>`
+  where available (this host's bwrap has it), else `--ro-bind /proc/self/fd/<N>
+  <Dest>`; the fd is passed via `ExtraFiles` exactly as the closure's
+  `--ro-bind-data` fds already are (`probe.go:642-647`). The original pathname
+  is never re-opened at launch.
+- Nothing else in the host FS becomes visible.
 
-Residual (named ceiling): a same-uid, same-INODE content rewrite (truncate +
-overwrite of the very inode the fd holds) between Compile hash and Launch is
-not closed by held-fd binding; on a single-owner box the model is our own
-trusted artifact. Full immutability (a sealed memfd copy) is rejected for a
-~140 MB model on an SD-card Pi (per-call full read). Stated, not hidden.
-
-## Detectors (RED before, GREEN after; anchored to the sandbox contract)
-- GRANTED-READABLE: a granted fixture is readable at `Dest` inside the
-  sandbox and returns the exact bytes.
+## Detectors (RED before, GREEN after; anchored to the contract)
+- GRANTED-READABLE: a registered fixture is readable at `Dest` inside the
+  sandbox and returns the startup bytes.
 - NEIGHBOR-INVISIBLE: an undeclared sibling in the same host dir is NOT
-  openable inside the sandbox (proves per-file allowlist, not a dir bind).
-- SWAP-DEFEATED: replace the source PATHNAME with different bytes between
-  Compile and Launch → the sandbox still reads the ORIGINAL pinned bytes
-  (held fd), proving the pathname swap is defeated. RED against a
+  openable inside the sandbox.
+- SWAP-DEFEATED: replace the source PATHNAME with different bytes after startup
+  → the sandbox still reads the ORIGINAL held inode. RED against a
   re-`--ro-bind <pathname>` implementation.
-- POLICY-IDENTITY: two Specs differing only in a grant's file produce
-  DIFFERENT `policyHash` and DIFFERENT attestation digests. RED against a
-  grant-not-in-identity implementation.
+- NO-FD-LEAK: N sequential launches referencing the same input keep the daemon
+  open-fd count flat (proves the registry, not per-call open). RED against a
+  per-call-open implementation.
+- POLICY-IDENTITY: two Specs differing only in an input produce DIFFERENT
+  `policyHash` and DIFFERENT attestation digests.
 - DEST-COLLISION: `/inputs/../nexus-target`, a `/work` descendant, and a
-  non-`/inputs` dest each fail Compile with a typed error.
-- REJECT-AT-COMPILE: a symlink source, device node, FIFO, `nlink>1`,
-  group-writable, and over-MaxSize file each fail Compile.
-- EMPTY-GRANT-UNCHANGED: `ReadOnly == nil` yields byte-identical bwrap argv
-  to the pre-slice build (guards the additive claim).
+  non-`/inputs` dest each fail with a typed error.
+- REJECT-AT-STARTUP: a symlink source, device node, FIFO, `nlink>1`,
+  group-writable, and over-MaxSize input each fail registry construction.
+- EMPTY-UNCHANGED: `Inputs == nil` yields byte-identical bwrap argv to the
+  pre-slice build.
 
 ## Non-goals
-- Writable extra binds (WorkDir stays the only RW mount).
-- Directory/glob grants (single regular files only).
-- Aggregate disk / file-count quotas — that is the existing S6.2 **P2.2
-  ResourceBudget** obligation (`docs/HARNESS-SPEC.md:1481-1484`), a separate
-  slice; this slice does NOT re-implement it.
-- Dynamic/runtime grant activation (sealed at Compile, per HARDQ B9).
+- Content-pinned execution / sealed-memfd inputs (a later variant if a
+  multi-user deployment needs it; identity-pinning is enough single-owner).
+- Writable extra binds; directory/glob grants.
+- Aggregate disk / file-count quotas — existing S6.2 **P2.2 ResourceBudget**
+  (`HARNESS-SPEC.md:1481-1484`), a separate slice.
+- Dynamic/runtime grant activation (sealed at startup, per HARDQ B9).

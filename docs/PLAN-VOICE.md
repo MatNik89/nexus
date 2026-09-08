@@ -19,12 +19,16 @@ per-segment prefixes into `out.txt`, which would enter the turn text as
 "what the user said". The model is at `/inputs/model.bin` via the
 prerequisite grant, not a host path.
 
-## PREREQUISITE (blocks this slice): sandbox read-only input grant
-whisper must read its ~140 MB model INSIDE the sandbox; the current
-`sandbox.Spec` mounts only the executable's ELF closure + writable WorkDir.
-See `docs/PLAN-SANDBOX-ROINPUT.md` (held-fd `--ro-bind`, digest-pinned,
-in policyHash + attestation). Voice is not buildable until it lands —
-listed as an explicit dependency, not smuggled in.
+## PREREQUISITES (block this slice) — explicit dependencies, not smuggled in
+1. Sandbox read-only input REGISTRY — whisper must read its ~140 MB model
+   INSIDE the sandbox; the current `sandbox.Spec` mounts only the closure +
+   writable WorkDir. See `docs/PLAN-SANDBOX-ROINPUT.md` (startup-owned held-fd
+   registry, identity-pinned, in policyHash + attestation; no per-call open).
+2. Telegram egress pinned-IP dialer — the file download is another
+   attacker-influenced fetch and E11 (locked) requires a pinned-IP,
+   proxy-sanitized, redirect-checked dialer. See `docs/PLAN-TG-EGRESS-DIALER.md`.
+   Voice reuses that compliant client rather than waiving E11 (r3 codex F4).
+Voice is not buildable until both land.
 
 ## Change (v4 — round-3 findings folded; all verified against the code)
 - EXECUTION THROUGH THE SANDBOX (r1 codex #2): ffmpeg and whisper-cli run
@@ -37,13 +41,20 @@ listed as an explicit dependency, not smuggled in.
   typed Croatian refusal via the SAME non-text C2 refusal path
   (EnqueueReplyID + offset advance, NO inbox row) — never "admit then
   TERMINAL". A voice that fails to transcribe is never admitted.
-- REPLAY-DETERMINISTIC TRANSCRIPT (r3 codex #5): the transcript is
-  persisted keyed by the update identity (the deterministic turn/update id)
-  BEFORE admission. On redelivery the stored transcript is LOADED and
-  admitted/handled — whisper is NEVER re-run into a divergent second text.
-  This closes the crash-window where "A admitted, B handled" and also
-  avoids re-transcribing on every redelivery. The handler always receives
-  the durable bytes the journal records as the input.
+- REPLAY-DETERMINISTIC via the EXISTING journal owner (r3 codex #5 + F1):
+  NO new durable store — the journal is the only canonical writer (E4/B7).
+  `chan_inbox` already persists the admitted text on `EvInboundAdmitted`
+  (`channel.go:225-240`). The flow: transcribe → `Admit(transcript)`. First
+  admission handles the transcript. On a REPLAY, admission returns
+  `Replayed` PLUS the CANONICAL stored text, and the handler runs THAT, not
+  its freshly-computed candidate — so a redelivery that re-transcribes into a
+  different B never handles/journals B; the first-admitted A always wins.
+  This requires only an additive change: `AdmitOutcome` (today `{MessageID,
+  Replayed}`, `channel.go:70-75`) returns the stored canonical text on
+  replay, and the adapter (`telegram.go:249-273`) hands the handler the
+  returned text. Whisper MAY re-run on redelivery (wasteful, harmless) — the
+  "never re-run" promise is relaxed; correctness comes from the stored text
+  winning, not from suppressing the second transcription.
 - SAFE OUTPUT READ (r3 codex #4): `/work/out.txt` is opened relative to a
   HELD WorkDir fd with no-follow / RESOLVE_BENEATH (openat2), then `fstat`ed
   on that fd — must be a REGULAR file, `nlink == 1`, owned by the daemon;
@@ -52,19 +63,13 @@ listed as an explicit dependency, not smuggled in.
   transcript channel into host-file disclosure (e.g. an `out.txt` symlink to
   a secret) or a daemon hang. Content is then length-capped, UTF-8 validated,
   trimmed; empty/whitespace output is rejected before admission.
-- BOUNDED, NON-PROXY, NON-REDIRECTING DOWNLOAD (r1 codex #3 + r3 codex #4/#6):
-  the getFile file GET uses a DEDICATED http.Client with an EXPLICIT transport
-  — `Proxy: nil` (ignore ambient HTTP(S)_PROXY, E11) and `CheckRedirect`
-  rejecting EVERY redirect (Go's default follows them; the existing telegram
-  client sets no policy and is NOT reused). URL scheme+exact host validated
-  before `Do`. Body read through `io.LimitReader` at 20 MiB, reading cap+1 and
-  rejecting if the extra byte arrives (distinguish "ended at cap" from
-  "truncated"). Token never in diagnostics.
-  Named ceiling (r3 codex #6): full S6.3 pinned-IP dialer (anti-DNS-rebind)
-  is NOT yet wired on ANY Telegram traffic; this download inherits that same
-  existing posture. Proxy-env + redirect are closed here; pinned-IP rebind is
-  the pre-existing Telegram-wide ceiling, tracked with the S6.3 dialer work,
-  not a voice-specific regression.
+- BOUNDED DOWNLOAD over the COMPLIANT client (r1 codex #3 + r3 codex #4/#6/F4):
+  the getFile file GET goes through the Telegram pinned-IP dialer client from
+  prerequisite 2 (Proxy sanitized, IP pinned anti-rebind, redirects rejected —
+  E11 satisfied, not waived). This slice adds only the bounded read: URL
+  scheme+exact host validated before `Do`; body read through `io.LimitReader`
+  at 20 MiB, reading cap+1 and rejecting if the extra byte arrives (distinguish
+  "ended at cap" from "truncated"). Token never in diagnostics.
 - RESOURCE BOUNDS, honestly scoped (r3 codex #3 / kilo F1): the decoded-WAV
   size is bounded DURING encode by `ffmpeg -t <maxSeconds>` (output is
   32 KB/s mono s16le, so bytes ≤ 32768 × maxSeconds regardless of input) —
@@ -89,12 +94,12 @@ listed as an explicit dependency, not smuggled in.
 - output-escape: a stub that writes `out.txt` as (a) a symlink to a host
   canary and (b) a FIFO — the daemon MUST reject both; the canary bytes never
   enter the transcript or journal, and the read does not block.
-- replay-determinism: force transcript A on the first run and B on a
-  redelivery; assert the handler/provider receives A only and the journal
-  records A (RED against re-transcribe-on-replay).
-- redirect+proxy: a two-server fake — a 30x on the file GET yields a typed
-  refusal and the SECOND server gets ZERO requests; with `HTTP_PROXY` set to a
-  canary, the request does NOT reach the proxy.
+- replay-determinism: transcript A admitted, then a redelivery transcribes B;
+  assert admission returns A's stored canonical text and the handler/provider
+  + journal see A only (RED against the adapter handling its local B candidate).
+- download-client: assert the voice download uses the prerequisite-2 compliant
+  client (proxy/redirect/rebind detectors live in the dialer slice); here,
+  assert the 20 MiB cap+1 rejection and scheme/host pre-validation.
 - adapter failure path (r2 codex #5 corrected): a transcription error yields
   the refusal DELIVERY row, ZERO inbox rows for that update, offset advances
   only after the refusal enqueue is durable, replay is idempotent. NO TERMINAL
