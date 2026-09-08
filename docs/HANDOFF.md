@@ -1,4 +1,78 @@
-# HANDOFF — NEXUS resume point (READ FIRST) — updated 2026-09-03
+# HANDOFF — NEXUS resume point (READ FIRST) — updated 2026-09-08
+
+## RESUME 2026-09-08 (P1 in progress) — start here
+
+**Phase status:** P0 DONE (27/27, on `main`, `P0-capable` attested). P1 IN PROGRESS.
+Consolidated build map: the docs below + `docs/PLAN-AUDIT-FIXES.md`.
+
+**Branches / state (all committed, nothing dangling):**
+- `main` @ 2cfeb16 — merged P1 so far: Telegram gateway polish (native tables,
+  time, typing+`/`menu, `/new` reset, convproj backlog fix, `/help` reword),
+  **E11 pinned-IP egress dialer**, and **/cronjob v1** (now renamed — see below).
+- `slice/p1-cronjob-v2` @ 9a15a01 — **/reminder v3**: date+time on ONE combined
+  keyboard (re-tappable, no back step), 10-min grid, today marker `·d·`,
+  force_reply text field; command renamed **/cronjob -> /reminder** (one-shot).
+  DEPLOYED to `~/bin/nexus` (the live bot runs this). **NOT YET REVIEWED/merged**
+  — the step-by-step v2 got 3xPASS, but the combined rewrite is new.
+- `slice/p1-audit` @ 4f5e652 — audit remediation: **F4 + F9 DONE**; F1,F2,F3,F5,
+  F6,F7,F8 pending per `docs/PLAN-AUDIT-FIXES.md` (audit = `docs/AUDIT-FULL-codex-2026-09-08.md`).
+
+**DIRECTION (owner, 2026-09-08): CORE-FIRST.** Telegram surface work
+(reminder-v3 merge, recurring /cronjob, voice, media) is PARKED on its branches —
+resume only when the owner says. Focus = the nexus CORE: audit-hardening first,
+then continuous core improvement (steal/refactor whatever is worth it). **AUTODEPLOY
+is ON**: after a slice reaches 3xPASS + merge to main, automatically build ->
+~/bin/nexus -> `systemctl --user restart nexus` -> verify capability ON (no per-deploy
+approval needed).
+
+**PENDING QUEUE (reordered — core first):**
+1. Audit remediation F1-F8 (`docs/AUDIT-FULL-codex-2026-09-08.md` +
+   `docs/PLAN-AUDIT-FIXES.md`) — mostly CORE hardening. Re-dispatch the plan review
+   (a restart killed it), then slices A-F. F3 needs the owner's Go>=1.26.6 upgrade.
+2. Continuous core improvement: coding USP trio, web search/browser, memory, and
+   steal-worthy patterns we find — each research->plan->agents->code->agents->autodeploy.
+3. PARKED (Telegram surface, resume on owner's word): review `/reminder` v3
+   (slice/p1-cronjob-v2) -> merge; real recurring /cronjob; voice; media.
+
+Old queue (kept for reference):
+- Review `/reminder` v3 (slice/p1-cronjob-v2) with the 3 herdr agents -> merge to main.
+- Audit remediation slices A-F (`docs/PLAN-AUDIT-FIXES.md`): A=shared E11 dialer
+   (F1+F8 provider), B=S7-bounded delivery retry (F2), C=context budget + bounded
+   reads (F5+F8), D=channel-health owner (F6), E=config-aware doctor (F7),
+   F=release Go-floor+govulncheck gate (F3 — needs the OWNER to upgrade the Pi's
+   Go to >= 1.26.6 first). The audit-PLAN review was killed by a session restart
+   (only kilo wrote its file) — RE-DISPATCH the plan review before coding.
+3. Real recurring **/cronjob** (owner wants recurring; current /reminder is
+   one-shot): recurrence picker + schedule re-arm after each fire + `/jobs`
+   list/cancel; the schedule backend is one-shot today (needs a recurrence rule).
+   Owner example: "every morning report the API-provider balance" = recurrence +
+   an action-per-fire (a tool run), not just a text ping.
+4. Voice (plan 3xPASS in `docs/PLAN-VOICE.md`): needs prereqs `docs/PLAN-SANDBOX-ROINPUT.md`
+   (startup input registry) + the E11 dialer (done).
+5. Media (images/vision, video, social links, documents), coding USP trio, web
+   search/browser, more channels — PRD P1 backlog.
+
+**Infra / gotchas for the new session:**
+- Needs **Bash in bypass mode** (Shift+Tab to bypass, or `--dangerously-skip-permissions`).
+- **GateGuard PreToolUse hook installed** (`~/.claude/hooks/gateguard-fact-force.py`):
+  the FIRST Edit/Write of each file per session is DENIED with "[Fact-Forcing Gate]"
+  — state importers/API/schema/instruction, then RETRY the same edit. Off-switch
+  `NEXUS_GATEGUARD=off`. This is EXPECTED, not an error.
+- **156 merged subagents** in `~/.claude/agents/` (from VoltAgent + iannuttall,
+  deduped vs the claude-code-workflows plugin): VoltAgent tiers `model:` — haiku
+  (light), sonnet (dev), inherit (security/architecture). Delegate the right
+  specialized agent to save main-thread tokens; override the model only when the
+  stakes don't match the agent default.
+- herdr review agents: **codex=w8:p2, kilo=w8:p3, agy=w8:p4**; dispatch by pane_id
+  via `herdr agent prompt w8:pN "<prompt>" --wait --until done --until idle`.
+  Prompts English, absolute paths. Only codex+kilo convergence counts (agy rubber-stamps).
+- Deploy: `CGO_ENABLED=0 go build -o ~/HARNESS/nexus/nexus ./cmd/nexus` -> stop
+  service -> `cp` to `~/bin/nexus` -> `systemctl --user start nexus` -> verify
+  "capability telegram ON".
+
+---
+
+
 
 Repo: `/home/matej/HARNESS/nexus` (github MatNik89/nexus, private). Language: **ENGLISH
 everywhere** in this repo (user directive); Croatian only in chat with the user.
