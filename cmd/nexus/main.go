@@ -721,12 +721,7 @@ func runDoctor(args []string) int {
 		return runDoctorP0()
 	}
 	strict := len(args) > 0 && args[0] == "--strict"
-	env, err := doctor.DefaultEnv()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "doctor: %v\n", err)
-		return 2
-	}
-	checks := doctor.Run(env)
+	checks := doctorChecks()
 	for _, c := range checks {
 		if c.Status == doctor.StatusOK {
 			fmt.Printf("OK   %-16s %s\n", c.Name, c.Detail)
@@ -744,6 +739,30 @@ func runDoctor(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+// doctorChecks runs the ordinary doctor against the RESOLVED configuration
+// (Slice E, AUDIT-FULL F7): the secret-reference names come from the same
+// resolver the daemon uses, so a custom provider_key_env / telegram_token_env
+// is checked by ITS name. A configuration that does not resolve is itself a
+// finding (the daemon would refuse it too), never a crash and never a silent
+// fallback to the default names.
+func doctorChecks() []doctor.Check {
+	var pre []doctor.Check
+	secrets := doctor.Secrets{}
+	if _, resolved, err := resolveEnv(); err != nil {
+		pre = append(pre, doctor.Check{Name: "config", Capability: "stateful-startup", Status: doctor.StatusOff,
+			Detail: "configuration does not resolve: " + err.Error(),
+			Fix:    "fix config.json / NEXUS_CFG_* (the daemon refuses the same configuration)"})
+	} else {
+		secrets = doctor.Secrets{ProviderKeyEnv: resolved.Config.ProviderKeyEnv, TelegramTokenEnv: resolved.Config.TelegramTokenEnv}
+	}
+	env, err := doctor.DefaultEnv(secrets)
+	if err != nil {
+		return append(pre, doctor.Check{Name: "host", Capability: "stateful-startup", Status: doctor.StatusOff,
+			Detail: err.Error(), Fix: "set HOME or XDG_CONFIG_HOME to a writable directory"})
+	}
+	return append(pre, doctor.Run(env)...)
 }
 
 // runDoctorP0 grants the P0-capable label from LIVE criteria (T27): each
