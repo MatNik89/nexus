@@ -712,6 +712,45 @@ func (m *Manager) CreateReminder(ctx context.Context, id, body string, w schedul
 	return err
 }
 
+// ReminderState is the outcome of ReminderIntent's durable lookup.
+type ReminderState int
+
+const (
+	ReminderNotFound ReminderState = iota
+	ReminderFound
+	ReminderStorageError
+)
+
+// ReminderIntent looks up a reminder by id for the /cronjob front replay guard
+// (PLAN-CRONJOB.md): it distinguishes NotFound from a StorageError and, when
+// Found, returns the persisted body + WallTime so the confirmation can be
+// reproduced WITHOUT any in-memory picker session (the crash-after-create
+// replay-safety guarantee). Read-only (QueryProjection cannot mutate).
+func (m *Manager) ReminderIntent(ctx context.Context, id string) (ReminderState, string, schedule.WallTime, error) {
+	var zero schedule.WallTime
+	rows, err := m.j.QueryProjection(ctx,
+		`SELECT o.body, s.wall FROM obl_obligations o JOIN sched_schedules s ON s.id = o.id WHERE o.id = ? AND o.kind = 'reminder'`, id)
+	if err != nil {
+		return ReminderStorageError, "", zero, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return ReminderStorageError, "", zero, err
+		}
+		return ReminderNotFound, "", zero, nil
+	}
+	var body, wallJSON string
+	if err := rows.Scan(&body, &wallJSON); err != nil {
+		return ReminderStorageError, "", zero, err
+	}
+	var w schedule.WallTime
+	if err := json.Unmarshal([]byte(wallJSON), &w); err != nil {
+		return ReminderStorageError, "", zero, err
+	}
+	return ReminderFound, body, w, nil
+}
+
 // taskIDOK: a closed id alphabet keeps the '[id] note' marker encoding
 // UNAMBIGUOUS (Phase-4-r2 codex #17: an id containing ']' or whitespace
 // could alias another task's marker).

@@ -48,6 +48,8 @@ type fakeBot struct {
 	sawTyping      bool
 	sawSetCommands bool
 	lastCommands   string
+	answerCount    int    // answerCallbackQuery calls (spinner cleared)
+	lastMarkup     string // last sendMessage reply_markup JSON (calendar)
 }
 
 func (f *fakeBot) handler() http.HandlerFunc {
@@ -80,13 +82,22 @@ func (f *fakeBot) handler() http.HandlerFunc {
 			f.lastRich = req.RichMessage.Markdown
 			f.sentTo = append(f.sentTo, req.ChatID)
 			w.Write([]byte(`{"ok":true,"result":{"message_id":1}}`))
+		case strings.HasSuffix(r.URL.Path, "/answerCallbackQuery"):
+			f.answerCount++
+			w.Write([]byte(`{"ok":true,"result":true}`))
+		case strings.HasSuffix(r.URL.Path, "/editMessageText"), strings.HasSuffix(r.URL.Path, "/editMessageReplyMarkup"):
+			w.Write([]byte(`{"ok":true,"result":{"message_id":1}}`))
 		case strings.HasSuffix(r.URL.Path, "/sendMessage"):
 			var req struct {
-				ChatID    int64  `json:"chat_id"`
-				Text      string `json:"text"`
-				ParseMode string `json:"parse_mode"`
+				ChatID      int64           `json:"chat_id"`
+				Text        string          `json:"text"`
+				ParseMode   string          `json:"parse_mode"`
+				ReplyMarkup json.RawMessage `json:"reply_markup"`
 			}
 			json.NewDecoder(r.Body).Decode(&req)
+			if len(req.ReplyMarkup) > 0 {
+				f.lastMarkup = string(req.ReplyMarkup)
+			}
 			if req.ParseMode != "" && f.rejectHTMLLeft > 0 {
 				f.rejectHTMLLeft--
 				w.WriteHeader(400)

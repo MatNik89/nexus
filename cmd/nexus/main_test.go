@@ -532,6 +532,60 @@ func TestChannelAskSuspendsThenApproveResumes(t *testing.T) {
 	}
 }
 
+// TestCronjobReconfirmBeforeGate proves the /cronjob durable contract (plan v4,
+// codex code-review F1): the deterministic-id lookup runs BEFORE the ephemeral
+// session gate, so a description replay after a lost picker session reconfirms
+// from persisted intent instead of mis-routing as a normal turn — and never
+// creates a second reminder. RED if the lookup moves behind AwaitingPick.
+func TestCronjobReconfirmBeforeGate(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "nexus")
+	if err := os.MkdirAll(base, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NEXUS_CRON_KEY", "sk-cron")
+	cfgJSON := `{"provider_base_url":"http://127.0.0.1:1","provider_key_env":"NEXUS_CRON_KEY","provider_model":"m","egress_allow":["127.0.0.1:1"],"default_profile":"private"}`
+	if err := os.WriteFile(filepath.Join(base, "config.json"), []byte(cfgJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := config.Resolve(filepath.Join(base, "config.json"), "", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := buildDaemon(pathx.Layout{Base: base}, resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.j.Close()
+	b.picker = telegram.NewPickerStore(time.Minute) // empty: no live session
+
+	ctx := context.Background()
+	in := channel.Inbound{AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 7, Text: "call the doctor", Profile: "private"}
+	remID := reminderIDFor(in)
+	wall := schedule.WallTime{Year: 2026, Month: time.December, Day: 1, Hour: 9, Minute: 0, TZ: "Europe/Zagreb"}
+	if err := b.obl.CreateReminder(ctx, remID, "call the doctor", wall); err != nil {
+		t.Fatalf("seed reminder: %v", err)
+	}
+
+	// Reminder durable + NO session -> must reconfirm (lookup precedes gate).
+	reply, handled, err := b.cronjobDescription(ctx, in)
+	if err != nil || !handled {
+		t.Fatalf("reconfirm not handled (lookup behind the gate?): handled=%v err=%v", handled, err)
+	}
+	if reply != cronjobConfirm(wall) {
+		t.Fatalf("reconfirm text mismatch: %q", reply)
+	}
+	// Replay -> idempotent: same confirmation, no second create.
+	reply2, handled2, err2 := b.cronjobDescription(ctx, in)
+	if err2 != nil || !handled2 || reply2 != reply {
+		t.Fatalf("replay not idempotent: %q handled=%v err=%v", reply2, handled2, err2)
+	}
+	// A different update with no reminder and no session -> normal turn.
+	other := channel.Inbound{AdapterID: "telegram", ChannelIdentity: "chat-42", UpdateID: 8, Text: "just chatting", Profile: "private"}
+	if _, handled3, _ := b.cronjobDescription(ctx, other); handled3 {
+		t.Fatalf("a normal message with no reminder/session was captured as a cronjob")
+	}
+}
+
 func newTestChannelCore(t *testing.T) *channel.Core {
 	t.Helper()
 	j, err := journal.Open(filepath.Join(t.TempDir(), "private.db"), "private",
