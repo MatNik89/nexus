@@ -1,4 +1,4 @@
-# PLAN v9: full-audit remediation (codex AUDIT-FULL-2026-09-08) — zero-defect
+# PLAN v10: full-audit remediation (codex AUDIT-FULL-2026-09-08) — zero-defect
 
 Source: `docs/AUDIT-FULL-codex-2026-09-08.md` (9 findings; bound at f135eef,
 reverified against current tree). v2 folded round 1 (`docs/REVIEW-AUDIT-PLAN-{codex,kilo,agy}.md`, 3x FAIL); v3 folds
@@ -14,7 +14,9 @@ effect class], kilo PASS, agy PASS + stale-wording notes). v8 folds round 7
 (`REVIEW-AUDIT-PLAN7-*.md`: codex FAIL 2 [one PolicyControl for two contracts, no
 nil-builder detector], kilo PASS [same PolicyControl note], agy PASS). v9 folds round 8
 (`REVIEW-AUDIT-PLAN8-*.md`: codex FAIL 1 [setMyCommands UNKNOWN blindly re-registered
-after restart], kilo PASS, agy PASS). Every fix: RED-capable
+after restart], kilo PASS, agy PASS). v10 folds round 9 (`REVIEW-AUDIT-PLAN9-*.md`:
+codex FAIL 1 [reconciliation has no S7 API / atomic recipe / validator], kilo PASS,
+agy PASS). Every fix: RED-capable
 detector at the real owner boundary, then 3-agent review to 3xPASS.
 
 ## Status
@@ -134,7 +136,8 @@ existing `test_adapter_cannot_self_retry` family stays valid).
   (= SPEC P0.2 `ExecutionPolicy` MUST-fields; `cancel_token_id` = the OperationID,
   `Cancel(op)` is the token). `BackoffPolicy{Base, Max time.Duration; Jitter bool}`
   exponential with full jitter (jitter source injectable for tests).
-- Three policy CONSTANTS owned by `s7` (no config knob; upgrade trigger: a second
+- The policy CONSTANTS owned by `s7` (Tool, Provider, Structured, Delivery, Poll,
+  ControlRead, ControlEffect, UI — codex r9 note) (no config knob; upgrade trigger: a second
   provider/target configured):
   - `PolicyTool`: MaxAttempts 1 (effectful; unchanged P0 behavior).
   - `PolicyProvider`: MaxAttempts 3, AttemptTimeout 120s, Deadline 5min, Backoff
@@ -204,6 +207,16 @@ existing `test_adapter_cannot_self_retry` family stays valid).
   never sleeps, loops, or calls `Next`. Delivery keeps the tick-polled `Next` style
   (S7 still decides due-ness; `Flush` neither waits nor loops). Both entry styles are
   S7 code; adapters/loops/planner contain no retry logic.
+- `Reconcile(op, ok bool, build)` (codex r9 #1) — the ONLY exit from UNKNOWN and an
+  S7-owner API: legal only from UNKNOWN; the owner supplies the typed proof of the
+  remote state (`ok` = the effect is present). Present -> `attempt.reconciled_ok` ->
+  SUCCEEDED. Absent -> `attempt.reconciled_retry` (new canonical edge UNKNOWN ->
+  FAILED_RETRYABLE) when the SAME operation still has attempt/deadline budget, else
+  `attempt.reconciled_failed` -> FAILED; only `Next` may then issue the next grant.
+  Durable: the `s7.operation_reconciled{op, state, next_attempt_unix}` event and
+  exactly ONE owner companion (`Key == op`) commit in ONE batch; a nil builder is
+  refused before any transition; UNKNOWN operations are rehydrated so Reconcile can
+  act after a restart. No `Begin` re-begin of a terminal identity exists.
 - `policy_json` rehydration fails closed on corrupt/unknown fields (agy r3 note 1).
 - `Next` on a Durable operation REFUSES a nil builder (agy r6 note 2). The in-memory
   `machine.AttemptTable` narrative and the durable `s7.*` projection are ONE story: the
@@ -306,12 +319,17 @@ existing `test_adapter_cannot_self_retry` family stays valid).
   NOT call setMyCommands blindly (codex r8 #1): a rehydrated `UNKNOWN` registration
   first runs an S7-governed READ-ONLY reconciliation `control:tg:getMyCommands:<n>`
   (`PolicyControlRead`; `getMyCommands` joins the call-site table) that compares the
-  remote menu with the exact desired payload — equal -> the UNKNOWN operation is
-  reconciled SUCCEEDED (`attempt.reconciled_ok`); different -> a NEW effect operation
-  (new hash-bound identity only if the desired set changed; otherwise the same
-  identity reconciled FAILED and re-begun) is authorized. A rehydrated SUCCEEDED
-  registration for the same hash performs no call at all; a changed desired set is a
-  new identity. Until reconciliation resolves, the channel health is `degraded`. Control classification is therefore split by effect:
+  remote menu with the exact desired payload and hands the proof to
+  `s7.Reconcile(op, equal, build)` (codex r9 #1): equal -> SUCCEEDED; different ->
+  the SAME operation lands FAILED_RETRYABLE within its budget and `Next` issues the
+  replacement grant (or FAILED when the budget is spent — health stays degraded). A
+  rehydrated SUCCEEDED registration for the same hash performs no call at all; a
+  changed desired set is a new identity. The owner companion
+  `channel.control_effect{operation_id, method, payload_hash, state}` is validated by
+  the channel PayloadValidator and projection: `operation_id ==
+  "control:tg:setMyCommands:" + payload_hash`, `method` in the closed set, `state` in
+  the closed landing set, profile = the journal's — a foreign hash is refused at the
+  journal boundary. Until reconciliation resolves, the channel health is `degraded`. Control classification is therefore split by effect:
   `control-read` (getMe) and `control-effect` (setMyCommands), each bound to its OWN
   closed policy constant (codex r7 #1, kilo r7 note): `PolicyPoll` and
   `PolicyControlRead` list exactly `{transport_prewire, http_429, http_5xx,
@@ -538,6 +556,12 @@ health state, not an internal counter):
    setMyCommands; a scripted different menu -> exactly ONE new setMyCommands under a
    fresh grant; a rehydrated SUCCEEDED registration for the same hash -> zero calls.
    Ablating the durable recovery guard (blind re-register on start) turns this RED.
+   Extended (codex r9 #1): every case asserts the S7 state beside the wire count
+   (UNKNOWN / SUCCEEDED / FAILED_RETRYABLE / FAILED); a `control_effect` companion
+   with a mismatched hash is refused by the channel validator (zero wire); an
+   injected failure of the reconcile+companion batch leaves S7 UNKNOWN and no
+   control_effect row (no torn state); ablating the reconciliation transition or
+   its atomic batch turns RED.
 3. FlushOutbox transport failure -> health `transport` degraded.
 4. Injected journal-mark failure in FlushOutbox -> health `substrate`, `Run` returns,
    NO further poll/flush wire calls (further channel work stops).
