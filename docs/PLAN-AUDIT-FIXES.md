@@ -1,4 +1,4 @@
-# PLAN v6: full-audit remediation (codex AUDIT-FULL-2026-09-08) — zero-defect
+# PLAN v7: full-audit remediation (codex AUDIT-FULL-2026-09-08) — zero-defect
 
 Source: `docs/AUDIT-FULL-codex-2026-09-08.md` (9 findings; bound at f135eef,
 reverified against current tree). v2 folded round 1 (`docs/REVIEW-AUDIT-PLAN-{codex,kilo,agy}.md`, 3x FAIL); v3 folds
@@ -8,7 +8,9 @@ codex FAIL 5 [B/D lifecycle], kilo PASS, agy PASS). v5 folds round 4
 (`REVIEW-AUDIT-PLAN4-*.md`: codex FAIL 3 [companion binding, ungoverned Bot API
 siblings, structured re-ask], kilo PASS, agy PASS). v6 folds round 5
 (`REVIEW-AUDIT-PLAN5-*.md`: codex FAIL 3 [Next exhaustion unpaired, structured attempt
-accounting, poll code vocabulary], kilo PASS, agy PASS). Every fix: RED-capable
+accounting, poll code vocabulary], kilo PASS, agy PASS). v7 folds round 6
+(`REVIEW-AUDIT-PLAN6-*.md`: codex FAIL 2 [salvage after terminalization, setMyCommands
+effect class], kilo PASS, agy PASS + stale-wording notes). Every fix: RED-capable
 detector at the real owner boundary, then 3-agent review to 3xPASS.
 
 ## Status
@@ -199,6 +201,10 @@ existing `test_adapter_cannot_self_retry` family stays valid).
   (S7 still decides due-ness; `Flush` neither waits nor loops). Both entry styles are
   S7 code; adapters/loops/planner contain no retry logic.
 - `policy_json` rehydration fails closed on corrupt/unknown fields (agy r3 note 1).
+- `Next` on a Durable operation REFUSES a nil builder (agy r6 note 2). The in-memory
+  `machine.AttemptTable` narrative and the durable `s7.*` projection are ONE story: the
+  projection is the durable source, rehydration rebuilds the in-memory record from it,
+  and a package doc comment ties the two (kilo r6 note 2).
 - State machine (`contracts.AttemptState` + `machine.AttemptTable`): new state
   `AttemptFailedRetryable` APPENDED to the enum (existing numeric values unchanged),
   name `FAILED_RETRYABLE`; new events `attempt.failed_retryable` (RUNNING ->
@@ -241,8 +247,10 @@ existing `test_adapter_cannot_self_retry` family stays valid).
 - One ordered lifecycle per row (codex r2 #1) — S7 and the outbox land as ONE causal
   result; neither owner may claim success while the other is non-terminal:
   `Core.Flush(ctx, send func(Outbound, s7.Grant) error)`: for each `PENDING` row:
-  `s7.Begin(delivery:<id>, target, PolicyDelivery)`; `g, err := s7.Next(op)`;
-  `ErrNotDue` -> skip this tick; `ErrExhausted`/terminal -> mark `FAILED`; grant ->
+  `s7.Begin(delivery:<id>, target, PolicyDelivery)`; `g, err := s7.Next(op, build)`;
+  `ErrNotDue` -> skip this tick (nothing committed); `ErrExhausted` -> ALREADY landed
+  (S7 `FAILED` + the builder's `FAILED` companion in one batch inside `Next`) — nothing
+  further to do; grant ->
   `send(o, g)`, inside which the adapter recomputes identity and calls
   `s7.Consume(g, Companion{Key: op, Params: outboxUnknownParams(op)})` — the S7
   STARTED and the outbox UNKNOWN park commit in ONE batch immediately before `client.Do` (if that batch fails: no wire,
@@ -270,7 +278,8 @@ existing `test_adapter_cannot_self_retry` family stays valid).
   | method(s) | kind | operation / target | policy |
   | sendMessage, sendRichMessage (outbox `Flush`) | delivery | `delivery:<id>` / `channel:tg:delivery:<id>` | `PolicyDelivery` (durable) |
   | getUpdates | poll | `poll:tg:<n>` / `channel:tg:getUpdates` | `PolicyPoll` (RetryableCodes {`transport_prewire`, `http_429`, `http_5xx`, `transport_postwrite`, `malformed_reply`}) |
-  | setMyCommands, getMe | control | `control:tg:<method>:<n>` / `channel:tg:<method>` | `PolicyControl` (MaxAttempts 3, backoff 2s..30s) |
+  | getMe | control-read | `control:tg:getMe:<n>` / `channel:tg:getMe` | `PolicyControl` (MaxAttempts 3, backoff 2s..30s; 5xx/post-write retryable) |
+  | setMyCommands | control-effect | `control:tg:setMyCommands:<n>` / `channel:tg:setMyCommands` | `PolicyControl` (RetryableCodes {`transport_prewire`, `http_429`} ONLY; 5xx/post-write/malformed -> UNKNOWN, E9) |
   | sendChatAction (typing) | ui | `ui:tg:<chat>:typing:<n>` / `channel:tg:chat:<chat>` | `PolicyUI` (MaxAttempts 1, EffectReversible, terminal on failure, outcome landed, in-memory) |
   | picker sendMessage, answerCallbackQuery, editMessageReplyMarkup, editMessageText | ui | `ui:tg:<callback_or_message_id>:<method>` / `channel:tg:chat:<chat>` | `PolicyUI` |
   Classification is KIND/EFFECT-aware with ONE closed code vocabulary (codex r5 #3):
@@ -278,20 +287,28 @@ existing `test_adapter_cannot_self_retry` family stays valid).
   `http_5xx`, `transport_postwrite` (timeout/reset after the request may have been
   sent), `malformed_reply`, `local_refused`. For the EFFECTFUL delivery kind, 5xx /
   post-write / malformed stay `ErrAmbiguousSend` -> `UNKNOWN` (E9: the remote may have
-  processed it). For READ-ONLY / idempotent kinds (getUpdates re-reads the same durable
-  offset and advances no admission; getMe; setMyCommands sets the same menu) those
-  same failures are `DefiniteFailure{code, Retryable}` proposals — S7's policy decides.
-  `PolicyPoll` and `PolicyControl` list exactly the codes above; a code not in a
-  policy is terminal.
+  processed it). For READ-ONLY kinds (getUpdates re-reads the same durable offset and advances
+  no admission; getMe) those same failures are `DefiniteFailure{code, Retryable}`
+  proposals — S7's policy decides. `setMyCommands` is EFFECTFUL (it mutates the remote
+  menu — codex r6 #2): pre-wire refusal and 429 follow `PolicyControl`, but 5xx /
+  post-write / malformed replies carry no commit receipt and land `OutcomeUnknown`
+  (E9) — no new grant, ever, without a reconciliation step that proves the remote
+  state (none exists in this slice; the menu is re-registered on the next daemon
+  start as a NEW operation). Control classification is therefore split by effect:
+  `control-read` (getMe) and `control-effect` (setMyCommands). `PolicyPoll` and
+  `PolicyControl` list exactly `{transport_prewire, http_429, http_5xx,
+  transport_postwrite, malformed_reply}` and `{transport_prewire, http_429}`
+  respectively; a code not in a policy is terminal.
   The picker chrome is the owner-accepted EPHEMERAL boundary (cronjob plan; not a
   durable delivery) — it is governed one-shot, never retried, never routed through the
   outbox. A grant added "merely to compile" is impossible: `call` refuses a kind whose
   recomputed identity does not match the presented grant. Polling and command
   registration are governed operations (Slice D); a poll iteration is a scheduled
   operation (HARDQ C3), a failed one is re-attempted only through S7.
-  Classification: pre-wire (egress refusal / DNS / dial) -> `DefiniteFailure{
-  transport_prewire, Retryable}`; HTTP 429 -> `{http_429, Retryable}`; other 4xx ->
-  `{http_4xx, Terminal}`; 5xx / post-write errors -> `ErrAmbiguousSend` (unchanged).
+  Delivery-kind classification: pre-wire (egress refusal / DNS / dial) ->
+  `DefiniteFailure{transport_prewire, Retryable}`; HTTP 429 -> `{http_429,
+  Retryable}`; other 4xx -> `{http_4xx, Terminal}`; 5xx / post-write / malformed ->
+  `ErrAmbiguousSend` (UNKNOWN, E9). Other kinds: see the kind/effect-aware rules below.
   An EGRESS refusal is additionally surfaced as a distinct redacted health/log event
   (kilo r2 note: poisoned DNS is a security signal, not a routine 4xx) — the health
   owner is Slice D; until D lands, a stderr line.
@@ -322,9 +339,15 @@ the typed proposal `OutcomeFailedRetryable, "invalid_general"`; attempt 2 =
 `generate(g, true)` (the re-ask prompt) + validate. `PolicyStructured{MaxAttempts 2,
 RetryableCodes {invalid_general}}` therefore means initial request + EXACTLY one
 re-ask; two invalid results never cause a third call. SECURITY/EFFECT classes propose
-`OutcomeFailedTerminal` on the first invalid result (no repair, no re-ask). The
-salvage ladder (re-ask text, then the original) runs AFTER the operation is terminal
-and is outside the transport count. The extractor never calls `Issue`/`Next`. The
+`OutcomeFailedTerminal` on the first invalid result (no repair, no re-ask). Salvage is
+outside the PHYSICAL attempt count but INSIDE the final attempt's outcome decision
+(codex r6 #1): when attempt 2 cannot strict-validate (or its transport fails), the
+callback runs the ordered salvage ladder (re-ask bytes, then the original bytes)
+BEFORE returning its S7 outcome — an accepted salvage returns `OutcomeSucceeded` with
+the accepted value; no accepted value returns `OutcomeFailedTerminal` and NO value.
+A value is never returned after `Execute` has committed a failed terminal state: the
+caller's result and the S7 state are one decision (returned value <=> `SUCCEEDED`).
+The extractor never calls `Issue`/`Next`. The
 planner's structured path submits this one operation (its plain-chat path submits
 its own `PolicyProvider` operation; the two are distinct operations, never nested). `Stream` failures after the first delivered byte are TERMINAL (partial output
 already reached the user). Tool attempts keep `PolicyTool` (MaxAttempts 1).
@@ -375,11 +398,15 @@ Detectors (RED against current code):
    refused, zero wire, no outbox change; a companion built for row B presented with
    A's grant -> refused by S7 (`Key != op`) AND, if forged past S7, by the channel
    validator (`operation_id` mismatch) — zero wire, neither row changes.
-9f. Structured accounting + ownership: (a) invalid then valid -> exactly TWO transport
-   calls, value accepted from the re-ask; (b) invalid, invalid -> exactly TWO calls
-   (never a third), salvage only over those two; (c) ablation: S7's second-grant path
-   disabled (MaxAttempts forced to 1) while extractor/provider code is untouched ->
-   exactly ONE total transport call; (d) SECURITY/EFFECT invalid -> ONE call, no re-ask.
+9f. Structured accounting + ownership + state/result equivalence: (a) invalid then
+   valid -> exactly TWO transport calls, value accepted from the re-ask, S7 `SUCCEEDED`;
+   (b) invalid, invalid with a prose-wrapped valid object -> TWO calls, salvage accepts,
+   S7 `SUCCEEDED`; (b2) invalid, invalid, nothing salvageable -> TWO calls, NO value, S7
+   `FAILED`; (c) ablation: S7's second-grant path disabled (MaxAttempts forced to 1)
+   while extractor/provider code is untouched -> exactly ONE total transport call;
+   (d) SECURITY/EFFECT invalid -> ONE call, no re-ask, no salvage, S7 `FAILED`. Every
+   case asserts the returned value and the S7 state TOGETHER (returned value <=>
+   `SUCCEEDED`).
 10. Egress refusal on delivery -> `DefiniteFailure{transport_prewire}` -> S7 retry
     path (not `UNKNOWN`) + distinct redacted security line (ties to Slice A #5).
 
@@ -447,7 +474,8 @@ Fix:
   adapter's class.
 - Polling is S7-governed (codex r2 #4; full S7 from Slice B): operation
   `poll:<adapter>:<n>` with `PolicyPoll` (Durable false, MaxAttempts 6, Backoff
-  2s..5min jitter, RetryableCodes {`transport`, `http_5xx`, `http_429`}); a SUCCESSFUL
+  2s..5min jitter, RetryableCodes {`transport_prewire`, `http_429`, `http_5xx`,
+  `transport_postwrite`, `malformed_reply`} — the B2 vocabulary, one list); a SUCCESSFUL
   poll completes the operation and the next tick begins `poll:<adapter>:<n+1>` (a
   scheduled iteration, HARDQ C3); a FAILED poll is retried ONLY when S7 issues the
   next grant (backoff), the ticker merely asks `Next`; the grant is PASSED INTO `PollOnce` and consumed by
@@ -476,7 +504,10 @@ health state, not an internal counter):
 1. Scripted permanent getUpdates 401 -> health `remote_rejected`, projection file
    written, stderr line present, `Run` returned; advancing several ticker intervals
    observes EXACTLY ONE failed poll (RED today: a poll every tick).
-2. setMyCommands 5xx -> health `transport` degraded (RED: today discarded).
+2. setMyCommands 5xx -> health `transport` degraded (RED: today discarded) AND S7
+   `UNKNOWN`: advancing past every backoff interval observes ZERO further
+   setMyCommands calls (E9 — codex r6 #2); a setMyCommands pre-wire refusal IS retried
+   once due (control).
 3. FlushOutbox transport failure -> health `transport` degraded.
 4. Injected journal-mark failure in FlushOutbox -> health `substrate`, `Run` returns,
    NO further poll/flush wire calls (further channel work stops).
