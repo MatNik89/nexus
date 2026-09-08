@@ -13,6 +13,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -44,6 +45,9 @@ type fakeBot struct {
 	rejectHTMLLeft int
 	lastMethod     string
 	lastRich       string
+	sawTyping      bool
+	sawSetCommands bool
+	lastCommands   string
 }
 
 func (f *fakeBot) handler() http.HandlerFunc {
@@ -94,6 +98,14 @@ func (f *fakeBot) handler() http.HandlerFunc {
 			f.sentTo = append(f.sentTo, req.ChatID)
 			f.parseModes = append(f.parseModes, req.ParseMode)
 			w.Write([]byte(`{"ok":true,"result":{"message_id":1}}`))
+		case strings.HasSuffix(r.URL.Path, "/sendChatAction"):
+			f.sawTyping = true
+			w.Write([]byte(`{"ok":true,"result":true}`))
+		case strings.HasSuffix(r.URL.Path, "/setMyCommands"):
+			b, _ := io.ReadAll(r.Body)
+			f.sawSetCommands = true
+			f.lastCommands = string(b)
+			w.Write([]byte(`{"ok":true,"result":true}`))
 		case strings.HasSuffix(r.URL.Path, "/getMe"):
 			w.Write([]byte(`{"ok":true,"result":{"id":1,"is_bot":true,"username":"nexus_test_bot"}}`))
 		default:
@@ -642,5 +654,33 @@ func TestNonTableSkipsRichMessage(t *testing.T) {
 	defer h.bot.mu.Unlock()
 	if h.bot.lastMethod == "sendRichMessage" {
 		t.Fatal("plain reply wrongly used sendRichMessage")
+	}
+}
+
+// TG polish: a handled message fires the typing chat action.
+func TestTypingActionOnHandledMessage(t *testing.T) {
+	h := build(t, map[int64]string{42: "work"})
+	h.bot.batches = [][]map[string]any{{textUpdate(1, 42, "bok")}}
+	if err := h.a.PollOnce(ctxT()); err != nil {
+		t.Fatal(err)
+	}
+	h.bot.mu.Lock()
+	defer h.bot.mu.Unlock()
+	if !h.bot.sawTyping {
+		t.Fatal("typing chat action not sent for a handled message")
+	}
+}
+
+// TG polish: registerCommands publishes the command menu.
+func TestRegisterCommandsPublishesMenu(t *testing.T) {
+	h := build(t, map[int64]string{42: "work"})
+	h.a.registerCommands(ctxT())
+	h.bot.mu.Lock()
+	defer h.bot.mu.Unlock()
+	if !h.bot.sawSetCommands {
+		t.Fatal("setMyCommands not called")
+	}
+	if !strings.Contains(h.bot.lastCommands, "help") {
+		t.Fatalf("command menu missing entries: %q", h.bot.lastCommands)
 	}
 }

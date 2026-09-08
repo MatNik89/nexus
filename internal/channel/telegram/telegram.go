@@ -267,6 +267,9 @@ func (a *Adapter) processUpdate(ctx context.Context, u tgUpdate) error {
 			return nil
 		}
 	}
+	// Typing indicator while the turn runs (best-effort — a failure
+	// here never affects delivery). Telegram shows it for ~5s.
+	a.call(ctx, "sendChatAction", map[string]any{"chat_id": chat, "action": "typing"}, nil)
 	reply, herr := a.handle(ctx, in)
 	if herr != nil {
 		// The admission stays durable; the failure gets a typed reply and
@@ -352,6 +355,7 @@ func (a *Adapter) Run(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = 2 * time.Second
 	}
+	a.registerCommands(ctx) // best-effort: "/" offers the command menu
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
@@ -363,6 +367,21 @@ func (a *Adapter) Run(ctx context.Context, interval time.Duration) {
 			a.FlushOutbox(ctx)
 		}
 	}
+}
+
+// registerCommands publishes the bot command menu (setMyCommands) so
+// typing "/" in the chat offers the options. Best-effort: a failure is
+// logged by the caller's next tick, never fatal.
+func (a *Adapter) registerCommands(ctx context.Context) {
+	cmds := []map[string]string{
+		{"command": "help", "description": "Što NEXUS zna raditi"},
+		{"command": "approve", "description": "Odobri zahtjev (approve ch-...)"},
+		{"command": "deny", "description": "Odbij zahtjev (deny ch-...)"},
+		{"command": "retry", "description": "Ponovi odobrenje (retry ch-...)"},
+		{"command": "ack", "description": "Potvrdi podsjetnik (ack occ-...)"},
+		{"command": "outbox", "description": "Stanje neisporučenih poruka"},
+	}
+	a.call(ctx, "setMyCommands", map[string]any{"commands": cmds}, nil)
 }
 
 // Probe is the LIVE channel probe for the T11 snapshot: one getMe round
