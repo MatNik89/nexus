@@ -14,7 +14,7 @@ round count.
 
 ## Slice A — F1 + F8(provider): one shared E11 egress dialer
 Root: `internal/llm/provider/provider.go` builds a client with no custom
-`Transport` (`:128-141`) → `http.DefaultTransport` (ambient proxy, unpinned DNS,
+`Transport` (`:132-141`) → `http.DefaultTransport` (ambient proxy, unpinned DNS,
 no receipt) while carrying the bearer token — an E11 violation
 (`ARCHITECTURE-ESSENTIALS.md:146-158`). Telegram already has the compliant
 dialer (`internal/channel/telegram/dialer.go`).
@@ -27,14 +27,14 @@ Telegram's `newPinnedClient` becomes a thin wrapper; provider builds its client
 from the same owner (production endpoint mode; host must be in `egress_allow`).
 No default-transport fallback anywhere.
 F8-provider half: provider response body read through `io.LimitReader` (a
-configured max) before JSON decode (`provider.go:193-213`).
+configured max) before JSON decode (`provider.go:~207`).
 Detectors: provider dialer refuses a metadata/rebind resolver answer; provider
 Proxy:nil; over-limit body rejected; a shared-owner test proving both telegram
 and provider reject the deny-floor set.
 
 ## Slice B — F2: S7-bounded delivery retry (channel core parks; S7 grants)
 Root: `channel.go:542-591` re-pends definite failures to PENDING; the telegram
-Run loop `FlushOutbox`es every tick (`telegram.go:388-403`) with no
+Run loop `FlushOutbox`es every tick (`telegram.go:433-442`) with no
 `AttemptGrant`, limit, or backoff — unbounded retry outside the S7 owner
 (`AGENTS.md:19-22`; tasks-P0.md:464-471 records the gap).
 Fix: the channel core CLASSIFIES + PARKS only (no self-driven resend). Every
@@ -59,7 +59,7 @@ never-ending stream is cut at the ceiling.
 
 ## Slice D — F6: channel-health owner (no silent death)
 Root: the Run loop ignores `PollOnce`/`FlushOutbox` errors and
-`registerCommands` return (`telegram.go:388-423`) — a revoked token / journal
+`registerCommands` return (`telegram.go:433-450`) — a revoked token / journal
 failure leaves the capability apparently ON while Telegram is silently dead.
 Fix: one channel-health owner records redacted last-error + state; durable
 substrate errors (journal) mark the channel OFF/degraded; transport failures are
