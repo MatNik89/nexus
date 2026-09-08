@@ -300,6 +300,20 @@ func (a *Adapter) FlushOutbox(ctx context.Context) error {
 		// next regular flush tick. This slice adds NO attempt and
 		// changes no scheduling — only the carried bytes.
 		if o.Attempts == 0 {
+			// A pipe table renders NATIVELY via sendRichMessage (Bot
+			// API 10.1, verified official) — the owner's live table
+			// complaint. ONE wire send this tick: if it fails (a
+			// pre-10.1 client 400), the row re-pends and the next tick
+			// (attempts>0) carries plain — same first-lease discipline
+			// as the HTML path, no double-send.
+			// Only when the WHOLE reply fits the sendRichMessage limit —
+			// never clip (a clipped body that earns SENT would silently
+			// drop the suffix, codex #1). An over-limit table falls to
+			// today's path; multipart is its own deferred slice.
+			if hasPipeTable(o.Text) && fitsRich(o.Text) {
+				return a.call(ctx, "sendRichMessage", map[string]any{
+					"chat_id": chat, "rich_message": map[string]any{"markdown": o.Text}}, nil)
+			}
 			if rendered, ok := renderHTML(o.Text); ok {
 				return a.call(ctx, "sendMessage", map[string]any{
 					"chat_id": chat, "text": rendered, "parse_mode": "HTML"}, nil)
@@ -307,6 +321,27 @@ func (a *Adapter) FlushOutbox(ctx context.Context) error {
 		}
 		return a.call(ctx, "sendMessage", map[string]any{"chat_id": chat, "text": o.Text}, nil)
 	})
+}
+
+// hasPipeTable reports whether the text contains a GFM pipe table
+// (a header row followed by a |---| delimiter). Reuses render.go's
+// table detection so both paths agree.
+func hasPipeTable(text string) bool {
+	lines := strings.Split(text, "\n")
+	for i := 0; i+1 < len(lines); i++ {
+		if strings.Contains(lines[i], "|") && isTableDivider(lines[i+1]) {
+			return true
+		}
+	}
+	return false
+}
+
+// fitsRich reports whether the WHOLE text is within the
+// sendRichMessage character limit (no clipping — lossless or not at
+// all).
+func fitsRich(s string) bool {
+	const max = 32768
+	return len([]rune(s)) <= max
 }
 
 // Outbound aliases the core row (keeps the Flush signature readable).

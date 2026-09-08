@@ -42,6 +42,8 @@ type fakeBot struct {
 	// rejection for the first N sends carrying parse_mode.
 	parseModes     []string
 	rejectHTMLLeft int
+	lastMethod     string
+	lastRich       string
 }
 
 func (f *fakeBot) handler() http.HandlerFunc {
@@ -62,6 +64,18 @@ func (f *fakeBot) handler() http.HandlerFunc {
 			}
 			out, _ := json.Marshal(map[string]any{"ok": true, "result": batch})
 			w.Write(out)
+		case strings.HasSuffix(r.URL.Path, "/sendRichMessage"):
+			var req struct {
+				ChatID      int64 `json:"chat_id"`
+				RichMessage struct {
+					Markdown string `json:"markdown"`
+				} `json:"rich_message"`
+			}
+			json.NewDecoder(r.Body).Decode(&req)
+			f.lastMethod = "sendRichMessage"
+			f.lastRich = req.RichMessage.Markdown
+			f.sentTo = append(f.sentTo, req.ChatID)
+			w.Write([]byte(`{"ok":true,"result":{"message_id":1}}`))
 		case strings.HasSuffix(r.URL.Path, "/sendMessage"):
 			var req struct {
 				ChatID    int64  `json:"chat_id"`
@@ -75,6 +89,7 @@ func (f *fakeBot) handler() http.HandlerFunc {
 				w.Write([]byte(`{"ok":false,"error_code":400,"description":"Bad Request: can't parse entities"}`))
 				return
 			}
+			f.lastMethod = "sendMessage"
 			f.sent = append(f.sent, req.Text)
 			f.sentTo = append(f.sentTo, req.ChatID)
 			f.parseModes = append(f.parseModes, req.ParseMode)
@@ -572,5 +587,60 @@ func TestOldVersionDatabaseRebuildsAttempts(t *testing.T) {
 	defer h2.bot.mu.Unlock()
 	if len(h2.bot.sent) != 1 || h2.bot.parseModes[0] != "" {
 		t.Fatalf("rebuilt database lost the lease count: sent=%v modes=%v", h2.bot.sent, h2.bot.parseModes)
+	}
+}
+
+// R1: a pipe table is delivered via sendRichMessage (Bot API 10.1).
+func TestPipeTableUsesRichMessage(t *testing.T) {
+	h := build(t, map[int64]string{42: "work"})
+	tbl := "Evo:\n| Proizvod | Cijena |\n|---|---|\n| Kruh | 1,50 € |"
+	if _, err := h.core.EnqueueReply(ctxT(), "telegram", "chat-42", "work", tbl); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.a.FlushOutbox(ctxT()); err != nil {
+		t.Fatal(err)
+	}
+	h.bot.mu.Lock()
+	defer h.bot.mu.Unlock()
+	if h.bot.lastMethod != "sendRichMessage" {
+		t.Fatalf("table not sent via sendRichMessage: %q", h.bot.lastMethod)
+	}
+	if !strings.Contains(h.bot.lastRich, "| Proizvod | Cijena |") {
+		t.Fatalf("raw markdown table not carried: %q", h.bot.lastRich)
+	}
+}
+
+// R1 codex #1: an OVER-LIMIT table must NOT use sendRichMessage (no
+// silent clip earning SENT) — it falls through to today's path.
+func TestOverLimitTableSkipsRich(t *testing.T) {
+	h := build(t, map[int64]string{42: "work"})
+	big := "| a | b |\n|---|---|\n" + strings.Repeat("| x | "+strings.Repeat("y", 100)+" |\n", 400)
+	if len([]rune(big)) <= 32768 {
+		t.Fatalf("fixture not over-limit: %d", len([]rune(big)))
+	}
+	if _, err := h.core.EnqueueReply(ctxT(), "telegram", "chat-42", "work", big); err != nil {
+		t.Fatal(err)
+	}
+	_ = h.a.FlushOutbox(ctxT())
+	h.bot.mu.Lock()
+	defer h.bot.mu.Unlock()
+	if h.bot.lastMethod == "sendRichMessage" {
+		t.Fatal("over-limit table clipped into sendRichMessage")
+	}
+}
+
+// A non-table reply keeps the plain/HTML path (no rich).
+func TestNonTableSkipsRichMessage(t *testing.T) {
+	h := build(t, map[int64]string{42: "work"})
+	if _, err := h.core.EnqueueReply(ctxT(), "telegram", "chat-42", "work", "obican odgovor"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.a.FlushOutbox(ctxT()); err != nil {
+		t.Fatal(err)
+	}
+	h.bot.mu.Lock()
+	defer h.bot.mu.Unlock()
+	if h.bot.lastMethod == "sendRichMessage" {
+		t.Fatal("plain reply wrongly used sendRichMessage")
 	}
 }
