@@ -26,16 +26,25 @@ Replace the adapter's client with one built from an explicit transport:
   2. Resolve the host ONCE to its address set. NORMALIZE every answer with
      `netip.Addr.Unmap()` (an IPv4-mapped-IPv6 form of a forbidden address must
      classify the same as its plain v4 form).
-  3. KERNEL DENY FLOOR, applied to EVERY normalized answer regardless of
-     `egress_allow`: reject loopback, unspecified, multicast, interface-local,
-     link-local (`169.254.0.0/16`, `fe80::/10` — this covers the cloud metadata
-     IP `169.254.169.254` in every representation), and — Telegram being a
-     public host — private v4 (`10/8`, `172.16/12`, `192.168/16`), CGNAT
-     (`100.64/10`), and ULA (`fc00::/7`).
-  4. MIXED-SET RULE (fail-closed): if ANY resolved answer fails the deny floor,
-     REFUSE the whole resolution — do not silently dial a "good" answer from a
-     poisoned set. Only when EVERY answer passes do we pin one and dial that
-     literal IP.
+  3. ADDRESS POLICY, mode-sensitive on the config-validated API base (r5 codex
+     F1 — `config.ValidateBounds` already accepts ONLY the production endpoint
+     or an explicit http(s) LOOPBACK override, `config.go:334-340`, so the two
+     modes are exactly those):
+     - PRODUCTION mode (`telegram_api_base == https://api.telegram.org`):
+       PUBLIC DENY FLOOR on EVERY normalized answer — reject loopback,
+       unspecified, multicast, interface-local, link-local (`169.254.0.0/16`,
+       `fe80::/10` — covers the cloud metadata IP `169.254.169.254` in every
+       representation), and — Telegram being public — private v4 (`10/8`,
+       `172.16/12`, `192.168/16`), CGNAT (`100.64/10`), and ULA (`fc00::/7`).
+     - LOOPBACK-OVERRIDE mode (the validated local bot-api / test endpoint):
+       require EVERY normalized answer to be loopback; reject any non-loopback
+       or mixed set. This keeps the supported local endpoint usable WITHOUT
+       weakening production enforcement (a production host can never enter
+       loopback mode — the base is fixed by config validation).
+  4. MIXED-SET RULE (fail-closed, both modes): if ANY resolved answer fails the
+     mode's policy, REFUSE the whole resolution — never dial a "good" answer
+     from a poisoned set. Only when EVERY answer passes do we pin one and dial
+     that literal IP.
   5. TLS verifies the ORIGINAL hostname (`ServerName = host`), so pinning the
      literal IP never downgrades cert validation.
   6. A retry re-resolves and re-applies steps 2-4; the connect target is always
@@ -69,6 +78,11 @@ This is one client, shared by all adapter calls; no new dependency (net/netip
   receipt with the refuse decision. Token never present.
 - HOST-DENY: a host outside `egress_allow` / the configured API host is refused
   before any connect.
+- MODE-LOOPBACK: with a validated loopback API base, an all-loopback answer set
+  connects (IPv4 `127.0.0.1` and IPv6 `::1` and `localhost` cases), while a
+  mixed loopback+public set is refused; with the production base, an all-public
+  answer connects and any loopback answer is refused. RED against a single
+  fixed floor that breaks the local bot-api endpoint.
 - TLS-SNI-PRESERVED: dialing the pinned IP still presents the hostname as SNI
   and validates the cert chain against the hostname (a cert for the wrong name
   is rejected).
