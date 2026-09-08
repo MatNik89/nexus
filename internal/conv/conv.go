@@ -88,7 +88,10 @@ func (p Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 			return err
 		}
 		// hist_seq = admission offset (history order); set once.
-		_, err := tx.Exec(`UPDATE conv_turns SET identity=?, update_id=?, user_text=?,
+		// First admission wins (reference keeps the earliest user text
+		// and admission offset): COALESCE both.
+		_, err := tx.Exec(`UPDATE conv_turns SET identity=?, update_id=?,
+			user_text=COALESCE(NULLIF(user_text,''), ?),
 			hist_seq=COALESCE(hist_seq, ?) WHERE turn_id=?`,
 			pl.ChannelIdentity, pl.UpdateID, pl.Text, ev.JournalOffset, turnID)
 		return err
@@ -113,8 +116,8 @@ func (p Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 		}
 		// recovery: SUCCEEDED requires a non-empty final (today's rule).
 		if pl.Final != "" {
-			_, err := tx.Exec(`UPDATE conv_turns SET rec_state='SUCCEEDED', rec_final=?
-				WHERE turn_id=?`, pl.Final, turnID)
+			_, err := tx.Exec(`UPDATE conv_turns SET rec_state='SUCCEEDED', rec_final=?,
+				code=NULL, tool=NULL, susp_summary=NULL WHERE turn_id=?`, pl.Final, turnID)
 			return err
 		}
 		return nil
@@ -129,8 +132,8 @@ func (p Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 		if err := upsert(tx, pl.TurnID, ev); err != nil {
 			return err
 		}
-		_, err := tx.Exec(`UPDATE conv_turns SET rec_state='SUSPENDED', susp_summary=?
-			WHERE turn_id=?`, pl.Summary, pl.TurnID)
+		_, err := tx.Exec(`UPDATE conv_turns SET rec_state='SUSPENDED', susp_summary=?,
+			code=NULL, tool=NULL, rec_final=NULL WHERE turn_id=?`, pl.Summary, pl.TurnID)
 		return err
 	case "turn.resumed":
 		if ev.Envelope.TurnID == nil {
@@ -158,8 +161,8 @@ func (p Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 			return err
 		}
 		// a terminal failure always overwrites recovery state.
-		_, err := tx.Exec(`UPDATE conv_turns SET rec_state='FAILED', code=?, tool=?
-			WHERE turn_id=?`, pl.Code, pl.Tool, turnID)
+		_, err := tx.Exec(`UPDATE conv_turns SET rec_state='FAILED', code=?, tool=?,
+			susp_summary=NULL, rec_final=NULL WHERE turn_id=?`, pl.Code, pl.Tool, turnID)
 		return err
 	}
 	return nil
