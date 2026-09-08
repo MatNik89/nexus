@@ -17,9 +17,26 @@ Consolidated build map: the docs below + `docs/PLAN-AUDIT-FIXES.md`.
 - `slice/p1-audit` @ 4f5e652 — audit remediation: **F4 + F9 DONE**; F1,F2,F3,F5,
   F6,F7,F8 pending per `docs/PLAN-AUDIT-FIXES.md` (audit = `docs/AUDIT-FULL-codex-2026-09-08.md`).
 
-**PENDING QUEUE (ordered):**
-1. Review `/reminder` v3 (slice/p1-cronjob-v2) with the 3 herdr agents -> merge to main.
-2. Audit remediation slices A-F (`docs/PLAN-AUDIT-FIXES.md`): A=shared E11 dialer
+**DIRECTION (owner, 2026-09-08): CORE-FIRST.** Telegram surface work
+(reminder-v3 merge, recurring /cronjob, voice, media) is PARKED on its branches —
+resume only when the owner says. Focus = the nexus CORE: audit-hardening first,
+then continuous core improvement (steal/refactor whatever is worth it). **AUTODEPLOY
+is ON**: after a slice reaches 3xPASS + merge to main, automatically build ->
+~/bin/nexus -> `systemctl --user restart nexus` -> verify capability ON (no per-deploy
+approval needed).
+
+**PENDING QUEUE (reordered — core first):**
+1. Audit remediation F1-F8 (`docs/AUDIT-FULL-codex-2026-09-08.md` +
+   `docs/PLAN-AUDIT-FIXES.md`) — mostly CORE hardening. Re-dispatch the plan review
+   (a restart killed it), then slices A-F. F3 needs the owner's Go>=1.26.6 upgrade.
+2. Continuous core improvement: coding USP trio, web search/browser, memory, and
+   steal-worthy patterns we find — each research->plan->agents->code->agents->autodeploy.
+3. PARKED (Telegram surface, resume on owner's word): review `/reminder` v3
+   (slice/p1-cronjob-v2) -> merge; real recurring /cronjob; voice; media.
+
+Old queue (kept for reference):
+- Review `/reminder` v3 (slice/p1-cronjob-v2) with the 3 herdr agents -> merge to main.
+- Audit remediation slices A-F (`docs/PLAN-AUDIT-FIXES.md`): A=shared E11 dialer
    (F1+F8 provider), B=S7-bounded delivery retry (F2), C=context budget + bounded
    reads (F5+F8), D=channel-health owner (F6), E=config-aware doctor (F7),
    F=release Go-floor+govulncheck gate (F3 — needs the OWNER to upgrade the Pi's
