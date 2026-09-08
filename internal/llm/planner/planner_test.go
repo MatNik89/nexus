@@ -428,3 +428,43 @@ func TestHistoryBlocksBecomeRoleMessages(t *testing.T) {
 		t.Fatalf("system prompt lost the language directive: %q", fc.msgs[0].Content)
 	}
 }
+
+// TIME: SetClock appends the current-time line to the CURRENT user
+// message (not the system prompt), with the configured zone + offset.
+func TestClockLineInUserMessage(t *testing.T) {
+	auth := s7min.NewAuthority(nil, time.Minute)
+	fc := &msgsCapturingChat{auth: auth}
+	p, err := New(fc, auth, "provider:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	loc, err := time.LoadLocation("Europe/Zagreb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixed := time.Date(2026, 7, 8, 15, 4, 0, 0, time.UTC) // July -> CEST +02:00
+	p.SetClock(loc, func() time.Time { return fixed })
+	text := "koliko je sati"
+	b, _ := contracts.NewContextBlock(contracts.ContextBlockParams{
+		BlockID: "b1", Kind: "user_message", Content: &text,
+		ContentHash: "h", SourceURI: "test://b", Producer: "t",
+		Trust: contracts.TrustUser, Sensitivity: contracts.Sensitivity(1),
+		Lineage: []string{}, ObservedAt: time.Unix(1, 0),
+	})
+	if _, err := p.Plan(context.Background(), []contracts.ContextBlock{b}); err != nil {
+		t.Fatal(err)
+	}
+	last := fc.msgs[len(fc.msgs)-1]
+	if last.Role != "user" {
+		t.Fatalf("last message not user: %s", last.Role)
+	}
+	if !strings.Contains(last.Content, "Europe/Zagreb") || !strings.Contains(last.Content, "UTC+02:00") {
+		t.Fatalf("time line missing/wrong: %q", last.Content)
+	}
+	if !strings.Contains(last.Content, "2026-07-08 17:04") { // 15:04 UTC -> 17:04 CEST
+		t.Fatalf("local time wrong: %q", last.Content)
+	}
+	if strings.Contains(fc.msgs[0].Content, "Current date and time") {
+		t.Fatal("time line leaked into the system prompt (cache prefix)")
+	}
+}

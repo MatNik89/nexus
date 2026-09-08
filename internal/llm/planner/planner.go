@@ -105,6 +105,21 @@ type ChatPlanner struct {
 	deliver func(string) error
 	specs   map[contracts.ToolID]effectpath.ToolSpec
 	profile contracts.ProfileID
+	// loc + nowFn render the conversational time line appended to the
+	// current user message (nil loc = feature off). Injected via
+	// SetClock so New keeps its signature.
+	loc   *time.Location
+	nowFn func() time.Time
+}
+
+// SetClock enables the current-time line: loc is the IANA zone, now the
+// clock (defaults to time.Now if nil). The line is appended to the
+// user content so the cacheable system+history prefix stays stable.
+func (c *ChatPlanner) SetClock(loc *time.Location, now func() time.Time) {
+	if now == nil {
+		now = time.Now
+	}
+	c.loc, c.nowFn = loc, now
 }
 
 // WithTools enables tool planning against a SEALED spec registry: the
@@ -263,6 +278,12 @@ func (c *ChatPlanner) Plan(ctx context.Context, blocks []contracts.ContextBlock)
 	msgs := make([]provider.ChatMessage, 0, len(history)+2)
 	msgs = append(msgs, provider.ChatMessage{Role: "system", Content: system})
 	msgs = append(msgs, history...)
+	if c.loc != nil {
+		t := c.nowFn().In(c.loc)
+		assembled += fmt.Sprintf("\n\nCurrent date and time: %s %s (%s, UTC%s).",
+			t.Format("2006-01-02 15:04 Monday"), c.loc.String(),
+			t.Format("MST"), t.Format("-07:00"))
+	}
 	msgs = append(msgs, provider.ChatMessage{Role: "user", Content: assembled})
 	op, err := opID()
 	if err != nil {

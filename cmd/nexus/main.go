@@ -26,8 +26,8 @@ import (
 	"github.com/MatNik89/nexus/internal/app/repl"
 	"github.com/MatNik89/nexus/internal/approval"
 	"github.com/MatNik89/nexus/internal/channel"
-	"github.com/MatNik89/nexus/internal/conv"
 	"github.com/MatNik89/nexus/internal/channel/telegram"
+	"github.com/MatNik89/nexus/internal/conv"
 	"github.com/MatNik89/nexus/internal/exectool"
 	"github.com/MatNik89/nexus/internal/foundation/atomicwrite"
 	"github.com/MatNik89/nexus/internal/foundation/clockid"
@@ -451,6 +451,13 @@ func resumeObservation(call contracts.ToolCall, result string) (contracts.Contex
 }
 
 func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, error) {
+	// Conversational clock zone (fail-closed): the model sees the local
+	// time in this zone. Config validation already rejected Local/""/
+	// unloadable, but resolve here so a bad value never starts the daemon.
+	convLoc, tzErr := time.LoadLocation(resolved.Config.Timezone)
+	if tzErr != nil {
+		return nil, fmt.Errorf("timezone %q: %w", resolved.Config.Timezone, tzErr)
+	}
 	profile := resolved.Config.DefaultProfile
 	profileDir, err := layout.ProfileDir(profile)
 	if err != nil {
@@ -582,6 +589,7 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 			if err != nil {
 				return nil, err
 			}
+			pl.SetClock(convLoc, time.Now)
 			specs := memory.Specs()
 			for k, v := range obligation.Specs() {
 				specs[k] = v

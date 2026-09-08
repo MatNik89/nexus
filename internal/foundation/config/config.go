@@ -21,6 +21,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
 )
@@ -44,6 +45,11 @@ type Config struct {
 	// SandboxDisabled exists ONLY so an attempt to set it is caught and
 	// rejected: the sandbox is kernel floor, not configuration.
 	SandboxDisabled bool `json:"sandbox_disabled"`
+	// Timezone is the IANA zone for the conversational time line the
+	// model sees (single-owner). Default Europe/Zagreb; validated by
+	// LoadLocation, "Local"/"" rejected (the reminder occurrences keep
+	// their own zone — this is only the chat clock).
+	Timezone string `json:"timezone"`
 }
 
 // Origin records which layer supplied each key.
@@ -95,6 +101,7 @@ var keySchema = map[string]keyKind{
 	"egress_allow":       kindStringList,
 	"exec_allow":         kindStringList,
 	"sandbox_disabled":   kindBool,
+	"timezone":           kindString,
 }
 
 // value is one typed, presence-aware layer entry.
@@ -116,6 +123,7 @@ func defaults() Config {
 		TelegramTokenEnv: "NEXUS_TELEGRAM_TOKEN",
 		TelegramAPIBase:  "https://api.telegram.org",
 		DefaultProfile:   "private",
+		Timezone:         "Europe/Zagreb",
 	}
 }
 
@@ -291,6 +299,14 @@ func applyValue(c *Config, key string, v value) error {
 			return fmt.Errorf("default_profile: invalid profile id")
 		}
 		c.DefaultProfile = p
+	case "timezone":
+		if v.str == "" || v.str == "Local" {
+			return fmt.Errorf("timezone: must be a real IANA zone (not %q)", v.str)
+		}
+		if _, err := time.LoadLocation(v.str); err != nil {
+			return fmt.Errorf("timezone: %v", err)
+		}
+		c.Timezone = v.str
 	case "egress_allow":
 		c.EgressAllow = v.list
 	case "exec_allow":
