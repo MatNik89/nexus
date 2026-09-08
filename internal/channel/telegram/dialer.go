@@ -86,31 +86,29 @@ func (d *pinnedDialer) emit(dec egressDecision) error {
 	return nil
 }
 
-// embeddedV4 extracts a v4 address embedded in an IPv6 transition form that
-// must be classified by the v4 policy (E11: metadata blocked in EVERY
-// encoding). Covers the NAT64 well-known prefix 64:ff9b::/96 and the
-// deprecated IPv4-compatible ::/96 form.
+// v4EmbedPrefixes is the COMPLETE set of standardized IPv6 forms that carry an
+// IPv4 address in their low 32 bits. Derived from the "metadata blocked in
+// EVERY encoding" invariant (E11) rather than extended one review at a time:
+// any address in one of these prefixes is reclassified by the v4 policy on its
+// embedded v4. (IPv4-mapped ::ffff:0:0/96 is handled by Unmap before this.)
+var v4EmbedPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("64:ff9b::/96"),    // RFC6052 NAT64 well-known
+	netip.MustParsePrefix("::ffff:0:0:0/96"), // RFC6145 IPv4-translated
+	netip.MustParsePrefix("::/96"),           // deprecated IPv4-compatible
+}
+
+// embeddedV4 extracts a v4 address embedded in a standardized IPv6 transition
+// form so the v4 policy classifies it too. :: and ::1 are excluded (the
+// unspecified/loopback predicates already own them).
 func embeddedV4(a netip.Addr) (netip.Addr, bool) {
-	if !a.Is6() {
+	if !a.Is6() || a == netip.IPv6Unspecified() || a == netip.IPv6Loopback() {
 		return netip.Addr{}, false
 	}
-	b := a.As16()
-	// NAT64 well-known prefix 64:ff9b::/96.
-	if b[0] == 0x00 && b[1] == 0x64 && b[2] == 0xff && b[3] == 0x9b &&
-		b[4] == 0 && b[5] == 0 && b[6] == 0 && b[7] == 0 &&
-		b[8] == 0 && b[9] == 0 && b[10] == 0 && b[11] == 0 {
-		return netip.AddrFrom4([4]byte{b[12], b[13], b[14], b[15]}), true
-	}
-	// IPv4-compatible ::/96 (deprecated), excluding :: and ::1.
-	allZeroHigh := true
-	for i := 0; i < 12; i++ {
-		if b[i] != 0 {
-			allZeroHigh = false
-			break
+	for _, p := range v4EmbedPrefixes {
+		if p.Contains(a) {
+			b := a.As16()
+			return netip.AddrFrom4([4]byte{b[12], b[13], b[14], b[15]}), true
 		}
-	}
-	if allZeroHigh && !(b[12] == 0 && b[13] == 0 && b[14] == 0 && (b[15] == 0 || b[15] == 1)) {
-		return netip.AddrFrom4([4]byte{b[12], b[13], b[14], b[15]}), true
 	}
 	return netip.Addr{}, false
 }

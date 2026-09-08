@@ -310,3 +310,42 @@ func TestEgressReceiptJournaled(t *testing.T) {
 		t.Fatalf("no complete allowed egress receipt journaled after a poll")
 	}
 }
+
+func TestDialerRejectsForbiddenV4EveryEncoding(t *testing.T) {
+	// Derived from the "metadata blocked in EVERY encoding" invariant (E11):
+	// every forbidden v4 class run through every standardized IPv6 embedding
+	// must be refused with no dial. Guards against the fix-one-prefix loop.
+	forbidden := map[string][4]byte{
+		"metadata": {169, 254, 169, 254},
+		"loopback": {127, 0, 0, 1},
+		"rfc1918":  {10, 0, 0, 1},
+		"cgnat":    {100, 64, 0, 1},
+	}
+	embed := []netip.Prefix{
+		netip.MustParsePrefix("64:ff9b::/96"),    // NAT64 well-known
+		netip.MustParsePrefix("::ffff:0:0:0/96"), // RFC6145 translated
+	}
+	for name, v4 := range forbidden {
+		cands := []netip.Addr{
+			netip.AddrFrom4(v4), // plain v4
+			netip.AddrFrom16([16]byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, v4[0], v4[1], v4[2], v4[3]}), // IPv4-mapped
+		}
+		for _, p := range embed {
+			pb := p.Addr().As16()
+			pb[12], pb[13], pb[14], pb[15] = v4[0], v4[1], v4[2], v4[3]
+			cands = append(cands, netip.AddrFrom16(pb))
+		}
+		for _, a := range cands {
+			var got string
+			var rc []egressDecision
+			ans := a
+			d := newTestDialer(false, func(context.Context, string) ([]netip.Addr, error) { return []netip.Addr{ans}, nil }, recordDial(&got), &rc)
+			if _, err := d.DialContext(context.Background(), "tcp", "api.telegram.org:443"); err == nil {
+				t.Fatalf("%s admitted via encoding %s", name, a)
+			}
+			if got != "" {
+				t.Fatalf("%s dialed via encoding %s -> %s", name, a, got)
+			}
+		}
+	}
+}
