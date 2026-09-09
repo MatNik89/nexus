@@ -84,7 +84,8 @@ task plan must satisfy SECTION-MAP dependency edges WITHIN the SPEC's vertical s
 Invariants that hold either way: S16.6-det minimal checker is a K0/P0-phase primitive;
 sandbox (S6.2) lands BEFORE tools/exec (S4). **RESOLVED (hard-questions, unanimous):**
 SPEC vertical slices bind delivery; SECTION-MAP DAG edges are satisfied by NAMED -min
-contracts pulled forward — `s7-min` (AttemptGrant + cancel + no-retry), `s5-min`
+contracts pulled forward — `s7-min` (AttemptGrant + cancel + no-retry; **superseded
+2026-09-09 by the full S7 engine in P1, owner decision — see AGENTS.md change-record**), `s5-min`
 (AtomicWriter), `3.6-min` (persisted scheduler + wake catch-up), `7.3-min` (inbox/outbox +
 occurrence idempotency); full engines keep their later phases. Walking-skeleton order:
 HARDQ-CONSOLIDATED A2 (7 steps) → tasks-P0.md.
