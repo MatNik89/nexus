@@ -674,34 +674,46 @@ func (a *Authority) AttemptContext(ctx context.Context, op contracts.OperationID
 	if !ok || rec.state != contracts.AttemptRunning {
 		return nil, nil, fmt.Errorf("s7 attempt-context: operation is not RUNNING: %w", ErrAttemptNotAuthorized)
 	}
-	deadline := callDeadline
+	// Authority-clock bounds (grant expiry, operation deadline, attempt
+	// timeout) are converted to the WALL clock through their REMAINING
+	// duration, so an injected clock and the wall clock agree; the caller's
+	// call deadline is already wall time and wins when it is earlier (so an
+	// executor sees EXACTLY the call deadline it was given).
+	now := a.now()
+	var authBound time.Time
 	earliest := func(t time.Time) {
 		if t.IsZero() {
 			return
 		}
-		if deadline.IsZero() || t.Before(deadline) {
-			deadline = t
+		if authBound.IsZero() || t.Before(authBound) {
+			authBound = t
 		}
 	}
 	earliest(rec.expires)
 	earliest(rec.deadline)
-	now := a.now()
 	if rec.policy.AttemptTimeout > 0 {
 		earliest(now.Add(rec.policy.AttemptTimeout))
 	}
-	// The deadline is expressed in the AUTHORITY's clock; the context gets
-	// the REMAINING duration so an injected clock and the wall clock agree
-	// (an already-expired attempt is refused, fail closed).
-	dctx, cancel := ctx, context.CancelFunc(func() {})
-	if !deadline.IsZero() {
-		remaining := deadline.Sub(now)
+	deadline := callDeadline
+	if !authBound.IsZero() {
+		remaining := authBound.Sub(now)
 		if remaining <= 0 {
 			return nil, nil, fmt.Errorf("s7 attempt-context: attempt deadline already passed: %w", ErrAttemptNotAuthorized)
 		}
-		dctx, cancel = context.WithTimeout(ctx, remaining)
-	} else {
-		dctx, cancel = context.WithCancel(ctx)
+		if wallBound := time.Now().Add(remaining); deadline.IsZero() || wallBound.Before(deadline) {
+			deadline = wallBound
+		}
 	}
+	var dctx context.Context
+	var cancel context.CancelFunc
+	if deadline.IsZero() {
+		dctx, cancel = context.WithCancel(ctx)
+	} else {
+		dctx, cancel = context.WithDeadline(ctx, deadline)
+	}
+	// Registered under the SAME lock as the state check: a Cancel racing
+	// this call either sees non-RUNNING (context refused) or finds the
+	// stored cancel and kills the live context.
 	rec.execCancel = cancel
 	return dctx, cancel, nil
 }

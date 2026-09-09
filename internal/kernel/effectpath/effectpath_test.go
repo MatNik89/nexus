@@ -610,16 +610,19 @@ func TestAttemptContextIsS7Owned(t *testing.T) {
 	if err := auth.Consume(g); err != nil {
 		t.Fatal(err)
 	}
-	// Grant expiry (issue+1m from the pinned clock) caps a longer call
-	// deadline.
-	dctx, cancel, err := auth.AttemptContext(context.Background(), "op-1", time.Unix(999999, 0))
+	// Grant expiry (issue+1m on the authority's pinned clock) caps a longer
+	// call deadline: the context deadline is the REMAINING lease projected
+	// onto the wall clock (~1m from now), not the hour the caller asked for.
+	longCall := time.Now().Add(time.Hour)
+	dctx, cancel, err := auth.AttemptContext(context.Background(), "op-1", longCall)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer cancel()
 	dl, ok := dctx.Deadline()
-	if !ok || !dl.Equal(g.ExpiresAt) {
-		t.Fatalf("S7 did not cap the deadline at grant expiry: %v (want %v)", dl, g.ExpiresAt)
+	remaining := time.Until(dl)
+	if !ok || !dl.Before(longCall) || remaining > 61*time.Second || remaining < 55*time.Second {
+		t.Fatalf("S7 did not cap the deadline at the grant lease: deadline in %v (want ~1m, grant expires %v)", remaining, g.ExpiresAt)
 	}
 }
 
