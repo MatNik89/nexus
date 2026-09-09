@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 
@@ -25,15 +26,14 @@ const (
 	ClassEffect
 )
 
-// ReAsk is one additional PHYSICAL provider attempt. The extractor issues
-// a fresh S7 AttemptGrant; the TRANSPORT consumes it (provider.Chat/
-// Stream), so a callback that tries a second physical call on the same
-// grant dies with ATTEMPT_NOT_AUTHORIZED before any bytes leave the
-// process (Phase-2 codex #2: consumption outside the transport was
-// decorative). Adapters never retry on their own.
-type ReAsk func(ctx context.Context, g s7.Grant) ([]byte, error)
+// Generate is ONE physical structured generation: attempt 1 (reask=false)
+// produces the initial reply, attempt 2 (reask=true) the re-ask. The
+// TRANSPORT consumes the grant (provider.Chat/Stream); a callback that
+// never consumes is a local refusal — its bytes are a claim, not a result.
+type Generate func(ctx context.Context, g s7.Grant, reask bool) ([]byte, error)
 
-// Extractor is the S2.3-min structured-output owner.
+// Extractor is the S2.3 structured-output owner. It VALIDATES and PROPOSES;
+// S7 (Execute, PolicyStructured) owns the one re-ask.
 type Extractor struct {
 	auth *s7.Authority
 }
@@ -99,82 +99,87 @@ func salvageJSON(raw []byte) ([]byte, bool) {
 	return nil, false
 }
 
-// Extract runs the P0.7 ladder for ONE structured payload:
-//
-//	strict decode+validate → (GENERAL only) re-ask with a fresh
-//	AttemptGrant → salvage from re-ask, then from the original → error.
-//
-// It NEVER returns a value without a passed validation, and a nil
-// validator is itself a refusal — "no validation" is silent accept.
-func Extract[T any](ctx context.Context, e *Extractor, class PayloadClass, raw []byte,
-	validate func(T) error, op contracts.OperationID, target contracts.TargetID, reask ReAsk) (T, error) {
+// ErrStructuredInvalid is the P0.7 literal: invalid output NEVER comes back
+// as a value without an error.
+var ErrStructuredInvalid = errors.New("structured: output invalid after validate, re-ask and salvage (never silently accepted)")
+
+// ExtractVia runs the P0.7 ladder as ONE S7 operation (Slice B3, plan v12):
+// attempt 1 = initial generation + strict validation; for GENERAL only, an
+// invalid result is the typed proposal invalid_general and S7 issues EXACTLY
+// one re-ask (PolicyStructured MaxAttempts 2); attempt 2 = re-ask + strict
+// validation, then — INSIDE the final attempt's outcome decision — the
+// salvage ladder (re-ask bytes, then the original bytes). An accepted value
+// lands SUCCEEDED; nothing accepted lands FAILED_TERMINAL and NO value is
+// returned: the caller's result and the S7 state are one decision.
+// SECURITY/EFFECT classes propose terminal on the first invalid result (no
+// re-ask, no salvage). The extractor never calls Issue/Next: S7 owns the
+// retry.
+func ExtractVia[T any](ctx context.Context, e *Extractor, class PayloadClass, validate func(T) error,
+	op contracts.OperationID, target contracts.TargetID, generate Generate) (T, error) {
 	var zero T
 	if validate == nil {
 		return zero, fmt.Errorf("structured: a validator is required (fail closed)")
 	}
-	if out, err := decodeStrict(raw, validate); err == nil {
-		return out, nil
-	} else if class != ClassGeneral {
-		// SECURITY/EFFECT: strict, no tolerant accept of any kind.
-		return zero, fmt.Errorf("structured: %d-class payload invalid — no repair permitted (fail closed): %w", class, err)
+	if generate == nil {
+		return zero, fmt.Errorf("structured: a generator is required (fail closed)")
 	}
-	// GENERAL: one re-ask, a NEW physical attempt. The transport consumes
-	// the grant; the extractor issues it and lands the outcome from the
-	// AUTHORITY's actual state on EVERY callback exit (Phase-2-r2 codex
-	// #3: a consumed-then-error callback leaked a RUNNING attempt, and an
-	// unconsumed callback's bytes were ungoverned):
-	//   - callback never consumed → operation CANCELLED, its bytes IGNORED
-	//     (an ungoverned reply is a claim, not a transport result);
-	//   - callback consumed → the attempt is RUNNING and gets exactly one
-	//     terminal outcome below, success only for the value actually
-	//     accepted.
-	var reaskRaw []byte
-	reaskLive := false // consumed, outcome not yet landed
-	if reask != nil {
-		if g, gerr := e.auth.Issue(op, target); gerr == nil {
-			rr, rerr := reask(ctx, g)
-			if st, _ := e.auth.State(op); st == contracts.AttemptRunning {
-				reaskLive = true
-				if rerr == nil {
-					reaskRaw = rr
+	var (
+		accepted T
+		gotValue bool
+		firstRaw []byte
+		lastErr  error
+	)
+	final := s7.PolicyStructured.MaxAttempts
+	attempt := func(ctx context.Context, g s7.Grant) (s7.Outcome, string, error) {
+		reask := g.AttemptNo > 1
+		raw, err := generate(ctx, g, reask)
+		if err != nil {
+			// A transport failure of the generation itself: the provider's
+			// own operation already governed its retries; here it is terminal.
+			lastErr = err
+			return s7.OutcomeFailedTerminal, s7.CodeTransportPostWrite, err
+		}
+		if !reask {
+			firstRaw = raw
+		}
+		if out, verr := decodeStrict(raw, validate); verr == nil {
+			accepted, gotValue = out, true
+			return s7.OutcomeSucceeded, "", nil
+		} else {
+			lastErr = verr
+			if class != ClassGeneral {
+				// SECURITY/EFFECT: strict, no tolerant accept of any kind.
+				lastErr = fmt.Errorf("structured: %d-class payload invalid — no repair permitted (fail closed): %w", class, verr)
+				return s7.OutcomeFailedTerminal, s7.CodeInvalidGeneral, lastErr
+			}
+		}
+		if g.AttemptNo < final {
+			return s7.OutcomeFailedRetryable, s7.CodeInvalidGeneral, lastErr
+		}
+		// FINAL attempt: salvage INSIDE the outcome decision — re-ask bytes,
+		// then the original bytes. Salvage relocates bytes; it never skips
+		// validation.
+		for _, src := range [][]byte{raw, firstRaw} {
+			if obj, ok := salvageJSON(src); ok {
+				if out, verr := decodeStrict(obj, validate); verr == nil {
+					accepted, gotValue = out, true
+					return s7.OutcomeSucceeded, "", nil
 				}
-			} else {
-				e.auth.Cancel(op, nil) // ungoverned callback: nothing ran
 			}
 		}
+		return s7.OutcomeFailedTerminal, s7.CodeInvalidGeneral, lastErr
 	}
-	land := func(outcome s7.Outcome) error {
-		if !reaskLive {
-			return nil
-		}
-		reaskLive = false
-		return e.auth.Report(op, outcome, "", nil)
+	err := e.auth.Execute(ctx, op, target, s7.PolicyStructured, attempt)
+	st, _ := e.auth.State(op)
+	if err == nil && gotValue && st == contracts.AttemptSucceeded {
+		return accepted, nil
 	}
-	if len(reaskRaw) > 0 {
-		if out, err := decodeStrict(reaskRaw, validate); err == nil {
-			if rerr := land(s7.OutcomeSucceeded); rerr != nil {
-				return zero, fmt.Errorf("structured: S7 outcome not recorded — value refused (fail closed): %w", rerr)
-			}
-			return out, nil
-		}
-		if obj, ok := salvageJSON(reaskRaw); ok {
-			if out, err := decodeStrict(obj, validate); err == nil {
-				if rerr := land(s7.OutcomeSucceeded); rerr != nil {
-					return zero, fmt.Errorf("structured: S7 outcome not recorded — value refused (fail closed): %w", rerr)
-				}
-				return out, nil
-			}
-		}
+	if gotValue && st != contracts.AttemptSucceeded {
+		// Never hand back a value S7 did not land as SUCCEEDED.
+		return zero, fmt.Errorf("structured: S7 outcome not recorded — value refused (fail closed): %v", err)
 	}
-	// The governed re-ask (if any) produced no accepted value: terminal.
-	if rerr := land(s7.OutcomeFailedTerminal); rerr != nil {
-		return zero, fmt.Errorf("structured: S7 outcome not recorded (fail closed): %w", rerr)
+	if err == nil {
+		err = ErrStructuredInvalid
 	}
-	// Salvage from the ORIGINAL raw as the last rung.
-	if obj, ok := salvageJSON(raw); ok {
-		if out, err := decodeStrict(obj, validate); err == nil {
-			return out, nil
-		}
-	}
-	return zero, fmt.Errorf("structured: output invalid after validate, re-ask and salvage (never silently accepted)")
+	return zero, fmt.Errorf("%w: %v", ErrStructuredInvalid, err)
 }

@@ -18,8 +18,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -185,6 +187,53 @@ func (p *APIKey) Target() contracts.TargetID {
 	return contracts.TargetID("provider:" + p.host)
 }
 
+// Failure is the provider's TYPED classification of one physical attempt
+// in the closed s7 code vocabulary (Slice B3): Retryable is a PROPOSAL —
+// S7's PolicyProvider decides. A chat completion is read-only (cost aside),
+// so a 429, a 5xx (status only, no body consumed) and a pre-wire refusal
+// propose a retry; anything else is terminal.
+type Failure struct {
+	Code      string
+	Retryable bool
+	Cause     error
+}
+
+func (f *Failure) Error() string {
+	if f.Cause != nil {
+		return fmt.Sprintf("provider: %s: %v", f.Code, f.Cause)
+	}
+	return "provider: " + f.Code
+}
+
+func (f *Failure) Unwrap() error { return f.Cause }
+
+// Classify maps an attempt error to the S7 outcome proposal.
+func Classify(err error) (s7.Outcome, string) {
+	if err == nil {
+		return s7.OutcomeSucceeded, ""
+	}
+	var f *Failure
+	if errors.As(err, &f) {
+		if f.Retryable {
+			return s7.OutcomeFailedRetryable, f.Code
+		}
+		return s7.OutcomeFailedTerminal, f.Code
+	}
+	return s7.OutcomeFailedTerminal, ""
+}
+
+func isPreWire(err error) bool {
+	if errors.Is(err, egress.ErrPreWire) {
+		return true
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+	var opErr *net.OpError
+	return errors.As(err, &opErr) && opErr.Op == "dial"
+}
+
 // transport performs ONE governed HTTP attempt: the grant is consumed
 // HERE, immediately before the wire — a second call on the same grant
 // fails ATTEMPT_NOT_AUTHORIZED before any bytes leave the process.
@@ -204,12 +253,22 @@ func (p *APIKey) transport(ctx context.Context, g s7.Grant, body []byte) (*http.
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("provider: transport: %w", err)
+		if isPreWire(err) {
+			return nil, &Failure{Code: s7.CodeTransportPreWire, Retryable: true, Cause: fmt.Errorf("transport: %w", err)}
+		}
+		return nil, &Failure{Code: s7.CodeTransportPostWrite, Cause: fmt.Errorf("transport: %w", err)}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		resp.Body.Close()
 		// Status only — upstream bodies can carry anything.
-		return nil, fmt.Errorf("provider: upstream HTTP %d", resp.StatusCode)
+		cause := fmt.Errorf("upstream HTTP %d", resp.StatusCode)
+		switch {
+		case resp.StatusCode == 429:
+			return nil, &Failure{Code: s7.CodeHTTP429, Retryable: true, Cause: cause}
+		case resp.StatusCode >= 500:
+			return nil, &Failure{Code: s7.CodeHTTP5xx, Retryable: true, Cause: cause}
+		}
+		return nil, &Failure{Code: s7.CodeHTTP4xx, Cause: cause}
 	}
 	return resp, nil
 }

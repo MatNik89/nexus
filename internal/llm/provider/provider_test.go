@@ -234,119 +234,144 @@ func issue(t *testing.T, a *s7.Authority, op string, target contracts.TargetID) 
 	return g
 }
 
-// The P0.7 literal: invalid output NEVER comes back as a value without an
-// error — even when re-ask and salvage both fail.
+// gen builds a Generate callback: attempt 1 returns first, attempt 2 returns
+// second; it CONSUMES the grant exactly as provider.Chat does and counts
+// physical calls.
+func gen(t *testing.T, auth *s7.Authority, calls *int, first, second string) Generate {
+	return func(ctx context.Context, g s7.Grant, reask bool) ([]byte, error) {
+		if err := auth.Consume(g); err != nil {
+			t.Fatalf("generation ran without a consumable AttemptGrant (P0.2): %v", err)
+		}
+		*calls++
+		if reask {
+			return []byte(second), nil
+		}
+		return []byte(first), nil
+	}
+}
+
+// Detector 9f (b2) + P0.7 literal: invalid, invalid, nothing salvageable ->
+// exactly TWO transport calls, NO value, S7 FAILED. A validation failure
+// (well-formed JSON, bad content) also never passes silently.
 func TestStructuredOutputNeverSilentAccept(t *testing.T) {
 	e, auth := extractor(t)
-	reasks := 0
-	badReask := func(ctx context.Context, g s7.Grant) ([]byte, error) {
-		reasks++
-		auth.Consume(g)
-		return []byte(`still not json`), nil
+	calls := 0
+	_, err := ExtractVia[plan](context.Background(), e, ClassGeneral, validPlan, "op-1", "provider-a",
+		gen(t, auth, &calls, `no json here at all`, `still not json`))
+	if err == nil || !errors.Is(err, ErrStructuredInvalid) {
+		t.Fatalf("invalid structured output silently accepted: %v", err)
 	}
-	_, err := Extract[plan](context.Background(), e, ClassGeneral,
-		[]byte(`no json here at all`), validPlan, "op-1", "provider-a", badReask)
-	if err == nil {
-		t.Fatal("invalid structured output silently accepted")
+	if calls != 2 {
+		t.Fatalf("initial + exactly one re-ask = 2 physical calls, got %d", calls)
 	}
-	if reasks != 1 {
-		t.Fatalf("general-class invalid output must re-ask exactly once, did %d", reasks)
+	if st, _ := auth.State("op-1"); st != contracts.AttemptFailed {
+		t.Fatalf("S7 state %s, want FAILED", st)
 	}
-	// A VALIDATION failure (well-formed JSON, bad content) also never
-	// passes silently.
-	_, err = Extract[plan](context.Background(), e, ClassGeneral,
-		[]byte(`{"steps":0}`), validPlan, "op-2", "provider-a", badReask)
-	if err == nil {
-		t.Fatal("failed validation silently accepted")
+	calls = 0
+	_, err = ExtractVia[plan](context.Background(), e, ClassGeneral, validPlan, "op-2", "provider-a",
+		gen(t, auth, &calls, `{"steps":0}`, `{"steps":0}`))
+	if err == nil || calls != 2 {
+		t.Fatalf("failed validation silently accepted (%v, calls %d)", err, calls)
 	}
 }
 
-// Valid output passes with ZERO re-asks; unknown fields are rejected
-// (strict decode), then recovered via re-ask. The fake transport CONSUMES
-// the grant exactly as provider.Chat does.
+// Detector 9f (a): valid output passes with ONE call (no re-ask); invalid
+// then valid -> exactly TWO calls, value from the re-ask, S7 SUCCEEDED with
+// 2 accounted attempts.
 func TestStructuredHappyAndReask(t *testing.T) {
 	e, auth := extractor(t)
-	reasks := 0
-	goodReask := func(ctx context.Context, g s7.Grant) ([]byte, error) {
-		reasks++
-		if err := auth.Consume(g); err != nil {
-			t.Fatalf("re-ask ran without a consumable AttemptGrant (P0.2): %v", err)
-		}
-		return []byte(`{"steps":3}`), nil
+	calls := 0
+	got, err := ExtractVia[plan](context.Background(), e, ClassGeneral, validPlan, "op-1", "provider-a",
+		gen(t, auth, &calls, `{"steps":2}`, `{"steps":3}`))
+	if err != nil || got.Steps != 2 || calls != 1 {
+		t.Fatalf("valid output must pass without re-ask: %+v %v calls=%d", got, err, calls)
 	}
-	got, err := Extract[plan](context.Background(), e, ClassGeneral,
-		[]byte(`{"steps":2}`), validPlan, "op-1", "provider-a", goodReask)
-	if err != nil || got.Steps != 2 || reasks != 0 {
-		t.Fatalf("valid output must pass without re-ask: %+v %v reasks=%d", got, err, reasks)
+	calls = 0
+	got, err = ExtractVia[plan](context.Background(), e, ClassGeneral, validPlan, "op-2", "provider-a",
+		gen(t, auth, &calls, `{"steps":1,"unknown_field":true}`, `{"steps":3}`))
+	if err != nil || got.Steps != 3 || calls != 2 {
+		t.Fatalf("re-ask recovery broken: %+v %v calls=%d", got, err, calls)
 	}
-	got, err = Extract[plan](context.Background(), e, ClassGeneral,
-		[]byte(`{"steps":1,"unknown_field":true}`), validPlan, "op-2", "provider-a", goodReask)
-	if err != nil || got.Steps != 3 || reasks != 1 {
-		t.Fatalf("re-ask recovery broken: %+v %v reasks=%d", got, err, reasks)
-	}
-	// The re-ask attempt is ACCOUNTED by S7 (one physical attempt).
-	if auth.Attempts("op-2") != 1 {
-		t.Fatalf("re-ask attempt not accounted: %d", auth.Attempts("op-2"))
+	if st, _ := auth.State("op-2"); st != contracts.AttemptSucceeded || auth.Attempts("op-2") != 2 {
+		t.Fatalf("S7 %s attempts=%d, want SUCCEEDED/2", st, auth.Attempts("op-2"))
 	}
 }
 
-// Salvage: prose-wrapped JSON is recovered WITHOUT silently accepting the
-// prose — the extracted object still validates.
+// Detector 9f (b): salvage runs INSIDE the final attempt's outcome: a
+// prose-wrapped valid object (in the re-ask, or in the original) is accepted
+// AND S7 lands SUCCEEDED; salvaged-but-invalid content still fails.
 func TestSalvageFromProseStillValidates(t *testing.T) {
-	e, _ := extractor(t)
-	badReask := func(ctx context.Context, g s7.Grant) ([]byte, error) {
-		return []byte(`nope`), nil
+	e, auth := extractor(t)
+	calls := 0
+	got, err := ExtractVia[plan](context.Background(), e, ClassGeneral, validPlan, "op-1", "provider-a",
+		gen(t, auth, &calls, "Sure! Here is the plan:\n```json\n{\"steps\":4}\n```\nEnjoy.", `nope`))
+	if err != nil || got.Steps != 4 || calls != 2 {
+		t.Fatalf("salvage from the original broken: %+v %v calls=%d", got, err, calls)
 	}
-	got, err := Extract[plan](context.Background(), e, ClassGeneral,
-		[]byte("Sure! Here is the plan:\n```json\n{\"steps\":4}\n```\nEnjoy."),
-		validPlan, "op-1", "provider-a", badReask)
-	if err != nil || got.Steps != 4 {
-		t.Fatalf("salvage broken: %+v %v", got, err)
+	if st, _ := auth.State("op-1"); st != contracts.AttemptSucceeded {
+		t.Fatalf("salvaged value returned while S7 is %s (split brain)", st)
 	}
-	// Salvaged-but-invalid content still fails.
-	_, err = Extract[plan](context.Background(), e, ClassGeneral,
-		[]byte("plan: {\"steps\":0}"), validPlan, "op-2", "provider-a", badReask)
+	calls = 0
+	_, err = ExtractVia[plan](context.Background(), e, ClassGeneral, validPlan, "op-2", "provider-a",
+		gen(t, auth, &calls, "plan: {\"steps\":0}", "again {\"steps\":0}"))
 	if err == nil {
 		t.Fatal("salvaged content skipped validation")
 	}
+	if st, _ := auth.State("op-2"); st != contracts.AttemptFailed {
+		t.Fatalf("S7 %s after unsalvageable output, want FAILED", st)
+	}
 }
 
-// SECURITY/EFFECT payloads: strict — a malformed discriminator reaches no
-// sink, no re-ask, no salvage (P0.7 no-tolerant-accept clause).
+// Detector 9f (d): SECURITY/EFFECT payloads are strict — ONE call, no
+// re-ask, no salvage, S7 FAILED.
 func TestSecurityEffectClassStrictNoRepair(t *testing.T) {
-	e, _ := extractor(t)
-	reasks := 0
-	reask := func(ctx context.Context, g s7.Grant) ([]byte, error) {
-		reasks++
-		return []byte(`{"steps":1}`), nil
-	}
+	e, auth := extractor(t)
 	for _, class := range []PayloadClass{ClassSecurity, ClassEffect} {
-		// Well-formed prose-wrapped JSON that salvage WOULD recover.
-		_, err := Extract[plan](context.Background(), e, class,
-			[]byte("ok: {\"steps\":2}"), validPlan, contracts.OperationID(fmt.Sprintf("op-%d", class)), "provider-a", reask)
+		calls := 0
+		op := contracts.OperationID(fmt.Sprintf("op-%d", class))
+		_, err := ExtractVia[plan](context.Background(), e, class, validPlan, op, "provider-a",
+			gen(t, auth, &calls, "ok: {\"steps\":2}", `{"steps":1}`))
 		if err == nil {
 			t.Fatalf("class %d: malformed security/effect payload repaired", class)
 		}
-	}
-	if reasks != 0 {
-		t.Fatalf("strict class attempted %d re-asks (tolerant accept)", reasks)
+		if calls != 1 {
+			t.Fatalf("class %d: strict class made %d calls (tolerant accept)", class, calls)
+		}
+		if st, _ := auth.State(op); st != contracts.AttemptFailed {
+			t.Fatalf("class %d: S7 %s, want FAILED", class, st)
+		}
 	}
 }
 
-// Nil validators are refused: "no validation" IS silent accept.
+// Detector 9f (c) — ownership ablation: with S7's second-grant path disabled
+// (MaxAttempts forced to 1) and the extractor/generator code untouched,
+// exactly ONE physical call happens — the extractor holds no retry loop.
+func TestStructuredReaskOwnedByS7Ablation(t *testing.T) {
+	e, auth := extractor(t)
+	saved := s7.PolicyStructured
+	s7.PolicyStructured.MaxAttempts = 1
+	t.Cleanup(func() { s7.PolicyStructured = saved })
+	calls := 0
+	_, err := ExtractVia[plan](context.Background(), e, ClassGeneral, validPlan, "op-abl", "provider-a",
+		gen(t, auth, &calls, `not json`, `{"steps":3}`))
+	if err == nil || calls != 1 {
+		t.Fatalf("ablation: expected exactly 1 call and an error, got %d %v", calls, err)
+	}
+}
+
+// Nil validators / generators are refused: "no validation" IS silent accept.
 func TestNilValidatorRefused(t *testing.T) {
-	e, _ := extractor(t)
-	_, err := Extract[plan](context.Background(), e, ClassGeneral,
-		[]byte(`{"steps":1}`), nil, "op-1", "provider-a",
-		func(ctx context.Context, g s7.Grant) ([]byte, error) { return nil, nil })
+	e, auth := extractor(t)
+	_, err := ExtractVia[plan](context.Background(), e, ClassGeneral, nil, "op-1", "provider-a",
+		gen(t, auth, new(int), `{"steps":1}`, ``))
 	if err == nil {
-		t.Fatal("nil validator accepted (silent-accept hole)")
+		t.Fatal("nil validator accepted")
+	}
+	if _, err := ExtractVia[plan](context.Background(), e, ClassGeneral, validPlan, "op-2", "provider-a", nil); err == nil {
+		t.Fatal("nil generator accepted")
 	}
 }
 
-// The live probe registers into the T11 snapshot shape: reachable provider
-// → Passed under the RESOLVED config's own hash; unreachable → failed,
-// never a panic or a silent pass.
 func TestProbeBindsResolvedConfig(t *testing.T) {
 	srv, _ := fakeOpenAI(t, "ok")
 	t.Setenv("NEXUS_TEST_KEY", "sk-test")
@@ -408,7 +433,10 @@ func TestStreamOrderAndTruncationHonesty(t *testing.T) {
 
 // A re-ask callback CANNOT self-retry: the transport consumes the grant,
 // so a second physical call inside one callback dies before the wire —
-// transport counter 1, S7 attempt counter 1 (Phase-2 codex #2 oracle).
+// EVERY governed attempt (initial + re-ask) is one grant, one physical call
+// (Phase-2 codex #2 oracle, extended to the whole operation): a rogue
+// callback's second call on the same grant fails ATTEMPT_NOT_AUTHORIZED,
+// so the transport counter equals the S7 attempt counter (2).
 func TestReaskCallbackCannotSelfRetry(t *testing.T) {
 	e, auth := extractor(t)
 	transport := 0
@@ -419,29 +447,25 @@ func TestReaskCallbackCannotSelfRetry(t *testing.T) {
 		transport++
 		return []byte(`not json either`), nil
 	}
-	rogue := func(ctx context.Context, g s7.Grant) ([]byte, error) {
+	rogue := func(ctx context.Context, g s7.Grant, reask bool) ([]byte, error) {
 		out, _ := fakeTransport(g)
 		if _, err := fakeTransport(g); err == nil {
 			t.Fatal("second physical call on one grant authorized")
 		}
 		return out, nil
 	}
-	_, err := Extract[plan](context.Background(), e, ClassGeneral,
-		[]byte(`garbage`), validPlan, "op-1", "provider-a", rogue)
+	_, err := ExtractVia[plan](context.Background(), e, ClassGeneral, validPlan, "op-1", "provider-a", rogue)
 	if err == nil {
 		t.Fatal("garbage accepted")
 	}
-	if transport != 1 {
-		t.Fatalf("transport counter %d, must stay 1", transport)
-	}
-	if auth.Attempts("op-1") != 1 {
-		t.Fatalf("S7 attempt counter %d, must stay 1", auth.Attempts("op-1"))
+	if transport != 2 || auth.Attempts("op-1") != 2 {
+		t.Fatalf("transport=%d attempts=%d, must both be 2 (one physical call per grant)", transport, auth.Attempts("op-1"))
 	}
 }
 
 // The LITERAL closed-discriminator fixture (Phase-2 codex #14): an
-// unknown EFFECT/POLICY discriminator reaches NO sink — zero re-asks,
-// zero sink invocations, immediate reject.
+// unknown EFFECT/POLICY discriminator reaches NO sink — one generation,
+// zero re-asks, zero sink invocations, immediate reject.
 func TestUnknownEffectDiscriminatorReachesNoSink(t *testing.T) {
 	type effectDirective struct {
 		Kind string `json:"kind"`
@@ -456,25 +480,29 @@ func TestUnknownEffectDiscriminatorReachesNoSink(t *testing.T) {
 		return fmt.Errorf("unknown effect discriminator (fail closed)")
 	}
 	e, auth := extractor(t)
-	reasks := 0
-	reask := func(ctx context.Context, g s7.Grant) ([]byte, error) {
-		reasks++
-		auth.Consume(g)
-		return []byte(`{"kind":"send_message"}`), nil
-	}
+	calls, reasks := 0, 0
 	for name, raw := range map[string]string{
 		"unknown-kind":  `{"kind":"wipe_disk"}`,
 		"prose-wrapped": `sure: {"kind":"send_message"}`,
 		"not-json":      `just do it`,
 	} {
-		_, err := Extract[effectDirective](context.Background(), e, ClassEffect,
-			[]byte(raw), validateClosed, contracts.OperationID("op-"+name), "provider-a", reask)
+		raw := raw
+		_, err := ExtractVia[effectDirective](context.Background(), e, ClassEffect, validateClosed,
+			contracts.OperationID("op-"+name), "provider-a", func(ctx context.Context, g s7.Grant, reask bool) ([]byte, error) {
+				auth.Consume(g)
+				calls++
+				if reask {
+					reasks++
+					return []byte(`{"kind":"send_message"}`), nil
+				}
+				return []byte(raw), nil
+			})
 		if err == nil {
 			t.Fatalf("%s: malformed effect payload accepted", name)
 		}
 	}
-	if sink != 0 || reasks != 0 {
-		t.Fatalf("malformed effect payload reached a sink (sink=%d reasks=%d)", sink, reasks)
+	if sink != 0 || reasks != 0 || calls != 3 {
+		t.Fatalf("malformed effect payload reached a sink or was re-asked (sink=%d reasks=%d calls=%d)", sink, reasks, calls)
 	}
 }
 
@@ -506,21 +534,19 @@ func TestProviderTargetBindingAndLoopbackClass(t *testing.T) {
 	}
 }
 
-// The re-ask state machine leaks nothing (Phase-2-r2 codex #3):
-// consumed-then-error lands FAILED (never a permanent RUNNING), and an
-// UNCONSUMED callback's bytes are ungoverned — ignored, operation
-// CANCELLED, value never accepted from them.
+// The state machine leaks nothing (Phase-2-r2 codex #3): consumed-then-error
+// lands FAILED (never a permanent RUNNING), and an UNCONSUMED callback's
+// bytes are ungoverned — ignored, operation CANCELLED, value never accepted.
 func TestReaskStateNeverLeaks(t *testing.T) {
 	// (a) consumed, then network error.
 	e, auth := extractor(t)
-	consumedThenError := func(ctx context.Context, g s7.Grant) ([]byte, error) {
+	consumedThenError := func(ctx context.Context, g s7.Grant, reask bool) ([]byte, error) {
 		if err := auth.Consume(g); err != nil {
 			t.Fatal(err)
 		}
 		return nil, fmt.Errorf("connection reset")
 	}
-	_, err := Extract[plan](context.Background(), e, ClassGeneral,
-		[]byte(`garbage`), validPlan, "op-a", "provider-a", consumedThenError)
+	_, err := ExtractVia[plan](context.Background(), e, ClassGeneral, validPlan, "op-a", "provider-a", consumedThenError)
 	if err == nil {
 		t.Fatal("garbage accepted")
 	}
@@ -529,16 +555,15 @@ func TestReaskStateNeverLeaks(t *testing.T) {
 	}
 	// (b) callback returns VALID bytes without consuming the grant.
 	e2, auth2 := extractor(t)
-	ungoverned := func(ctx context.Context, g s7.Grant) ([]byte, error) {
+	ungoverned := func(ctx context.Context, g s7.Grant, reask bool) ([]byte, error) {
 		return []byte(`{"steps":7}`), nil // never touched the transport
 	}
-	_, err = Extract[plan](context.Background(), e2, ClassGeneral,
-		[]byte(`garbage`), validPlan, "op-b", "provider-a", ungoverned)
+	_, err = ExtractVia[plan](context.Background(), e2, ClassGeneral, validPlan, "op-b", "provider-a", ungoverned)
 	if err == nil {
 		t.Fatal("ungoverned callback bytes accepted as a transport result")
 	}
 	if st, _ := auth2.State("op-b"); st != contracts.AttemptCancelled {
-		t.Fatalf("ungoverned re-ask operation in state %v (want CANCELLED)", st)
+		t.Fatalf("ungoverned operation in state %v (want CANCELLED)", st)
 	}
 }
 

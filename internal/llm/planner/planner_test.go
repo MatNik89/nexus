@@ -217,7 +217,7 @@ func TestFailedPlanLandsHonestS7State(t *testing.T) {
 	fc3 := &failingChat{auth: auth, consume: true, preReport: true}
 	p3, _ := New(fc3, auth, "provider:test", 64000)
 	_, perr := p3.Plan(context.Background(), []contracts.ContextBlock{b})
-	if perr == nil || !strings.Contains(perr.Error(), "S7 landing") {
+	if perr == nil || !strings.Contains(perr.Error(), "landing") {
 		t.Fatalf("landing failure not surfaced: %v", perr)
 	}
 }

@@ -181,23 +181,60 @@ func NewStreaming(p ChatProvider, sp StreamProvider, auth *s7.Authority,
 	return base, nil
 }
 
-// landFailure records the honest S7 terminal for a failed provider call:
-// an UNCONSUMED grant is cancelled (nothing physically ran — the adapter
-// refused locally); a CONSUMED one lands FAILED_TERMINAL. Landing errors
-// propagate (Phase-2-r3 codex #2: a discarded Report left AUTHORIZED
-// forever).
-func (c *ChatPlanner) landFailure(op contracts.OperationID) error {
-	if st, _ := c.auth.State(op); st == contracts.AttemptAuthorized {
-		return c.auth.Cancel(op, nil)
+// chatVia submits ONE S7 operation for a buffered completion: S7 (Execute,
+// PolicyProvider) owns the retry loop and backoff — the planner never
+// sleeps, loops or asks for a second grant (Slice B3). A transport that
+// returns content without consuming its grant is refused by Execute
+// (ungoverned claim), never accepted as a reply.
+func (c *ChatPlanner) chatVia(ctx context.Context, op contracts.OperationID, msgs []provider.ChatMessage) (provider.ChatOutput, error) {
+	var out provider.ChatOutput
+	err := c.auth.Execute(ctx, op, c.target, s7.PolicyProvider, func(ctx context.Context, g s7.Grant) (s7.Outcome, string, error) {
+		o, cerr := c.chat.Chat(ctx, msgs, g)
+		if cerr == nil {
+			out = o
+			return s7.OutcomeSucceeded, "", nil
+		}
+		oc, code := provider.Classify(cerr)
+		return oc, code, cerr
+	})
+	if err != nil {
+		return provider.ChatOutput{}, fmt.Errorf("planner: %w", err)
 	}
-	return c.auth.Report(op, s7.OutcomeFailedTerminal, "", nil)
+	return out, nil
 }
 
-func errorsJoin(cause, landing error) error {
-	if landing == nil {
-		return cause
+// streamVia is the streaming counterpart: a failure AFTER the first
+// delivered delta is TERMINAL (partial output already reached the user —
+// never re-streamed); before it the provider's classification proposes.
+func (c *ChatPlanner) streamVia(ctx context.Context, op contracts.OperationID, msgs []provider.ChatMessage) (string, error) {
+	var b strings.Builder
+	err := c.auth.Execute(ctx, op, c.target, s7.PolicyProvider, func(ctx context.Context, g s7.Grant) (s7.Outcome, string, error) {
+		b.Reset()
+		delivered := false
+		serr := c.stream.Stream(ctx, msgs, g, func(d string) error {
+			// Accumulator ceiling (F8): refuse growth beyond the total,
+			// which cancels the stream through the provider's delivery
+			// error path; the partial content is never a final.
+			if b.Len()+len(d) > maxStreamTotal {
+				return fmt.Errorf("streamed reply exceeds the %d-byte ceiling — cut (fail closed)", maxStreamTotal)
+			}
+			b.WriteString(d)
+			delivered = true
+			return c.deliver(d)
+		})
+		if serr == nil {
+			return s7.OutcomeSucceeded, "", nil
+		}
+		if delivered {
+			return s7.OutcomeFailedTerminal, s7.CodeTransportPostWrite, serr
+		}
+		oc, code := provider.Classify(serr)
+		return oc, code, serr
+	})
+	if err != nil {
+		return "", fmt.Errorf("planner: %w", err)
 	}
-	return fmt.Errorf("%w (and S7 landing: %v)", cause, landing)
+	return b.String(), nil
 }
 
 func opID() (contracts.OperationID, error) {
@@ -316,19 +353,12 @@ func (c *ChatPlanner) Plan(ctx context.Context, blocks []contracts.ContextBlock)
 	if err != nil {
 		return loop.Action{}, fmt.Errorf("planner: %w", err)
 	}
-	g, err := c.auth.Issue(op, c.target)
-	if err != nil {
-		return loop.Action{}, fmt.Errorf("planner: %w", err)
-	}
 	if len(c.specs) > 0 {
 		// Buffered Chat: a tool-call JSON must never stream raw to the
 		// terminal; a final answer goes to the sink in one piece.
-		out, err := c.chat.Chat(ctx, msgs, g)
+		out, err := c.chatVia(ctx, op, msgs)
 		if err != nil {
-			return loop.Action{}, errorsJoin(fmt.Errorf("planner: %w", err), c.landFailure(op))
-		}
-		if rerr := c.auth.Report(op, s7.OutcomeSucceeded, "", nil); rerr != nil {
-			return loop.Action{}, fmt.Errorf("planner: transport did not consume its grant — reply refused (fail closed): %w", rerr)
+			return loop.Action{}, err
 		}
 		call, isTool, terr := c.toolCallFromReply(out.Content)
 		if terr != nil {
@@ -355,34 +385,15 @@ func (c *ChatPlanner) Plan(ctx context.Context, blocks []contracts.ContextBlock)
 		return loop.Action{Final: &out.Content}, nil
 	}
 	if c.stream != nil && c.deliver != nil {
-		var b strings.Builder
-		if err := c.stream.Stream(ctx, msgs, g, func(d string) error {
-			// Accumulator ceiling (F8): refuse growth beyond the total,
-			// which cancels the stream through the provider's delivery
-			// error path; the partial content is never a final.
-			if b.Len()+len(d) > maxStreamTotal {
-				return fmt.Errorf("streamed reply exceeds the %d-byte ceiling — cut (fail closed)", maxStreamTotal)
-			}
-			b.WriteString(d)
-			return c.deliver(d)
-		}); err != nil {
-			return loop.Action{}, errorsJoin(fmt.Errorf("planner: %w", err), c.landFailure(op))
+		final, err := c.streamVia(ctx, op, msgs)
+		if err != nil {
+			return loop.Action{}, err
 		}
-		// A success the S7 authority refuses to record is a claim from an
-		// UNGOVERNED transport — the answer is rejected (Phase-2-r2 codex
-		// #2: a provider that skipped grant consumption returned content).
-		if rerr := c.auth.Report(op, s7.OutcomeSucceeded, "", nil); rerr != nil {
-			return loop.Action{}, fmt.Errorf("planner: transport did not consume its grant — reply refused (fail closed): %w", rerr)
-		}
-		final := b.String()
 		return loop.Action{Final: &final}, nil
 	}
-	out, err := c.chat.Chat(ctx, msgs, g)
+	out, err := c.chatVia(ctx, op, msgs)
 	if err != nil {
-		return loop.Action{}, errorsJoin(fmt.Errorf("planner: %w", err), c.landFailure(op))
-	}
-	if rerr := c.auth.Report(op, s7.OutcomeSucceeded, "", nil); rerr != nil {
-		return loop.Action{}, fmt.Errorf("planner: transport did not consume its grant — reply refused (fail closed): %w", rerr)
+		return loop.Action{}, err
 	}
 	return loop.Action{Final: &out.Content}, nil
 }
