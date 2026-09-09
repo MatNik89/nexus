@@ -260,13 +260,13 @@ func TestDeliveryHonesty(t *testing.T) {
 	}
 	clock.advance(time.Minute) // past the 5s backoff
 	// Accept → sent exactly once; second flush sends nothing.
-	if err := c.Flush(ctxT(), auth, sendVia(auth, func(o Outbound) error { sent++; return nil })); err != nil {
+	if err := c.Flush(ctxT(), auth, sendVia(auth, func(o Outbound) error { sent++; return nil })); err != nil && !errors.Is(err, ErrNothingDue) {
 		t.Fatal(err)
 	}
 	if sent != 1 || len(mustPending(t, c)) != 0 {
 		t.Fatalf("delivery not exactly-once-marked: sent=%d pending=%d", sent, len(mustPending(t, c)))
 	}
-	if err := c.Flush(ctxT(), auth, sendVia(auth, func(o Outbound) error { sent++; return nil })); err != nil {
+	if err := c.Flush(ctxT(), auth, sendVia(auth, func(o Outbound) error { sent++; return nil })); err != nil && !errors.Is(err, ErrNothingDue) {
 		t.Fatal(err)
 	}
 	if sent != 1 {
@@ -394,7 +394,7 @@ func TestAmbiguousSendParksUnknownNeverResends(t *testing.T) {
 	}
 	// UNKNOWN, not pending: a second flush sends NOTHING (even long after).
 	clock.advance(time.Hour)
-	if err := c.Flush(ctxT(), auth, sendVia(auth, func(o Outbound) error { accepts++; return nil })); err != nil {
+	if err := c.Flush(ctxT(), auth, sendVia(auth, func(o Outbound) error { accepts++; return nil })); err != nil && !errors.Is(err, ErrNothingDue) {
 		t.Fatal(err)
 	}
 	if accepts != 1 {
@@ -405,7 +405,7 @@ func TestAmbiguousSendParksUnknownNeverResends(t *testing.T) {
 	c2, _ := open(t, dir)
 	clock.advance(time.Hour)
 	auth2 := authFor(t, c2, clock)
-	if err := c2.Flush(ctxT(), auth2, sendVia(auth2, func(o Outbound) error { accepts++; return nil })); err != nil {
+	if err := c2.Flush(ctxT(), auth2, sendVia(auth2, func(o Outbound) error { accepts++; return nil })); err != nil && !errors.Is(err, ErrNothingDue) {
 		t.Fatal(err)
 	}
 	if accepts != 1 {
@@ -546,5 +546,40 @@ func TestPoisonHeadDoesNotStarve(t *testing.T) {
 	// The poison row is re-pended (definite failure), not lost.
 	if p, _ := c.Pending(ctxT()); len(p) != 1 || p[0].ChannelIdentity != "chat-poison" {
 		t.Fatalf("poison row not re-pended: %v", p)
+	}
+}
+
+// Detector 2 (plan B): two PENDING rows in one flush receive two DISTINCT
+// grants; a reused grant is refused before the wire (the first use consumed
+// it); a flush with nothing to attempt is ErrNothingDue, not a success.
+func TestTwoRowsDistinctGrantsAndReuseRefused(t *testing.T) {
+	c, _ := open(t, t.TempDir())
+	clock := &fakeClock{time.Unix(1000, 0)}
+	auth := authFor(t, c, clock)
+	c.EnqueueReply(ctxT(), "telegram", "chat-42", "work", "a")
+	c.EnqueueReply(ctxT(), "telegram", "chat-42", "work", "b")
+	var grants []s7.Grant
+	reuseRefused := 0
+	err := c.Flush(ctxT(), auth, func(o Outbound, g s7.Grant, park s7.Companion) error {
+		grants = append(grants, g)
+		if err := auth.Consume(g, park); err != nil {
+			return &Failure{Code: s7.CodeLocalRefused, Cause: err}
+		}
+		if err := auth.Consume(g, park); errors.Is(err, s7.ErrAttemptNotAuthorized) {
+			reuseRefused++ // a second physical use of the same grant is refused
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(grants) != 2 || grants[0].OperationID == grants[1].OperationID || grants[0].Nonce == grants[1].Nonce {
+		t.Fatalf("grants not distinct per row: %+v", grants)
+	}
+	if reuseRefused != 2 {
+		t.Fatalf("grant reuse refused %d/2 times", reuseRefused)
+	}
+	if err := c.Flush(ctxT(), auth, sendVia(auth, func(Outbound) error { t.Fatal("resend"); return nil })); !errors.Is(err, ErrNothingDue) {
+		t.Fatalf("idle flush must be ErrNothingDue, got %v", err)
 	}
 }

@@ -53,9 +53,9 @@ const (
 	EvControlEffect  = "channel.control_effect"
 )
 
-// ErrNothingDue marks a cycle in which rows were pending but NONE was due
-// (S7 backoff): no physical attempt happened, so health stays as it was.
-var ErrNothingDue = errors.New("channel: pending rows exist but none is due (no attempt this cycle)")
+// ErrNothingDue marks a cycle with NO physical attempt (no pending row, or
+// none due under S7 backoff): health stays exactly as it was.
+var ErrNothingDue = errors.New("channel: no delivery attempt this cycle (nothing pending or none due)")
 
 // Failure is the adapter's TYPED classification of one physical call
 // (Slice B2, one closed code vocabulary shared with s7): Ambiguous = the
@@ -812,6 +812,12 @@ func (c *Core) markParams(eventType, deliveryID string, op contracts.OperationID
 	return c.params(eventType, m)
 }
 
+// MarkParamsForTest exposes markParams to sibling-package detectors that
+// must present a REAL park companion to the transport (inert in production).
+func (c *Core) MarkParamsForTest(eventType, deliveryID string, op contracts.OperationID) (contracts.EnvelopeParams, error) {
+	return c.markParams(eventType, deliveryID, op, "", time.Time{})
+}
+
 // companionBuilder is the channel's ONE owner-side mapping from an S7
 // Landing to the outbox companion committed in the SAME batch as the S7
 // transition (Slice B2): Succeeded -> SENT; Retry -> re-pend (PENDING);
@@ -875,7 +881,7 @@ func (c *Core) Flush(ctx context.Context, auth *s7.Authority, send Send) error {
 	// codex #6): failures are collected and the loop CONTINUES; only a
 	// journal/S7 landing failure aborts (the durable substrate is broken).
 	var failures []error
-	deferred := 0
+	attempted := 0
 	for _, o := range pending {
 		op, target := OperationFor(o), TargetFor(o)
 		if err := auth.Begin(op, target, s7.PolicyDelivery); err != nil {
@@ -887,8 +893,7 @@ func (c *Core) Flush(ctx context.Context, auth *s7.Authority, send Send) error {
 		g, err := auth.Next(op, build)
 		switch {
 		case errors.Is(err, s7.ErrNotDue):
-			deferred++
-			continue // S7 scheduled a later attempt
+			continue // S7 scheduled a later attempt (no physical attempt)
 		case errors.Is(err, s7.ErrExhausted):
 			failures = append(failures, &ClassifiedError{Class: health.ClassTransport, Code: o.LastCode,
 				Cause: fmt.Errorf("channel: delivery %s exhausted its S7 budget — parked FAILED: %w", o.DeliveryID, err)})
@@ -905,6 +910,7 @@ func (c *Core) Flush(ctx context.Context, auth *s7.Authority, send Send) error {
 		if perr != nil {
 			return substrate("params", perr)
 		}
+		attempted++
 		sendErr := send(o, g, s7.Companion{Key: op, Params: parkParams})
 		st, _ := auth.State(op)
 		if st == contracts.AttemptAuthorized {
@@ -962,10 +968,10 @@ func (c *Core) Flush(ctx context.Context, auth *s7.Authority, send Send) error {
 			failures = append(failures, &ClassifiedError{Class: cls, Code: code, Cause: fmt.Errorf("channel: delivery %s: %w", o.DeliveryID, sendErr)})
 		}
 	}
-	if len(failures) == 0 && deferred > 0 {
-		// Nothing physical happened this tick: NOT a success — a degraded
-		// health state must not be cleared by a no-op cycle (code-review r2
-		// codex #7).
+	if len(failures) == 0 && attempted == 0 {
+		// Nothing physical happened this tick (no row, or none due): NOT a
+		// success — a degraded health state is cleared only by a real
+		// successful attempt (code-review r2 codex #7, r3 codex #3).
 		return ErrNothingDue
 	}
 	return errors.Join(failures...)

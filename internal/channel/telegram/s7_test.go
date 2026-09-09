@@ -261,13 +261,13 @@ func TestRegistrationDurableBotBoundReconciled(t *testing.T) {
 	}
 	// Same bot, same menu, repeated ticks + restart: zero further calls.
 	for i := 0; i < 3; i++ {
-		if err := h.a.registerCommands(ctxT()); err != nil {
+		if err := h.a.registerCommands(ctxT()); err != nil && !errors.Is(err, channel.ErrNothingDue) {
 			t.Fatal(err)
 		}
 	}
 	h.j.Close()
 	h2, _ := buildAt(t, dir, map[int64]string{42: "work"})
-	if err := h2.a.registerCommands(ctxT()); err != nil {
+	if err := h2.a.registerCommands(ctxT()); err != nil && !errors.Is(err, channel.ErrNothingDue) {
 		t.Fatal(err)
 	}
 	if h2.bot.setCalls() != 0 {
@@ -314,7 +314,7 @@ func TestRegistrationDurableBotBoundReconciled(t *testing.T) {
 	h5.bot.mu.Lock()
 	h5.bot.botID = 3
 	h5.bot.mu.Unlock()
-	if err := h5.a.registerCommands(ctxT()); err != nil {
+	if err := h5.a.registerCommands(ctxT()); err != nil && !errors.Is(err, channel.ErrNothingDue) {
 		t.Fatal(err)
 	}
 	if h5.bot.setCalls() != 0 || h5.bot.getMyCommandsCalls != 0 {

@@ -130,19 +130,10 @@ func Events() map[string]journal.PayloadValidator {
 			if p.Op == "" || p.AttemptNo < 1 {
 				return fmt.Errorf("s7: attempt_reported requires op and attempt_no")
 			}
-			if p.Outcome < int(OutcomeSucceeded) || p.Outcome > int(OutcomeUnknown) {
-				return fmt.Errorf("s7: attempt_reported outcome %d outside the closed set", p.Outcome)
-			}
-			if p.Landing < int(LandingSucceeded) || p.Landing > int(LandingCancelled) {
-				return fmt.Errorf("s7: attempt_reported landing %d outside the closed set", p.Landing)
-			}
 			if p.Code != "" && !knownCodes[p.Code] {
 				return fmt.Errorf("s7: attempt_reported code %q outside the closed vocabulary", p.Code)
 			}
-			if (LandingKind(p.Landing) == LandingRetry) != (p.NextAt > 0) {
-				return fmt.Errorf("s7: attempt_reported next_attempt_unix must accompany exactly the retry landing")
-			}
-			return nil
+			return validReport(Outcome(p.Outcome), LandingKind(p.Landing), p.Code, p.NextAt)
 		},
 		EvOperationTerminal: func(raw json.RawMessage) error {
 			var p terminalPayload
@@ -159,15 +150,60 @@ func Events() map[string]journal.PayloadValidator {
 			if err := strictDecode(raw, &p); err != nil {
 				return err
 			}
-			if p.Op == "" || !validStates[p.State] || p.NextAt < 0 {
-				return fmt.Errorf("s7: operation_reconciled requires op and a valid state")
+			// Reconcile is the ONLY exit from UNKNOWN: it lands SUCCEEDED,
+			// FAILED_RETRYABLE (with a due time) or FAILED — never UNKNOWN or
+			// CANCELLED (code-review r3 codex #4).
+			if p.Op == "" || p.NextAt < 0 {
+				return fmt.Errorf("s7: operation_reconciled requires op")
 			}
-			if (p.State == contracts.AttemptFailedRetryable.String()) != (p.NextAt > 0) {
-				return fmt.Errorf("s7: operation_reconciled next_attempt_unix must accompany exactly the retry state")
+			switch p.State {
+			case contracts.AttemptSucceeded.String(), contracts.AttemptFailed.String():
+				if p.NextAt != 0 {
+					return fmt.Errorf("s7: operation_reconciled terminal state carries a due time")
+				}
+			case contracts.AttemptFailedRetryable.String():
+				if p.NextAt <= 0 {
+					return fmt.Errorf("s7: operation_reconciled retry state requires next_attempt_unix")
+				}
+			default:
+				return fmt.Errorf("s7: operation_reconciled state %q is not a reconciliation exit", p.State)
 			}
 			return nil
 		},
 	}
+}
+
+// validReport is the closed (outcome, landing, code, next_at) compatibility
+// table (code-review r3 codex #4): the journal narrative can never disagree
+// with the authoritative transition it records.
+func validReport(o Outcome, l LandingKind, code string, nextAt int64) error {
+	bad := func(why string) error {
+		return fmt.Errorf("s7: attempt_reported %s (outcome %d, landing %d, code %q, next %d)", why, o, l, code, nextAt)
+	}
+	switch o {
+	case OutcomeSucceeded:
+		if l != LandingSucceeded || code != "" || nextAt != 0 {
+			return bad("succeeded outcome must land SUCCEEDED without code/due")
+		}
+	case OutcomeUnknown:
+		if l != LandingUnknown || nextAt != 0 {
+			return bad("unknown outcome must land UNKNOWN without due")
+		}
+	case OutcomeFailedRetryable:
+		if l != LandingRetry && l != LandingTerminal {
+			return bad("retryable proposal must land RETRY or TERMINAL")
+		}
+		if (l == LandingRetry) != (nextAt > 0) {
+			return bad("retry landing requires exactly one due time")
+		}
+	case OutcomeFailedTerminal:
+		if l != LandingTerminal || nextAt != 0 {
+			return bad("terminal outcome must land TERMINAL without due")
+		}
+	default:
+		return bad("outcome outside the closed set")
+	}
+	return nil
 }
 
 var eventSeq atomic.Int64

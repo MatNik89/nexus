@@ -741,7 +741,10 @@ func (a *Adapter) record(ctx context.Context, component string, err error) error
 		return ctx.Err()
 	}
 	cls, code := channel.ClassOf(err)
-	fatal := cls.Fatal()
+	// The adapter STOPS on a fatal class OR on a typed terminal poll (an
+	// exhausted poll budget is transport-class for health but still ends
+	// polling: no further wire calls happen without a restart).
+	fatal := cls.Fatal() || errors.Is(err, ErrPollTerminal)
 	if herr := a.health.Report(component, cls, code, clip(a.sanitize(err).Error()), fatal); herr != nil {
 		return &channel.ClassifiedError{Class: health.ClassSubstrate, Code: "health_write", Cause: errors.Join(err, herr)}
 	}
@@ -831,7 +834,7 @@ func (a *Adapter) registerCommands(ctx context.Context) error {
 	}
 	switch state {
 	case "SUCCEEDED":
-		return nil // this bot already has exactly this menu
+		return channel.ErrNothingDue // this bot already has exactly this menu: no attempt
 	case "UNKNOWN", "RUNNING":
 		if st, ok := a.auth.State(op); !ok || st != contracts.AttemptUnknown {
 			return fmt.Errorf("telegram: registration %s recorded UNKNOWN but S7 disagrees (fail closed)", op)

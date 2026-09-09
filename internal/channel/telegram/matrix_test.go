@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"testing"
 	"time"
 
@@ -337,4 +338,138 @@ func TestOutboxMarkFaultsAreSubstrate(t *testing.T) {
 func init() {
 	_ = fmt.Sprint
 	_ = context.Background
+}
+
+// Detector 9d (per method, first-use then reuse / zero grant): for every Bot
+// API method a VALID first call happens under its own grant; presenting the
+// SAME grant again, or no grant at all, is refused before the wire (exactly
+// one wire call per method).
+func TestEveryMethodReuseAndMissingGrantRefused(t *testing.T) {
+	h := build(t, map[int64]string{42: "work"})
+	h.bot.mu.Lock()
+	h.bot.remoteCommands = mustJSON(commandMenu())
+	h.bot.mu.Unlock()
+	total := func() int { return h.bot.polls() + sends(h) + h.bot.getMes() + h.bot.setCalls() + h.bot.chatActions() }
+	// delivery
+	enqueue(t, h, "plain")
+	rows, _ := h.core.Pending(ctxT())
+	dOp, dT := channel.OperationFor(rows[0]), channel.TargetFor(rows[0])
+	h.auth.Begin(dOp, dT, s7.PolicyDelivery)
+	dG, _ := h.auth.Next(dOp, func(s7.Landing) s7.Companion { return s7.Companion{} })
+	parkParams := func() s7.Companion {
+		p, _ := h.core.MarkParamsForTest(channel.EvOutboundUnknown, rows[0].DeliveryID, dOp)
+		return s7.Companion{Key: dOp, Params: p}
+	}
+	// poll / control-read / control-effect / ui grants
+	pOp := contracts.OperationID("poll:tg:77")
+	h.auth.Begin(pOp, pollTarget, s7.PolicyPoll)
+	pG, _ := h.auth.Next(pOp, nil)
+	rOp, rT := contracts.OperationID("control:tg:getMe:77"), contracts.TargetID("channel:tg:getMe")
+	h.auth.Begin(rOp, rT, s7.PolicyControlRead)
+	rG, _ := h.auth.Next(rOp, nil)
+	uOp, uT := contracts.OperationID("ui:tg:sendChatAction:77"), contracts.TargetID("channel:tg:chat:42")
+	h.auth.Begin(uOp, uT, s7.PolicyUI)
+	uG, _ := h.auth.Next(uOp, nil)
+	cases := []struct {
+		name   string
+		method string
+		kind   callKind
+		g      s7.Grant
+		op     contracts.OperationID
+		target contracts.TargetID
+		comp   func() []s7.Companion
+	}{
+		{"sendMessage", "sendMessage", kindDelivery, dG, dOp, dT, func() []s7.Companion { return []s7.Companion{parkParams()} }},
+		{"getUpdates", "getUpdates", kindPoll, pG, pOp, pollTarget, func() []s7.Companion { return nil }},
+		{"getMe", "getMe", kindControlRead, rG, rOp, rT, func() []s7.Companion { return nil }},
+		{"sendChatAction", "sendChatAction", kindUI, uG, uOp, uT, func() []s7.Companion { return nil }},
+	}
+	for _, tc := range cases {
+		before := total()
+		req := map[string]any{"chat_id": 42, "text": "x", "offset": 0, "action": "typing"}
+		if err := h.a.call(ctxT(), tc.method, req, nil, tc.g, tc.kind, tc.op, tc.target, tc.comp()...); err != nil {
+			t.Fatalf("%s: valid first use failed: %v", tc.name, err)
+		}
+		if total() != before+1 {
+			t.Fatalf("%s: first use made %d wire calls", tc.name, total()-before)
+		}
+		if err := h.a.call(ctxT(), tc.method, req, nil, tc.g, tc.kind, tc.op, tc.target, tc.comp()...); !errors.Is(err, s7.ErrAttemptNotAuthorized) {
+			t.Fatalf("%s: same grant reused: %v", tc.name, err)
+		}
+		if err := h.a.call(ctxT(), tc.method, req, nil, s7.Grant{}, tc.kind, tc.op, tc.target, tc.comp()...); !errors.Is(err, s7.ErrAttemptNotAuthorized) {
+			t.Fatalf("%s: zero grant accepted: %v", tc.name, err)
+		}
+		if total() != before+1 {
+			t.Fatalf("%s: reuse/zero grant reached the wire", tc.name)
+		}
+	}
+}
+
+// Detector D2 (immediate, ablation-capable): after the registration cycle
+// that receives a 5xx, telegram.register is ALREADY degraded (transport,
+// http_5xx) with S7 UNKNOWN — observed before any reconciliation; a
+// registration pre-wire refusal is retried exactly when due.
+func TestRegistrationDegradedImmediatelyAndPreWireRetry(t *testing.T) {
+	h := build(t, map[int64]string{42: "work"})
+	h.bot.mu.Lock()
+	h.bot.setStatus, h.bot.setStatusLeft = 503, 1
+	h.bot.remoteCommands = `[{"command":"stale","description":"x"}]`
+	h.bot.mu.Unlock()
+	if err := h.a.record(ctxT(), "telegram.register", h.a.registerCommands(ctxT())); err != nil {
+		t.Fatalf("5xx registration classified fatal: %v", err)
+	}
+	e := entry(t, h, "telegram.register")
+	if e.Healthy || e.Class != health.ClassTransport || e.Code != s7.CodeHTTP5xx {
+		t.Fatalf("register not degraded immediately: %+v", e)
+	}
+	if st, _ := h.auth.State(channel.ControlOperation("tg", 1, "setMyCommands", menuHash())); st != contracts.AttemptUnknown {
+		t.Fatalf("S7 %s, want UNKNOWN", st)
+	}
+	// Pre-wire refusal on a fresh bot: retried exactly when due.
+	h2 := build(t, map[int64]string{42: "work"})
+	h2.bot.mu.Lock()
+	h2.bot.botID = 11
+	h2.bot.mu.Unlock()
+	live := h2.a.base
+	// getMe must succeed first (bot id), then the effect call hits a dead base.
+	var me struct {
+		ID int64 `json:"id"`
+	}
+	if err := h2.a.controlRead(ctxT(), "getMe", map[string]any{}, &me); err != nil {
+		t.Fatal(err)
+	}
+	h2.a.botID = me.ID
+	h2.a.base = "http://127.0.0.1:1"
+	err := h2.a.registerCommands(ctxT())
+	op := channel.ControlOperation("tg", 11, "setMyCommands", menuHash())
+	if err == nil {
+		t.Fatal("pre-wire refusal reported success")
+	}
+	if st, _ := h2.auth.State(op); st != contracts.AttemptFailedRetryable {
+		t.Fatalf("pre-wire registration landed %s, want FAILED_RETRYABLE", st)
+	}
+	h2.a.base = live
+	if err := h2.a.registerCommands(ctxT()); !errors.Is(err, channel.ErrNothingDue) || h2.bot.setCalls() != 0 {
+		t.Fatalf("re-registered before due: err=%v set=%d", err, h2.bot.setCalls())
+	}
+	tgClock.advance(time.Hour)
+	if err := h2.a.registerCommands(ctxT()); err != nil || h2.bot.setCalls() != 1 {
+		t.Fatalf("registration when due: err=%v set=%d", err, h2.bot.setCalls())
+	}
+}
+
+// Detector D (health substrate): when the health projection itself cannot be
+// written, the cycle is a SUBSTRATE failure and Run stops (never a silent
+// health blackout).
+func TestHealthProjectionWriteFailureStopsAdapter(t *testing.T) {
+	h := build(t, map[int64]string{42: "work"})
+	// Make the projection path unwritable: a directory where the file goes.
+	if err := os.MkdirAll(h.hpath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	err := runUntilStop(t, h, 500*time.Millisecond)
+	var ce *channel.ClassifiedError
+	if !errors.As(err, &ce) || ce.Class != health.ClassSubstrate || ce.Code != "health_write" {
+		t.Fatalf("health write failure not fatal substrate: %v", err)
+	}
 }

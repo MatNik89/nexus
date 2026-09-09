@@ -12,6 +12,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -44,15 +45,16 @@ type fakeBot struct {
 	offsets []int64
 	// tgout detectors: parse_mode per send, and a scripted parse-400
 	// rejection for the first N sends carrying parse_mode.
-	parseModes     []string
-	rejectHTMLLeft int
-	lastMethod     string
-	lastRich       string
-	sawTyping      bool
-	sawSetCommands bool
-	lastCommands   string
-	answerCount    int    // answerCallbackQuery calls (spinner cleared)
-	lastMarkup     string // last sendMessage reply_markup JSON (calendar)
+	parseModes      []string
+	rejectHTMLLeft  int
+	lastMethod      string
+	lastRich        string
+	sawTyping       bool
+	chatActionCalls int
+	sawSetCommands  bool
+	lastCommands    string
+	answerCount     int    // answerCallbackQuery calls (spinner cleared)
+	lastMarkup      string // last sendMessage reply_markup JSON (calendar)
 	// B2 scripting: bot identity, remote menu for getMyCommands, and a
 	// scripted HTTP status for the next N sendMessage / setMyCommands calls.
 	botID              int64
@@ -85,8 +87,9 @@ func hijackClose(w http.ResponseWriter) {
 	}
 }
 
-func (f *fakeBot) setCalls() int { f.mu.Lock(); defer f.mu.Unlock(); return f.setCommandsCalls }
-func (f *fakeBot) polls() int    { f.mu.Lock(); defer f.mu.Unlock(); return f.pollCalls }
+func (f *fakeBot) setCalls() int    { f.mu.Lock(); defer f.mu.Unlock(); return f.setCommandsCalls }
+func (f *fakeBot) polls() int       { f.mu.Lock(); defer f.mu.Unlock(); return f.pollCalls }
+func (f *fakeBot) chatActions() int { f.mu.Lock(); defer f.mu.Unlock(); return f.chatActionCalls }
 
 func mustJSON(v any) string { b, _ := json.Marshal(v); return string(b) }
 
@@ -167,6 +170,7 @@ func (f *fakeBot) handler() http.HandlerFunc {
 			w.Write([]byte(`{"ok":true,"result":{"message_id":1}}`))
 		case strings.HasSuffix(r.URL.Path, "/sendChatAction"):
 			f.sawTyping = true
+			f.chatActionCalls++
 			w.Write([]byte(`{"ok":true,"result":true}`))
 		case strings.HasSuffix(r.URL.Path, "/setMyCommands"):
 			b, _ := io.ReadAll(r.Body)
@@ -673,7 +677,7 @@ func TestPreWireFailureConsumesLease(t *testing.T) {
 	tgClock.advance(time.Minute)
 	_ = h.a.FlushOutbox(ctxT())
 	tgClock.advance(time.Minute)
-	if err := h.a.FlushOutbox(ctxT()); err != nil {
+	if err := h.a.FlushOutbox(ctxT()); err != nil && !errors.Is(err, channel.ErrNothingDue) {
 		t.Fatal(err)
 	}
 	h.bot.mu.Lock()

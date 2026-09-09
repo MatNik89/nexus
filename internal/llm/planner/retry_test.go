@@ -82,3 +82,21 @@ func TestProviderRetryAtPlannerBoundary(t *testing.T) {
 		t.Fatalf("S7 %s after partial stream, want FAILED (never re-streamed)", st)
 	}
 }
+
+// Detector 8b (ownership ablation): with S7's second-grant path disabled for
+// provider operations (PolicyProvider.MaxAttempts=1) and the planner/provider
+// code untouched, a 429 produces exactly ONE call and an error — the planner
+// holds no retry loop of its own.
+func TestPlannerHoldsNoRetryLoopAblation(t *testing.T) {
+	saved := s7.PolicyProvider
+	s7.PolicyProvider.MaxAttempts = 1
+	t.Cleanup(func() { s7.PolicyProvider = saved })
+	auth := s7.NewAuthority(nil, time.Minute)
+	auth.SetJitterSource(func() float64 { return 0 })
+	sc := &scriptedChat{auth: auth, results: []error{&provider.Failure{Code: s7.CodeHTTP429, Retryable: true, Cause: errors.New("429")}}}
+	p, _ := New(sc, auth, "provider:test", 64000)
+	p.newOp = func() (contracts.OperationID, error) { return "op-abl", nil }
+	if _, err := p.Plan(context.Background(), []contracts.ContextBlock{userBlockT(t, "hello")}); err == nil || sc.calls != 1 {
+		t.Fatalf("ablation: expected exactly 1 call and an error, got %d %v", sc.calls, err)
+	}
+}
