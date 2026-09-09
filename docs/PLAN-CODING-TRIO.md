@@ -304,7 +304,10 @@ All four independently converged on (unchanged from v1/v2, still holds):
        - GC performs mark-and-sweep across ALL retained journal references and all
          currently-active pins in one pass — never per-transaction ad hoc deletion — so
          one artifact referenced by MULTIPLE records (evidence AND a transaction bundle,
-         say) is never removed while any reference to it still lives.
+         say) is never removed while any reference to it still lives. GC's live-root set
+         explicitly includes rehydrated `UNKNOWN` operations and any active
+         `PolicyWorkspaceRollback` companion (agy round-6 finding) — an in-progress
+         restart recovery must never have its own sealed bundle swept out from under it.
        - Required detectors: cleanup racing the artifact-fsync-to-journal-append window;
          two records sharing one artifact while only one of them ages out (the artifact
          must survive until BOTH are gone).
@@ -559,7 +562,11 @@ main + autodeploy + push per standing rules after each slice converges, not batc
 
 ## Status
 
-v6 — plan-review round 5 folded (codex FAIL 1 NEW HIGH, re-verified against the existing
-durable-rehydration rule; kilo PASS + 3 notes folded; agy PASS + 3 notes folded).
-Finding count converging: 5 → 5 → 3 → 2 → 1 across five rounds. Next: dispatch v6 for
-plan-review round 6.
+**CONVERGED — plan-review round 6: codex PASS, kilo PASS, agy PASS.** Finding count
+across six review rounds: 5 → 5 → 3 → 2 → 1 → 0 (blocking). One trailing agy note
+(GC live-root set) folded as a minor clarification, not a re-review trigger. Six plan
+versions, six real adversarial review rounds, every codex finding independently
+re-verified against the actual code or the plan's own text before folding (never taken
+on faith), two factual disagreements with kilo resolved the same way (kilo wrong both
+times, confirmed by reading the code/text directly rather than averaging opinions).
+Ready to begin Slice 0 implementation.
