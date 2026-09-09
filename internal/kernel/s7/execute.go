@@ -96,6 +96,15 @@ func (a *Authority) waitDue(ctx context.Context, op contracts.OperationID) error
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-t.C:
-		return nil
 	}
+	// Fail closed if the authority's clock did not reach the due time (an
+	// injected/frozen clock): never spin waiting for a clock that will not
+	// move.
+	a.mu.Lock()
+	still := a.now().Before(at)
+	a.mu.Unlock()
+	if still {
+		return fmt.Errorf("s7 execute: clock did not reach next_attempt_at: %w", ErrNotDue)
+	}
+	return nil
 }

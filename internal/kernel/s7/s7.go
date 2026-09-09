@@ -127,9 +127,12 @@ func (p Policy) retryable(code string) bool {
 
 // The closed failure-code vocabulary shared by every adapter (Slice B2).
 const (
-	CodeTransportPreWire   = "transport_prewire"
-	CodeHTTP429            = "http_429"
-	CodeHTTP4xx            = "http_4xx"
+	CodeTransportPreWire = "transport_prewire"
+	CodeHTTP429          = "http_429"
+	CodeHTTP4xx          = "http_4xx"
+	// CodeHTTP400Format: a formatted first send rejected by the remote
+	// parser — definite and FIXABLE (the next attempt carries plain text).
+	CodeHTTP400Format      = "http_400_format"
 	CodeHTTP5xx            = "http_5xx"
 	CodeTransportPostWrite = "transport_postwrite"
 	CodeMalformedReply     = "malformed_reply"
@@ -153,7 +156,7 @@ var (
 	// PolicyDelivery: durable at-least-once delivery (HARDQ B2).
 	PolicyDelivery = Policy{EffectClass: contracts.EffectIrreversible, MaxAttempts: 8, Deadline: 24 * time.Hour,
 		Backoff:        BackoffPolicy{Base: 5 * time.Second, Max: 30 * time.Minute, Jitter: true},
-		RetryableCodes: []string{CodeTransportPreWire, CodeHTTP429}, Durable: true}
+		RetryableCodes: []string{CodeTransportPreWire, CodeHTTP429, CodeHTTP400Format}, Durable: true}
 	// PolicyPoll: read-only polling iteration (getUpdates re-reads the same
 	// durable offset; retrying advances no admission).
 	PolicyPoll = Policy{EffectClass: contracts.EffectReadOnly, MaxAttempts: 6,

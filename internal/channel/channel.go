@@ -26,12 +26,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/MatNik89/nexus/internal/foundation/egress"
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
 	"github.com/MatNik89/nexus/internal/kernel/journal"
+	"github.com/MatNik89/nexus/internal/kernel/s7"
 )
 
 // Event types (closed).
@@ -42,7 +44,42 @@ const (
 	EvOutboundSent     = "channel.outbound_sent"
 	EvOutboundUnknown  = "channel.outbound_unknown"
 	EvOutboundResolved = "channel.outbound_resolved"
+	// Slice B2 (full S7 delivery): an S7-decided re-pend (FAILED_RETRYABLE),
+	// the terminal park (FAILED), and the durable record of a governed
+	// control effect (setMyCommands registration).
+	EvOutboundRepend = "channel.outbound_repend"
+	EvOutboundFailed = "channel.outbound_failed"
+	EvControlEffect  = "channel.control_effect"
 )
+
+// Failure is the adapter's TYPED classification of one physical call
+// (Slice B2, one closed code vocabulary shared with s7): Ambiguous = the
+// wire may have been touched (E9: UNKNOWN, never a blind retry);
+// otherwise the failure is DEFINITE (nothing committed remotely) and
+// Retryable is the adapter's PROPOSAL — S7's policy decides.
+type Failure struct {
+	Code      string
+	Ambiguous bool
+	Retryable bool
+	Cause     error
+}
+
+func (f *Failure) Error() string {
+	kind := "definite"
+	if f.Ambiguous {
+		kind = "ambiguous"
+	}
+	if f.Cause != nil {
+		return fmt.Sprintf("channel: %s failure %s: %v", kind, f.Code, f.Cause)
+	}
+	return fmt.Sprintf("channel: %s failure %s", kind, f.Code)
+}
+
+func (f *Failure) Unwrap() error { return f.Cause }
+
+// Is lets errors.Is(err, ErrAmbiguousSend) keep working for ambiguous
+// typed failures.
+func (f *Failure) Is(target error) bool { return f.Ambiguous && target == ErrAmbiguousSend }
 
 // ErrAmbiguousSend marks a transport outcome where the request may have
 // been ACCEPTED remotely (the HTTP call was issued but its result is
@@ -85,6 +122,10 @@ type Outbound struct {
 	// channel.outbound_unknown): 0 means never wire-attempted — the
 	// only state where a formatted body may be carried (tgout plan).
 	Attempts int
+	// Generation counts HUMAN redelivers (each begins a new S7 operation).
+	Generation int
+	// LastCode is the last recorded failure code (empty when none).
+	LastCode string
 }
 
 // --- payloads (closed) ---
@@ -114,7 +155,65 @@ type deliveryMark struct {
 	Adapter  string `json:"adapter,omitempty"`
 	Identity string `json:"identity,omitempty"`
 	Source   string `json:"source,omitempty"`
+	// OperationID binds an S7-paired mark to its delivery operation
+	// (Slice B2): the validator and projection REJECT a mark whose operation
+	// is not this delivery's (a companion for row B can never ride A's grant).
+	OperationID string `json:"operation_id,omitempty"`
+	Code        string `json:"code,omitempty"`
+	NextAt      int64  `json:"next_attempt_unix,omitempty"`
 }
+
+// controlEffectPayload is the adapter's durable record of ONE governed
+// control effect (setMyCommands registration): operation_id is bound to the
+// payload hash, so a rehydrated record names exactly the menu it registered.
+type controlEffectPayload struct {
+	OperationID string `json:"operation_id"`
+	Adapter     string `json:"adapter"`
+	BotID       int64  `json:"bot_id"`
+	Method      string `json:"method"`
+	PayloadHash string `json:"payload_hash"`
+	State       string `json:"state"`
+}
+
+// ControlOperation is the durable identity of ONE control effect: bound to
+// the adapter, the REMOTE BOT (a replacement token is a different bot and a
+// different operation — plan-review r10) and the hash of the exact canonical
+// wire payload.
+func ControlOperation(adapter string, botID int64, method, payloadHash string) contracts.OperationID {
+	return contracts.OperationID(fmt.Sprintf("control:%s:%d:%s:%s", adapter, botID, method, payloadHash))
+}
+
+// ControlTarget binds the grant to the bot resource the effect mutates.
+func ControlTarget(adapter string, botID int64, method string) contracts.TargetID {
+	return contracts.TargetID(fmt.Sprintf("channel:%s:bot:%d:%s", adapter, botID, method))
+}
+
+// OperationFor is the stable S7 operation identity of ONE delivery
+// generation: the first is `delivery:<id>`; a HUMAN redeliver starts a new
+// generation `delivery:<id>:r<n>` (human authority begins a new operation,
+// it never re-grants an exhausted one).
+func OperationFor(o Outbound) contracts.OperationID {
+	if o.Generation == 0 {
+		return contracts.OperationID("delivery:" + o.DeliveryID)
+	}
+	return contracts.OperationID(fmt.Sprintf("delivery:%s:r%d", o.DeliveryID, o.Generation))
+}
+
+// TargetFor binds the grant to the immutable delivery resource, not the
+// adapter (plan-review r2 codex #2).
+func TargetFor(o Outbound) contracts.TargetID {
+	return contracts.TargetID("channel:" + o.AdapterID + ":delivery:" + o.DeliveryID)
+}
+
+// operationMatchesDelivery: the S7 operation id belongs to THIS delivery
+// (any generation).
+func operationMatchesDelivery(op, deliveryID string) bool {
+	base := "delivery:" + deliveryID
+	return op == base || strings.HasPrefix(op, base+":r")
+}
+
+var controlMethods = map[string]bool{"setMyCommands": true}
+var controlStates = map[string]bool{"PENDING": true, "RUNNING": true, "UNKNOWN": true, "SUCCEEDED": true, "FAILED_RETRYABLE": true, "FAILED": true}
 
 type terminalPayload struct {
 	MessageID string `json:"message_id"`
@@ -122,6 +221,8 @@ type terminalPayload struct {
 
 // Events returns the closed payload validators.
 func Events() map[string]journal.PayloadValidator {
+	// S7-paired marks (unknown/sent/repend/failed) REQUIRE the bound
+	// operation id and its consistency with the delivery (Slice B2).
 	markV := func(raw json.RawMessage) error {
 		var p deliveryMark
 		if err := json.Unmarshal(raw, &p); err != nil {
@@ -130,9 +231,32 @@ func Events() map[string]journal.PayloadValidator {
 		if p.DeliveryID == "" {
 			return fmt.Errorf("channel: a delivery id is required")
 		}
+		if p.OperationID == "" {
+			return fmt.Errorf("channel: an S7-paired mark requires its operation_id (fail closed)")
+		}
+		if !operationMatchesDelivery(p.OperationID, p.DeliveryID) {
+			return fmt.Errorf("channel: mark operation %q does not belong to delivery %q (fail closed)", p.OperationID, p.DeliveryID)
+		}
+		return nil
+	}
+	controlV := func(raw json.RawMessage) error {
+		var p controlEffectPayload
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return err
+		}
+		if p.OperationID == "" || p.Adapter == "" || p.BotID == 0 || p.Method == "" || p.PayloadHash == "" || p.State == "" {
+			return fmt.Errorf("channel: control_effect requires operation_id, adapter, bot_id, method, payload_hash, state")
+		}
+		if !controlMethods[p.Method] || !controlStates[p.State] {
+			return fmt.Errorf("channel: control_effect method/state outside the closed set (fail closed)")
+		}
+		if contracts.OperationID(p.OperationID) != ControlOperation(p.Adapter, p.BotID, p.Method, p.PayloadHash) {
+			return fmt.Errorf("channel: control_effect operation_id is not bound to its bot + payload hash (fail closed)")
+		}
 		return nil
 	}
 	return map[string]journal.PayloadValidator{
+		EvOutboundRepend: markV, EvOutboundFailed: markV, EvControlEffect: controlV,
 		EvInboundAdmitted: func(raw json.RawMessage) error {
 			var p inboundPayload
 			if err := json.Unmarshal(raw, &p); err != nil {
@@ -260,7 +384,7 @@ type Projection struct{}
 func NewProjection() *Projection { return &Projection{} }
 
 func (Projection) Name() string { return "channel" }
-func (Projection) Version() int { return 2 } // v2: chan_outbox.attempts (tgout)
+func (Projection) Version() int { return 3 } // v3: FAILED status, generation, control effects (Slice B2)
 
 func (Projection) Init(db *journal.ProjDB) error {
 	_, err := db.Exec(`
@@ -283,16 +407,27 @@ func (Projection) Init(db *journal.ProjDB) error {
 			adapter_id TEXT NOT NULL,
 			channel_identity TEXT NOT NULL,
 			text TEXT NOT NULL,
-			status TEXT NOT NULL, -- PENDING | SENT | UNKNOWN
+			status TEXT NOT NULL, -- PENDING | SENT | UNKNOWN | FAILED
 			created INTEGER NOT NULL,
-			attempts INTEGER NOT NULL DEFAULT 0
+			attempts INTEGER NOT NULL DEFAULT 0,
+			generation INTEGER NOT NULL DEFAULT 0,
+			last_code TEXT NOT NULL DEFAULT ''
+		);
+		CREATE TABLE IF NOT EXISTS chan_control_effect (
+			operation_id TEXT PRIMARY KEY,
+			adapter_id TEXT NOT NULL,
+			bot_id INTEGER NOT NULL,
+			method TEXT NOT NULL,
+			payload_hash TEXT NOT NULL,
+			state TEXT NOT NULL,
+			updated INTEGER NOT NULL
 		);
 	`)
 	return err
 }
 
 func (Projection) Reset(db *journal.ProjDB) error {
-	for _, stmt := range []string{`DROP TABLE IF EXISTS chan_inbox`, `DROP TABLE IF EXISTS chan_outbox`} {
+	for _, stmt := range []string{`DROP TABLE IF EXISTS chan_inbox`, `DROP TABLE IF EXISTS chan_outbox`, `DROP TABLE IF EXISTS chan_control_effect`} {
 		if _, err := db.Exec(stmt); err != nil {
 			return err
 		}
@@ -365,16 +500,55 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 		if n, _ := res.RowsAffected(); n != 1 {
 			return fmt.Errorf("channel: unknown-mark for a non-pending delivery (fail closed)")
 		}
+	case EvOutboundRepend:
+		var p deliveryMark
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return err
+		}
+		// S7 decided FAILED_RETRYABLE: nothing left the process, the row
+		// returns to PENDING for the S7-scheduled next attempt.
+		res, err := tx.Exec(`UPDATE chan_outbox SET status='PENDING', last_code=? WHERE delivery_id=? AND status='UNKNOWN'`, p.Code, p.DeliveryID)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return fmt.Errorf("channel: repend for a delivery that is not in flight (fail closed)")
+		}
+	case EvOutboundFailed:
+		var p deliveryMark
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return err
+		}
+		// Terminal park: exhausted, terminal code, or a local refusal.
+		res, err := tx.Exec(`UPDATE chan_outbox SET status='FAILED', last_code=? WHERE delivery_id=? AND status IN ('UNKNOWN','PENDING')`, p.Code, p.DeliveryID)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return fmt.Errorf("channel: failed-mark for a delivery that is not in flight or pending (fail closed)")
+		}
+	case EvControlEffect:
+		var p controlEffectPayload
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`INSERT INTO chan_control_effect(operation_id, adapter_id, bot_id, method, payload_hash, state, updated)
+			VALUES(?,?,?,?,?,?,?) ON CONFLICT(operation_id) DO UPDATE SET state=excluded.state, updated=excluded.updated`,
+			p.OperationID, p.Adapter, p.BotID, p.Method, p.PayloadHash, p.State, int64(ev.JournalOffset)); err != nil {
+			return fmt.Errorf("channel: control_effect upsert: %w", err)
+		}
 	case EvOutboundResolved:
 		var p deliveryMark
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return err
 		}
 		to := "SENT"
+		gen := ""
 		if !p.Proved {
-			to = "PENDING" // proof of LOSS: safe to retry
+			to = "PENDING" // proof of LOSS (human): a NEW S7 generation
+			gen = ", generation=generation+1"
 		}
-		q := `UPDATE chan_outbox SET status=? WHERE delivery_id=? AND status='UNKNOWN'`
+		q := `UPDATE chan_outbox SET status=?` + gen + ` WHERE delivery_id=? AND status IN ('UNKNOWN','FAILED')`
 		args := []interface{}{to, p.DeliveryID}
 		if p.Identity != "" || p.Adapter != "" {
 			// Atomic FULL-destination guard in the SAME statement: both
@@ -537,7 +711,7 @@ func (c *Core) DeliveryStatus(ctx context.Context, id string) (string, error) {
 
 func (c *Core) rowsByStatus(ctx context.Context, status string) ([]Outbound, error) {
 	rows, err := c.j.QueryProjection(ctx,
-		`SELECT delivery_id, adapter_id, channel_identity, text, attempts FROM chan_outbox WHERE status=? ORDER BY created`, status)
+		`SELECT delivery_id, adapter_id, channel_identity, text, attempts, generation, last_code FROM chan_outbox WHERE status=? ORDER BY created`, status)
 	if err != nil {
 		return nil, err
 	}
@@ -545,7 +719,7 @@ func (c *Core) rowsByStatus(ctx context.Context, status string) ([]Outbound, err
 	var out []Outbound
 	for rows.Next() {
 		var o Outbound
-		if err := rows.Scan(&o.DeliveryID, &o.AdapterID, &o.ChannelIdentity, &o.Text, &o.Attempts); err != nil {
+		if err := rows.Scan(&o.DeliveryID, &o.AdapterID, &o.ChannelIdentity, &o.Text, &o.Attempts, &o.Generation, &o.LastCode); err != nil {
 			return nil, err
 		}
 		out = append(out, o)
@@ -563,70 +737,147 @@ func (c *Core) Unreconciled(ctx context.Context) ([]Outbound, error) {
 	return c.rowsByStatus(ctx, "UNKNOWN")
 }
 
-func (c *Core) mark(ctx context.Context, eventType, deliveryID string) error {
-	p, err := c.params(eventType, deliveryMark{DeliveryID: deliveryID})
-	if err != nil {
-		return err
+// markParams builds one S7-paired outbox mark bound to its operation.
+func (c *Core) markParams(eventType, deliveryID string, op contracts.OperationID, code string, nextAt time.Time) (contracts.EnvelopeParams, error) {
+	m := deliveryMark{DeliveryID: deliveryID, OperationID: string(op), Code: code}
+	if !nextAt.IsZero() {
+		m.NextAt = nextAt.Unix()
 	}
-	_, err = c.j.Append(ctx, p)
-	return err
+	return c.params(eventType, m)
 }
 
-// Flush delivers every PENDING row with UNKNOWN-FIRST honesty (Phase-5
-// codex #3/#4): the row is durably parked UNKNOWN BEFORE the wire is
-// touched, so a crash mid-send, an ambiguous transport result, or a
-// failed sent-mark ALL leave the row in reconciliation — a blind resend
-// is structurally impossible. Outcomes:
-//   - DEFINITE pre-wire failure (send returns a non-ambiguous error):
-//     the row resolves back to PENDING (nothing left the process; retry
-//     is safe) and the error surfaces;
-//   - accept: the SENT mark closes it; if THAT mark fails the row simply
-//     stays UNKNOWN (already durable) and the error surfaces;
-//   - ErrAmbiguousSend (the wire was touched, result unknown): the row
-//     stays UNKNOWN for reconciliation.
-func (c *Core) Flush(ctx context.Context, send func(Outbound) error) error {
+// companionBuilder is the channel's ONE owner-side mapping from an S7
+// Landing to the outbox companion committed in the SAME batch as the S7
+// transition (Slice B2): Succeeded -> SENT; Retry -> re-pend (PENDING);
+// Terminal / Cancelled -> FAILED (the code names why); Unknown -> no
+// companion (the row is already durably UNKNOWN from the Consume park).
+func (c *Core) companionBuilder(o Outbound, op contracts.OperationID) s7.Builder {
+	return func(l s7.Landing) s7.Companion {
+		var (
+			p   contracts.EnvelopeParams
+			err error
+		)
+		switch l.Kind {
+		case s7.LandingSucceeded:
+			p, err = c.markParams(EvOutboundSent, o.DeliveryID, op, "", time.Time{})
+		case s7.LandingRetry:
+			p, err = c.markParams(EvOutboundRepend, o.DeliveryID, op, l.Code, l.NextAt)
+		case s7.LandingTerminal:
+			p, err = c.markParams(EvOutboundFailed, o.DeliveryID, op, l.Code, time.Time{})
+		case s7.LandingCancelled:
+			code := l.Code
+			if code == "" {
+				code = s7.CodeLocalRefused
+			}
+			p, err = c.markParams(EvOutboundFailed, o.DeliveryID, op, code, time.Time{})
+		default:
+			return s7.Companion{}
+		}
+		if err != nil {
+			return s7.Companion{}
+		}
+		return s7.Companion{Key: op, Params: p}
+	}
+}
+
+// Send is the adapter's physical delivery of ONE row under ONE grant. The
+// adapter recomputes the row's operation/target, compares them with the
+// grant, and passes the park companion into s7.Consume IMMEDIATELY before
+// the wire (STARTED + UNKNOWN park commit in one batch). It returns nil,
+// a typed *Failure, or (legacy) an error wrapping ErrAmbiguousSend.
+type Send func(o Outbound, g s7.Grant, park s7.Companion) error
+
+// Flush drives every PENDING row through the S7 owner (Slice B2): for each
+// row the operation is begun (idempotent), the next grant is asked for
+// (S7 decides due-ness, cap and deadline; exhaustion lands FAILED together
+// with the companion), the adapter sends under that grant, and the outcome
+// is REPORTED to S7 which decides the landing — SENT / re-pend / FAILED /
+// UNKNOWN — committing the S7 transition and the outbox companion in ONE
+// batch. The channel never resends on its own: a definite failure only
+// returns to PENDING because S7 said "retry is safe", and the next tick
+// asks S7 again. UNKNOWN (the wire may have been touched) is never resent
+// (E9); a human `redeliver` starts a new generation.
+func (c *Core) Flush(ctx context.Context, auth *s7.Authority, send Send) error {
+	if auth == nil || send == nil {
+		return fmt.Errorf("channel: flush requires the S7 authority and a send (fail closed)")
+	}
 	pending, err := c.Pending(ctx)
 	if err != nil {
 		return err
 	}
 	// One poisoned head must not starve every later delivery (Phase-5-r2
 	// codex #6): failures are collected and the loop CONTINUES; only a
-	// journal-mark failure aborts (the durable substrate itself is broken).
+	// journal/S7 landing failure aborts (the durable substrate is broken).
 	var failures []error
 	for _, o := range pending {
-		// Durable in-flight parking BEFORE the wire.
-		if err := c.mark(ctx, EvOutboundUnknown, o.DeliveryID); err != nil {
-			return fmt.Errorf("channel: delivery %s could not be parked in-flight — not sending: %w", o.DeliveryID, err)
+		op, target := OperationFor(o), TargetFor(o)
+		if err := auth.Begin(op, target, s7.PolicyDelivery); err != nil {
+			failures = append(failures, fmt.Errorf("channel: delivery %s: %w", o.DeliveryID, err))
+			continue
 		}
-		sendErr := send(o)
+		build := c.companionBuilder(o, op)
+		g, err := auth.Next(op, build)
+		switch {
+		case errors.Is(err, s7.ErrNotDue):
+			continue // S7 scheduled a later attempt
+		case errors.Is(err, s7.ErrExhausted):
+			failures = append(failures, fmt.Errorf("channel: delivery %s exhausted its S7 budget — parked FAILED: %w", o.DeliveryID, err))
+			continue
+		case err != nil:
+			if strings.Contains(err.Error(), "not durable") {
+				return fmt.Errorf("channel: delivery %s: S7 authorization could not be made durable — not sending: %w", o.DeliveryID, err)
+			}
+			failures = append(failures, fmt.Errorf("channel: delivery %s: %w", o.DeliveryID, err))
+			continue
+		}
+		parkParams, perr := c.markParams(EvOutboundUnknown, o.DeliveryID, op, "", time.Time{})
+		if perr != nil {
+			return perr
+		}
+		sendErr := send(o, g, s7.Companion{Key: op, Params: parkParams})
+		st, _ := auth.State(op)
+		if st == contracts.AttemptAuthorized {
+			// Never consumed: a LOCAL refusal (identity mismatch, request
+			// build) — nothing physical ran; cancel + FAILED in one batch.
+			if cerr := auth.Cancel(op, build); cerr != nil {
+				return fmt.Errorf("channel: delivery %s: local refusal could not be landed: %w", o.DeliveryID, errors.Join(sendErr, cerr))
+			}
+			failures = append(failures, fmt.Errorf("channel: delivery %s refused locally (FAILED): %w", o.DeliveryID, sendErr))
+			continue
+		}
+		var outcome s7.Outcome
+		code := ""
+		var f *Failure
 		switch {
 		case sendErr == nil:
-			sentErr := error(nil)
-			if c.testFailSentMark {
-				sentErr = fmt.Errorf("injected sent-mark failure")
-			} else {
-				sentErr = c.markSentFromUnknown(ctx, o.DeliveryID)
+			outcome = s7.OutcomeSucceeded
+		case errors.As(sendErr, &f) && !f.Ambiguous:
+			code = f.Code
+			outcome = s7.OutcomeFailedTerminal
+			if f.Retryable {
+				outcome = s7.OutcomeFailedRetryable
 			}
-			if sentErr != nil {
-				// Already durably UNKNOWN: reconciliation owns it.
-				return fmt.Errorf("channel: delivery %s accepted but the sent-mark failed — stays UNKNOWN for reconciliation: %w", o.DeliveryID, sentErr)
-			}
-		case errors.Is(sendErr, ErrAmbiguousSend):
-			failures = append(failures, fmt.Errorf("channel: delivery %s ambiguous — stays UNKNOWN for reconciliation: %w", o.DeliveryID, sendErr))
+		case errors.As(sendErr, &f):
+			outcome, code = s7.OutcomeUnknown, f.Code
 		default:
-			// DEFINITE pre-wire failure: nothing left the process.
-			if rerr := c.Reconcile(ctx, o.DeliveryID, false); rerr != nil {
-				return fmt.Errorf("channel: delivery %s failed pre-wire and could not re-pend: %w", o.DeliveryID, errors.Join(sendErr, rerr))
-			}
-			failures = append(failures, fmt.Errorf("channel: delivery %s failed (re-pended): %w", o.DeliveryID, sendErr))
+			// Untyped or ErrAmbiguousSend: the wire MAY have been touched.
+			outcome, code = s7.OutcomeUnknown, s7.CodeTransportPostWrite
+		}
+		if c.testFailSentMark && outcome == s7.OutcomeSucceeded {
+			// Simulated death between transport accept and the landing: the
+			// row is already durably UNKNOWN (park) — reconciliation owns it.
+			return fmt.Errorf("channel: delivery %s accepted but the sent-mark failed — stays UNKNOWN for reconciliation: injected sent-mark failure", o.DeliveryID)
+		}
+		if rerr := auth.Report(op, outcome, code, build); rerr != nil {
+			// The S7 landing + companion did not commit: the row STAYS
+			// UNKNOWN (never claims SENT); the substrate is broken.
+			return fmt.Errorf("channel: delivery %s: landing failed — stays UNKNOWN for reconciliation: %w", o.DeliveryID, errors.Join(sendErr, rerr))
+		}
+		if sendErr != nil {
+			failures = append(failures, fmt.Errorf("channel: delivery %s: %w", o.DeliveryID, sendErr))
 		}
 	}
 	return errors.Join(failures...)
-}
-
-// markSentFromUnknown closes an in-flight row as SENT.
-func (c *Core) markSentFromUnknown(ctx context.Context, deliveryID string) error {
-	return c.mark(ctx, EvOutboundSent, deliveryID)
 }
 
 // CompleteInbound is THE terminal-result+outbox recipe (B7): the inbound
@@ -672,9 +923,6 @@ func (c *Core) MarkInboundTerminal(ctx context.Context, messageID string) error 
 // Reconcile resolves an UNKNOWN delivery with external proof: proved=true
 // (the remote shows the message) → SENT; proved=false (the remote proves
 // loss) → back to PENDING for a safe retry.
-func (c *Core) Reconcile(ctx context.Context, deliveryID string, proved bool) error {
-	return c.ReconcileFor(ctx, deliveryID, proved, "", "", "")
-}
 
 // ReconcileFor reconciles WITH a destination binding: the transition
 // commits only if the row's channel identity matches (empty identity =
@@ -687,6 +935,73 @@ func (c *Core) ReconcileFor(ctx context.Context, deliveryID string, proved bool,
 	}
 	_, err = c.j.Append(ctx, p)
 	return err
+}
+
+// FailedFor lists FAILED (terminally parked) deliveries FOR ONE destination
+// chat, with the code that parked them.
+func (c *Core) FailedFor(ctx context.Context, adapter, identity string) ([]Outbound, error) {
+	rows, err := c.j.QueryProjection(ctx,
+		`SELECT delivery_id, adapter_id, channel_identity, text, attempts, generation, last_code FROM chan_outbox
+		 WHERE status='FAILED' AND adapter_id=? AND channel_identity=? ORDER BY created`, adapter, identity)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Outbound
+	for rows.Next() {
+		var o Outbound
+		if err := rows.Scan(&o.DeliveryID, &o.AdapterID, &o.ChannelIdentity, &o.Text, &o.Attempts, &o.Generation, &o.LastCode); err != nil {
+			return nil, err
+		}
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}
+
+// ControlEffectParams builds the adapter's durable companion for ONE
+// governed control effect; the operation id is bound to the payload hash.
+func (c *Core) ControlEffectParams(adapter string, botID int64, method, payloadHash, state string) (contracts.OperationID, contracts.EnvelopeParams, error) {
+	op := ControlOperation(adapter, botID, method, payloadHash)
+	p, err := c.params(EvControlEffect, controlEffectPayload{OperationID: string(op), Adapter: adapter, BotID: botID, Method: method, PayloadHash: payloadHash, State: state})
+	return op, p, err
+}
+
+// ControlProof is the OWNER's typed evidence about the remote state of one
+// control effect (Slice B2, plan-review r11): the bot the proof was read
+// from, the payload hash it was compared against, and the comparison. It
+// is reduced to the boolean handed to s7.Reconcile ONLY when it is bound to
+// the operation being reconciled — a proof read from bot B can never resolve
+// bot A's UNKNOWN effect.
+type ControlProof struct {
+	BotID       int64
+	PayloadHash string
+	RemoteEqual bool
+}
+
+// VerifyControlProof binds a proof to the operation it claims to resolve.
+func VerifyControlProof(op contracts.OperationID, adapter, method string, proof ControlProof) (bool, error) {
+	if ControlOperation(adapter, proof.BotID, method, proof.PayloadHash) != op {
+		return false, fmt.Errorf("channel: control proof (bot %d, hash %.12s) is not bound to operation %s (fail closed)", proof.BotID, proof.PayloadHash, op)
+	}
+	return proof.RemoteEqual, nil
+}
+
+// ControlEffectState reads the recorded state of one control effect ("" =
+// never recorded).
+func (c *Core) ControlEffectState(ctx context.Context, op contracts.OperationID) (string, error) {
+	rows, err := c.j.QueryProjection(ctx, `SELECT state FROM chan_control_effect WHERE operation_id=?`, string(op))
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return "", rows.Err()
+	}
+	var st string
+	if err := rows.Scan(&st); err != nil {
+		return "", err
+	}
+	return st, nil
 }
 
 // UnreconciledFor lists UNKNOWN deliveries FOR ONE destination chat.

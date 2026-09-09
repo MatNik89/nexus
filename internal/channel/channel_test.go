@@ -22,14 +22,60 @@ import (
 
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
 	"github.com/MatNik89/nexus/internal/kernel/journal"
+	"github.com/MatNik89/nexus/internal/kernel/s7"
 	"github.com/MatNik89/nexus/internal/security/redact"
 )
 
 func ctxT() context.Context { return context.Background() }
 
+// testEvents merges the channel and S7 event sets (Slice B2: the delivery
+// lifecycle journals both owners in one batch).
+func testEvents() map[string]journal.PayloadValidator {
+	m := Events()
+	for k, v := range s7.Events() {
+		m[k] = v
+	}
+	return m
+}
+
+// fakeClock drives S7 backoff deterministically.
+type fakeClock struct{ t time.Time }
+
+func (c *fakeClock) now() time.Time          { return c.t }
+func (c *fakeClock) advance(d time.Duration) { c.t = c.t.Add(d) }
+
+// authFor builds the journal-bound S7 authority for a core (jitter pinned to
+// 1 so backoff = Base * 2^(n-1)).
+func authFor(t *testing.T, c *Core, clock *fakeClock) *s7.Authority {
+	t.Helper()
+	a, err := s7.New(c.j, clock.now, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.SetJitterSource(func() float64 { return 1 })
+	return a
+}
+
+// sendVia is the test adapter: it CONSUMES the grant with the park
+// companion (as the real adapter does immediately before the wire) and then
+// returns the scripted transport result. A scripted result may be nil, a
+// typed *Failure, or an ErrAmbiguousSend-wrapped error.
+func sendVia(auth *s7.Authority, f func(Outbound) error) Send {
+	return func(o Outbound, g s7.Grant, park s7.Companion) error {
+		if err := auth.Consume(g, park); err != nil {
+			return &Failure{Code: s7.CodeLocalRefused, Cause: err}
+		}
+		return f(o)
+	}
+}
+
+func preWire() error {
+	return &Failure{Code: s7.CodeTransportPreWire, Retryable: true, Cause: fmt.Errorf("network down")}
+}
+
 func open(t *testing.T, dir string) (*Core, *journal.Journal) {
 	t.Helper()
-	j, err := journal.Open(filepath.Join(dir, "journal.db"), "work", redact.None{}, Events(), NewProjection())
+	j, err := journal.Open(filepath.Join(dir, "journal.db"), "work", redact.None{}, testEvents(), NewProjection(), s7.NewProjection())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +165,7 @@ func TestInboxRecipeAtomicUnderSigkill(t *testing.T) {
 
 func inboxCrashChild() {
 	dir := os.Getenv("CHAN_CRASH_DIR")
-	j, err := journal.Open(filepath.Join(dir, "journal.db"), "work", redact.None{}, Events(), NewProjection())
+	j, err := journal.Open(filepath.Join(dir, "journal.db"), "work", redact.None{}, testEvents(), NewProjection(), s7.NewProjection())
 	if err != nil {
 		os.Exit(1)
 	}
@@ -162,7 +208,7 @@ func TestOutboxRecipeAtomicUnderSigkill(t *testing.T) {
 
 func outboxCrashChild() {
 	dir := os.Getenv("CHAN_CRASH_DIR")
-	j, err := journal.Open(filepath.Join(dir, "journal.db"), "work", redact.None{}, Events(), NewProjection())
+	j, err := journal.Open(filepath.Join(dir, "journal.db"), "work", redact.None{}, testEvents(), NewProjection(), s7.NewProjection())
 	if err != nil {
 		os.Exit(1)
 	}
@@ -193,24 +239,31 @@ func TestDeliveryHonesty(t *testing.T) {
 	if _, err := c.EnqueueReply(ctxT(), "telegram", "chat-42", "work", "hi"); err != nil {
 		t.Fatal(err)
 	}
-	// DEFINITE transport error → re-pended for a safe retry.
+	clock := &fakeClock{time.Unix(1000, 0)}
+	auth := authFor(t, c, clock)
+	// DEFINITE pre-wire failure → S7 lands FAILED_RETRYABLE → re-pended
+	// for the S7-scheduled retry (nothing resends before it is due).
 	fails := 0
-	err := c.Flush(ctxT(), func(o Outbound) error { fails++; return fmt.Errorf("network down") })
+	err := c.Flush(ctxT(), auth, sendVia(auth, func(o Outbound) error { fails++; return preWire() }))
 	if err == nil {
 		t.Fatal("transport failure swallowed")
 	}
 	if len(mustPending(t, c)) != 1 {
 		t.Fatal("failed delivery lost the pending row")
 	}
-	// Accept → sent exactly once; second flush sends nothing.
 	sent := 0
-	if err := c.Flush(ctxT(), func(o Outbound) error { sent++; return nil }); err != nil {
+	if err := c.Flush(ctxT(), auth, sendVia(auth, func(o Outbound) error { sent++; return nil })); err != nil || sent != 0 {
+		t.Fatalf("resent before S7 said due: sent=%d err=%v", sent, err)
+	}
+	clock.advance(time.Minute) // past the 5s backoff
+	// Accept → sent exactly once; second flush sends nothing.
+	if err := c.Flush(ctxT(), auth, sendVia(auth, func(o Outbound) error { sent++; return nil })); err != nil {
 		t.Fatal(err)
 	}
 	if sent != 1 || len(mustPending(t, c)) != 0 {
 		t.Fatalf("delivery not exactly-once-marked: sent=%d pending=%d", sent, len(mustPending(t, c)))
 	}
-	if err := c.Flush(ctxT(), func(o Outbound) error { sent++; return nil }); err != nil {
+	if err := c.Flush(ctxT(), auth, sendVia(auth, func(o Outbound) error { sent++; return nil })); err != nil {
 		t.Fatal(err)
 	}
 	if sent != 1 {
@@ -225,8 +278,9 @@ func TestSentButUnrecordedParksUnknown(t *testing.T) {
 	if _, err := c.EnqueueReply(ctxT(), "telegram", "chat-42", "work", "hi"); err != nil {
 		t.Fatal(err)
 	}
+	auth := authFor(t, c, &fakeClock{time.Unix(1000, 0)})
 	c.testFailSentMark = true
-	if err := c.Flush(ctxT(), func(o Outbound) error { return nil }); err == nil {
+	if err := c.Flush(ctxT(), auth, sendVia(auth, func(o Outbound) error { return nil })); err == nil {
 		t.Fatal("sent-mark failure swallowed")
 	}
 	c.testFailSentMark = false
@@ -240,7 +294,7 @@ func TestSentButUnrecordedParksUnknown(t *testing.T) {
 		t.Fatalf("UNKNOWN row not visible for reconciliation: %v %v", unknown, err)
 	}
 	// Reconciliation with proof-of-send closes it; proof-of-loss re-pends.
-	if err := c.Reconcile(ctxT(), unknown[0].DeliveryID, true); err != nil {
+	if err := c.ReconcileFor(ctxT(), unknown[0].DeliveryID, true, "", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if u, _ := c.Unreconciled(ctxT()); len(u) != 0 {
@@ -296,7 +350,7 @@ func TestChannelStateSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	j.Close()
-	j2, err := journal.Open(filepath.Join(dir, "journal.db"), "work", redact.None{}, Events(), NewProjection())
+	j2, err := journal.Open(filepath.Join(dir, "journal.db"), "work", redact.None{}, testEvents(), NewProjection(), s7.NewProjection())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -325,16 +379,19 @@ func TestAmbiguousSendParksUnknownNeverResends(t *testing.T) {
 	if _, err := c.EnqueueReply(ctxT(), "telegram", "chat-42", "work", "hi"); err != nil {
 		t.Fatal(err)
 	}
+	clock := &fakeClock{time.Unix(1000, 0)}
+	auth := authFor(t, c, clock)
 	accepts := 0
-	err := c.Flush(ctxT(), func(o Outbound) error {
+	err := c.Flush(ctxT(), auth, sendVia(auth, func(o Outbound) error {
 		accepts++ // the wire WAS touched
 		return fmt.Errorf("connection reset: %w", ErrAmbiguousSend)
-	})
+	}))
 	if err == nil {
 		t.Fatal("ambiguous send swallowed")
 	}
-	// UNKNOWN, not pending: a second flush sends NOTHING.
-	if err := c.Flush(ctxT(), func(o Outbound) error { accepts++; return nil }); err != nil {
+	// UNKNOWN, not pending: a second flush sends NOTHING (even long after).
+	clock.advance(time.Hour)
+	if err := c.Flush(ctxT(), auth, sendVia(auth, func(o Outbound) error { accepts++; return nil })); err != nil {
 		t.Fatal(err)
 	}
 	if accepts != 1 {
@@ -343,7 +400,9 @@ func TestAmbiguousSendParksUnknownNeverResends(t *testing.T) {
 	// RESTART: still not resent (the parking is durable).
 	j.Close()
 	c2, _ := open(t, dir)
-	if err := c2.Flush(ctxT(), func(o Outbound) error { accepts++; return nil }); err != nil {
+	clock.advance(time.Hour)
+	auth2 := authFor(t, c2, clock)
+	if err := c2.Flush(ctxT(), auth2, sendVia(auth2, func(o Outbound) error { accepts++; return nil })); err != nil {
 		t.Fatal(err)
 	}
 	if accepts != 1 {
@@ -356,7 +415,7 @@ func TestAmbiguousSendParksUnknownNeverResends(t *testing.T) {
 	if _, err := c2.EnqueueReply(ctxT(), "telegram", "chat-42", "work", "second"); err != nil {
 		t.Fatal(err)
 	}
-	if err := c2.Flush(ctxT(), func(o Outbound) error { return fmt.Errorf("definite pre-wire failure") }); err == nil {
+	if err := c2.Flush(ctxT(), auth2, sendVia(auth2, func(o Outbound) error { return preWire() })); err == nil {
 		t.Fatal("definite failure swallowed")
 	}
 	p, _ := c2.Pending(ctxT())
@@ -466,14 +525,15 @@ func TestPoisonHeadDoesNotStarve(t *testing.T) {
 	if _, err := c.EnqueueReply(ctxT(), "telegram", "chat-42", "work", "must deliver"); err != nil {
 		t.Fatal(err)
 	}
+	auth := authFor(t, c, &fakeClock{time.Unix(1000, 0)})
 	good := 0
-	err := c.Flush(ctxT(), func(o Outbound) error {
+	err := c.Flush(ctxT(), auth, sendVia(auth, func(o Outbound) error {
 		if o.ChannelIdentity == "chat-poison" {
-			return fmt.Errorf("chat rejected permanently")
+			return preWire()
 		}
 		good++
 		return nil
-	})
+	}))
 	if err == nil {
 		t.Fatal("poison failure swallowed")
 	}

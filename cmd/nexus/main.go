@@ -82,6 +82,10 @@ func main() {
 	fmt.Fprintf(os.Stdout, "nexus %s\nusage: nexus <daemon|chat [--yolo]|doctor>\n", version)
 }
 
+// s7Now is the S7 clock (nil = time.Now); tests pin it to drive backoff
+// deterministically through the real composition.
+var s7Now func() time.Time
+
 // resolveEnv loads layout + configuration (global file only in P0;
 // project layer joins with the workspace slice).
 func resolveEnv() (pathx.Layout, config.Resolved, error) {
@@ -170,6 +174,7 @@ func runDaemon() int {
 				Profile:     b.profile,
 				EgressAllow: resolved.Config.EgressAllow,
 				Receipt:     b.egressSink,
+				Authority:   b.authority,
 			}, b.chanCore, telegramHandler(b))
 			if aerr != nil {
 				fmt.Fprintf(os.Stderr, "nexus daemon: telegram: %v\n", aerr)
@@ -290,7 +295,13 @@ func runDaemon() int {
 	}
 	if tgAdapter != nil {
 		if snap.On("telegram") {
-			go tgAdapter.Run(ctx, 2*time.Second)
+			go func() {
+				// Slice D owns the health record; until then the stop is at
+				// least LOUD (never a silently dead capability).
+				if err := tgAdapter.Run(ctx, 2*time.Second); err != nil {
+					fmt.Fprintf(os.Stderr, "nexus daemon: telegram adapter STOPPED: %v\n", err)
+				}
+			}()
 			fmt.Println("nexus daemon: telegram adapter running (sealed capability ON)")
 		} else {
 			fmt.Fprintf(os.Stderr, "nexus daemon: telegram capability OFF (%s) — adapter not started (fail closed)\n",
@@ -531,7 +542,7 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 	// Full S7 (Slice B1): the durable-capable authority bound to the profile
 	// journal — it rehydrates every non-terminal durable operation
 	// (deliveries, command registration) before anything can ask for a grant.
-	authority, err := s7.New(j, nil, 5*time.Minute)
+	authority, err := s7.New(j, s7Now, 5*time.Minute)
 	if err != nil {
 		j.Close()
 		return nil, fmt.Errorf("s7: %w", err)
@@ -893,7 +904,7 @@ func runDoctorP0() int {
 	} else if adapter, aerr := telegram.New(telegram.Config{
 		APIBase: resolved.Config.TelegramAPIBase, TokenEnv: resolved.Config.TelegramTokenEnv,
 		Bindings: bindings, Profile: resolved.Config.DefaultProfile,
-		EgressAllow: resolved.Config.EgressAllow, Receipt: probeSink,
+		EgressAllow: resolved.Config.EgressAllow, Receipt: probeSink, Authority: authority,
 	}, probeCore, func(context.Context, channel.Inbound) (string, error) { return "", nil }); aerr != nil {
 		tgWhy = aerr.Error()
 	} else if pr := adapter.Probe(ctx, resolved); !pr.Passed {
@@ -1476,18 +1487,33 @@ func telegramHandler(b *daemonBundle) telegram.Handler {
 			if err != nil {
 				return "", err
 			}
-			if len(rows) == 0 {
+			failed, err := b.chanCore.FailedFor(ctx, "telegram", in.ChannelIdentity)
+			if err != nil {
+				return "", err
+			}
+			if len(rows) == 0 && len(failed) == 0 {
 				return "Outbox clean: no deliveries awaiting reconciliation.", nil
 			}
-			out := "Deliveries with UNKNOWN outcome (may or may not have arrived):\n"
-			for _, r := range rows {
-				txt := r.Text
+			clip := func(txt string) string {
 				if len(txt) > 80 {
-					txt = txt[:80] + "…"
+					return txt[:80] + "…"
 				}
-				out += r.DeliveryID + ": " + txt + "\n"
+				return txt
 			}
-			out += "Reply redeliver <dlv-id> to resend one (it MAY arrive twice)."
+			out := ""
+			if len(rows) > 0 {
+				out += "Deliveries with UNKNOWN outcome (may or may not have arrived):\n"
+				for _, r := range rows {
+					out += r.DeliveryID + ": " + clip(r.Text) + "\n"
+				}
+			}
+			if len(failed) > 0 {
+				out += "Deliveries FAILED (S7 gave up: budget spent or a definite rejection):\n"
+				for _, r := range failed {
+					out += r.DeliveryID + " [" + r.LastCode + "]: " + clip(r.Text) + "\n"
+				}
+			}
+			out += "Reply redeliver <dlv-id> to resend one as a NEW delivery attempt (an UNKNOWN one MAY arrive twice)."
 			return out, nil
 		case strings.HasPrefix(lower, "redeliver ") && deliveryIDRe.MatchString(strings.TrimSpace(text[len("redeliver "):])):
 			// HUMAN-confirmed E9 reconciliation: the owner accepts the

@@ -19,11 +19,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/MatNik89/nexus/internal/channel"
@@ -31,6 +33,7 @@ import (
 	"github.com/MatNik89/nexus/internal/foundation/egress"
 	"github.com/MatNik89/nexus/internal/kernel/closure"
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
+	"github.com/MatNik89/nexus/internal/kernel/s7"
 )
 
 const adapterID = "telegram"
@@ -50,6 +53,10 @@ type Config struct {
 	// Receipt is the shared E11 receipt sink (channel.EgressSink at the
 	// composition root). MANDATORY: the shared egress owner refuses a nil sink.
 	Receipt egress.ReceiptSink
+	// Authority is the S7 owner (Slice B2): EVERY physical Bot API call
+	// (delivery, poll, control, ui) presents and consumes a grant it issued;
+	// the adapter holds no retry loop. MANDATORY.
+	Authority *s7.Authority
 }
 
 // Handler runs one admitted inbound message to a reply (the daemon wires
@@ -65,6 +72,15 @@ type Adapter struct {
 	core     *channel.Core
 	handle   Handler
 	client   *http.Client
+	auth     *s7.Authority
+	// S7 operation identities the adapter is currently driving (B2).
+	pollOp contracts.OperationID
+	pollN  atomic.Int64
+	uiN    atomic.Int64
+	ctlN   atomic.Int64
+	// botID is the immutable remote bot identity from the governed getMe; it
+	// binds the durable command-registration operation to THIS bot.
+	botID int64
 	// picker + loc drive the /cronjob inline calendar (ephemeral UI). nil
 	// until SetPicker wires them; a nil picker disables /cronjob (fail-safe).
 	picker *PickerStore
@@ -83,6 +99,9 @@ func New(cfg Config, core *channel.Core, h Handler) (*Adapter, error) {
 	if cfg.APIBase == "" || cfg.TokenEnv == "" || !cfg.Profile.Valid() {
 		return nil, fmt.Errorf("telegram: api base, token env and profile are required (fail closed)")
 	}
+	if cfg.Authority == nil {
+		return nil, fmt.Errorf("telegram: an S7 authority is required — no ungoverned Bot API call (fail closed)")
+	}
 	token := os.Getenv(cfg.TokenEnv)
 	if token == "" {
 		return nil, fmt.Errorf("telegram: env var %s holds no bot token (fail closed)", cfg.TokenEnv)
@@ -97,7 +116,7 @@ func New(cfg Config, core *channel.Core, h Handler) (*Adapter, error) {
 	}
 	a := &Adapter{
 		base: strings.TrimRight(cfg.APIBase, "/"), token: token,
-		bindings: b, profile: cfg.Profile, core: core, handle: h,
+		bindings: b, profile: cfg.Profile, core: core, handle: h, auth: cfg.Authority,
 	}
 	// E11 egress boundary: the SHARED pinned-IP, proxy-sanitized,
 	// redirect-rejecting owner (internal/foundation/egress, Slice A) that talks
@@ -178,65 +197,236 @@ func (a *Adapter) sanitize(err error) error {
 	return errors.New(strings.ReplaceAll(err.Error(), a.token, "[REDACTED-TOKEN]"))
 }
 
-func (a *Adapter) call(ctx context.Context, method string, req any, out any) error {
+// callKind selects the effect-aware classification of ONE Bot API call (B2):
+// effectful kinds (delivery, control-effect, ui) turn every post-write /
+// 5xx / malformed outcome into an AMBIGUOUS failure (E9: UNKNOWN, never a
+// blind retry); read kinds (poll, control-read) propose the same outcomes as
+// retryable — S7's policy decides.
+type callKind int
+
+const (
+	kindDelivery callKind = iota + 1
+	kindPoll
+	kindControlRead
+	kindControlEffect
+	kindUI
+)
+
+func (k callKind) effectful() bool { return k == kindDelivery || k == kindControlEffect || k == kindUI }
+
+var pollTarget = contracts.TargetID("channel:tg:getUpdates")
+
+// postWire classifies an outcome after the request may have reached the
+// remote, by effect class.
+func postWire(kind callKind, code string, cause error) error {
+	if kind.effectful() {
+		return &channel.Failure{Code: code, Ambiguous: true, Cause: cause}
+	}
+	return &channel.Failure{Code: code, Retryable: true, Cause: cause}
+}
+
+// call performs ONE governed physical Bot API request: the presented grant
+// must be bound to exactly (op, target); it is CONSUMED immediately before
+// client.Do (a durable delivery passes its UNKNOWN-park companion so STARTED
+// and the park commit in one batch). Every failure is a typed
+// *channel.Failure in the closed code vocabulary. A failure BEFORE Consume
+// (identity mismatch, request build) leaves the grant unconsumed — the
+// caller sees the operation still AUTHORIZED and cancels it.
+func (a *Adapter) call(ctx context.Context, method string, req any, out any, g s7.Grant, kind callKind,
+	op contracts.OperationID, target contracts.TargetID, companions ...s7.Companion) error {
+	if g.OperationID != op || g.TargetID != target {
+		return &channel.Failure{Code: s7.CodeLocalRefused,
+			Cause: fmt.Errorf("telegram: grant %s/%s is not bound to %s/%s: %w", g.OperationID, g.TargetID, op, target, s7.ErrAttemptNotAuthorized)}
+	}
 	body, err := json.Marshal(req)
 	if err != nil {
-		return err
+		return &channel.Failure{Code: s7.CodeLocalRefused, Cause: err}
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		a.base+"/bot"+a.token+"/"+method, bytes.NewReader(body))
 	if err != nil {
 		// Request construction can embed the full bot URL in parser
 		// errors (Phase-5-r2 codex #8).
-		return a.sanitize(err)
+		return &channel.Failure{Code: s7.CodeLocalRefused, Cause: a.sanitize(err)}
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	if err := a.auth.Consume(g, companions...); err != nil {
+		return &channel.Failure{Code: s7.CodeLocalRefused, Cause: err}
+	}
 	resp, err := a.client.Do(httpReq)
 	if err != nil {
-		// Classify (Phase-5-r2 kilo #2): a dial/DNS-phase failure is
-		// DEFINITE — nothing left the process, a retry is safe. Only a
-		// failure after the request may have been sent is ambiguous
-		// (Phase-5 codex #3). The token never leaks (codex #9).
+		// A dial/DNS-phase or egress refusal is DEFINITE — nothing left the
+		// process (Phase-5-r2 kilo #2); anything after the request may have
+		// been sent is post-write. The token never leaks (codex #9).
 		if isPreWire(err) {
-			return fmt.Errorf("telegram: connect: %w", a.sanitize(err))
+			return &channel.Failure{Code: s7.CodeTransportPreWire, Retryable: true, Cause: fmt.Errorf("telegram: connect: %w", a.sanitize(err))}
 		}
-		return fmt.Errorf("telegram: transport: %w: %w", channel.ErrAmbiguousSend, a.sanitize(err))
+		return postWire(kind, s7.CodeTransportPostWrite, fmt.Errorf("telegram: transport: %w", a.sanitize(err)))
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		if resp.StatusCode >= 500 {
-			// 5xx after a POST: the remote may have processed it.
-			return fmt.Errorf("telegram: %s HTTP %d: %w", method, resp.StatusCode, channel.ErrAmbiguousSend)
+	switch {
+	case resp.StatusCode == 429:
+		return &channel.Failure{Code: s7.CodeHTTP429, Retryable: true, Cause: fmt.Errorf("telegram: %s HTTP 429", method)}
+	case resp.StatusCode >= 500:
+		return postWire(kind, s7.CodeHTTP5xx, fmt.Errorf("telegram: %s HTTP %d", method, resp.StatusCode))
+	case resp.StatusCode < 200 || resp.StatusCode > 299:
+		if kind == kindDelivery && resp.StatusCode == 400 && formatted(req) {
+			// A parse rejection of a FORMATTED first send is definite and
+			// fixable: the next S7-scheduled attempt carries plain text
+			// (tgout self-heal), so the adapter proposes a retry.
+			return &channel.Failure{Code: s7.CodeHTTP400Format, Retryable: true, Cause: fmt.Errorf("telegram: %s HTTP 400 (formatting rejected)", method)}
 		}
-		return fmt.Errorf("telegram: %s HTTP %d", method, resp.StatusCode)
+		return &channel.Failure{Code: s7.CodeHTTP4xx, Cause: fmt.Errorf("telegram: %s HTTP %d", method, resp.StatusCode)}
 	}
 	var envelope struct {
 		OK     bool            `json:"ok"`
 		Result json.RawMessage `json:"result"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&envelope); err != nil {
 		// 2xx but unreadable body: the remote ACCEPTED — ambiguous for
-		// effectful methods.
-		return fmt.Errorf("telegram: malformed %s reply: %w: %w", method, channel.ErrAmbiguousSend, a.sanitize(err))
+		// effectful methods, a retryable read failure otherwise.
+		return postWire(kind, s7.CodeMalformedReply, fmt.Errorf("telegram: malformed %s reply: %w", method, a.sanitize(err)))
 	}
 	if !envelope.OK {
-		return fmt.Errorf("telegram: %s not ok", method)
+		return &channel.Failure{Code: s7.CodeHTTP4xx, Cause: fmt.Errorf("telegram: %s not ok", method)}
 	}
 	if out != nil {
-		return json.Unmarshal(envelope.Result, out)
+		if err := json.Unmarshal(envelope.Result, out); err != nil {
+			return postWire(kind, s7.CodeMalformedReply, fmt.Errorf("telegram: %s result: %w", method, a.sanitize(err)))
+		}
 	}
 	return nil
+}
+
+// formatted reports whether a send request carried formatting (parse_mode
+// or a rich message) — the only case a 400 is a fixable definite failure.
+func formatted(req any) bool {
+	m, ok := req.(map[string]any)
+	if !ok {
+		return false
+	}
+	return m["parse_mode"] != nil || m["rich_message"] != nil
+}
+
+// classify maps a call result to the S7 outcome PROPOSAL.
+func classify(err error) (s7.Outcome, string) {
+	if err == nil {
+		return s7.OutcomeSucceeded, ""
+	}
+	var f *channel.Failure
+	if errors.As(err, &f) {
+		switch {
+		case f.Ambiguous:
+			return s7.OutcomeUnknown, f.Code
+		case f.Retryable:
+			return s7.OutcomeFailedRetryable, f.Code
+		default:
+			return s7.OutcomeFailedTerminal, f.Code
+		}
+	}
+	return s7.OutcomeUnknown, s7.CodeTransportPostWrite
+}
+
+// oneShot drives ONE non-durable governed call (ui / control-read probes):
+// Begin, Next, call, Report — the S7 lifecycle for a single attempt whose
+// retry (if the policy allows one) is asked for on the NEXT tick by the
+// caller, never looped here.
+func (a *Adapter) oneShot(ctx context.Context, op contracts.OperationID, target contracts.TargetID, pol s7.Policy,
+	method string, req, out any, kind callKind) error {
+	if err := a.auth.Begin(op, target, pol); err != nil {
+		return err
+	}
+	g, err := a.auth.Next(op, nil)
+	if err != nil {
+		return err
+	}
+	cerr := a.call(ctx, method, req, out, g, kind, op, target)
+	if st, _ := a.auth.State(op); st == contracts.AttemptAuthorized {
+		_ = a.auth.Cancel(op, nil) // never consumed: local refusal
+		return cerr
+	}
+	outcome, code := classify(cerr)
+	if rerr := a.auth.Report(op, outcome, code, nil); rerr != nil {
+		return errors.Join(cerr, rerr)
+	}
+	return cerr
+}
+
+// uiCall is the ephemeral chrome path (typing indicator, picker edits):
+// PolicyUI, one shot, never retried; an ambiguous outcome is UNKNOWN (E9).
+func (a *Adapter) uiCall(ctx context.Context, method string, req, out any, chat int64) error {
+	n := a.uiN.Add(1)
+	op := contracts.OperationID(fmt.Sprintf("ui:tg:%s:%d", method, n))
+	target := contracts.TargetID(fmt.Sprintf("channel:tg:chat:%d", chat))
+	return a.oneShot(ctx, op, target, s7.PolicyUI, method, req, out, kindUI)
+}
+
+// controlRead runs a governed READ-ONLY control call (getMe, getMyCommands)
+// through the S7-owned Execute driver (PolicyControlRead: retries with
+// backoff are S7's, the adapter submits one operation). A read about a
+// KNOWN bot is bound to that bot (control:tg:<bot>:<method>:<n> /
+// channel:tg:bot:<bot>:<method>); getMe, which discovers the bot, is not.
+func (a *Adapter) controlRead(ctx context.Context, method string, req, out any) error {
+	n := a.ctlN.Add(1)
+	op := contracts.OperationID(fmt.Sprintf("control:tg:%s:%d", method, n))
+	target := contracts.TargetID("channel:tg:" + method)
+	if a.botID != 0 && method != "getMe" {
+		op = contracts.OperationID(fmt.Sprintf("control:tg:%d:%s:%d", a.botID, method, n))
+		target = contracts.TargetID(fmt.Sprintf("channel:tg:bot:%d:%s", a.botID, method))
+	}
+	return a.auth.Execute(ctx, op, target, s7.PolicyControlRead, func(ctx context.Context, g s7.Grant) (s7.Outcome, string, error) {
+		cerr := a.call(ctx, method, req, out, g, kindControlRead, op, target)
+		o, c := classify(cerr)
+		return o, c, cerr
+	})
 }
 
 // PollOnce fetches one getUpdates batch and processes every update. The
 // offset advances ONLY past updates whose outcome is durable (admitted +
 // handled, or typed-refused) — a crash before that redelivers, and the
 // T22 dedup makes the redelivery return the existing outcome.
+// ErrPollTerminal marks a poll operation S7 has landed terminal (exhausted
+// retries or a terminal remote code such as 401/403): the adapter stops
+// polling — a token change is only observable after a daemon restart.
+var ErrPollTerminal = errors.New("telegram: polling stopped (S7 terminal)")
+
 func (a *Adapter) PollOnce(ctx context.Context) error {
+	// Polling is S7-governed (B2/D): each successful poll completes its
+	// operation and the next tick begins the next one (a scheduled
+	// iteration, HARDQ C3); a FAILED poll is re-attempted ONLY when S7
+	// issues the next grant.
+	if a.pollOp == "" {
+		a.pollOp = contracts.OperationID(fmt.Sprintf("poll:tg:%d", a.pollN.Add(1)))
+		if err := a.auth.Begin(a.pollOp, pollTarget, s7.PolicyPoll); err != nil {
+			a.pollOp = ""
+			return err
+		}
+	}
+	g, err := a.auth.Next(a.pollOp, nil)
+	if errors.Is(err, s7.ErrNotDue) {
+		return nil // backoff: nothing to do this tick
+	}
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrPollTerminal, err)
+	}
 	var updates []tgUpdate
-	if err := a.call(ctx, "getUpdates",
-		map[string]any{"offset": a.offset, "timeout": 0}, &updates); err != nil {
-		return err
+	cerr := a.call(ctx, "getUpdates", map[string]any{"offset": a.offset, "timeout": 0}, &updates, g, kindPoll, a.pollOp, pollTarget)
+	if st, _ := a.auth.State(a.pollOp); st == contracts.AttemptAuthorized {
+		_ = a.auth.Cancel(a.pollOp, nil)
+		a.pollOp = ""
+		return cerr
+	}
+	outcome, code := classify(cerr)
+	if rerr := a.auth.Report(a.pollOp, outcome, code, nil); rerr != nil {
+		return rerr
+	}
+	switch st, _ := a.auth.State(a.pollOp); st {
+	case contracts.AttemptSucceeded:
+		a.pollOp = ""
+	case contracts.AttemptFailedRetryable:
+		return cerr
+	default:
+		return fmt.Errorf("%w: %v", ErrPollTerminal, cerr)
 	}
 	for _, u := range updates {
 		if err := a.processUpdate(ctx, u); err != nil {
@@ -332,7 +522,7 @@ func (a *Adapter) processUpdate(ctx context.Context, u tgUpdate) error {
 	}
 	// Typing indicator while the turn runs (best-effort — a failure
 	// here never affects delivery). Telegram shows it for ~5s.
-	a.call(ctx, "sendChatAction", map[string]any{"chat_id": chat, "action": "typing"}, nil)
+	_ = a.uiCall(ctx, "sendChatAction", map[string]any{"chat_id": chat, "action": "typing"}, nil, chat)
 	reply, herr := a.handle(ctx, in)
 	if herr != nil {
 		// The admission stays durable; the failure gets a typed reply and
@@ -352,11 +542,14 @@ func (a *Adapter) processUpdate(ctx context.Context, u tgUpdate) error {
 // FlushOutbox delivers pending outbox rows through sendMessage (the T22
 // honesty rules own the marks).
 func (a *Adapter) FlushOutbox(ctx context.Context) error {
-	return a.core.Flush(ctx, func(o Outbound) error {
+	return a.core.Flush(ctx, a.auth, func(o channel.Outbound, g s7.Grant, park s7.Companion) error {
 		chat, err := strconv.ParseInt(strings.TrimPrefix(o.ChannelIdentity, "chat-"), 10, 64)
 		if err != nil {
-			return fmt.Errorf("telegram: malformed channel identity %q", o.ChannelIdentity)
+			return &channel.Failure{Code: s7.CodeLocalRefused, Cause: fmt.Errorf("telegram: malformed channel identity %q", o.ChannelIdentity)}
 		}
+		// The adapter RECOMPUTES the delivery's operation/target and call
+		// verifies the grant is bound to exactly them before Consume.
+		op, target := channel.OperationFor(o), channel.TargetFor(o)
 		// FIRST-LEASE-ONLY FORMATTING (tgout plan): the rendered HTML
 		// body is carried only when this delivery has never been
 		// wire-attempted (attempts folds the pre-wire outbound_unknown
@@ -378,14 +571,14 @@ func (a *Adapter) FlushOutbox(ctx context.Context) error {
 			// today's path; multipart is its own deferred slice.
 			if hasPipeTable(o.Text) && fitsRich(o.Text) {
 				return a.call(ctx, "sendRichMessage", map[string]any{
-					"chat_id": chat, "rich_message": map[string]any{"markdown": o.Text}}, nil)
+					"chat_id": chat, "rich_message": map[string]any{"markdown": o.Text}}, nil, g, kindDelivery, op, target, park)
 			}
 			if rendered, ok := renderHTML(o.Text); ok {
 				return a.call(ctx, "sendMessage", map[string]any{
-					"chat_id": chat, "text": rendered, "parse_mode": "HTML"}, nil)
+					"chat_id": chat, "text": rendered, "parse_mode": "HTML"}, nil, g, kindDelivery, op, target, park)
 			}
 		}
-		return a.call(ctx, "sendMessage", map[string]any{"chat_id": chat, "text": o.Text}, nil)
+		return a.call(ctx, "sendMessage", map[string]any{"chat_id": chat, "text": o.Text}, nil, g, kindDelivery, op, target, park)
 	})
 }
 
@@ -413,30 +606,35 @@ func fitsRich(s string) bool {
 // Outbound aliases the core row (keeps the Flush signature readable).
 type Outbound = channel.Outbound
 
-// Run drives poll+flush until ctx ends.
-func (a *Adapter) Run(ctx context.Context, interval time.Duration) {
+// Run drives registration + poll + flush until ctx ends or S7 lands the
+// poll operation terminal (ErrPollTerminal — the adapter STOPS; Slice D
+// records the health class and the supervisor reports it). Every tick only
+// ASKS S7 (registration/poll/delivery grants are S7-scheduled); nothing
+// here retries on its own.
+func (a *Adapter) Run(ctx context.Context, interval time.Duration) error {
 	if interval <= 0 {
 		interval = 2 * time.Second
 	}
-	a.registerCommands(ctx) // best-effort: "/" offers the command menu
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
+		_ = a.registerCommands(ctx) // S7-scheduled; a durable UNKNOWN is reconciled, never blindly re-registered
+		if err := a.PollOnce(ctx); errors.Is(err, ErrPollTerminal) {
+			return err
+		}
+		_ = a.FlushOutbox(ctx)
 		select {
 		case <-ctx.Done():
-			return
+			return nil
 		case <-t.C:
-			a.PollOnce(ctx) // errors: the next tick retries; dedup holds
-			a.FlushOutbox(ctx)
 		}
 	}
 }
 
-// registerCommands publishes the bot command menu (setMyCommands) so
-// typing "/" in the chat offers the options. Best-effort: a failure is
-// logged by the caller's next tick, never fatal.
-func (a *Adapter) registerCommands(ctx context.Context) {
-	cmds := []map[string]string{
+// commandMenu is the ORDERED desired command set (the exact wire payload
+// is hashed — never sorted away).
+func commandMenu() []map[string]string {
+	return []map[string]string{
 		{"command": "help", "description": "Što NEXUS zna i popis komandi"},
 		{"command": "new", "description": "Novi razgovor (zaboravi kontekst)"},
 		{"command": "cronjob", "description": "Zakaži podsjetnik (kalendar)"},
@@ -448,7 +646,111 @@ func (a *Adapter) registerCommands(ctx context.Context) {
 		{"command": "ack", "description": "Potvrdi podsjetnik (ack occ-...)"},
 		{"command": "redeliver", "description": "Ponovno pošalji poruku (redeliver dlv-...)"},
 	}
-	a.call(ctx, "setMyCommands", map[string]any{"commands": cmds}, nil)
+}
+
+const registrationPolicyDurable = true
+
+// registerCommands publishes the bot command menu as ONE DURABLE S7
+// operation bound to the remote bot and the exact payload hash
+// (control:tg:<bot>:setMyCommands:<sha256(wire)>, PolicyControlEffect,
+// Durable). On start a recorded SUCCEEDED registration for THIS bot and
+// payload performs no call; a rehydrated UNKNOWN one is RECONCILED through a
+// governed read-only getMyCommands (equal -> SUCCEEDED; different -> the
+// same operation becomes retryable within its budget) — never blindly
+// re-registered (E9). Every wire call carries and consumes a grant; a
+// 5xx/post-write/malformed reply lands UNKNOWN.
+func (a *Adapter) registerCommands(ctx context.Context) error {
+	if a.botID == 0 {
+		var me struct {
+			ID    int64 `json:"id"`
+			IsBot bool  `json:"is_bot"`
+		}
+		if err := a.controlRead(ctx, "getMe", map[string]any{}, &me); err != nil {
+			return err
+		}
+		if !me.IsBot || me.ID == 0 {
+			return fmt.Errorf("telegram: token does not identify a bot (fail closed)")
+		}
+		a.botID = me.ID
+	}
+	wire := map[string]any{"commands": commandMenu()}
+	raw, err := json.Marshal(wire)
+	if err != nil {
+		return err
+	}
+	sum := sha256.Sum256(raw)
+	hash := hex.EncodeToString(sum[:])
+	op := channel.ControlOperation("tg", a.botID, "setMyCommands", hash)
+	target := channel.ControlTarget("tg", a.botID, "setMyCommands")
+	build := func(l s7.Landing) s7.Companion {
+		st := map[s7.LandingKind]string{s7.LandingSucceeded: "SUCCEEDED", s7.LandingRetry: "FAILED_RETRYABLE",
+			s7.LandingTerminal: "FAILED", s7.LandingCancelled: "FAILED", s7.LandingUnknown: "UNKNOWN"}[l.Kind]
+		_, p, perr := a.core.ControlEffectParams("tg", a.botID, "setMyCommands", hash, st)
+		if perr != nil {
+			return s7.Companion{}
+		}
+		return s7.Companion{Key: op, Params: p}
+	}
+	state, err := a.core.ControlEffectState(ctx, op)
+	if err != nil {
+		return err
+	}
+	switch state {
+	case "SUCCEEDED":
+		return nil // this bot already has exactly this menu
+	case "UNKNOWN":
+		if st, ok := a.auth.State(op); !ok || st != contracts.AttemptUnknown {
+			return fmt.Errorf("telegram: registration %s recorded UNKNOWN but S7 disagrees (fail closed)", op)
+		}
+		// Reconciliation is bound to THIS bot: the read op/target carry the
+		// current bot id, and the typed proof must bind to the UNKNOWN
+		// operation (same bot, same hash) before it becomes S7's boolean —
+		// an old bot's UNKNOWN registration is never resolved by a new bot.
+		var remote []map[string]string
+		if err := a.controlRead(ctx, "getMyCommands", map[string]any{}, &remote); err != nil {
+			return err
+		}
+		got, _ := json.Marshal(map[string]any{"commands": remote})
+		equal, err := channel.VerifyControlProof(op, "tg", "setMyCommands",
+			channel.ControlProof{BotID: a.botID, PayloadHash: hash, RemoteEqual: bytes.Equal(got, raw)})
+		if err != nil {
+			return err
+		}
+		if err := a.auth.Reconcile(op, equal, build); err != nil {
+			return err
+		}
+		if equal {
+			return nil
+		}
+	}
+	pol := s7.PolicyControlEffect
+	pol.Durable = registrationPolicyDurable
+	if err := a.auth.Begin(op, target, pol); err != nil {
+		return err
+	}
+	g, err := a.auth.Next(op, build)
+	if errors.Is(err, s7.ErrNotDue) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	_, park, perr := a.core.ControlEffectParams("tg", a.botID, "setMyCommands", hash, "RUNNING")
+	if perr != nil {
+		return perr
+	}
+	cerr := a.call(ctx, "setMyCommands", wire, nil, g, kindControlEffect, op, target, s7.Companion{Key: op, Params: park})
+	if st, _ := a.auth.State(op); st == contracts.AttemptAuthorized {
+		if cancelErr := a.auth.Cancel(op, build); cancelErr != nil {
+			return errors.Join(cerr, cancelErr)
+		}
+		return cerr
+	}
+	outcome, code := classify(cerr)
+	if rerr := a.auth.Report(op, outcome, code, build); rerr != nil {
+		return errors.Join(cerr, rerr)
+	}
+	return cerr
 }
 
 // Probe is the LIVE channel probe for the T11 snapshot: one getMe round
@@ -458,9 +760,10 @@ func (a *Adapter) Probe(ctx context.Context, resolved config.Resolved) closure.P
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	var me struct {
-		IsBot bool `json:"is_bot"`
+		ID    int64 `json:"id"`
+		IsBot bool  `json:"is_bot"`
 	}
-	if err := a.call(ctx, "getMe", map[string]any{}, &me); err != nil {
+	if err := a.controlRead(ctx, "getMe", map[string]any{}, &me); err != nil {
 		pr.Detail = err.Error()
 		return pr
 	}
@@ -468,6 +771,7 @@ func (a *Adapter) Probe(ctx context.Context, resolved config.Resolved) closure.P
 		pr.Detail = "token does not identify a bot"
 		return pr
 	}
+	a.botID = me.ID
 	pr.Passed = true
 	return pr
 }

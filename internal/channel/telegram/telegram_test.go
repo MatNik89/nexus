@@ -20,12 +20,14 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite"
 
 	"github.com/MatNik89/nexus/internal/channel"
 	"github.com/MatNik89/nexus/internal/foundation/config"
 	"github.com/MatNik89/nexus/internal/kernel/journal"
+	"github.com/MatNik89/nexus/internal/kernel/s7"
 	"github.com/MatNik89/nexus/internal/security/redact"
 )
 
@@ -50,7 +52,25 @@ type fakeBot struct {
 	lastCommands   string
 	answerCount    int    // answerCallbackQuery calls (spinner cleared)
 	lastMarkup     string // last sendMessage reply_markup JSON (calendar)
+	// B2 scripting: bot identity, remote menu for getMyCommands, and a
+	// scripted HTTP status for the next N sendMessage / setMyCommands calls.
+	botID              int64
+	remoteCommands     string
+	getMyCommandsCalls int
+	setCommandsCalls   int
+	sendStatusLeft     int
+	sendStatus         int
+	setStatusLeft      int
+	setStatus          int
+	pollStatusLeft     int
+	pollStatus         int
+	pollCalls          int
 }
+
+func (f *fakeBot) setCalls() int { f.mu.Lock(); defer f.mu.Unlock(); return f.setCommandsCalls }
+func (f *fakeBot) polls() int    { f.mu.Lock(); defer f.mu.Unlock(); return f.pollCalls }
+
+func mustJSON(v any) string { b, _ := json.Marshal(v); return string(b) }
 
 func (f *fakeBot) handler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -58,6 +78,13 @@ func (f *fakeBot) handler() http.HandlerFunc {
 		defer f.mu.Unlock()
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/getUpdates"):
+			f.pollCalls++
+			if f.pollStatusLeft > 0 {
+				f.pollStatusLeft--
+				w.WriteHeader(f.pollStatus)
+				w.Write([]byte(`{"ok":false}`))
+				return
+			}
 			var req struct {
 				Offset int64 `json:"offset"`
 			}
@@ -98,6 +125,12 @@ func (f *fakeBot) handler() http.HandlerFunc {
 			if len(req.ReplyMarkup) > 0 {
 				f.lastMarkup = string(req.ReplyMarkup)
 			}
+			if f.sendStatusLeft > 0 {
+				f.sendStatusLeft--
+				w.WriteHeader(f.sendStatus)
+				w.Write([]byte(`{"ok":false}`))
+				return
+			}
 			if req.ParseMode != "" && f.rejectHTMLLeft > 0 {
 				f.rejectHTMLLeft--
 				w.WriteHeader(400)
@@ -114,11 +147,29 @@ func (f *fakeBot) handler() http.HandlerFunc {
 			w.Write([]byte(`{"ok":true,"result":true}`))
 		case strings.HasSuffix(r.URL.Path, "/setMyCommands"):
 			b, _ := io.ReadAll(r.Body)
+			f.setCommandsCalls++
+			if f.setStatusLeft > 0 {
+				f.setStatusLeft--
+				w.WriteHeader(f.setStatus)
+				w.Write([]byte(`{"ok":false}`))
+				return
+			}
 			f.sawSetCommands = true
 			f.lastCommands = string(b)
 			w.Write([]byte(`{"ok":true,"result":true}`))
+		case strings.HasSuffix(r.URL.Path, "/getMyCommands"):
+			f.getMyCommandsCalls++
+			remote := f.remoteCommands
+			if remote == "" {
+				remote = "[]"
+			}
+			w.Write([]byte(`{"ok":true,"result":` + remote + `}`))
 		case strings.HasSuffix(r.URL.Path, "/getMe"):
-			w.Write([]byte(`{"ok":true,"result":{"id":1,"is_bot":true,"username":"nexus_test_bot"}}`))
+			id := f.botID
+			if id == 0 {
+				id = 1
+			}
+			w.Write([]byte(fmt.Sprintf(`{"ok":true,"result":{"id":%d,"is_bot":true,"username":"nexus_test_bot"}}`, id)))
 		default:
 			http.Error(w, "unknown method", 404)
 		}
@@ -142,6 +193,34 @@ type harness struct {
 	core *channel.Core
 	got  []channel.Inbound
 	j    *journal.Journal
+	auth *s7.Authority
+}
+
+// tgClock is the ONE pinned S7 clock for the adapter tests: backoff is
+// advanced explicitly (never slept through) and shared across "restarts".
+type fakeClock struct{ t time.Time }
+
+func (c *fakeClock) now() time.Time          { return c.t }
+func (c *fakeClock) advance(d time.Duration) { c.t = c.t.Add(d) }
+
+var tgClock = &fakeClock{time.Now()}
+
+func testEvents() map[string]journal.PayloadValidator {
+	m := channel.Events()
+	for k, v := range s7.Events() {
+		m[k] = v
+	}
+	return m
+}
+
+func authFor(t *testing.T, j *journal.Journal) *s7.Authority {
+	t.Helper()
+	a, err := s7.New(j, tgClock.now, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.SetJitterSource(func() float64 { return 1 })
+	return a
 }
 
 func build(t *testing.T, bindings map[int64]string) *harness {
@@ -155,7 +234,7 @@ func buildAt(t *testing.T, dir string, bindings map[int64]string) (*harness, str
 	bot := &fakeBot{}
 	srv := httptest.NewServer(bot.handler())
 	t.Cleanup(srv.Close)
-	j, err := journal.Open(filepath.Join(dir, "journal.db"), "work", redact.None{}, channel.Events(), channel.NewProjection())
+	j, err := journal.Open(filepath.Join(dir, "journal.db"), "work", redact.None{}, testEvents(), channel.NewProjection(), s7.NewProjection())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,14 +243,16 @@ func buildAt(t *testing.T, dir string, bindings map[int64]string) (*harness, str
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := &harness{bot: bot, core: core}
+	auth := authFor(t, j)
+	h := &harness{bot: bot, core: core, auth: auth}
 	t.Setenv("NEXUS_TEST_TG", "123:token")
 	a, err := New(Config{
-		APIBase:  srv.URL,
-		TokenEnv: "NEXUS_TEST_TG",
-		Bindings: bindings,
-		Profile:  "work",
-		Receipt:  channel.EgressSink(j),
+		APIBase:   srv.URL,
+		TokenEnv:  "NEXUS_TEST_TG",
+		Bindings:  bindings,
+		Profile:   "work",
+		Receipt:   channel.EgressSink(j),
+		Authority: auth,
 	}, core, func(ctx context.Context, in channel.Inbound) (string, error) {
 		h.got = append(h.got, in)
 		return "reply to: " + in.Text, nil
@@ -308,7 +389,7 @@ func TestHandlerErrorTypedReply(t *testing.T) {
 func TestConstructionAndProbe(t *testing.T) {
 	h := build(t, map[int64]string{42: "work"})
 	if _, err := New(Config{APIBase: "http://x", TokenEnv: "NEXUS_MISSING_TG",
-		Bindings: map[int64]string{}, Profile: "work", Receipt: channel.EgressSink(h.j)}, h.core, h.a.handle); err == nil {
+		Bindings: map[int64]string{}, Profile: "work", Receipt: channel.EgressSink(h.j), Authority: h.auth}, h.core, h.a.handle); err == nil {
 		t.Fatal("empty token accepted")
 	}
 	resolved := config.Resolved{}
@@ -375,7 +456,7 @@ func TestTokenNeverInErrors(t *testing.T) {
 	dead, err := New(Config{
 		APIBase: "http://127.0.0.1:1", TokenEnv: "NEXUS_TEST_TG",
 		Bindings: map[int64]string{42: "work"}, Profile: "work",
-		Receipt: channel.EgressSink(h.j),
+		Receipt: channel.EgressSink(h.j), Authority: h.auth,
 	}, h.core, h.a.handle)
 	if err != nil {
 		t.Fatal(err)
@@ -403,7 +484,7 @@ func TestPreWireFailureRepends(t *testing.T) {
 	dead, err := New(Config{
 		APIBase: "http://127.0.0.1:1", TokenEnv: "NEXUS_TEST_TG",
 		Bindings: map[int64]string{42: "work"}, Profile: "work",
-		Receipt: channel.EgressSink(h.j),
+		Receipt: channel.EgressSink(h.j), Authority: h.auth,
 	}, h.core, h.a.handle)
 	if err != nil {
 		t.Fatal(err)
@@ -431,6 +512,7 @@ func TestRequestConstructionSanitized(t *testing.T) {
 	_, err := New(Config{
 		APIBase: "http://x/%zz", TokenEnv: "NEXUS_TEST_TG",
 		Bindings: map[int64]string{42: "work"}, Profile: "work",
+		Receipt: channel.EgressSink(h.j), Authority: h.auth,
 	}, h.core, h.a.handle)
 	if err == nil {
 		t.Fatal("malformed api base accepted (must fail closed)")
@@ -480,9 +562,11 @@ func TestFirstLeaseFormattedThenPlainAfterParse400(t *testing.T) {
 	if _, err := h.core.EnqueueReply(ctxT(), "telegram", "chat-42", "work", "**bold** reply"); err != nil {
 		t.Fatal(err)
 	}
-	// First flush: rendered+parse_mode -> scripted parse-400 -> re-pend.
+	// First flush: rendered+parse_mode -> scripted parse-400 -> S7 lands
+	// FAILED_RETRYABLE (http_400_format) -> re-pend; the next S7-due tick
+	// carries plain.
 	_ = h.a.FlushOutbox(ctxT())
-	// Existing machinery: definite error re-pends; next tick carries plain.
+	tgClock.advance(time.Minute)
 	if err := h.a.FlushOutbox(ctxT()); err != nil {
 		t.Fatal(err)
 	}
@@ -536,9 +620,10 @@ func TestPreWireFailureConsumesLease(t *testing.T) {
 	h.a.base = "http://127.0.0.1:1"
 	_ = h.a.FlushOutbox(ctxT())
 	h.a.base = live
-	// The lease was consumed pre-wire; recovery re-pends via reconcile
-	// semantics — drive the existing paths.
+	// The lease was consumed pre-wire; S7 schedules the retry.
+	tgClock.advance(time.Minute)
 	_ = h.a.FlushOutbox(ctxT())
+	tgClock.advance(time.Minute)
 	if err := h.a.FlushOutbox(ctxT()); err != nil {
 		t.Fatal(err)
 	}
@@ -563,6 +648,7 @@ func TestAttemptsSurviveRestart(t *testing.T) {
 	}
 	_ = h.a.FlushOutbox(ctxT()) // formatted attempt -> parse-400 -> re-pend
 	h.j.Close()
+	tgClock.advance(time.Minute)
 	h2, _ := open()
 	_ = jp
 	if err := h2.a.FlushOutbox(ctxT()); err != nil {
@@ -604,6 +690,7 @@ func TestOldVersionDatabaseRebuildsAttempts(t *testing.T) {
 	}
 	db.Close()
 	// Reopen: version mismatch -> reset + whole refold from events.
+	tgClock.advance(time.Minute)
 	h2, _ := buildAt(t, dir, map[int64]string{42: "work"})
 	if err := h2.a.FlushOutbox(ctxT()); err != nil {
 		t.Fatal(err)
@@ -687,7 +774,9 @@ func TestTypingActionOnHandledMessage(t *testing.T) {
 // TG polish: registerCommands publishes the command menu.
 func TestRegisterCommandsPublishesMenu(t *testing.T) {
 	h := build(t, map[int64]string{42: "work"})
-	h.a.registerCommands(ctxT())
+	if err := h.a.registerCommands(ctxT()); err != nil {
+		t.Fatal(err)
+	}
 	h.bot.mu.Lock()
 	defer h.bot.mu.Unlock()
 	if !h.bot.sawSetCommands {

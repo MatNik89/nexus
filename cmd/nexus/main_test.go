@@ -34,6 +34,7 @@ import (
 	"github.com/MatNik89/nexus/internal/kernel/closure"
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
 	"github.com/MatNik89/nexus/internal/kernel/journal"
+	"github.com/MatNik89/nexus/internal/kernel/s7"
 	"github.com/MatNik89/nexus/internal/obligation"
 	"github.com/MatNik89/nexus/internal/sandbox"
 	"github.com/MatNik89/nexus/internal/schedule"
@@ -375,7 +376,7 @@ func TestTelegramSpineEndToEnd(t *testing.T) {
 	adapter, err := telegram.New(telegram.Config{
 		APIBase: bot.URL, TokenEnv: "NEXUS_TG_SPINE_TOKEN",
 		Bindings: map[int64]string{42: "private"}, Profile: "private",
-		Receipt: b.egressSink,
+		Receipt: b.egressSink, Authority: b.authority,
 	}, b.chanCore, telegramHandler(b))
 	if err != nil {
 		t.Fatal(err)
@@ -645,8 +646,9 @@ func TestTelegramProbeGate(t *testing.T) {
 	}))
 	t.Cleanup(bot.Close)
 	sink := func(egress.Decision) error { return nil }
+	probeAuth := s7.NewAuthority(nil, time.Minute)
 	live, err := telegram.New(telegram.Config{APIBase: bot.URL, TokenEnv: "NEXUS_TG_PROBE_TOKEN",
-		Bindings: map[int64]string{42: "private"}, Profile: "private", Receipt: sink}, core, h)
+		Bindings: map[int64]string{42: "private"}, Profile: "private", Receipt: sink, Authority: probeAuth}, core, h)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -663,7 +665,7 @@ func TestTelegramProbeGate(t *testing.T) {
 		t.Fatalf("healthy channel sealed OFF: %s", snapLive.Status("telegram").Reason)
 	}
 	dead, err := telegram.New(telegram.Config{APIBase: "http://127.0.0.1:1", TokenEnv: "NEXUS_TG_PROBE_TOKEN",
-		Bindings: map[int64]string{42: "private"}, Profile: "private", Receipt: sink}, core, h)
+		Bindings: map[int64]string{42: "private"}, Profile: "private", Receipt: sink, Authority: probeAuth}, core, h)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -686,6 +688,29 @@ func TestTelegramProbeGate(t *testing.T) {
 
 // hitlBundle builds a daemon over a deterministic 2-step provider (tool
 // call, then final) for the round-2 HITL crash/deadline REDs.
+// mainClock is the pinned S7 clock for composition-level tests (backoff is
+// advanced explicitly, never slept through).
+var mainClock = &struct{ t time.Time }{time.Now()}
+
+func advanceClock(d time.Duration) { mainClock.t = mainClock.t.Add(d) }
+
+func init() { s7Now = func() time.Time { return mainClock.t } }
+
+// flushB drives one S7-governed flush with a scripted transport result; the
+// grant is consumed with the park companion exactly as the adapter does.
+func flushB(b *daemonBundle, f func(channel.Outbound) error) error {
+	return b.chanCore.Flush(context.Background(), b.authority, func(o channel.Outbound, g s7.Grant, park s7.Companion) error {
+		if err := b.authority.Consume(g, park); err != nil {
+			return &channel.Failure{Code: s7.CodeLocalRefused, Cause: err}
+		}
+		return f(o)
+	})
+}
+
+func preWireFailure() error {
+	return &channel.Failure{Code: s7.CodeTransportPreWire, Retryable: true, Cause: fmt.Errorf("wire down (definite)")}
+}
+
 func hitlBundle(t *testing.T, name string) *daemonBundle {
 	t.Helper()
 	step := 0
@@ -1222,9 +1247,7 @@ func TestReminderReceiptOnlyFromSent(t *testing.T) {
 	// the occurrence must NOT be marked delivered, and repeated passes
 	// must not multiply outbox rows (stable id).
 	b.deliverPendingReminders(context.Background(), "chat-42")
-	b.chanCore.Flush(context.Background(), func(o channel.Outbound) error {
-		return fmt.Errorf("wire down (definite)")
-	})
+	flushB(b, func(o channel.Outbound) error { return preWireFailure() })
 	b.deliverPendingReminders(context.Background(), "chat-42")
 	if st, _ := b.obl.Status(context.Background(), "rem-rcpt"); st != obligation.StateDeliveryPending {
 		t.Fatalf("receipt minted without a SENT transition: %v", st)
@@ -1233,8 +1256,10 @@ func TestReminderReceiptOnlyFromSent(t *testing.T) {
 	if len(pendingRows) != 1 {
 		t.Fatalf("stable-id violated: %d outbox rows for one occurrence", len(pendingRows))
 	}
-	// The wire recovers: flush SENDS, the next pass mints the receipt.
-	if err := b.chanCore.Flush(context.Background(), func(o channel.Outbound) error { return nil }); err != nil {
+	// The wire recovers (after the S7 backoff): flush SENDS, the next pass
+	// mints the receipt.
+	advanceClock(time.Minute)
+	if err := flushB(b, func(o channel.Outbound) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
 	b.deliverPendingReminders(context.Background(), "chat-42")
@@ -1258,7 +1283,7 @@ func TestAckSettlesSentReceiptInline(t *testing.T) {
 	}
 	// Enqueue + SEND, but NO delivery-loop receipt pass (the race window).
 	b.deliverPendingReminders(context.Background(), "chat-42") // enqueue only (status PENDING)
-	if err := b.chanCore.Flush(context.Background(), func(o channel.Outbound) error { return nil }); err != nil {
+	if err := flushB(b, func(o channel.Outbound) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
 	// The user acks NOW.
@@ -1333,7 +1358,7 @@ func TestOutboxRedeliverCommand(t *testing.T) {
 	if _, err := b.chanCore.EnqueueReply(context.Background(), "telegram", "chat-42", "private", "lost message"); err != nil {
 		t.Fatal(err)
 	}
-	b.chanCore.Flush(context.Background(), func(o channel.Outbound) error {
+	flushB(b, func(o channel.Outbound) error {
 		return fmt.Errorf("wire wobble: %w", channel.ErrAmbiguousSend)
 	})
 	h := telegramHandler(b)
@@ -1358,7 +1383,7 @@ func TestOutboxRedeliverCommand(t *testing.T) {
 		t.Fatalf("redeliver refused: %q", reply)
 	}
 	sent := 0
-	if err := b.chanCore.Flush(context.Background(), func(o channel.Outbound) error { sent++; return nil }); err != nil {
+	if err := flushB(b, func(o channel.Outbound) error { sent++; return nil }); err != nil {
 		t.Fatal(err)
 	}
 	if sent != 1 {
@@ -1383,7 +1408,7 @@ func TestOutboxIsDestinationBound(t *testing.T) {
 	if _, err := b.chanCore.EnqueueReply(context.Background(), "telegram", "chat-42", "private", "for chat 42 only"); err != nil {
 		t.Fatal(err)
 	}
-	b.chanCore.Flush(context.Background(), func(o channel.Outbound) error {
+	flushB(b, func(o channel.Outbound) error {
 		return fmt.Errorf("wobble: %w", channel.ErrAmbiguousSend)
 	})
 	h := telegramHandler(b)
@@ -1434,7 +1459,7 @@ func TestOutboxIsDestinationBound(t *testing.T) {
 	if _, err := b.chanCore.EnqueueReply(context.Background(), "other-adapter", "chat-42", "private", "other adapter row"); err != nil {
 		t.Fatal(err)
 	}
-	b.chanCore.Flush(context.Background(), func(o channel.Outbound) error {
+	flushB(b, func(o channel.Outbound) error {
 		return fmt.Errorf("wobble: %w", channel.ErrAmbiguousSend)
 	})
 	others, _ := b.chanCore.UnreconciledFor(context.Background(), "other-adapter", "chat-42")
