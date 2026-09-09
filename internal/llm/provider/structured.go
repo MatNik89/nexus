@@ -134,9 +134,22 @@ func ExtractVia[T any](ctx context.Context, e *Extractor, class PayloadClass, va
 		reask := g.AttemptNo > 1
 		raw, err := generate(ctx, g, reask)
 		if err != nil {
-			// A transport failure of the generation itself: the provider's
-			// own operation already governed its retries; here it is terminal.
+			// A transport failure of the generation itself is terminal for
+			// this operation — but on the FINAL attempt the salvage ladder
+			// still runs over whatever bytes exist (re-ask bytes, then the
+			// original) before the outcome is decided (plan B3; code-review
+			// r2 codex #5).
 			lastErr = err
+			if g.AttemptNo >= final {
+				for _, src := range [][]byte{raw, firstRaw} {
+					if obj, ok := salvageJSON(src); ok {
+						if out, verr := decodeStrict(obj, validate); verr == nil {
+							accepted, gotValue = out, true
+							return s7.OutcomeSucceeded, "", nil
+						}
+					}
+				}
+			}
 			return s7.OutcomeFailedTerminal, s7.CodeTransportPostWrite, err
 		}
 		if !reask {

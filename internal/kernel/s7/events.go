@@ -70,16 +70,23 @@ type reconcilePayload struct {
 	NextAt int64  `json:"next_attempt_unix,omitempty"`
 }
 
-// Events registers the closed s7.* event set with strict payload validators.
+// validStates is the closed set a durable terminal/reconcile event may name.
+var validStates = map[string]bool{
+	contracts.AttemptSucceeded.String(): true, contracts.AttemptFailed.String(): true,
+	contracts.AttemptCancelled.String(): true, contracts.AttemptUnknown.String(): true,
+	contracts.AttemptFailedRetryable.String(): true,
+}
+
+// Events registers the closed s7.* event set with STRICT payload validators
+// (no unknown fields, no trailing data, closed enums — code-review r2 codex #6).
 func Events() map[string]journal.PayloadValidator {
-	req := func(name string) error { return fmt.Errorf("s7: %s requires op", name) }
 	return map[string]journal.PayloadValidator{
 		EvOperationBegun: func(raw json.RawMessage) error {
 			var p begunPayload
-			if err := json.Unmarshal(raw, &p); err != nil {
+			if err := strictDecode(raw, &p); err != nil {
 				return err
 			}
-			if p.Op == "" || p.Target == "" || len(p.Policy) == 0 {
+			if p.Op == "" || p.Target == "" || len(p.Policy) == 0 || p.Deadline < 0 {
 				return fmt.Errorf("s7: operation_begun requires op, target and policy")
 			}
 			_, err := unmarshalPolicy(p.Policy)
@@ -87,61 +94,76 @@ func Events() map[string]journal.PayloadValidator {
 		},
 		EvAttemptAuthorized: func(raw json.RawMessage) error {
 			var p authorizedPayload
-			if err := json.Unmarshal(raw, &p); err != nil {
+			if err := strictDecode(raw, &p); err != nil {
 				return err
 			}
-			if p.Op == "" || p.AttemptNo < 1 || len(p.NonceHash) != 64 || p.ExpiresAt == 0 {
+			if p.Op == "" || p.AttemptNo < 1 || len(p.NonceHash) != 64 || p.ExpiresAt <= 0 {
 				return fmt.Errorf("s7: attempt_authorized requires op, attempt_no>=1, nonce_hash, expires")
 			}
 			return nil
 		},
 		EvAttemptStarted: func(raw json.RawMessage) error {
 			var p startedPayload
-			if err := json.Unmarshal(raw, &p); err != nil {
+			if err := strictDecode(raw, &p); err != nil {
 				return err
 			}
 			if p.Op == "" || p.AttemptNo < 1 {
-				return req("attempt_started")
+				return fmt.Errorf("s7: attempt_started requires op and attempt_no>=1")
 			}
 			return nil
 		},
 		EvLeaseRevoked: func(raw json.RawMessage) error {
 			var p revokedPayload
-			if err := json.Unmarshal(raw, &p); err != nil {
+			if err := strictDecode(raw, &p); err != nil {
 				return err
 			}
-			if p.Op == "" || len(p.NonceHash) != 64 {
-				return req("lease_revoked")
+			if p.Op == "" || p.AttemptNo < 1 || len(p.NonceHash) != 64 {
+				return fmt.Errorf("s7: lease_revoked requires op, attempt_no and nonce_hash")
 			}
 			return nil
 		},
 		EvAttemptReported: func(raw json.RawMessage) error {
 			var p reportedPayload
-			if err := json.Unmarshal(raw, &p); err != nil {
+			if err := strictDecode(raw, &p); err != nil {
 				return err
 			}
-			if p.Op == "" || p.AttemptNo < 1 || p.Outcome < 1 || p.Landing < 1 {
-				return req("attempt_reported")
+			if p.Op == "" || p.AttemptNo < 1 {
+				return fmt.Errorf("s7: attempt_reported requires op and attempt_no")
+			}
+			if p.Outcome < int(OutcomeSucceeded) || p.Outcome > int(OutcomeUnknown) {
+				return fmt.Errorf("s7: attempt_reported outcome %d outside the closed set", p.Outcome)
+			}
+			if p.Landing < int(LandingSucceeded) || p.Landing > int(LandingCancelled) {
+				return fmt.Errorf("s7: attempt_reported landing %d outside the closed set", p.Landing)
+			}
+			if p.Code != "" && !knownCodes[p.Code] {
+				return fmt.Errorf("s7: attempt_reported code %q outside the closed vocabulary", p.Code)
+			}
+			if (LandingKind(p.Landing) == LandingRetry) != (p.NextAt > 0) {
+				return fmt.Errorf("s7: attempt_reported next_attempt_unix must accompany exactly the retry landing")
 			}
 			return nil
 		},
 		EvOperationTerminal: func(raw json.RawMessage) error {
 			var p terminalPayload
-			if err := json.Unmarshal(raw, &p); err != nil {
+			if err := strictDecode(raw, &p); err != nil {
 				return err
 			}
-			if p.Op == "" || p.State == "" {
-				return req("operation_terminal")
+			if p.Op == "" || !validStates[p.State] || p.State == contracts.AttemptFailedRetryable.String() {
+				return fmt.Errorf("s7: operation_terminal requires op and a terminal state")
 			}
 			return nil
 		},
 		EvOperationReconcile: func(raw json.RawMessage) error {
 			var p reconcilePayload
-			if err := json.Unmarshal(raw, &p); err != nil {
+			if err := strictDecode(raw, &p); err != nil {
 				return err
 			}
-			if p.Op == "" || p.State == "" {
-				return req("operation_reconciled")
+			if p.Op == "" || !validStates[p.State] || p.NextAt < 0 {
+				return fmt.Errorf("s7: operation_reconciled requires op and a valid state")
+			}
+			if (p.State == contracts.AttemptFailedRetryable.String()) != (p.NextAt > 0) {
+				return fmt.Errorf("s7: operation_reconciled next_attempt_unix must accompany exactly the retry state")
 			}
 			return nil
 		},
@@ -241,7 +263,7 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 	switch ev.Envelope.EventType {
 	case EvOperationBegun:
 		var p begunPayload
-		if err := json.Unmarshal(raw, &p); err != nil {
+		if err := strictDecode(raw, &p); err != nil {
 			return err
 		}
 		pol, err := unmarshalPolicy(p.Policy)
@@ -254,7 +276,7 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 		}
 	case EvAttemptAuthorized:
 		var p authorizedPayload
-		if err := json.Unmarshal(raw, &p); err != nil {
+		if err := strictDecode(raw, &p); err != nil {
 			return err
 		}
 		return exec1(tx, `UPDATE s7_operations SET state=?, lease_nonce_hash=?, lease_expires_unix=?, lease_started=0
@@ -262,21 +284,21 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 			contracts.AttemptPlanned.String(), contracts.AttemptFailedRetryable.String())
 	case EvAttemptStarted:
 		var p startedPayload
-		if err := json.Unmarshal(raw, &p); err != nil {
+		if err := strictDecode(raw, &p); err != nil {
 			return err
 		}
 		return exec1(tx, `UPDATE s7_operations SET state=?, lease_started=1, attempts=attempts+1
 			WHERE op=? AND state=?`, contracts.AttemptRunning.String(), p.Op, contracts.AttemptAuthorized.String())
 	case EvLeaseRevoked:
 		var p revokedPayload
-		if err := json.Unmarshal(raw, &p); err != nil {
+		if err := strictDecode(raw, &p); err != nil {
 			return err
 		}
 		return exec1(tx, `UPDATE s7_operations SET state=?, lease_nonce_hash='', lease_expires_unix=0, lease_started=0
 			WHERE op=? AND state=? AND lease_started=0`, contracts.AttemptPlanned.String(), p.Op, contracts.AttemptAuthorized.String())
 	case EvAttemptReported:
 		var p reportedPayload
-		if err := json.Unmarshal(raw, &p); err != nil {
+		if err := strictDecode(raw, &p); err != nil {
 			return err
 		}
 		var state string
@@ -296,8 +318,11 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 			WHERE op=? AND state=?`, state, p.NextAt, p.Code, p.Op, contracts.AttemptRunning.String())
 	case EvOperationTerminal:
 		var p terminalPayload
-		if err := json.Unmarshal(raw, &p); err != nil {
+		if err := strictDecode(raw, &p); err != nil {
 			return err
+		}
+		if !validStates[p.State] {
+			return fmt.Errorf("s7 fold: terminal state %q outside the closed set (fail closed)", p.State)
 		}
 		// Idempotent with a preceding reported fold (same terminal state).
 		if _, err := tx.Exec(`UPDATE s7_operations SET state=?, lease_nonce_hash='', lease_expires_unix=0 WHERE op=?`, p.State, p.Op); err != nil {
@@ -305,8 +330,11 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 		}
 	case EvOperationReconcile:
 		var p reconcilePayload
-		if err := json.Unmarshal(raw, &p); err != nil {
+		if err := strictDecode(raw, &p); err != nil {
 			return err
+		}
+		if !validStates[p.State] {
+			return fmt.Errorf("s7 fold: reconciled state %q outside the closed set (fail closed)", p.State)
 		}
 		return exec1(tx, `UPDATE s7_operations SET state=?, next_attempt_unix=? WHERE op=? AND state=?`, p.State, p.NextAt, p.Op, contracts.AttemptUnknown.String())
 	}

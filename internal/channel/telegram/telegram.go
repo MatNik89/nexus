@@ -23,6 +23,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -222,7 +223,45 @@ const (
 
 func (k callKind) effectful() bool { return k == kindDelivery || k == kindControlEffect || k == kindUI }
 
+// kindMethods is the closed method set per kind; a method presented under
+// another kind is refused before Consume (code-review r2 codex #4).
+var kindMethods = map[callKind]map[string]bool{
+	kindDelivery:      {"sendMessage": true, "sendRichMessage": true},
+	kindPoll:          {"getUpdates": true},
+	kindControlRead:   {"getMe": true, "getMyCommands": true},
+	kindControlEffect: {"setMyCommands": true},
+	kindUI:            {"sendChatAction": true, "sendMessage": true, "answerCallbackQuery": true, "editMessageReplyMarkup": true, "editMessageText": true},
+}
+
+// bound verifies the (method, kind, op, target) tuple against the kind's
+// operation/target GRAMMAR, so a valid grant minted for one kind can never
+// be presented under another kind or method (cross-kind substitution).
+func bound(method string, kind callKind, op contracts.OperationID, target contracts.TargetID) bool {
+	if !kindMethods[kind][method] {
+		return false
+	}
+	o, t := string(op), string(target)
+	switch kind {
+	case kindDelivery:
+		return strings.HasPrefix(o, "delivery:") && deliveryTarget.MatchString(t)
+	case kindPoll:
+		return strings.HasPrefix(o, "poll:tg:") && target == pollTarget
+	case kindControlRead:
+		return strings.HasPrefix(o, "control:tg:") && strings.Contains(o, ":"+method+":") &&
+			(t == "channel:tg:"+method || (strings.HasPrefix(t, "channel:tg:bot:") && strings.HasSuffix(t, ":"+method)))
+	case kindControlEffect:
+		return strings.HasPrefix(o, "control:tg:") && strings.Contains(o, ":setMyCommands:") &&
+			strings.HasPrefix(t, "channel:tg:bot:") && strings.HasSuffix(t, ":setMyCommands")
+	case kindUI:
+		return strings.HasPrefix(o, "ui:tg:"+method+":") && strings.HasPrefix(t, "channel:tg:chat:")
+	}
+	return false
+}
+
 var pollTarget = contracts.TargetID("channel:tg:getUpdates")
+
+// deliveryTarget is channel.TargetFor's grammar: channel:<adapter>:delivery:<id>.
+var deliveryTarget = regexp.MustCompile(`^channel:[^:]+:delivery:[^:]+$`)
 
 // postWire classifies an outcome after the request may have reached the
 // remote, by effect class.
@@ -242,9 +281,13 @@ func postWire(kind callKind, code string, cause error) error {
 // caller sees the operation still AUTHORIZED and cancels it.
 func (a *Adapter) call(ctx context.Context, method string, req any, out any, g s7.Grant, kind callKind,
 	op contracts.OperationID, target contracts.TargetID, companions ...s7.Companion) error {
-	if g.OperationID != op || g.TargetID != target {
+	if g.OperationID != op || g.TargetID != target || !bound(method, kind, op, target) {
 		return &channel.Failure{Code: s7.CodeLocalRefused,
-			Cause: fmt.Errorf("telegram: grant %s/%s is not bound to %s/%s: %w", g.OperationID, g.TargetID, op, target, s7.ErrAttemptNotAuthorized)}
+			Cause: fmt.Errorf("telegram: grant %s/%s is not bound to %s %s/%s: %w", g.OperationID, g.TargetID, method, op, target, s7.ErrAttemptNotAuthorized)}
+	}
+	if (kind == kindDelivery || kind == kindControlEffect) != (len(companions) == 1) {
+		return &channel.Failure{Code: s7.CodeLocalRefused,
+			Cause: fmt.Errorf("telegram: %s requires exactly its durable companion (got %d): %w", method, len(companions), s7.ErrAttemptNotAuthorized)}
 	}
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -261,6 +304,14 @@ func (a *Adapter) call(ctx context.Context, method string, req any, out any, g s
 	if err := a.auth.Consume(g, companions...); err != nil {
 		return &channel.Failure{Code: s7.CodeLocalRefused, Cause: err}
 	}
+	// S7 owns the attempt deadline/cancel (code-review r2 codex #2): the
+	// physical request runs under the authority's attempt context.
+	actx, cancel, err := a.auth.AttemptContext(ctx, g.OperationID, time.Time{})
+	if err != nil {
+		return &channel.Failure{Code: s7.CodeLocalRefused, Cause: err}
+	}
+	defer cancel()
+	httpReq = httpReq.WithContext(actx)
 	resp, err := a.client.Do(httpReq)
 	if err != nil {
 		// A dial/DNS-phase or egress refusal is DEFINITE — nothing left the
@@ -419,7 +470,7 @@ func (a *Adapter) PollOnce(ctx context.Context) error {
 	}
 	g, err := a.auth.Next(a.pollOp, nil)
 	if errors.Is(err, s7.ErrNotDue) {
-		return nil // backoff: nothing to do this tick
+		return channel.ErrNothingDue // backoff: no physical attempt this tick
 	}
 	if err != nil {
 		return &channel.ClassifiedError{Class: health.ClassTransport, Code: "poll_exhausted", Cause: fmt.Errorf("%w: %v", ErrPollTerminal, err)}
@@ -675,8 +726,14 @@ func (a *Adapter) Run(ctx context.Context, interval time.Duration) error {
 // record renders one cycle outcome into the health owner. It returns the
 // error only when its class is FATAL for the adapter.
 func (a *Adapter) record(ctx context.Context, component string, err error) error {
+	if errors.Is(err, channel.ErrNothingDue) {
+		return nil // no physical attempt: prior health stands (never "recovered" by a no-op)
+	}
 	if err == nil {
-		_ = a.health.Healthy(component)
+		if herr := a.health.Healthy(component); herr != nil {
+			// The health substrate itself failed: fatal (fail closed).
+			return &channel.ClassifiedError{Class: health.ClassSubstrate, Code: "health_write", Cause: herr}
+		}
 		return nil
 	}
 	if ctx.Err() != nil {
@@ -685,7 +742,9 @@ func (a *Adapter) record(ctx context.Context, component string, err error) error
 	}
 	cls, code := channel.ClassOf(err)
 	fatal := cls.Fatal()
-	_ = a.health.Report(component, cls, code, clip(a.sanitize(err).Error()), fatal)
+	if herr := a.health.Report(component, cls, code, clip(a.sanitize(err).Error()), fatal); herr != nil {
+		return &channel.ClassifiedError{Class: health.ClassSubstrate, Code: "health_write", Cause: errors.Join(err, herr)}
+	}
 	if fatal {
 		if _, ok := err.(*channel.ClassifiedError); ok {
 			return err
@@ -773,7 +832,7 @@ func (a *Adapter) registerCommands(ctx context.Context) error {
 	switch state {
 	case "SUCCEEDED":
 		return nil // this bot already has exactly this menu
-	case "UNKNOWN":
+	case "UNKNOWN", "RUNNING":
 		if st, ok := a.auth.State(op); !ok || st != contracts.AttemptUnknown {
 			return fmt.Errorf("telegram: registration %s recorded UNKNOWN but S7 disagrees (fail closed)", op)
 		}
@@ -805,12 +864,16 @@ func (a *Adapter) registerCommands(ctx context.Context) error {
 	}
 	g, err := a.auth.Next(op, build)
 	if errors.Is(err, s7.ErrNotDue) {
-		return nil
+		return channel.ErrNothingDue
 	}
 	if err != nil {
 		return err
 	}
-	_, park, perr := a.core.ControlEffectParams("tg", a.botID, "setMyCommands", hash, "RUNNING")
+	// The Consume companion parks the owner row UNKNOWN: once the grant is
+	// durably STARTED the irreversible effect MAY have happened, so a crash
+	// before Report leaves S7 and the channel row in the SAME state and
+	// reconciliation stays reachable (code-review r2 codex #3).
+	_, park, perr := a.core.ControlEffectParams("tg", a.botID, "setMyCommands", hash, "UNKNOWN")
 	if perr != nil {
 		return perr
 	}

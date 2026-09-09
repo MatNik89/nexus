@@ -53,6 +53,10 @@ const (
 	EvControlEffect  = "channel.control_effect"
 )
 
+// ErrNothingDue marks a cycle in which rows were pending but NONE was due
+// (S7 backoff): no physical attempt happened, so health stays as it was.
+var ErrNothingDue = errors.New("channel: pending rows exist but none is due (no attempt this cycle)")
+
 // Failure is the adapter's TYPED classification of one physical call
 // (Slice B2, one closed code vocabulary shared with s7): Ambiguous = the
 // wire may have been touched (E9: UNKNOWN, never a blind retry);
@@ -871,6 +875,7 @@ func (c *Core) Flush(ctx context.Context, auth *s7.Authority, send Send) error {
 	// codex #6): failures are collected and the loop CONTINUES; only a
 	// journal/S7 landing failure aborts (the durable substrate is broken).
 	var failures []error
+	deferred := 0
 	for _, o := range pending {
 		op, target := OperationFor(o), TargetFor(o)
 		if err := auth.Begin(op, target, s7.PolicyDelivery); err != nil {
@@ -882,6 +887,7 @@ func (c *Core) Flush(ctx context.Context, auth *s7.Authority, send Send) error {
 		g, err := auth.Next(op, build)
 		switch {
 		case errors.Is(err, s7.ErrNotDue):
+			deferred++
 			continue // S7 scheduled a later attempt
 		case errors.Is(err, s7.ErrExhausted):
 			failures = append(failures, &ClassifiedError{Class: health.ClassTransport, Code: o.LastCode,
@@ -949,6 +955,12 @@ func (c *Core) Flush(ctx context.Context, auth *s7.Authority, send Send) error {
 			}
 			failures = append(failures, &ClassifiedError{Class: cls, Code: code, Cause: fmt.Errorf("channel: delivery %s: %w", o.DeliveryID, sendErr)})
 		}
+	}
+	if len(failures) == 0 && deferred > 0 {
+		// Nothing physical happened this tick: NOT a success — a degraded
+		// health state must not be cleared by a no-op cycle (code-review r2
+		// codex #7).
+		return ErrNothingDue
 	}
 	return errors.Join(failures...)
 }

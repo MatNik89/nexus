@@ -12,6 +12,7 @@ package channel
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -252,7 +253,9 @@ func TestDeliveryHonesty(t *testing.T) {
 		t.Fatal("failed delivery lost the pending row")
 	}
 	sent := 0
-	if err := c.Flush(ctxT(), auth, sendVia(auth, func(o Outbound) error { sent++; return nil })); err != nil || sent != 0 {
+	// Not due yet: NO physical attempt, and the cycle says so (ErrNothingDue —
+	// health must not read a no-op as recovery).
+	if err := c.Flush(ctxT(), auth, sendVia(auth, func(o Outbound) error { sent++; return nil })); !errors.Is(err, ErrNothingDue) || sent != 0 {
 		t.Fatalf("resent before S7 said due: sent=%d err=%v", sent, err)
 	}
 	clock.advance(time.Minute) // past the 5s backoff

@@ -237,40 +237,55 @@ func isPreWire(err error) bool {
 // transport performs ONE governed HTTP attempt: the grant is consumed
 // HERE, immediately before the wire — a second call on the same grant
 // fails ATTEMPT_NOT_AUTHORIZED before any bytes leave the process.
-func (p *APIKey) transport(ctx context.Context, g s7.Grant, body []byte) (*http.Response, error) {
+// transport returns the response together with the S7 attempt context's
+// cancel: the caller MUST defer it after the body is consumed (the attempt
+// spans the whole physical exchange, not only the request).
+func (p *APIKey) transport(ctx context.Context, g s7.Grant, body []byte) (*http.Response, context.CancelFunc, error) {
+	nop := func() {}
 	if g.TargetID != p.Target() {
-		return nil, fmt.Errorf("provider: grant is not bound to this provider target: %w", s7.ErrAttemptNotAuthorized)
+		return nil, nop, fmt.Errorf("provider: grant is not bound to this provider target: %w", s7.ErrAttemptNotAuthorized)
 	}
 	if err := p.auth.Consume(g); err != nil {
-		return nil, fmt.Errorf("provider: %w", err)
+		return nil, nop, fmt.Errorf("provider: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		p.baseURL+"/v1/chat/completions", bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("provider: %w", err)
+		return nil, nop, fmt.Errorf("provider: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+p.key)
 	req.Header.Set("Content-Type", "application/json")
+	// S7 OWNS the attempt deadline/cancel (code-review r2 codex #2): the
+	// physical request runs under the authority's attempt context — grant
+	// expiry, AttemptTimeout, operation deadline and Cancel(op) all abort
+	// the in-flight call.
+	actx, cancel, err := p.auth.AttemptContext(ctx, g.OperationID, time.Time{})
+	if err != nil {
+		return nil, nop, fmt.Errorf("provider: %w", err)
+	}
+	req = req.WithContext(actx)
 	resp, err := p.client.Do(req)
 	if err != nil {
+		cancel()
 		if isPreWire(err) {
-			return nil, &Failure{Code: s7.CodeTransportPreWire, Retryable: true, Cause: fmt.Errorf("transport: %w", err)}
+			return nil, nop, &Failure{Code: s7.CodeTransportPreWire, Retryable: true, Cause: fmt.Errorf("transport: %w", err)}
 		}
-		return nil, &Failure{Code: s7.CodeTransportPostWrite, Cause: fmt.Errorf("transport: %w", err)}
+		return nil, nop, &Failure{Code: s7.CodeTransportPostWrite, Cause: fmt.Errorf("transport: %w", err)}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		resp.Body.Close()
+		cancel()
 		// Status only — upstream bodies can carry anything.
 		cause := fmt.Errorf("upstream HTTP %d", resp.StatusCode)
 		switch {
 		case resp.StatusCode == 429:
-			return nil, &Failure{Code: s7.CodeHTTP429, Retryable: true, Cause: cause}
+			return nil, nop, &Failure{Code: s7.CodeHTTP429, Retryable: true, Cause: cause}
 		case resp.StatusCode >= 500:
-			return nil, &Failure{Code: s7.CodeHTTP5xx, Retryable: true, Cause: cause}
+			return nil, nop, &Failure{Code: s7.CodeHTTP5xx, Retryable: true, Cause: cause}
 		}
-		return nil, &Failure{Code: s7.CodeHTTP4xx, Cause: cause}
+		return nil, nop, &Failure{Code: s7.CodeHTTP4xx, Cause: cause}
 	}
-	return resp, nil
+	return resp, cancel, nil
 }
 
 // Chat performs one OpenAI-compatible completion call under grant g.
@@ -282,10 +297,11 @@ func (p *APIKey) Chat(ctx context.Context, msgs []ChatMessage, g s7.Grant) (Chat
 	if err != nil {
 		return ChatOutput{}, fmt.Errorf("provider: %w", err)
 	}
-	resp, err := p.transport(ctx, g, body)
+	resp, cancel, err := p.transport(ctx, g, body)
 	if err != nil {
 		return ChatOutput{}, err
 	}
+	defer cancel()
 	defer resp.Body.Close()
 	raw, err := readBounded(resp.Body, maxBodyBytes)
 	if err != nil {
@@ -352,10 +368,11 @@ func (p *APIKey) Stream(ctx context.Context, msgs []ChatMessage, g s7.Grant, del
 	if err != nil {
 		return fmt.Errorf("provider: %w", err)
 	}
-	resp, err := p.transport(ctx, g, body)
+	resp, cancel, err := p.transport(ctx, g, body)
 	if err != nil {
 		return err
 	}
+	defer cancel()
 	defer resp.Body.Close()
 	// Transport-layer total ceiling (F8): a never-ending stream is cut here;
 	// the planner's accumulator has its own, lower, ceiling.
@@ -381,6 +398,11 @@ func (p *APIKey) Stream(ctx context.Context, msgs []ChatMessage, g s7.Grant, del
 			} `json:"choices"`
 		}
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			if lim.N <= 0 {
+				// The ceiling cut the stream mid-chunk: report the ceiling,
+				// not the truncated JSON.
+				return fmt.Errorf("provider: stream exceeded the %d-byte ceiling without [DONE] — cut, content is INCOMPLETE (fail closed)", maxStreamBytes)
+			}
 			return fmt.Errorf("provider: malformed stream chunk: %w", err)
 		}
 		for _, c := range chunk.Choices {

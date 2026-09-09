@@ -34,6 +34,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	mrand "math/rand/v2"
 	"sync"
@@ -115,6 +116,44 @@ type Policy struct {
 	// never be asked for a grant after a restart (honest in-memory).
 	Durable bool
 }
+
+// knownCodes is the closed failure-code vocabulary; a policy naming an
+// unknown code is a typo, not a policy (E11: unknown typed input is refused).
+var knownCodes = map[string]bool{
+	CodeTransportPreWire: true, CodeHTTP429: true, CodeHTTP4xx: true, CodeHTTP5xx: true,
+	CodeTransportPostWrite: true, CodeMalformedReply: true, CodeLocalRefused: true,
+	CodeInvalidGeneral: true, CodeCrashRecovered: true, CodeHTTP400Format: true,
+}
+
+// Validate rejects a policy that cannot be honoured or serialised.
+func (p Policy) Validate() error {
+	if p.MaxAttempts < 1 {
+		return fmt.Errorf("s7 policy: MaxAttempts must be >= 1")
+	}
+	if !p.EffectClass.Valid() {
+		return fmt.Errorf("s7 policy: an effect class is required")
+	}
+	if p.AttemptTimeout < 0 || p.Deadline < 0 || p.Backoff.Base < 0 || p.Backoff.Max < 0 {
+		return fmt.Errorf("s7 policy: negative timing")
+	}
+	if p.Backoff.Max > 0 && p.Backoff.Base > p.Backoff.Max {
+		return fmt.Errorf("s7 policy: backoff base exceeds max")
+	}
+	for _, c := range p.RetryableCodes {
+		if !knownCodes[c] {
+			return fmt.Errorf("s7 policy: unknown retryable code %q", c)
+		}
+	}
+	for _, t := range p.FallbackTargets {
+		if !t.Valid() {
+			return fmt.Errorf("s7 policy: invalid fallback target")
+		}
+	}
+	return nil
+}
+
+// canonical is the comparison/serialisation form (same identity ⇔ same bytes).
+func (p Policy) canonical() ([]byte, error) { return marshalPolicy(p) }
 
 func (p Policy) retryable(code string) bool {
 	for _, c := range p.RetryableCodes {
@@ -280,11 +319,12 @@ func (a *Authority) Begin(op contracts.OperationID, target contracts.TargetID, p
 	if !op.Valid() || !target.Valid() {
 		return fmt.Errorf("s7 begin: operation and target ids are required (fail closed)")
 	}
-	if policy.MaxAttempts < 1 {
-		return fmt.Errorf("s7 begin: policy needs MaxAttempts >= 1 (fail closed)")
+	if err := policy.Validate(); err != nil {
+		return fmt.Errorf("s7 begin: %w (fail closed)", err)
 	}
-	if !policy.EffectClass.Valid() {
-		return fmt.Errorf("s7 begin: policy needs an effect class (fail closed)")
+	want, err := policy.canonical()
+	if err != nil {
+		return fmt.Errorf("s7 begin: %w", err)
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -292,7 +332,11 @@ func (a *Authority) Begin(op contracts.OperationID, target contracts.TargetID, p
 		if rec.state == contracts.AttemptCancelled && rec.target == "" {
 			return fmt.Errorf("s7 begin: operation %q was cancelled before it began: %w", op, ErrAttemptNotAuthorized)
 		}
-		if rec.target != target || rec.policy.Durable != policy.Durable || rec.policy.MaxAttempts != policy.MaxAttempts {
+		// Re-begin is a strict no-op ONLY for the identical canonical policy
+		// and target (code-review r2 codex #6: partial comparison let the
+		// contract drift silently).
+		have, _ := rec.policy.canonical()
+		if rec.target != target || string(have) != string(want) {
 			return fmt.Errorf("s7 begin: operation %q already begun with a different target/policy (fail closed)", op)
 		}
 		return nil
@@ -628,10 +672,23 @@ func (a *Authority) AttemptContext(ctx context.Context, op contracts.OperationID
 	}
 	earliest(rec.expires)
 	earliest(rec.deadline)
+	now := a.now()
 	if rec.policy.AttemptTimeout > 0 {
-		earliest(a.now().Add(rec.policy.AttemptTimeout))
+		earliest(now.Add(rec.policy.AttemptTimeout))
 	}
-	dctx, cancel := context.WithDeadline(ctx, deadline)
+	// The deadline is expressed in the AUTHORITY's clock; the context gets
+	// the REMAINING duration so an injected clock and the wall clock agree
+	// (an already-expired attempt is refused, fail closed).
+	dctx, cancel := ctx, context.CancelFunc(func() {})
+	if !deadline.IsZero() {
+		remaining := deadline.Sub(now)
+		if remaining <= 0 {
+			return nil, nil, fmt.Errorf("s7 attempt-context: attempt deadline already passed: %w", ErrAttemptNotAuthorized)
+		}
+		dctx, cancel = context.WithTimeout(ctx, remaining)
+	} else {
+		dctx, cancel = context.WithCancel(ctx)
+	}
 	rec.execCancel = cancel
 	return dctx, cancel, nil
 }
@@ -689,16 +746,30 @@ func marshalPolicy(p Policy) ([]byte, error) {
 	return b, nil
 }
 
-// unmarshalPolicy fails closed on corrupt or unknown fields.
+// unmarshalPolicy fails closed on corrupt, unknown, trailing or semantically
+// invalid policy data (code-review r2 codex #6).
 func unmarshalPolicy(b []byte) (Policy, error) {
-	dec := json.NewDecoder(bytesReader(b))
-	dec.DisallowUnknownFields()
 	var pj policyJSON
-	if err := dec.Decode(&pj); err != nil {
+	if err := strictDecode(b, &pj); err != nil {
 		return Policy{}, fmt.Errorf("s7: corrupt policy_json (fail closed): %w", err)
 	}
-	if pj.MaxAttempts < 1 {
-		return Policy{}, fmt.Errorf("s7: corrupt policy_json: max_attempts %d in %.200s (fail closed)", pj.MaxAttempts, string(b))
+	p := Policy(pj)
+	if err := p.Validate(); err != nil {
+		return Policy{}, fmt.Errorf("s7: invalid policy_json (fail closed): %w", err)
 	}
-	return Policy(pj), nil
+	return p, nil
+}
+
+// strictDecode decodes exactly ONE JSON value with no unknown fields and no
+// trailing data.
+func strictDecode(b []byte, out any) error {
+	dec := json.NewDecoder(bytesReader(b))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(out); err != nil {
+		return err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return fmt.Errorf("trailing data after the JSON value")
+	}
+	return nil
 }

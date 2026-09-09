@@ -313,7 +313,11 @@ func runDaemon() int {
 				}()
 				if err := tgAdapter.Run(adapterCtx, 2*time.Second); err != nil {
 					cls, code := channel.ClassOf(err)
-					_ = b.health.Report("telegram", cls, code, err.Error(), true)
+					// The stderr line is the final fallback when even the health
+					// projection cannot be written (never a silent stop).
+					if herr := b.health.Report("telegram", cls, code, err.Error(), true); herr != nil {
+						fmt.Fprintf(os.Stderr, "nexus daemon: health projection write FAILED: %v\n", herr)
+					}
 					fmt.Fprintf(os.Stderr, "nexus daemon: telegram adapter STOPPED (%s/%s): %v\n", cls, code, err)
 				}
 			}()
