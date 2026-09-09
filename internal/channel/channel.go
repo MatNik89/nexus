@@ -88,75 +88,94 @@ func (c *ClassifiedError) Error() string {
 
 func (c *ClassifiedError) Unwrap() error { return c.Cause }
 
-// ClassOf renders the class of an error TREE (code-review CODE4 codex #2):
-// walks every node reachable via Unwrap() error / Unwrap() []error (so a
-// join nested inside a %w-wrapped error is found too, not just a direct
-// top-level join), collects every ClassifiedError, and applies explicit
-// precedence substrate > remote_rejected > transport BEFORE any fatality
-// decision is made by the caller — an invalid/unrecognized Class value
-// (a construction bug elsewhere) is normalized to substrate here, at the
-// same point the precedence is computed, so a caller's `cls.Fatal()` can
-// never fail open on it. nil -> "" (healthy); no ClassifiedError anywhere
-// falls back to the typed Failure's own fields; wholly unclassified ->
-// substrate (fail closed).
+// localClass derives ONE node's own class, if it carries one directly — a
+// *ClassifiedError names its class explicitly (an invalid/unrecognized
+// value is normalized to substrate here, at the point of collection, so a
+// caller's cls.Fatal() can never fail open on it); a bare *Failure is
+// classified by its own fields (the adapter's call boundary is the
+// originating owner of that type): a receipt the journal could not record
+// = substrate, 401/403 = remote_rejected, anything else = transport.
+// Returns nil when e carries no class of its own (only its children might).
+func localClass(e error) *ClassifiedError {
+	if ce, ok := e.(*ClassifiedError); ok {
+		cls := ce.Class
+		if !cls.Valid() {
+			cls = health.ClassSubstrate
+		}
+		return &ClassifiedError{Class: cls, Code: ce.Code}
+	}
+	if f, ok := e.(*Failure); ok {
+		switch {
+		case f.Code == s7.CodeReceiptNotDurable:
+			return &ClassifiedError{Class: health.ClassSubstrate, Code: f.Code}
+		case f.Status == 401 || f.Status == 403:
+			return &ClassifiedError{Class: health.ClassRemoteRejected, Code: f.Code}
+		default:
+			return &ClassifiedError{Class: health.ClassTransport, Code: f.Code}
+		}
+	}
+	return nil
+}
+
+// classOfMaxDepth bounds the ClassOf tree walk (code-review CODE5 codex #2):
+// a defensive ceiling, not an expected depth — no error tree in this
+// codebase unwraps anywhere near this deep.
+const classOfMaxDepth = 64
+
+// ClassOf renders the class of an error TREE (code-review CODE4 codex #2,
+// tightened CODE5 codex #2): walks every node reachable via Unwrap() error
+// / Unwrap() []error (so a join nested inside a %w-wrapped error is found
+// too, not just a direct top-level join), classifying EVERY node — typed
+// ClassifiedError and bare Failure alike — in ONE pass, and applies
+// explicit precedence substrate > remote_rejected > transport BEFORE any
+// fatality decision is made by the caller. A Failure joined alongside a
+// less-severe ClassifiedError can therefore never be shadowed (CODE5 codex
+// #2: the previous version consulted Failure nodes only as a last-resort
+// fallback when zero ClassifiedError existed anywhere in the tree). nil ->
+// "" (healthy); no classified node anywhere -> substrate (fail closed).
 func ClassOf(err error) (health.Class, string) {
 	if err == nil {
 		return "", ""
 	}
 	var subs, rej, tra *ClassifiedError
-	var walk func(error)
-	walk = func(e error) {
-		if e == nil {
+	var walk func(error, int)
+	walk = func(e error, depth int) {
+		if e == nil || depth > classOfMaxDepth {
 			return
 		}
-		if ce, ok := e.(*ClassifiedError); ok {
-			switch {
-			case ce.Class == health.ClassSubstrate || !ce.Class.Valid():
+		if lc := localClass(e); lc != nil {
+			switch lc.Class {
+			case health.ClassSubstrate:
 				if subs == nil {
-					subs = ce
+					subs = lc
 				}
-			case ce.Class == health.ClassRemoteRejected:
+			case health.ClassRemoteRejected:
 				if rej == nil {
-					rej = ce
+					rej = lc
 				}
 			default:
 				if tra == nil {
-					tra = ce
+					tra = lc
 				}
 			}
 		}
 		switch x := e.(type) {
 		case interface{ Unwrap() []error }:
 			for _, sub := range x.Unwrap() {
-				walk(sub)
+				walk(sub, depth+1)
 			}
 		case interface{ Unwrap() error }:
-			walk(x.Unwrap())
+			walk(x.Unwrap(), depth+1)
 		}
 	}
-	walk(err)
+	walk(err, 0)
 	switch {
 	case subs != nil:
-		return health.ClassSubstrate, subs.Code
+		return subs.Class, subs.Code
 	case rej != nil:
 		return rej.Class, rej.Code
 	case tra != nil:
 		return tra.Class, tra.Code
-	}
-	// A typed transport Failure without an explicit class is classified by
-	// its own fields (the adapter's call boundary is the originating owner
-	// of that type): 401/403 = remote_rejected, a receipt the journal could
-	// not record = substrate, anything else = transport.
-	var f *Failure
-	if errors.As(err, &f) {
-		switch {
-		case f.Code == "receipt_not_durable":
-			return health.ClassSubstrate, f.Code
-		case f.Status == 401 || f.Status == 403:
-			return health.ClassRemoteRejected, f.Code
-		default:
-			return health.ClassTransport, f.Code
-		}
 	}
 	return health.ClassSubstrate, "unclassified"
 }
@@ -993,7 +1012,7 @@ func (c *Core) Flush(ctx context.Context, auth *s7.Authority, send Send) error {
 			return substrate("landing", fmt.Errorf("channel: delivery %s: landing failed — stays UNKNOWN for reconciliation: %w", o.DeliveryID, errors.Join(sendErr, rerr)))
 		}
 		if sendErr != nil {
-			if f != nil && f.Code == "receipt_not_durable" {
+			if f != nil && f.Code == s7.CodeReceiptNotDurable {
 				return substrate("receipt", fmt.Errorf("channel: delivery %s: %w", o.DeliveryID, sendErr))
 			}
 			cls := health.ClassTransport

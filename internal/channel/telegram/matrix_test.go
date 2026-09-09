@@ -390,17 +390,26 @@ func TestEveryMethodReuseAndMissingGrantRefused(t *testing.T) {
 	meOp, meT := contracts.OperationID("control:tg:getMe:77"), contracts.TargetID("channel:tg:getMe")
 	h.auth.Begin(meOp, meT, s7.PolicyControlRead)
 	meG, _ := h.auth.Next(meOp, nil)
-	gcOp, gcT := contracts.OperationID("control:tg:getMyCommands:77"), contracts.TargetID("channel:tg:getMyCommands")
+	// getMyCommands is bot-bound in production (registerCommands only calls
+	// it once a.botID is resolved): the bot id in the operation must match
+	// the bot id in the target exactly (code-review CODE5 codex, new
+	// finding #1) — an unbound identity is refused by bound() now.
+	gcOp, gcT := contracts.OperationID("control:tg:1:getMyCommands:77"), contracts.TargetID("channel:tg:bot:1:getMyCommands")
 	h.auth.Begin(gcOp, gcT, s7.PolicyControlRead)
 	gcG, _ := h.auth.Next(gcOp, nil)
-	setOp := channel.ControlOperation("tg", 1, "setMyCommands", "deadbeef")
+	// setMyCommands' payload hash grammar requires 64 lowercase hex
+	// characters — the real sha256 shape production always builds
+	// (code-review CODE5 codex, new finding #1: a short placeholder like
+	// "deadbeef" no longer proves anything about the tightened bound()).
+	const setHash = "6f06dd0e26608013eff30bb1e951cda7de3fdd9e78e907470e0dd5c0ed25e273"
+	setOp := channel.ControlOperation("tg", 1, "setMyCommands", setHash)
 	setT := channel.ControlTarget("tg", 1, "setMyCommands")
 	setPol := s7.PolicyControlEffect
 	setPol.Durable = true // matches registerCommands' own pol.Durable = registrationPolicyDurable
 	h.auth.Begin(setOp, setT, setPol)
 	setG, _ := h.auth.Next(setOp, func(s7.Landing) s7.Companion { return s7.Companion{} })
 	setParams := func() s7.Companion {
-		_, p, _ := h.core.ControlEffectParams("tg", 1, "setMyCommands", "deadbeef", "UNKNOWN")
+		_, p, _ := h.core.ControlEffectParams("tg", 1, "setMyCommands", setHash, "UNKNOWN")
 		return s7.Companion{Key: setOp, Params: p}
 	}
 	uiOp := func(method string) contracts.OperationID {
@@ -528,5 +537,53 @@ func TestHealthProjectionWriteFailureStopsAdapter(t *testing.T) {
 	var ce *channel.ClassifiedError
 	if !errors.As(err, &ce) || ce.Class != health.ClassSubstrate || ce.Code != "health_write" {
 		t.Fatalf("health write failure not fatal substrate: %v", err)
+	}
+}
+
+// Detector (code-review CODE5 codex, new finding #1): bound() must require
+// EXACT bot-id agreement between the operation and the target for every
+// bot-bound control method — a mismatched bot id (grant minted for bot 1,
+// presented against bot 2's target, or vice versa) is refused before the
+// wire, for both control-read (getMyCommands) and control-effect
+// (setMyCommands).
+func TestControlBotIDMismatchRefusedBeforeWire(t *testing.T) {
+	h := build(t, map[int64]string{42: "work"})
+	before := h.bot.getMyCommandsCalls
+	beforeSet := h.bot.setCommandsCalls
+
+	// getMyCommands: op names bot 1, target names bot 2.
+	op1 := contracts.OperationID("control:tg:1:getMyCommands:1")
+	t2 := contracts.TargetID("channel:tg:bot:2:getMyCommands")
+	h.auth.Begin(op1, t2, s7.PolicyControlRead)
+	g1, _ := h.auth.Next(op1, nil)
+	if err := h.a.call(ctxT(), "getMyCommands", map[string]any{}, nil, g1, kindControlRead, op1, t2); !errors.Is(err, s7.ErrAttemptNotAuthorized) {
+		t.Fatalf("bot-id mismatch (getMyCommands) accepted: %v", err)
+	}
+
+	// setMyCommands: op names bot 1, target names bot 2 (same hash on both).
+	const hash = "6f06dd0e26608013eff30bb1e951cda7de3fdd9e78e907470e0dd5c0ed25e273"
+	sOp := channel.ControlOperation("tg", 1, "setMyCommands", hash)
+	sT := channel.ControlTarget("tg", 2, "setMyCommands")
+	sPol := s7.PolicyControlEffect
+	sPol.Durable = true
+	h.auth.Begin(sOp, sT, sPol)
+	sg, _ := h.auth.Next(sOp, func(s7.Landing) s7.Companion { return s7.Companion{} })
+	_, park, _ := h.core.ControlEffectParams("tg", 1, "setMyCommands", hash, "UNKNOWN")
+	if err := h.a.call(ctxT(), "setMyCommands", map[string]any{}, nil, sg, kindControlEffect, sOp, sT, s7.Companion{Key: sOp, Params: park}); !errors.Is(err, s7.ErrAttemptNotAuthorized) {
+		t.Fatalf("bot-id mismatch (setMyCommands) accepted: %v", err)
+	}
+
+	// getMe presented with a bot-bound target: refused (getMe is never bound).
+	op3 := contracts.OperationID("control:tg:1:getMe:1")
+	t3 := contracts.TargetID("channel:tg:bot:1:getMe")
+	h.auth.Begin(op3, t3, s7.PolicyControlRead)
+	g3, _ := h.auth.Next(op3, nil)
+	if err := h.a.call(ctxT(), "getMe", map[string]any{}, nil, g3, kindControlRead, op3, t3); !errors.Is(err, s7.ErrAttemptNotAuthorized) {
+		t.Fatalf("bot-bound target accepted for getMe: %v", err)
+	}
+
+	if h.bot.getMyCommandsCalls != before || h.bot.setCommandsCalls != beforeSet {
+		t.Fatalf("a mismatched/malformed control identity reached the wire: getMyCommands=%d(want %d) setMyCommands=%d(want %d)",
+			h.bot.getMyCommandsCalls, before, h.bot.setCommandsCalls, beforeSet)
 	}
 }

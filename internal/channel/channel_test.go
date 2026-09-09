@@ -613,3 +613,23 @@ func TestClassOfNestedJoinAndUnknownClassNormalizeToSubstrate(t *testing.T) {
 		t.Fatalf("remote_rejected precedence: got %s/%s, want remote_rejected/r1", cls, code)
 	}
 }
+
+// CODE5 codex #2: a bare *Failure joined ALONGSIDE a less-severe
+// ClassifiedError must not be shadowed — substrate dominance is computed
+// over EVERY classified node in the tree (typed ClassifiedError and bare
+// Failure alike), not just typed nodes with a Failure fallback consulted
+// only when zero ClassifiedError exists anywhere.
+func TestClassOfMixedFailureAndClassifiedErrorJoinPrefersSubstrate(t *testing.T) {
+	transportErr := &ClassifiedError{Class: health.ClassTransport, Code: "t2"}
+	receiptFailure := &Failure{Code: s7.CodeReceiptNotDurable, Cause: fmt.Errorf("dial refused")}
+	mixed := errors.Join(transportErr, receiptFailure)
+	if cls, code := ClassOf(mixed); cls != health.ClassSubstrate || code != s7.CodeReceiptNotDurable {
+		t.Fatalf("mixed Failure+ClassifiedError join: got %s/%s, want substrate/%s", cls, code, s7.CodeReceiptNotDurable)
+	}
+
+	rejFailure := &Failure{Status: 401, Code: "http_4xx"}
+	mixed2 := errors.Join(transportErr, rejFailure)
+	if cls, code := ClassOf(mixed2); cls != health.ClassRemoteRejected || code != "http_4xx" {
+		t.Fatalf("mixed 401 Failure+transport ClassifiedError join: got %s/%s, want remote_rejected/http_4xx", cls, code)
+	}
+}

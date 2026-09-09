@@ -126,6 +126,7 @@ var knownCodes = map[string]bool{
 	CodeTransportPreWire: true, CodeHTTP429: true, CodeHTTP4xx: true, CodeHTTP5xx: true,
 	CodeTransportPostWrite: true, CodeMalformedReply: true, CodeLocalRefused: true,
 	CodeInvalidGeneral: true, CodeCrashRecovered: true, CodeHTTP400Format: true,
+	CodeReceiptNotDurable: true,
 }
 
 // Validate rejects a policy that cannot be honoured or serialised.
@@ -181,6 +182,12 @@ const (
 	CodeLocalRefused       = "local_refused"
 	CodeInvalidGeneral     = "invalid_general"
 	CodeCrashRecovered     = "crash_recovered"
+	// CodeReceiptNotDurable: the shared E11 egress owner could not durably
+	// record a dial receipt — substrate, terminal, never retried blind
+	// (code-review CODE5 codex #1: this must be a canonical vocabulary
+	// member so Report's closed-code check recognizes it directly, not
+	// only via a caller-side Failure fallback).
+	CodeReceiptNotDurable = "receipt_not_durable"
 )
 
 // Policy constants — the ONE place retry policy lives (no config knob;

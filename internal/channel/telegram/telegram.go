@@ -247,11 +247,31 @@ func bound(method string, kind callKind, op contracts.OperationID, target contra
 	case kindPoll:
 		return strings.HasPrefix(o, "poll:tg:") && target == pollTarget
 	case kindControlRead:
-		return strings.HasPrefix(o, "control:tg:") && strings.Contains(o, ":"+method+":") &&
-			(t == "channel:tg:"+method || (strings.HasPrefix(t, "channel:tg:bot:") && strings.HasSuffix(t, ":"+method)))
+		// getMe discovers the bot: it is NEVER bound to a bot id (there is
+		// none yet). Every other control-read method IS bound, and the bot
+		// id embedded in the operation must equal the one embedded in the
+		// target exactly — a loose prefix/suffix/contains check would also
+		// accept a bot-id MISMATCH between op and target (code-review
+		// CODE5 codex, new finding #1).
+		if method == "getMe" {
+			m := ctrlUnboundOp.FindStringSubmatch(o)
+			return m != nil && m[1] == "getMe" && t == "channel:tg:getMe"
+		}
+		m := ctrlBoundOp.FindStringSubmatch(o)
+		if m == nil || m[2] != method {
+			return false
+		}
+		tm := ctrlBoundTarget.FindStringSubmatch(t)
+		return tm != nil && tm[1] == m[1] && tm[2] == method
 	case kindControlEffect:
-		return strings.HasPrefix(o, "control:tg:") && strings.Contains(o, ":setMyCommands:") &&
-			strings.HasPrefix(t, "channel:tg:bot:") && strings.HasSuffix(t, ":setMyCommands")
+		// setMyCommands is bot-bound AND payload-hash-bound; the bot id in
+		// the operation must equal the one in the target exactly.
+		m := ctrlEffectOp.FindStringSubmatch(o)
+		if m == nil || m[2] != "setMyCommands" {
+			return false
+		}
+		tm := ctrlBoundTarget.FindStringSubmatch(t)
+		return tm != nil && tm[1] == m[1] && tm[2] == "setMyCommands"
 	case kindUI:
 		return strings.HasPrefix(o, "ui:tg:"+method+":") && strings.HasPrefix(t, "channel:tg:chat:")
 	}
@@ -262,6 +282,17 @@ var pollTarget = contracts.TargetID("channel:tg:getUpdates")
 
 // deliveryTarget is channel.TargetFor's grammar: channel:<adapter>:delivery:<id>.
 var deliveryTarget = regexp.MustCompile(`^channel:[^:]+:delivery:[^:]+$`)
+
+// Control-read/control-effect operation and target grammars (code-review
+// CODE5 codex, new finding #1): the bot id is a CAPTURE GROUP, not a loose
+// prefix/suffix check, so bound() can require the op's bot id and the
+// target's bot id to match EXACTLY.
+var (
+	ctrlUnboundOp   = regexp.MustCompile(`^control:tg:([A-Za-z]+):\d+$`)
+	ctrlBoundOp     = regexp.MustCompile(`^control:tg:(\d+):([A-Za-z]+):\d+$`)
+	ctrlBoundTarget = regexp.MustCompile(`^channel:tg:bot:(\d+):([A-Za-z]+)$`)
+	ctrlEffectOp    = regexp.MustCompile(`^control:tg:(\d+):([A-Za-z]+):[0-9a-f]{64}$`)
+)
 
 // postWire classifies an outcome after the request may have reached the
 // remote, by effect class.
@@ -320,7 +351,7 @@ func (a *Adapter) call(ctx context.Context, method string, req any, out any, g s
 		if errors.Is(err, egress.ErrReceiptNotDurable) {
 			// The JOURNAL could not record the egress receipt: a substrate
 			// failure — terminal for this attempt, fatal for the adapter.
-			return &channel.Failure{Code: "receipt_not_durable", Cause: fmt.Errorf("telegram: %w", a.sanitize(err))}
+			return &channel.Failure{Code: s7.CodeReceiptNotDurable, Cause: fmt.Errorf("telegram: %w", a.sanitize(err))}
 		}
 		if isPreWire(err) {
 			return &channel.Failure{Code: s7.CodeTransportPreWire, Retryable: true, Cause: fmt.Errorf("telegram: connect: %w", a.sanitize(err))}
@@ -544,7 +575,7 @@ func (a *Adapter) PollOnce(ctx context.Context) error {
 		if errors.As(cerr, &f) && (f.Status == 401 || f.Status == 403) {
 			cls = health.ClassRemoteRejected
 		}
-		if f != nil && f.Code == "receipt_not_durable" {
+		if f != nil && f.Code == s7.CodeReceiptNotDurable {
 			cls = health.ClassSubstrate
 		}
 		return &channel.ClassifiedError{Class: cls, Code: code, Cause: fmt.Errorf("%w: %v", ErrPollTerminal, a.sanitize(cerr))}
