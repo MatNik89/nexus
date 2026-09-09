@@ -1,4 +1,4 @@
-# PLAN v3: coding-agent trio (TIA / symbol-edit / proof-of-done)
+# PLAN v4: coding-agent trio (TIA / symbol-edit / proof-of-done)
 
 Repo's own deferred ledger (`docs/tasks-P0.md:410`, "coding trio TIA/symedit/deep evidence
 (P1)") names this as the next P1 priority after audit-hardening. NEXUS currently has ZERO
@@ -24,6 +24,18 @@ non-durable-only, end to end — codex's HIGH #2 (round 2) is confirmed real; ki
 this specific point did not check past "Consume happens before dispatch" into whether a
 companion could actually be carried. This is why, on a factual disagreement between two
 independent reviewers, the resolution is "read the code," not "average the opinions."
+**v4 folds plan-review round 3** (codex FAIL 3 NEW HIGH — the finding count is
+converging, 5→5→3 across three rounds; kilo PASS+3 notes; agy PASS+3 notes, one
+independently corroborating codex's inode/atomicwrite finding). Folded: an exact
+`PolicyWorkspaceApply` retry/reconcile contract binding the recovery table's "retry
+fresh" language to the real `Reconcile(false)`→`Next`(same op) / `Reconcile(true)`
+primitives; a defined profile-scoped sealed-artifact owner (physical location,
+permissions, write/fsync/rename protocol, digest verification, retention) for the
+transaction bundle, which had no persistence owner in v3; and a corrected identity
+model for invariant 4 — "device+inode throughout" literally contradicted atomic
+replacement (a rename always changes the inode), fixed to a pinned-parent-directory +
+validated-relative-path identity with the pre-edit inode as a precondition check, not
+a permanent identity.
 
 ## Research basis (four independent research threads before any review; two review rounds
 since)
@@ -104,6 +116,27 @@ All four independently converged on (unchanged from v1/v2, still holds):
      method alongside `RunTool` (not overloading `RunTool` itself, which stays the
      non-durable `PolicyTool` path for ordinary tools), or specify an equally explicit
      alternate route that still enforces S6.0/S6.9 and never duplicates S7 ownership.
+     If the alternate route is chosen, that slice's own review must specify its
+     S6.0/S6.9 re-enforcement mechanism explicitly (kilo round-3 Note 3) — a
+     slice-level decision, not a plan gap.
+   - **Retry/reconcile contract — DECIDED now** (v4, codex round-3 HIGH #1, verified:
+     `Reconcile(false)` retries the SAME operation within its existing S7 budget,
+     `internal/kernel/s7/events.go:478` — the v3 recovery table said "retry the whole
+     operation fresh" without binding that phrase to the actual S7 primitive, leaving
+     room for an implementation to mint a new operation, reset the attempt budget, or
+     report retryable before rollback was even proven):
+     - Exact `PolicyWorkspaceApply` attempt cap, deadline, backoff, and closed failure
+       codes are specified in Slice 3's own review (not this plan — that's ordinary
+       policy tuning), but the STATE-TRANSITION BINDING is a plan-level invariant:
+     - `Report(Succeeded)` atomically pairs with `workspace.mutation_committed`.
+     - A FULLY VERIFIED rollback to all-BEFORE may report `FailedRetryable`.
+     - A FAILED or INCOMPLETE rollback reports `Unknown` — never retryable, never
+       silently retried.
+     - On restart with the transaction committed / classified all-AFTER: `Reconcile(true)`.
+     - On restart with all-BEFORE, or a mixed state successfully restored to all-BEFORE:
+       `Reconcile(false)`, and ONLY THEN `Next` on the SAME operation (never a new one).
+     - Any FOREIGN classification stays `Unknown`/manual reconciliation — it never
+       receives a new grant, under any circumstance.
    - RED-capable detector: injecting a fault into EITHER half of the paired companion
      batch (the S7 half or the `workspace.apply_started` half) must result in ZERO
      filesystem writes (mirrors S7's own `SetAppendFault` seam pattern, already used
@@ -132,7 +165,9 @@ All four independently converged on (unchanged from v1/v2, still holds):
      inconsistency between the edit's declared document version and the preimage's own
      version/hash.
    - Canonically sort the complete path set and reject it outright if two lexically
-     distinct paths resolve to the SAME file identity (device+inode) — a duplicate
+     distinct paths resolve to the SAME PRE-EDIT file identity (device+inode of the
+     preimage, checked once at Prepare — see invariant 4's identity model for why this
+     is a precondition check, not a permanent identity kept "throughout") — a duplicate
      target under two names is refused, not silently deduplicated.
    - Apply all validated edits within one file in DESCENDING byte-offset order.
    - Preserve CRLF and final-newline exactly as found — never silently normalize.
@@ -142,10 +177,34 @@ All four independently converged on (unchanged from v1/v2, still holds):
    RECONSTRUCTABLE after-image, not just an after-image digest** (v3, codex round-2
    HIGH #3, verified: a digest alone cannot reconstruct the actual bytes after a crash,
    and re-running `gopls` to regenerate them would violate the no-blind-rerun rule):
-   1. Before the FIRST write: persist ONE sealed transaction bundle containing the
-      COMPLETE before-image AND after-image BYTES (not just digests) for every file in
-      the write set, plus their permissions, canonical identities, and digests. `fsync`
-      this bundle to durable storage.
+   - **Sealed-artifact owner — DEFINED now, not left to incidental implementation
+     choice** (v4, codex round-3 HIGH #2, verified: no artifact-store primitive exists
+     anywhere under `internal/` today — grep confirms it; the journal only exposes a
+     nullable reference field and always inserts NULL on its append path,
+     `internal/kernel/journal/journal.go:43,500` — and this bundle carries COMPLETE
+     source bytes, potentially including secrets, as the ONLY rollback material after a
+     crash, so it cannot be left implicit the way the round-1 exec-substrate gap
+     originally was). One profile-scoped sealed-artifact owner, built in Slice 0 (or
+     Slice 1 at the latest, before Slice 3 needs it) and reused by evidence (invariant 7)
+     and by this transaction bundle alike:
+     - Physical location: content-addressed files (named by their own sha256) under the
+       profile's data root, in a directory NEVER exposed to the coding-run sandbox as
+       read-write.
+     - `0700` directory permissions, `0600` file permissions.
+     - Write path: write to a temp name in the same directory, `fsync` the file, atomic
+       rename into place, `fsync` the containing directory.
+     - All reads and writes are descriptor-relative (no symlink traversal into or out of
+       the store).
+     - Every recovery use re-verifies the digest before trusting the bytes.
+     - The journal references it through exactly ONE canonical field
+       (`sealed_payload_ref` — a content digest, not a second competing reference shape).
+     - Orphan artifacts (no journal event ever referenced them, or their referencing
+       transaction fully completed and aged out) get a defined retention/cleanup policy
+       — bounded storage growth, not "keep forever."
+   1. Before the FIRST write: persist ONE sealed transaction bundle (via the owner
+      above) containing the COMPLETE before-image AND after-image BYTES (not just
+      digests) for every file in the write set, plus their permissions, canonical
+      identities, and digests. `fsync` this bundle to durable storage.
    2. Atomically pair `workspace.apply_started{artifact_ref, digest}` with the S7
       `Consume` companion batch (invariant 2) — the journal entry names the sealed
       bundle by reference+digest, it does not duplicate the bundle's bytes into the
@@ -191,10 +250,30 @@ All four independently converged on (unchanged from v1/v2, still holds):
      symlink path COMPONENT in the write set outright at Prepare (not just the leaf).
      Perform the actual create/rename at Apply time descriptor-relatively — `openat2`
      with `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS` (or an equivalent directory-file-
-     descriptor design) so the checked target and the written target are provably the
-     SAME kernel object, not just the same lexical path re-resolved a second time.
-     Digest sets are keyed by canonical (device+inode-bound) identity throughout, never
-     by lexical path.
+     descriptor design), against a `internal/coding/workspace`-owned helper (NOT the
+     plain `atomicwrite.WriteFile` path-string API — agy round-3 weakest-point #1) so the
+     checked target and the written target are provably the SAME kernel object.
+   - **Identity model — corrected in v4** (codex round-3 HIGH #3: "device+inode identity
+     throughout" as originally worded literally contradicts atomic replacement itself —
+     `atomicwrite` creates a temp file and renames it OVER the destination
+     (`atomicwrite.go:22,47`), so the AFTER file necessarily has a DIFFERENT inode than
+     the BEFORE file; a literal reading of "throughout" would make the coordinator
+     classify its own successful Apply as FOREIGN). The identity binding is instead:
+     - A descriptor-pinned parent-directory (the workspace root's directory file
+       descriptor, held open across Prepare→Apply).
+     - A validated relative path + basename beneath that pinned root — this pair, not an
+       inode, is the PERSISTENT identity a file is tracked by across the transaction.
+     - The PRE-EDIT inode is a PRECONDITION check at Apply time (confirms the on-disk
+       file is still the exact one Prepare hashed), not a permanent identity held
+       "throughout" — an inode change from the Apply's own `renameat2` is EXPECTED and
+       fine; an inode change to the pinned PARENT directory, or a change to the tracked
+       NAME resolving somewhere else, is refused.
+     - Content, mode, and metadata expectations are checked explicitly (digest match),
+       independent of inode.
+     - Required detector (v4, codex + agy both independently flagged this class): a
+       successful Apply, followed by restart classification, correctly recognizes its
+       own AFTER state despite the expected inode change from `renameat2` — this must be
+       tested alongside the symlink-swap detector, not assumed.
 5. **Fail-SAFE toward closure on uncertainty** ("fail-open" was the wrong term in v1 for
    behavior that is actually conservative/fail-closed — kilo+agy both flagged this
    independently in round 1):
@@ -239,7 +318,11 @@ before implementation begins, not just name the requirements.
   host executables remain absent, matching the existing closure discipline
   (`docs/ARCHITECTURE-ESSENTIALS.md:131`). The discovery/pinning mechanism for
   `compile`/`link`/`asm`/`cgo`/test-binary children is Slice 0's own hardest design
-  surface (kilo round-2 Note 1) — treat it as such, not an afterthought.
+  surface (kilo round-2 Note 1) — treat it as such, not an afterthought. Starting point
+  (agy round-3 weakest-point #2): query `go env GOTOOLDIR` during Slice 0's own
+  probe/initialization to resolve the architecture-specific compiler/linker directory
+  (e.g. `GOROOT/pkg/tool/linux_arm64` on this deployment target) and mount it read-only
+  into the closure — do not hardcode the path.
 - **`gopls` transport — DECIDED now:** a stdio JSON-RPC session
   (`gopls serve` → `initialize` → `textDocument/rename` → `shutdown`), not the `gopls`
   CLI (agy round-2 Note 2, verified: the CLI emits unified text diffs or writes files
@@ -307,6 +390,13 @@ twice, round 1 and round 2).
 - Fail-safe rule (invariant 5) applies from day one.
 
 ### Slice 3 — symedit (`internal/coding/symedit` + `internal/coding/workspace`)
+- **Precondition (v4, kilo round-3 Note 2): kernel ≥ 5.6** (for `openat2`). The
+  deployment host is confirmed Linux aarch64, kernel 6.12.34
+  (`docs/HANDOFF.md`) — trivially satisfied — and NEXUS is already Linux-first (`bwrap`
+  is Linux-only); no portability fallback needed, but state the floor explicitly here so
+  it's never silently assumed on a different box. `golang.org/x/sys` (which carries
+  `Openat2`) is already in `go.mod`. An unavailable syscall or a failed capability probe
+  disables symedit fail-closed (invariant 5's spirit), never a silent weaker fallback.
 - Start with **only `RenameSymbol`** (topknot: minimal-machinery core, not an ambitious
   API surface) — `gopls`'s own reference-finding only covers the active build
   configuration and can't rule out reflection/string-based lookup either, so
@@ -340,8 +430,7 @@ main + autodeploy + push per standing rules after each slice converges, not batc
 
 ## Status
 
-v3 — plan-review round 2 folded (codex FAIL 5 NEW HIGH, all re-verified against the code
-— including resolving a factual disagreement with kilo's round-2 PASS by reading the code
-directly, kilo was wrong on that one point; kilo PASS + 4 notes folded; agy PASS + 4 notes
-folded, including the gopls-transport finding that resolved an open question from round 1).
-Next: dispatch v3 for plan-review round 3.
+v4 — plan-review round 3 folded (codex FAIL 3 NEW HIGH, all re-verified against the code;
+kilo PASS + 3 notes folded; agy PASS + 3 notes folded, one corroborating codex's HIGH #3
+independently). Finding count converging: 5 → 5 → 3 across three rounds. Next: dispatch
+v4 for plan-review round 4.
