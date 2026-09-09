@@ -1,4 +1,4 @@
-# PLAN v4: coding-agent trio (TIA / symbol-edit / proof-of-done)
+# PLAN v5: coding-agent trio (TIA / symbol-edit / proof-of-done)
 
 Repo's own deferred ledger (`docs/tasks-P0.md:410`, "coding trio TIA/symedit/deep evidence
 (P1)") names this as the next P1 priority after audit-hardening. NEXUS currently has ZERO
@@ -35,7 +35,26 @@ transaction bundle, which had no persistence owner in v3; and a corrected identi
 model for invariant 4 — "device+inode throughout" literally contradicted atomic
 replacement (a rename always changes the inode), fixed to a pinned-parent-directory +
 validated-relative-path identity with the pre-edit inode as a precondition check, not
-a permanent identity.
+a permanent identity. **v5 folds plan-review round 4** (codex FAIL 2 NEW HIGH — finding
+count 5→5→3→2, still converging; kilo PASS+3 notes; agy PASS+3 notes). A SECOND factual
+disagreement between codex and kilo was independently checked directly against the
+plan's own text (no external code needed this time — an internal-consistency question):
+kilo claimed all 6 recovery-table cases "map cleanly" to invariant 2's Reconcile
+contract; checked directly and this was WRONG in the same way round 2's disagreement
+was — v4's table genuinely omitted a "no commit, all files AFTER" case (the exact crash
+window step 7's own detector list already required a test for), and v4's invariant 2
+illegally routed an ALREADY-`Report(Succeeded)`-committed transaction through
+`Reconcile`, which S7 only permits from `UNKNOWN` (`s7/events.go:478,484`) — a committed
+transaction is already SUCCEEDED, not UNKNOWN. Folded: recovery scans are now scoped to
+incomplete/non-terminal operations only (a closed transaction is never rescanned, so a
+later legitimate edit to the same files can't wrongly reopen it); the missing
+no-commit-all-AFTER case is added to the table as its own mid-crash rollback case; and
+the sealed-artifact GC/write race codex separately found (an orphan sweep could delete
+an artifact in the window between its own fsync and the journal reference that names it)
+is closed with an owner-held live pin through the journal-append step plus mark-and-sweep
+GC. Two of agy's round-4 notes were also folded (name the store
+`internal/foundation/sealedstore`, built in Slice 0 directly; name the durable EffectPath
+method `RunDurableTool`).
 
 ## Research basis (four independent research threads before any review; two review rounds
 since)
@@ -114,7 +133,10 @@ All four independently converged on (unchanged from v1/v2, still holds):
      workspace companion — never a nil builder.
    - Either extend `EffectPath` with a second, explicitly durable-effect lifecycle
      method alongside `RunTool` (not overloading `RunTool` itself, which stays the
-     non-durable `PolicyTool` path for ordinary tools), or specify an equally explicit
+     non-durable `PolicyTool` path for ordinary tools) — agy round-4 weakest point #2
+     suggests naming it `EffectPath.RunDurableTool`, passing the S7 companion builder
+     directly rather than bifurcating the authorization pipeline, as a reasonable
+     starting shape for Slice 3's own review to refine — or specify an equally explicit
      alternate route that still enforces S6.0/S6.9 and never duplicates S7 ownership.
      If the alternate route is chosen, that slice's own review must specify its
      S6.0/S6.9 re-enforcement mechanism explicitly (kilo round-3 Note 3) — a
@@ -132,11 +154,34 @@ All four independently converged on (unchanged from v1/v2, still holds):
      - A FULLY VERIFIED rollback to all-BEFORE may report `FailedRetryable`.
      - A FAILED or INCOMPLETE rollback reports `Unknown` — never retryable, never
        silently retried.
-     - On restart with the transaction committed / classified all-AFTER: `Reconcile(true)`.
-     - On restart with all-BEFORE, or a mixed state successfully restored to all-BEFORE:
-       `Reconcile(false)`, and ONLY THEN `Next` on the SAME operation (never a new one).
+     - **Corrected in v5** (codex round-4 HIGH #1, verified against `s7/events.go:478,484`:
+       `Reconcile` is legal ONLY from `UNKNOWN` — a transaction that already committed
+       `Report(Succeeded)` is already in S7's SUCCEEDED state, so calling `Reconcile`
+       on it is an ILLEGAL transition, not merely redundant. v4's "committed / classified
+       all-AFTER" phrasing wrongly treated these as one case):
+       - Recovery scans, on every restart, are scoped to INCOMPLETE / NON-TERMINAL
+         workspace operations ONLY — a transaction whose `Report(Succeeded)` already
+         landed is CLOSED; it is never rescanned, never reconciled, and never compared
+         against the current workspace state on a LATER restart (a legitimate
+         subsequent edit to the same files must not reopen or FOREIGN-classify an old,
+         already-closed transaction).
+       - On restart, `workspace.mutation_committed` PRESENT (⟺ `Report(Succeeded)`
+         already landed): terminal, closed, out of scope for recovery — verify AFTER
+         once as a sanity check if desired, but take no S7 action.
+       - On restart, NO commit event, all files classify AFTER (the crash window step
+         7's own required detector names — "fault after all files are written but
+         before `mutation_committed`" — that v4's classification table omitted listing
+         as its own case): this is a MID-CRASH, not a success — roll every file back to
+         its sealed before-image, verify all-BEFORE achieved, THEN `Reconcile(false)`,
+         and ONLY THEN `Next` on the SAME operation.
+       - On restart, no commit event, all-BEFORE or mixed BEFORE/AFTER: identical
+         rollback treatment — restore to all-BEFORE, `Reconcile(false)`, `Next` on the
+         SAME operation only.
      - Any FOREIGN classification stays `Unknown`/manual reconciliation — it never
        receives a new grant, under any circumstance.
+     - Required detector (v5): a successfully closed transaction, followed by a later
+       LEGITIMATE edit to one of its files, followed by a restart, must NOT reopen or
+       FOREIGN-classify the old transaction.
    - RED-capable detector: injecting a fault into EITHER half of the paired companion
      batch (the S7 half or the `workspace.apply_started` half) must result in ZERO
      filesystem writes (mirrors S7's own `SetAppendFault` seam pattern, already used
@@ -184,9 +229,10 @@ All four independently converged on (unchanged from v1/v2, still holds):
      `internal/kernel/journal/journal.go:43,500` — and this bundle carries COMPLETE
      source bytes, potentially including secrets, as the ONLY rollback material after a
      crash, so it cannot be left implicit the way the round-1 exec-substrate gap
-     originally was). One profile-scoped sealed-artifact owner, built in Slice 0 (or
-     Slice 1 at the latest, before Slice 3 needs it) and reused by evidence (invariant 7)
-     and by this transaction bundle alike:
+     originally was). One profile-scoped sealed-artifact owner (v5, agy round-4 weakest
+     point #1: name it `internal/foundation/sealedstore`, built directly in Slice 0 as a
+     foundational primitive — not deferred to Slice 1, avoiding a mid-Slice-1 refactor)
+     and reused by evidence (invariant 7) and by this transaction bundle alike:
      - Physical location: content-addressed files (named by their own sha256) under the
        profile's data root, in a directory NEVER exposed to the coding-run sandbox as
        read-write.
@@ -198,7 +244,30 @@ All four independently converged on (unchanged from v1/v2, still holds):
      - Every recovery use re-verifies the digest before trusting the bytes.
      - The journal references it through exactly ONE canonical field
        (`sealed_payload_ref` — a content digest, not a second competing reference shape).
-     - Orphan artifacts (no journal event ever referenced them, or their referencing
+     - **GC/write race — closed in v5** (codex round-4 HIGH #2, verified: the required
+       ordering — persist+fsync the artifact, THEN append the journal reference, THEN
+       mutate workspace files — deliberately creates a window where the artifact exists
+       with no journal reference yet; a concurrent orphan sweep could delete it in that
+       window, after which the journal append durably commits a reference to nothing):
+       - `Put` returns an owner-managed live pin/lease, held by the caller through the
+         journal-append step.
+       - GC and the (`Put` → journal-reference-commit) sequence serialize through the
+         artifact owner itself (one owner-held lock around the critical section) — GC
+         never runs concurrently with an in-flight `Put`-then-reference-commit.
+       - The live pin is released only once the journal reference is durable.
+       - On a process crash mid-pin: the in-memory pin simply disappears — this is SAFE
+         precisely because no workspace write ever precedes the durable journal
+         reference (the existing "step 1 before step 3" ordering already protects this;
+         the pin only protects the artifact from GC, not from the crash itself).
+       - GC performs mark-and-sweep across ALL retained journal references and all
+         currently-active pins in one pass — never per-transaction ad hoc deletion — so
+         one artifact referenced by MULTIPLE records (evidence AND a transaction bundle,
+         say) is never removed while any reference to it still lives.
+       - Required detectors: cleanup racing the artifact-fsync-to-journal-append window;
+         two records sharing one artifact while only one of them ages out (the artifact
+         must survive until BOTH are gone).
+     - Orphan artifacts (no journal event ever referenced them and no live pin holds
+       them, or their referencing
        transaction fully completed and aged out) get a defined retention/cleanup policy
        — bounded storage growth, not "keep forever."
    1. Before the FIRST write: persist ONE sealed transaction bundle (via the owner
@@ -218,12 +287,22 @@ All four independently converged on (unchanged from v1/v2, still holds):
    6. On restart, classify EVERY file in the transaction's write set as BEFORE (matches
       the sealed before-image), AFTER (matches the sealed after-image), or FOREIGN
       (matches neither) — this table is exhaustive:
-      - `workspace.mutation_committed` exists → verify every file matches AFTER; any
-        mismatch is FOREIGN, not silently accepted.
+      - `workspace.mutation_committed` exists → the transaction is CLOSED (`Report(Succeeded)`
+        already landed atomically with it — S7 is already SUCCEEDED, not UNKNOWN). Out
+        of scope for recovery entirely (v5 correction, see invariant 2): verify AFTER
+        as a sanity check if desired, but take no S7 action and never rescan it on a
+        LATER restart even if a subsequent legitimate edit changes those same files.
       - No commit event, all files BEFORE → transaction never effectively started;
-        reconcile as "not applied," safe to retry the whole operation fresh.
+        `Reconcile(false)` then `Next` the SAME operation, safe to retry fresh.
+      - No commit event, ALL files AFTER (v5: this case was missing from v4's table
+        despite step 7 already requiring its own crash detector — codex round-4 HIGH #1)
+        → mid-crash: every file replaced but the transaction never committed. Roll every
+        file back to its sealed before-image, verify all-BEFORE achieved, then
+        `Reconcile(false)` then `Next` the SAME operation. NEVER treat this as a
+        completed transaction merely because every file happens to match AFTER.
       - No commit event, mixed BEFORE/AFTER → mid-crash; roll every AFTER-matching file
-        back to its sealed before-image (never roll forward without the commit marker).
+        back to its sealed before-image, then `Reconcile(false)` then `Next` the SAME
+        operation (never roll forward without the commit marker).
       - Any file FOREIGN (in any of the above) → refuse; manual reconciliation only,
         never a guess and never a blind re-run.
       - The recovery journal entry itself missing after a crash → SAFE, because step 1
@@ -430,7 +509,7 @@ main + autodeploy + push per standing rules after each slice converges, not batc
 
 ## Status
 
-v4 — plan-review round 3 folded (codex FAIL 3 NEW HIGH, all re-verified against the code;
-kilo PASS + 3 notes folded; agy PASS + 3 notes folded, one corroborating codex's HIGH #3
-independently). Finding count converging: 5 → 5 → 3 across three rounds. Next: dispatch
-v4 for plan-review round 4.
+v5 — plan-review round 4 folded (codex FAIL 2 NEW HIGH, both re-verified — one against a
+second kilo factual disagreement, checked directly against the plan text and confirmed
+kilo wrong again; kilo PASS + 3 notes folded; agy PASS + 3 notes folded). Finding count
+converging: 5 → 5 → 3 → 2 across four rounds. Next: dispatch v5 for plan-review round 5.
