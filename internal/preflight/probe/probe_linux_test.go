@@ -763,3 +763,143 @@ func TestTransitiveRpathBinaryResolves(t *testing.T) {
 		t.Fatalf("transitive-RPATH binary must resolve and run: %v\n%s", err, out)
 	}
 }
+
+// --- ExtraROBinds / ExtraEnv (PLAN-CODING-TRIO.md Slice 0: a governed
+// toolchain child-process closure) ---
+
+// robindDir returns a guard-compliant read-only-bindable dir (0755 under
+// TempDir): t.TempDir() subdirs are 0775 on umask-002 hosts and
+// guardROBind now rejects group-writable grants.
+func robindDir(t *testing.T) string {
+	t.Helper()
+	d := filepath.Join(t.TempDir(), "robind")
+	if err := os.Mkdir(d, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return d
+}
+
+// Detector: a path in ExtraROBinds becomes readable inside the sandbox —
+// the positive half of the same boundary TestCanaryOutsideClosureNotReadable
+// proves as denied by default.
+func TestExtraROBindMakesPathReadable(t *testing.T) {
+	av := mustDetect(t)
+	hp := helperPath(t)
+	dir := robindDir(t)
+	canary := filepath.Join(dir, "canary.txt")
+	if err := os.WriteFile(canary, []byte("CANARY"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	spec := Spec{Target: hp, Args: []string{"readfile", canary}, WorkDir: wdir(t), ExtraROBinds: []string{dir}}
+	out, err := run(t, av, spec)
+	if err != nil {
+		t.Fatalf("ExtraROBinds did not expose the canary: %v\n%s", err, out)
+	}
+}
+
+// Detector: an ExtraROBinds path stays READ-ONLY — a write attempt inside
+// it must fail exactly like the rest of the remounted-ro root.
+func TestExtraROBindStillReadOnly(t *testing.T) {
+	av := mustDetect(t)
+	hp := helperPath(t)
+	dir := robindDir(t)
+	target := filepath.Join(dir, "attempt.txt")
+	spec := Spec{Target: hp, Args: []string{"writefile", target, "x"}, WorkDir: wdir(t), ExtraROBinds: []string{dir}}
+	out, err := run(t, av, spec)
+	if err == nil {
+		t.Fatalf("write inside an ExtraROBinds path SUCCEEDED — read-only boundary broken:\n%s", out)
+	}
+}
+
+// Detector: the exact capability Slice 0 exists for — a child binary
+// placed inside an ExtraROBinds tree can be exec'd from there, unlike
+// TestUndeclaredChildExecFailsForUsrBinary's denial of an un-bound path.
+// This is the positive proof that a governed toolchain closure (go's own
+// compile/link/asm children) is actually launchable, not just visible.
+func TestExtraROBindExecSucceedsForBoundChild(t *testing.T) {
+	av := mustDetect(t)
+	hp := helperPath(t)
+	dir := robindDir(t)
+	child := filepath.Join(dir, "child")
+	src, err := os.ReadFile(hp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(child, src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	spec := Spec{Target: hp, Args: []string{"exec", child, "print", "hello-from-child"}, WorkDir: wdir(t), ExtraROBinds: []string{dir}}
+	out, err := run(t, av, spec)
+	if err != nil {
+		t.Fatalf("exec of a bound child binary failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "hello-from-child") {
+		t.Fatalf("child output missing from: %q", out)
+	}
+}
+
+// Detector: guardROBind rejects a symlink, mirroring guardWorkDir's own
+// symlink defense (the RO-bind guard must not be a weaker sibling).
+func TestExtraROBindRejectsSymlink(t *testing.T) {
+	av := mustDetect(t)
+	hp := helperPath(t)
+	real := robindDir(t)
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	// The symlink itself resolves fine via EvalSymlinks (that's the point
+	// of EvalSymlinks — it's the TARGET's own permissions that matter),
+	// so this detector instead proves a hostile chain: group-writable
+	// PARENT with an escape is refused via the mode check on the
+	// resolved directory itself in the sibling test below. Here we prove
+	// a dangling/foreign-owned symlink target is refused outright.
+	if err := os.Remove(real); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Prepare(av, Spec{Target: hp, Args: []string{"sleep", "0"}, WorkDir: wdir(t), ExtraROBinds: []string{link}}); err == nil {
+		t.Fatal("a dangling symlink was accepted as an ExtraROBinds target")
+	}
+}
+
+// Detector: guardROBind rejects a group/world-writable directory —
+// mirrors TestWorkdirGroupWritableRefused for the RO-bind guard.
+func TestExtraROBindGroupWritableRefused(t *testing.T) {
+	av := mustDetect(t)
+	hp := helperPath(t)
+	d := filepath.Join(t.TempDir(), "gw")
+	if err := os.Mkdir(d, 0o775); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Prepare(av, Spec{Target: hp, Args: []string{"sleep", "0"}, WorkDir: wdir(t), ExtraROBinds: []string{d}}); err == nil {
+		t.Fatal("group-writable ExtraROBinds path accepted")
+	}
+}
+
+// Detector: ExtraEnv sets a variable visible inside the sandbox, on top of
+// the fixed PATH/LD_LIBRARY_PATH baseline (--clearenv still runs first).
+func TestExtraEnvSetsVariable(t *testing.T) {
+	av := mustDetect(t)
+	hp := helperPath(t)
+	spec := Spec{Target: hp, Args: []string{"printenv", "NEXUS_CODING_TEST"}, WorkDir: wdir(t),
+		ExtraEnv: map[string]string{"NEXUS_CODING_TEST": "toolchain-value"}}
+	out, err := run(t, av, spec)
+	if err != nil {
+		t.Fatalf("ExtraEnv variable not visible: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "toolchain-value") {
+		t.Fatalf("unexpected env output: %q", out)
+	}
+}
+
+// Detector: an invalid ExtraEnv key (containing '=') is refused before
+// bwrap ever launches — never silently dropped or misparsed.
+func TestExtraEnvRejectsInvalidKey(t *testing.T) {
+	av := mustDetect(t)
+	hp := helperPath(t)
+	spec := Spec{Target: hp, Args: []string{"sleep", "0"}, WorkDir: wdir(t),
+		ExtraEnv: map[string]string{"BAD=KEY": "x"}}
+	if _, err := Prepare(av, spec); err == nil {
+		t.Fatal("an ExtraEnv key containing '=' was accepted")
+	}
+}

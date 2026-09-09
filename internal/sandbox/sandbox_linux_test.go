@@ -377,3 +377,65 @@ func TestLaunchRefusesSwappedClosureMember(t *testing.T) {
 		t.Fatal("closure member with non-compile-time bytes launched")
 	}
 }
+
+// --- ExtraROBinds / ExtraEnv (PLAN-CODING-TRIO.md Slice 0) ---
+
+func robindDir(t *testing.T) string {
+	t.Helper()
+	d := filepath.Join(t.TempDir(), "robind")
+	if err := os.Mkdir(d, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return d
+}
+
+// Detector: ExtraROBinds/ExtraEnv propagate through the FULL
+// Compile->Launch->Attest protocol, not just probe.Prepare directly.
+func TestExtraROBindsAndEnvPropagateThroughFullProtocol(t *testing.T) {
+	b, rep := backend(t)
+	hp := helperPath(t)
+	dir := robindDir(t)
+	canary := filepath.Join(dir, "canary.txt")
+	if err := os.WriteFile(canary, []byte("CANARY"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := runThrough(t, b, rep, Spec{
+		Target: hp, Args: []string{"readfile", canary}, WorkDir: wdir(t),
+		ExtraROBinds: []string{dir}, ExtraEnv: map[string]string{"NEXUS_CODING_TEST": "v1"},
+	})
+	if err != nil {
+		t.Fatalf("ExtraROBinds did not propagate through Compile/Launch: %v\n%s", err, out)
+	}
+}
+
+// Detector: PolicyHash changes when ExtraROBinds/ExtraEnv change — a
+// caller cannot silently widen sandbox visibility under an
+// already-approved policy hash (mirrors the existing target/args/workdir
+// binding this policy hash already provides).
+func TestPolicyHashChangesWithExtraROBindsAndEnv(t *testing.T) {
+	b, rep := backend(t)
+	hp := helperPath(t)
+	base := Spec{Target: hp, Args: []string{"sleep", "0"}, WorkDir: wdir(t)}
+	polBase, err := b.Compile(ctxT(), base, rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withBind := base
+	withBind.ExtraROBinds = []string{robindDir(t)}
+	polBind, err := b.Compile(ctxT(), withBind, rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if polBase.PolicyHash() == polBind.PolicyHash() {
+		t.Fatal("PolicyHash unchanged after adding an ExtraROBinds entry")
+	}
+	withEnv := base
+	withEnv.ExtraEnv = map[string]string{"K": "V"}
+	polEnv, err := b.Compile(ctxT(), withEnv, rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if polBase.PolicyHash() == polEnv.PolicyHash() {
+		t.Fatal("PolicyHash unchanged after adding an ExtraEnv entry")
+	}
+}

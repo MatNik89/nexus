@@ -18,7 +18,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fail("usage: probehelper <readfile|writefile|dial|exec|spawn-sleep> ...")
+		fail("usage: probehelper <readfile|writefile|dial|exec|spawn-sleep|printenv> ...")
 	}
 	switch os.Args[1] {
 	case "readfile": // readfile <path> — succeeds only if content is readable
@@ -81,6 +81,12 @@ func main() {
 		for written := 0; written < n; written += len(chunk) {
 			os.Stdout.Write(chunk)
 		}
+	case "printenv": // printenv <NAME> — prints the value, or fails if unset
+		v, ok := os.LookupEnv(arg(2))
+		if !ok {
+			fail("env %s not set", arg(2))
+		}
+		fmt.Println(v)
 	case "hang": // never exits — timeout/cleanup fixture. NOT select{}: an
 		// empty select trips Go's deadlock detector and self-terminates,
 		// making the timeout test vacuous (Phase-0 r2 kilo #1).

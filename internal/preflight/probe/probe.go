@@ -27,6 +27,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -94,11 +95,33 @@ func FloorProbe(av Availability, probeTarget string, args []string) error {
 // Spec describes one sandboxed launch of a promoted ELF target.
 // It cannot express a weakened boundary: negative-control switches live in
 // an unexported loosen struct reachable only from this package's tests.
+// ExtraROBinds/ExtraEnv ADD narrowly-scoped read-only visibility (never
+// remove an existing protection — network/pid/seccomp/remount-ro are
+// unaffected) for a governed toolchain child-process closure
+// (PLAN-CODING-TRIO.md Slice 0: `go`/`gopls` must locate and exec their
+// own compiler/linker/asm/cgo children, which this sandbox otherwise
+// makes entirely invisible).
 type Spec struct {
 	Target  string // absolute HOST path of the promoted executable (ELF only)
 	Args    []string
 	WorkDir string // host dir bound read-write at /work (guarded; see Prepare)
 	Timeout time.Duration
+
+	// ExtraROBinds are additional host directories bound READ-ONLY at the
+	// SAME absolute path inside the sandbox — verbatim, so a toolchain's
+	// own baked-in absolute paths keep resolving. Each is guarded by
+	// guardROBind (owned by the current user or root, never group/world
+	// writable, symlink-resolved) before Prepare ever touches bwrap argv.
+	// Unlike the memfd-pinned shared-library closure, these are NOT
+	// individually content-hashed — a toolchain install is large and
+	// operator-controlled, not per-request content; only its identity
+	// (the resolved canonical path) is verified, not its bytes.
+	ExtraROBinds []string
+	// ExtraEnv sets additional environment variables beyond the fixed
+	// PATH=/nowhere + LD_LIBRARY_PATH baseline (still --clearenv first —
+	// this ADDS named variables, it does not restore the ambient
+	// environment). Keys must be non-empty and contain no '=' or NUL.
+	ExtraEnv map[string]string
 
 	loosen loosen
 }
@@ -500,6 +523,51 @@ func guardWorkDir(dir string) (string, error) {
 	return wd, nil
 }
 
+// guardROBind canonicalizes and rejects a hazardous read-only-visibility
+// grant: a symlink component swap, foreign ownership (neither the current
+// user nor root), or group/world write access (0o022 — writable by
+// anyone but the owner is not a trusted, operator-controlled tree).
+// Unlike guardWorkDir this is NOT restricted to /run or a root-sticky
+// temp root — a read-only grant's risk is "whose bytes get exposed and
+// executed," not "who can write into a shared RW area," so a normal
+// user-owned install tree (e.g. $HOME/go/pkg/mod, holding the downloaded
+// Go toolchain) is an acceptable shape here where it would NOT be for a
+// disposable RW workdir.
+func guardROBind(dir string) (string, error) {
+	canon, err := filepath.EvalSymlinks(filepath.Clean(dir))
+	if err != nil {
+		return "", fmt.Errorf("ro-bind %s: %w", dir, err)
+	}
+	if !filepath.IsAbs(canon) {
+		return "", fmt.Errorf("ro-bind %s: not an absolute path (fail closed)", dir)
+	}
+	st, err := os.Stat(canon)
+	if err != nil {
+		return "", fmt.Errorf("ro-bind %s: %w", dir, err)
+	}
+	if !st.IsDir() {
+		return "", fmt.Errorf("ro-bind %s: not a directory (fail closed)", canon)
+	}
+	sys, ok := st.Sys().(*syscall.Stat_t)
+	if !ok {
+		return "", fmt.Errorf("ro-bind %s: cannot determine ownership (fail closed)", canon)
+	}
+	if int(sys.Uid) != os.Geteuid() && sys.Uid != 0 {
+		return "", fmt.Errorf("ro-bind %s: owned by neither the current user nor root (fail closed)", canon)
+	}
+	if st.Mode().Perm()&0o022 != 0 {
+		return "", fmt.Errorf("ro-bind %s: group/world-writable (%o) — not a trusted read-only tree (fail closed)", canon, st.Mode().Perm())
+	}
+	return canon, nil
+}
+
+// validEnvKey rejects an environment key that could confuse the child
+// process or an argv-adjacent parser: empty, containing '=' (the KEY=VALUE
+// separator itself), or a NUL byte.
+func validEnvKey(k string) bool {
+	return k != "" && !strings.ContainsAny(k, "=\x00")
+}
+
 // Handle is a running (or prepared) sandboxed process. The underlying
 // command is PRIVATE: no caller can alter argv, fds or environment after
 // Prepare (Phase-0 r2 codex #5).
@@ -626,6 +694,38 @@ func Prepare(av Availability, spec Spec) (*Handle, error) {
 	}
 	if spec.loosen.roBind != "" {
 		args = append(args, "--ro-bind", spec.loosen.roBind, spec.loosen.roBind)
+	}
+	if len(spec.ExtraROBinds) > 0 {
+		// Deterministic order: two Specs differing only in ExtraROBinds
+		// ordering must compile to the SAME bwrap argv (and therefore the
+		// same sandbox.Compile policyHash) — sort before guarding.
+		binds := append([]string(nil), spec.ExtraROBinds...)
+		sort.Strings(binds)
+		seen := map[string]bool{}
+		for _, b := range binds {
+			canon, err := guardROBind(b)
+			if err != nil {
+				return fail(err)
+			}
+			if seen[canon] {
+				continue // de-duplicate after canonicalization
+			}
+			seen[canon] = true
+			args = append(args, "--ro-bind", canon, canon)
+		}
+	}
+	if len(spec.ExtraEnv) > 0 {
+		keys := make([]string, 0, len(spec.ExtraEnv))
+		for k := range spec.ExtraEnv {
+			if !validEnvKey(k) {
+				return fail(fmt.Errorf("extra env key %q is invalid (fail closed)", k))
+			}
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			args = append(args, "--setenv", k, spec.ExtraEnv[k])
+		}
 	}
 	if !spec.loosen.net {
 		args = append(args, "--unshare-net")

@@ -37,6 +37,15 @@ type Spec struct {
 	Args    []string
 	WorkDir string
 	Timeout time.Duration
+
+	// ExtraROBinds/ExtraEnv thread through to probe.Spec unchanged — a
+	// narrowly-scoped, ADDITIVE read-only visibility grant for a governed
+	// toolchain child-process closure (PLAN-CODING-TRIO.md Slice 0). Both
+	// are folded into policyHash below: two Specs differing only here
+	// must compile to DIFFERENT policies (a caller cannot silently widen
+	// visibility under an already-approved policy hash).
+	ExtraROBinds []string
+	ExtraEnv     map[string]string
 }
 
 // ProbeReport is the live host measurement a policy compiles against.
@@ -231,8 +240,35 @@ func (b *Bwrap) Compile(ctx context.Context, spec Spec, report ProbeReport) (Com
 		closurePins: pins,
 		policyHash: digest("policy", spec.Target, targetHash, closureDigest(pins),
 			strings.Join(spec.Args, "\x00"),
-			spec.WorkDir, spec.Timeout.String(), report.ProbeHash),
+			spec.WorkDir, spec.Timeout.String(), report.ProbeHash,
+			roBindsDigest(spec.ExtraROBinds), envDigest(spec.ExtraEnv)),
 	}, nil
+}
+
+// roBindsDigest folds a read-only bind list into one deterministic digest
+// (order-independent — the list is sorted first).
+func roBindsDigest(binds []string) string {
+	sorted := append([]string(nil), binds...)
+	sort.Strings(sorted)
+	h := sha256.New()
+	for _, b := range sorted {
+		fmt.Fprintf(h, "%d:%s", len(b), b)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// envDigest folds an env map into one deterministic digest (key-sorted).
+func envDigest(env map[string]string) string {
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	h := sha256.New()
+	for _, k := range keys {
+		fmt.Fprintf(h, "%d:%s=%d:%s", len(k), k, len(env[k]), env[k])
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // closureDigest folds a closure pin map into one deterministic digest.
@@ -301,6 +337,7 @@ func (b *Bwrap) Launch(ctx context.Context, policy CompiledPolicy) (*Process, er
 	h, err := probe.Prepare(b.av, probe.Spec{
 		Target: policy.spec.Target, Args: policy.spec.Args,
 		WorkDir: policy.spec.WorkDir, Timeout: timeout,
+		ExtraROBinds: policy.spec.ExtraROBinds, ExtraEnv: policy.spec.ExtraEnv,
 	})
 	if err != nil {
 		return nil, err
