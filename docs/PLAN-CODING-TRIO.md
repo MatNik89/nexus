@@ -536,6 +536,12 @@ and this deployment host's live `go env`, not assumed.
      for the GOTOOLDIR set alone; two more files is negligible), fold into the run's
      evidence event; this closes the in-place-edit gap `ExtraROBindIdentities`
      deliberately leaves open, specifically for the executables where it matters most.
+   - **Forward note for Slice 3 (agy plan-review round 1):** `gopls` itself is NOT part
+     of `GOROOT`/`GOTOOLDIR` — it typically lives at `$GOPATH/bin/gopls` or another
+     user binary directory. When Slice 3 introduces the `gopls` stdio session, its
+     resolved binary path must be added to this same content-hash pin set; Slice 0's
+     hash list (`GOTOOLDIR`'s entries + `bin/go` + `bin/gofmt`) does not yet need to
+     include it, since Slice 0 never execs `gopls`.
    - `ExtraEnv`: `CGO_ENABLED=0`, `GOTOOLCHAIN=local` (forbid downloading a DIFFERENT
      toolchain over the network — the plan's existing network-denial requirement),
      `GOCACHE`/`GOTMPDIR` pointed at a location INSIDE the sandbox's disposable
@@ -549,11 +555,15 @@ and this deployment host's live `go env`, not assumed.
    sandbox-side plumbing. Tree copy + digest: `filepath.WalkDir` the source tree,
    reject any non-regular-file/non-directory node (device/socket/fifo — `fail closed`
    per invariant 4), reject symlinks outright (never resolve-and-follow), enforce a
-   file-count and total-byte cap (values TBD by the review round — no existing NEXUS
-   precedent to reuse verbatim; propose 20,000 files / 500MB as a starting point,
-   generous for any real Go module, tight enough to bound resource use), copy each
-   regular file's bytes while hashing them, then `TreeDigest = sha256(sorted
-   "relpath\x00sha256(bytes)" lines joined by newline)` — a plain Merkle-style content
+   file-count, total-byte, AND directory-depth cap (agy plan-review round 1: an
+   explicit `MaxDepth` — e.g. 64 — closes a resource-exhaustion angle the file-count/
+   byte caps alone don't bound, since a pathologically deep-but-narrow tree could
+   exhaust stack/path-length limits before either cap is hit; values TBD precisely at
+   implementation — no existing NEXUS precedent to reuse verbatim; propose 20,000
+   files / 500MB / depth 64 as a starting point, generous for any real Go module,
+   tight enough to bound resource use), copy each regular file's bytes while hashing
+   them, then `TreeDigest = sha256(sorted "relpath\x00sha256(bytes)" lines joined by
+   newline)` — a plain Merkle-style content
    digest, no new dependency, ~50 LOC against stdlib `io/fs`/`crypto/sha256`.
 
 4. **OPEN QUESTION — revises a previously-converged plan sentence, needs explicit
@@ -735,18 +745,32 @@ on faith), two factual disagreements with kilo resolved the same way (kilo wrong
 times, confirmed by reading the code/text directly rather than averaging opinions).
 Ready to begin Slice 0 implementation.
 
-## Status — Slice 0 concrete design, plan-review round 1 (in progress)
+## Status — Slice 0 concrete design, plan-review round 1
 
 The "Slice 0 — concrete design, round 1" section above is drafted from independent
 research (my own reading of `effectpath`/`s7`/`exectool`/`probe` plus a live `go env`
 check on this host; agy's and kilo's independently-dispatched parallel research, both
 returned and folded; codex's independently-dispatched parallel research, an
-exceptionally long run — folded incrementally as findings landed: the `bin/go`/
-`bin/gofmt` pinning gap already folded; its full final report, if it lands after this
-plan-review dispatch, gets folded as an explicit review-round finding instead). Four
-open design questions resolved with cross-agent convergence (S7 non-durability, dual
-GOROOT+GOMODCACHE binding, disposable-snapshot mechanism, direct `sandbox.Backend`+
-non-durable-S7 caller shape bypassing `EffectPath`) — the last one explicitly flagged
-as revising a previously-converged plan sentence, not silently adopted. Dispatched for
-adversarial plan-review (codex/kilo/agy) before implementation begins, per the standing
-discipline.
+exceptionally long run — folded incrementally as findings landed, most notably the
+`bin/go`/`bin/gofmt` pinning gap). Four open design questions resolved with cross-agent
+convergence (S7 non-durability, dual GOROOT+GOMODCACHE binding, disposable-snapshot
+mechanism, direct `sandbox.Backend`+non-durable-S7 caller shape bypassing
+`EffectPath`) — the last one explicitly flagged as revising a previously-converged plan
+sentence, not silently adopted.
+
+**Plan-review round 1 dispatched to codex/kilo/agy. agy: PASS**, all 5 checklist items
+sound, 2 notes folded (a `MaxDepth` cap for the snapshot walk; `gopls`'s own binary
+needs joining the content-hash pin set when Slice 3 introduces it — not a Slice 0 gap).
+**kilo's review ran for an exceptionally long time** (independently found a genuine new
+consideration mid-review — a hardlink-based exfiltration angle in the snapshot copy,
+self-assessed as low-risk since it requires same-filesystem + the workspace owner
+hardlinking their own secret into the tree — worth folding as a note once its final
+verdict lands) **and codex's parallel research task, dispatched even earlier, had not
+yet reached the review stage at all** when this status was last updated — both
+exceptionally slow this session (see `docs/HANDOFF.md`'s operational-lessons note).
+**Per the owner's "keep going, don't block on a slow reviewer" standing directive**,
+proceeding to begin Slice 0 implementation on agy's PASS + this session's own
+synthesis, rather than waiting indefinitely — kilo's and codex's plan-review input,
+whenever it lands, folds in as explicit findings against the implementation's own
+code-review cycle (which is the stricter, harder gate this project already requires
+codex+kilo convergence on) rather than blocking the plan from being actionable.
