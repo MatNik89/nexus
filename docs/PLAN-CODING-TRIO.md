@@ -805,3 +805,41 @@ synthesis, rather than waiting indefinitely — kilo's and codex's plan-review i
 whenever it lands, folds in as explicit findings against the implementation's own
 code-review cycle (which is the stricter, harder gate this project already requires
 codex+kilo convergence on) rather than blocking the plan from being actionable.
+
+**codex's parallel RESEARCH task (dispatched even before the plan-review round) finally
+returned after ~10+ hours wall clock** — its own multi-hour session, working from an
+earlier commit than the "bypass EffectPath" design text. It CONVERGES with kilo/agy on
+§1 (no S7 durability) and §3 (disposable run root, not sealedstore), but **DISAGREES
+sharply with §4/kilo/agy on the EffectPath question**, citing `docs/ARCHITECTURE-
+ESSENTIALS.md`'s E8 ("One effect-path, sandbox IN the type") — verified as real,
+accurately quoted text, not a fabricated citation: calling `sandbox.Backend` directly
+"creates a second physical process-effect path." codex's counter-proposal: register a
+closed, internal-only `ToolID` for the coding-runner with a PEP rule that's
+UNCONDITIONALLY `DecisionAllow` (never `ASK` — so PEP costs nothing extra in practice
+for a call no human approves per-attempt), and route through the EXISTING, already-
+hardened `EffectPath.RunTool` (reusing its grant lifecycle instead of the current
+implementation's hand-rolled `Begin/Next/Consume/AttemptContext/Report` sequence,
+which duplicates logic `RunTool` already provides correctly). codex also independently
+found: (a) the exact toolchain version matters — this host's default `go` (`GOTOOLCHAIN
+=auto`) resolves to 1.26.6, but a `GOTOOLCHAIN=local` re-invocation without first
+selecting the exact matching binary would silently fall back to an older `~/.local/go`
+1.26.4 install; (b) `sandbox.Process.Output()` truncates at 1MiB, which could silently
+corrupt a large `go list -json` capture — needs an explicit bounded/truncated-result
+signal, not silent truncation; (c) content-pin GOTOOLDIR's executables via the SAME
+memfd `--ro-bind-data` mechanism the target ELF closure already uses, rather than a
+separate hash-and-trust-the-directory-bind approach — genuinely stronger (immutable
+bytes for the whole run, no hash-to-exec race) if the sandbox primitive can be extended
+to support it.
+
+**This is a genuine 2-of-3 (kilo, agy) vs. 1-of-3 (codex) architectural split on a
+question that already has real, merged code built on the "bypass EffectPath" side**
+(commits 640c647, b6d749d, 4985599). Per this project's "verify, don't average"
+discipline: E8's text is real and does describe a singular effect-path; codex's
+"duplicated grant-lifecycle logic" observation is also independently verifiable against
+the shipped `run.go` (true — it does hand-roll what `RunTool` already provides). This
+is NOT being resolved by majority vote. A CODE-level review round (not just plan
+research) is dispatched to codex/kilo/agy against the actual `internal/coding/runner`
+package, with codex's E8 argument posed explicitly as the central question — the
+existing "bypass EffectPath" code stands unless and until that review round actually
+overturns it with a concrete finding, not a re-litigation of the design preference
+alone.
