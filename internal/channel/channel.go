@@ -203,6 +203,29 @@ func substrate(code string, err error) error {
 	return &ClassifiedError{Class: health.ClassSubstrate, Code: code, Cause: err}
 }
 
+// CompanionOperationID extracts the "operation_id" field every owner
+// companion payload embeds (deliveryMark, controlEffectPayload — same JSON
+// tag regardless of event type). S7 deliberately never interprets a
+// Companion's payload (s7.Companion's own doc comment: "it never interprets
+// the payload") — Consume validates only Companion.Key == Grant.OperationID,
+// never that Companion.Params itself NAMES that same operation internally.
+// A caller must use this to verify the two agree before ever handing the
+// companion to S7 (code-review CODE7 codex: a foreign companion payload —
+// self-consistent on its own, but naming a DIFFERENT operation than
+// Companion.Key — would otherwise ride a valid grant undetected).
+func CompanionOperationID(p contracts.EnvelopeParams) (string, error) {
+	var wrap struct {
+		OperationID string `json:"operation_id"`
+	}
+	if err := json.Unmarshal(p.Payload, &wrap); err != nil {
+		return "", err
+	}
+	if wrap.OperationID == "" {
+		return "", fmt.Errorf("channel: companion payload carries no operation_id")
+	}
+	return wrap.OperationID, nil
+}
+
 func (f *Failure) Error() string {
 	kind := "definite"
 	if f.Ambiguous {

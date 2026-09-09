@@ -655,3 +655,64 @@ func TestControlCurrentBotAndPayloadHashEnforced(t *testing.T) {
 		t.Fatalf("matching payload did not reach the wire: %d calls", h.bot.setCommandsCalls)
 	}
 }
+
+// Detector (code-review CODE7 codex, new finding): S7 validates only
+// Companion.Key == Grant.OperationID and never interprets Companion.Params
+// (by design — s7.Companion's own doc comment). A companion that is
+// internally self-consistent but names a DIFFERENT operation than the one
+// being consumed must still be refused BEFORE the wire, for both durable
+// kinds that carry a companion (control-effect and delivery).
+func TestForeignCompanionOperationIDRefusedBeforeWire(t *testing.T) {
+	h := build(t, map[int64]string{42: "work"})
+	h.a.botID = 1
+
+	// control-effect: a valid grant for operation A (whose declared hash
+	// matches the ACTUAL request body, so the CODE6 payload-hash check
+	// does not itself refuse this call), but the companion's payload is
+	// self-consistent for a DIFFERENT operation B.
+	const hashB = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	pol := s7.PolicyControlEffect
+	pol.Durable = true
+	reqBody := map[string]any{"commands": []map[string]string{{"command": "probe-a", "description": "x"}}}
+	rb, _ := json.Marshal(reqBody)
+	sum := sha256.Sum256(rb)
+	hashA := hex.EncodeToString(sum[:])
+	opA := channel.ControlOperation("tg", 1, "setMyCommands", hashA)
+	tA := channel.ControlTarget("tg", 1, "setMyCommands")
+	h.auth.Begin(opA, tA, pol)
+	gA, _ := h.auth.Next(opA, func(s7.Landing) s7.Companion { return s7.Companion{} })
+	_, paramsB, _ := h.core.ControlEffectParams("tg", 1, "setMyCommands", hashB, "UNKNOWN")
+	if err := h.a.call(ctxT(), "setMyCommands", reqBody, nil, gA, kindControlEffect, opA, tA, s7.Companion{Key: opA, Params: paramsB}); !errors.Is(err, s7.ErrAttemptNotAuthorized) {
+		t.Fatalf("foreign companion (control-effect) accepted: %v", err)
+	}
+	if h.bot.setCommandsCalls != 0 {
+		t.Fatalf("wire touched for a foreign control-effect companion: %d calls", h.bot.setCommandsCalls)
+	}
+	if st, _ := h.auth.State(opA); st != contracts.AttemptAuthorized {
+		t.Fatalf("grant consumed by a refused foreign companion: %s", st)
+	}
+
+	// delivery: a valid grant for delivery row A, but the companion's park
+	// payload names delivery row B's operation.
+	enqueue(t, h, "row-a")
+	enqueue(t, h, "row-b")
+	rows, _ := h.core.Pending(ctxT())
+	if len(rows) < 2 {
+		t.Fatalf("expected at least 2 pending rows, got %d", len(rows))
+	}
+	rowA, rowB := rows[0], rows[1]
+	dOpA, dTA := channel.OperationFor(rowA), channel.TargetFor(rowA)
+	dOpB := channel.OperationFor(rowB)
+	h.auth.Begin(dOpA, dTA, s7.PolicyDelivery)
+	dgA, _ := h.auth.Next(dOpA, func(s7.Landing) s7.Companion { return s7.Companion{} })
+	paramsRowB, _ := h.core.MarkParamsForTest(channel.EvOutboundUnknown, rowB.DeliveryID, dOpB)
+	if err := h.a.call(ctxT(), "sendMessage", map[string]any{"chat_id": 42, "text": rowA.Text}, nil, dgA, kindDelivery, dOpA, dTA, s7.Companion{Key: dOpA, Params: paramsRowB}); !errors.Is(err, s7.ErrAttemptNotAuthorized) {
+		t.Fatalf("foreign companion (delivery) accepted: %v", err)
+	}
+	if sends(h) != 0 {
+		t.Fatalf("wire touched for a foreign delivery companion: %d sends", sends(h))
+	}
+	if st, _ := h.auth.State(dOpA); st != contracts.AttemptAuthorized {
+		t.Fatalf("delivery grant consumed by a refused foreign companion: %s", st)
+	}
+}

@@ -335,6 +335,19 @@ func (a *Adapter) call(ctx context.Context, method string, req any, out any, g s
 		return &channel.Failure{Code: s7.CodeLocalRefused,
 			Cause: fmt.Errorf("telegram: %s requires exactly its durable companion (got %d): %w", method, len(companions), s7.ErrAttemptNotAuthorized)}
 	}
+	if len(companions) == 1 {
+		// S7 validates only Companion.Key == Grant.OperationID; it deliberately
+		// never interprets Companion.Params (s7.Companion's own doc comment).
+		// A companion that is internally self-consistent but names a
+		// DIFFERENT operation than Key would otherwise ride this valid grant
+		// undetected (code-review CODE7 codex): the owner (this adapter) must
+		// verify the two agree before Consume ever sees it.
+		cid, cerr := channel.CompanionOperationID(companions[0].Params)
+		if cerr != nil || cid != string(op) || companions[0].Key != op {
+			return &channel.Failure{Code: s7.CodeLocalRefused,
+				Cause: fmt.Errorf("telegram: %s companion does not name the operation being consumed: %w", method, s7.ErrAttemptNotAuthorized)}
+		}
+	}
 	body, err := json.Marshal(req)
 	if err != nil {
 		return &channel.Failure{Code: s7.CodeLocalRefused, Cause: err}
