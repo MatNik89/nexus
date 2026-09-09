@@ -1,5 +1,48 @@
 # HANDOFF — NEXUS resume point (READ FIRST) — updated 2026-09-09
 
+## RESUME 2026-09-09 (coding-trio Slice 0 partial: CODE1+CODE2+codex-CODE2-fixes; CODE3 dispatched, pending) — start here
+
+**Superseding note on top of the CODE1+CODE2 section below**: after that section was
+written, codex's CODE2 review (which had been running for ~3.5h across two genuine
+mid-review context-compaction stalls) finally returned its full verdict: FAIL against
+the pre-fold commit b227412, citing finding #1 (LD_AUDIT, already fixed by then) plus
+two findings that had only been DOCUMENTED as deferred in the plan, not code-fixed.
+Given codex's concrete reproductions and concrete fix suggestions, both were actually
+implemented (commit 6a6085b, per the owner's "resolve fully now" rule, not left
+deferred):
+- `sealedstore.GC` changed from `GC(liveDigests map[string]bool)` to
+  `GC(loadLive func() map[string]bool)`, called while `s.mu` is held — closes the
+  staleness window between "caller decided what's live" and "GC actually started."
+  Proven by `TestGCLoadLiveIsCalledUnderTheLock`.
+- `probe.Spec` gained `ExtraROBindIdentities` (device+inode pins, cheap — reuses
+  `guardROBind`'s existing `stat`), `sandbox.Compile` pins each ExtraROBinds entry's
+  identity via the new exported `probe.PinROBindIdentity` and folds it into
+  `policyHash`; `probe.Prepare` refuses a bind whose identity no longer matches at
+  Launch. Closes the directory-swap-after-Compile attack. Proven by
+  `TestLaunchRefusesROBindDirectorySwappedAfterCompile` — RED verified against the
+  pre-fix code via `git stash` before restoring the fix, GREEN after.
+
+`docs/PLAN-CODING-TRIO.md`'s residual-items section updated to mark both CLOSED
+(commit 8946c3a). Full repo suite green at every step.
+
+**A CODE3 narrow-scope re-verification round was dispatched to codex+kilo+agy (herdr
+panes w8:p2/p3/p4) to confirm these two fixes actually close codex's findings** — as of
+this HANDOFF update, all three were still genuinely working (confirmed via live pane
+reads, not just status flags) after several hours, none had produced a final verdict
+yet. **If you're resuming and want to check on it**: `herdr agent get w8:p2` (and p3,
+p4) for status; `herdr agent read w8:p2 --source recent-unwrapped --lines 300` to read
+whatever it's produced. If a verdict is sitting there, read and fold it (a FAIL needs a
+real fix per the owner's standing rules; PASS-with-notes just needs the notes triaged).
+If nothing has happened in a long time, per the pattern observed repeatedly this
+session, a `herdr agent send-keys w8:p2 esc` can unstick a session that appears frozen
+(this was needed twice with codex — each time it turned out to be mid
+context-compaction, not truly hung; give it a few minutes after the interrupt before
+concluding it's genuinely stuck). Given the extensive independent verification already
+done in-session (RED/GREEN proof reproducing codex's OWN attack scenarios, full suite
+green, fixes implementing codex's own suggested approach almost verbatim), this is a
+confirmation step, not a blocker for further coding-trio work — proceed with whatever's
+next and fold CODE3's verdict whenever it lands.
+
 ## RESUME 2026-09-09 (coding-trio Slice 0 partial: CODE1+CODE2 converged) — start here
 
 **PLAN-CODING-TRIO.md converged 2026-09-09** (6 plan-review rounds, codex+kilo+agy all
