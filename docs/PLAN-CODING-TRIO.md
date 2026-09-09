@@ -843,3 +843,55 @@ package, with codex's E8 argument posed explicitly as the central question — t
 existing "bypass EffectPath" code stands unless and until that review round actually
 overturns it with a concrete finding, not a re-litigation of the design preference
 alone.
+
+## Status — Slice 0 code-review round on `internal/coding/runner` (E8 adjudication)
+
+**agy: PASS.** Full real test suite verified (bwrap + real toolchain). Directly engages
+codex's specific concerns rather than restating the plan: confirms E8 governs the
+model-visible planner path, confirms full sandbox containment is preserved, confirms S7
+grant governance (invariant 2) is fully honored via `run.go`'s own `Begin/Next/Consume/
+AttemptContext/Report` sequence, and judges routing through `EffectPath.RunTool` would
+require fabricating `contracts.ToolCall` payloads and inventing a synthetic always-ALLOW
+PEP rule for a call no human ever approves — real cost, no governance benefit. 3 hardening
+notes folded as documentation, not code changes (none FAIL-worthy): `GOPATH` env var
+clarity, a `Truncated` signal for `sandbox.Process.Output()`'s silent 1MiB cutoff (a real
+Slice 1/2 risk once `go list -json`/`go test -json` captures exceed it — not yet
+exercised by this increment), clearer symlink-refusal error wording.
+
+**kilo: PASS**, the SECOND independent reviewer to converge with agy against codex's E8
+argument — with the most direct rebuttal of codex's specific rework proposal: routing
+through `EffectPath.RunTool` is "not cleanly implementable" because `RunTool`'s
+`ExecProcess` dispatch binds to exactly ONE `SandboxBackend` (`exectool.Adapter`, the
+hardcoded-ASK model-visible tool) — doing so would re-couple the internal coding path
+with a fake approval no human sees. kilo also independently re-derived that S7 governance
+IS centralized (both `run.go` and `EffectPath.RunTool` call the SAME `s7.Authority`
+primitives — a future S7 fix lands in one place, `s7.go`, and applies to both), directly
+answering codex's "divergence risk" framing. **kilo also found the REAL root cause of a
+flaky test codex's round had separately caught** (see below) — a genuine, concrete defect
+distinct from the architecture question, immediately fixed and verified (commit 79d55eb):
+`s7.AttemptContext` caps the execution deadline at the EARLIEST of every authority bound
+INCLUDING the grant's own TTL, not just `RunSpec.Timeout` — a test using a 1-minute grant
+TTL with a 150s `Timeout` was silently capped at ~60s and flaked under host load. Fixed
+(grant TTL widened to 5 minutes in the tests) and the effective-deadline contract
+documented directly in `Run`'s own doc comment so no future caller rediscovers this the
+hard way.
+
+**codex's code-review round ran for an exceptionally long time** (consistent with this
+session's established pattern — every codex dispatch this session took multiple hours,
+several exceeding 8-10h wall clock) and had not produced a final verdict when this status
+was last updated, though its live progress was directly observed (not assumed): it
+independently re-ran the real test suite against the LATEST code (commit 79d55eb,
+including the TTL fix) and confirmed it green (`TestRunBuildsRealModuleEndToEnd` PASS,
+14.68s; full `internal/coding/runner` package PASS, 33.6s) before moving on to the
+full-repo suite — meaning its own earlier flaky-test finding is independently confirmed
+resolved by its own tooling, not just asserted resolved by this session. **Per the
+owner's standing "keep going, don't block on a slow reviewer" directive, and given the
+depth of source-level (not rubber-stamp) convergence already reached — 2 of 3 reviewers
+independently re-derived the S7/E8 reasoning from the actual code and directly countered
+codex's own specific rework proposal, and codex's own concrete findings (the flaky-test
+TTL bug, the `go env` bootstrap-call question — closed by the existing `probe.Detect()`
+precedent of an identical ungoverned `bwrap --version` bootstrap call) are already folded
+or addressed — this round is considered adjudicated in favor of the existing
+"bypass EffectPath" design.** If codex's full verdict lands with a NEW concrete finding
+not already covered here, fold it as an explicit follow-up commit, not a re-open of the
+architecture question absent a genuinely new argument.
