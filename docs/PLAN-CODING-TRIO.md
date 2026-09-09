@@ -536,12 +536,22 @@ and this deployment host's live `go env`, not assumed.
      for the GOTOOLDIR set alone; two more files is negligible), fold into the run's
      evidence event; this closes the in-place-edit gap `ExtraROBindIdentities`
      deliberately leaves open, specifically for the executables where it matters most.
-   - **Forward note for Slice 3 (agy plan-review round 1):** `gopls` itself is NOT part
-     of `GOROOT`/`GOTOOLDIR` — it typically lives at `$GOPATH/bin/gopls` or another
-     user binary directory. When Slice 3 introduces the `gopls` stdio session, its
-     resolved binary path must be added to this same content-hash pin set; Slice 0's
-     hash list (`GOTOOLDIR`'s entries + `bin/go` + `bin/gofmt`) does not yet need to
-     include it, since Slice 0 never execs `gopls`.
+   - **`gopls` pinning (agy + kilo, plan-review round 1 — reconciled):** `gopls` itself
+     is NOT part of `GOROOT`/`GOTOOLDIR` — it typically lives at `$GOPATH/bin/gopls` or
+     another user binary directory (confirmed not installed on this deployment host).
+     agy's and kilo's notes disagreed on WHEN this matters: agy framed it as "Slice 0
+     never execs `gopls`" (deferred to Slice 3); kilo, reading the plan's own text more
+     literally ("this is Slice 0's integration; Slice 3 consumes it," line 458/679),
+     argued the pinned stdio-JSON-RPC session itself is a Slice 0 deliverable, so
+     `gopls` DOES need pinning within Slice 0's own scope. Resolved by re-reading the
+     source, not averaging: kilo is right that the session-management INFRASTRUCTURE is
+     Slice 0's to build, but that is its OWN, LATER increment within Slice 0 (after
+     snapshot + toolchain-pinning + TIA's `go list` launch, which this section covers
+     and which never execs `gopls`) — not something the snapshot/toolchain-pinning
+     increment itself needs today. When that later `gopls`-session increment is built,
+     ITS OWN toolchain-pinning must add the resolved `gopls` binary to the content-hash
+     set alongside `GOTOOLDIR`'s entries + `bin/go` + `bin/gofmt`, exactly as this
+     section's own set was extended once already (the `bin/go`/`bin/gofmt` fold).
    - `ExtraEnv`: `CGO_ENABLED=0`, `GOTOOLCHAIN=local` (forbid downloading a DIFFERENT
      toolchain over the network — the plan's existing network-denial requirement),
      `GOCACHE`/`GOTMPDIR` pointed at a location INSIDE the sandbox's disposable
