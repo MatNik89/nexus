@@ -115,8 +115,25 @@ type Spec struct {
 	// Unlike the memfd-pinned shared-library closure, these are NOT
 	// individually content-hashed — a toolchain install is large and
 	// operator-controlled, not per-request content; only its identity
-	// (the resolved canonical path) is verified, not its bytes.
+	// (the resolved canonical path, AND — when ExtraROBindIdentities pins
+	// it — the resolved directory's device+inode) is verified, not its
+	// bytes.
 	ExtraROBinds []string
+	// ExtraROBindIdentities, keyed by an ExtraROBinds entry's CANONICAL
+	// (EvalSymlinks-resolved) path, pins that path's device+inode as
+	// observed at an earlier point (sandbox.Compile) — Prepare, running
+	// at Launch, refuses the bind if the SAME path now resolves to a
+	// DIFFERENT directory (code-review CODE2 codex finding #2,
+	// reproduced: a directory renamed away and replaced at the same path
+	// between Compile and Launch served different bytes under an
+	// unchanged policy). Optional: a nil map (or a path absent from it)
+	// performs no identity check, so a caller that never runs through
+	// sandbox.Compile (e.g. Prepare called directly in tests) is
+	// unaffected. This is a cheap, bounded SWAP detector — it does not,
+	// and cannot without unbounded cost, detect an in-place edit of files
+	// WITHIN an unchanged directory; that remains the toolchain-pinning
+	// caller's own responsibility (docs/PLAN-CODING-TRIO.md Slice 0).
+	ExtraROBindIdentities map[string]ROBindIdentity
 	// ExtraEnv sets additional environment variables beyond the fixed
 	// PATH=/nowhere + LD_LIBRARY_PATH baseline (still --clearenv first —
 	// this ADDS named variables, it does not restore the ambient
@@ -567,35 +584,55 @@ func denylistedROBindRoot(canon string) bool {
 	return false
 }
 
-func guardROBind(dir string) (string, error) {
+// ROBindIdentity is an ExtraROBinds directory's device+inode, cheap to
+// capture (one stat already performed by guardROBind) and cheap to
+// compare — a bounded, generic defense against a directory SWAPPED at
+// the same path, distinct from (and much cheaper than) hashing the
+// directory's entire contents. See ExtraROBindIdentities' doc comment.
+type ROBindIdentity struct {
+	Dev, Ino uint64
+}
+
+// PinROBindIdentity resolves and validates dir exactly as guardROBind
+// does (same canonicalization, denylist, ownership, and permission
+// checks — a Compile-time caller must be refused for any reason a later
+// Launch-time Prepare call would refuse it), and additionally returns
+// its ROBindIdentity for pinning into a policy compiled now and launched
+// later.
+func PinROBindIdentity(dir string) (canon string, identity ROBindIdentity, err error) {
+	canon, identity, err = guardROBind(dir)
+	return canon, identity, err
+}
+
+func guardROBind(dir string) (string, ROBindIdentity, error) {
 	canon, err := filepath.EvalSymlinks(filepath.Clean(dir))
 	if err != nil {
-		return "", fmt.Errorf("ro-bind %s: %w", dir, err)
+		return "", ROBindIdentity{}, fmt.Errorf("ro-bind %s: %w", dir, err)
 	}
 	if !filepath.IsAbs(canon) {
-		return "", fmt.Errorf("ro-bind %s: not an absolute path (fail closed)", dir)
+		return "", ROBindIdentity{}, fmt.Errorf("ro-bind %s: not an absolute path (fail closed)", dir)
 	}
 	if denylistedROBindRoot(canon) {
-		return "", fmt.Errorf("ro-bind %s: a well-known system directory may never be exposed (fail closed)", canon)
+		return "", ROBindIdentity{}, fmt.Errorf("ro-bind %s: a well-known system directory may never be exposed (fail closed)", canon)
 	}
 	st, err := os.Stat(canon)
 	if err != nil {
-		return "", fmt.Errorf("ro-bind %s: %w", canon, err)
+		return "", ROBindIdentity{}, fmt.Errorf("ro-bind %s: %w", canon, err)
 	}
 	if !st.IsDir() {
-		return "", fmt.Errorf("ro-bind %s: not a directory (fail closed)", canon)
+		return "", ROBindIdentity{}, fmt.Errorf("ro-bind %s: not a directory (fail closed)", canon)
 	}
 	sys, ok := st.Sys().(*syscall.Stat_t)
 	if !ok {
-		return "", fmt.Errorf("ro-bind %s: cannot determine ownership (fail closed)", canon)
+		return "", ROBindIdentity{}, fmt.Errorf("ro-bind %s: cannot determine ownership (fail closed)", canon)
 	}
 	if int(sys.Uid) != os.Geteuid() && sys.Uid != 0 {
-		return "", fmt.Errorf("ro-bind %s: owned by neither the current user nor root (fail closed)", canon)
+		return "", ROBindIdentity{}, fmt.Errorf("ro-bind %s: owned by neither the current user nor root (fail closed)", canon)
 	}
 	if st.Mode().Perm()&0o022 != 0 {
-		return "", fmt.Errorf("ro-bind %s: group/world-writable (%o) — not a trusted read-only tree (fail closed)", canon, st.Mode().Perm())
+		return "", ROBindIdentity{}, fmt.Errorf("ro-bind %s: group/world-writable (%o) — not a trusted read-only tree (fail closed)", canon, st.Mode().Perm())
 	}
-	return canon, nil
+	return canon, ROBindIdentity{Dev: uint64(sys.Dev), Ino: sys.Ino}, nil
 }
 
 // validEnvKey rejects an environment key that could confuse the child
@@ -761,7 +798,7 @@ func Prepare(av Availability, spec Spec) (*Handle, error) {
 		sort.Strings(binds)
 		seen := map[string]bool{}
 		for _, b := range binds {
-			canon, err := guardROBind(b)
+			canon, identity, err := guardROBind(b)
 			if err != nil {
 				return fail(err)
 			}
@@ -769,6 +806,9 @@ func Prepare(av Availability, spec Spec) (*Handle, error) {
 				continue // de-duplicate after canonicalization
 			}
 			seen[canon] = true
+			if pinned, ok := spec.ExtraROBindIdentities[canon]; ok && pinned != identity {
+				return fail(fmt.Errorf("ro-bind %s: directory identity changed since it was compiled (dev/ino %v now, %v pinned) — possible swap attack (fail closed)", canon, identity, pinned))
+			}
 			args = append(args, "--ro-bind", canon, canon)
 		}
 	}

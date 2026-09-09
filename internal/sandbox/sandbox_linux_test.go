@@ -492,6 +492,46 @@ func TestPolicyHashCanonicalizesROBindSpelling(t *testing.T) {
 	}
 }
 
+// Detector (code-review CODE2 codex finding #2, reproduced): a directory
+// bound via ExtraROBinds and renamed away then replaced at the SAME path
+// between Compile and Launch must be refused, not silently served — the
+// resolved path alone is not a stable identity across time, only the
+// (device, inode) pair is.
+func TestLaunchRefusesROBindDirectorySwappedAfterCompile(t *testing.T) {
+	b, rep := backend(t)
+	hp := helperPath(t)
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "toolchain")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	canary := filepath.Join(dir, "canary")
+	if err := os.WriteFile(canary, []byte("BEFORE"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pol, err := b.Compile(ctxT(), Spec{
+		Target: hp, Args: []string{"readfile", canary}, WorkDir: wdir(t),
+		ExtraROBinds: []string{dir},
+	}, rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := dir + ".old"
+	if err := os.Rename(dir, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	canary2 := filepath.Join(dir, "canary")
+	if err := os.WriteFile(canary2, []byte("AFTER"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Launch(ctxT(), pol); err == nil {
+		t.Fatal("Launch accepted an ExtraROBinds directory swapped at the same path after Compile")
+	}
+}
+
 // Detector (code-review CODE1 codex finding #2): CompiledPolicy must not
 // alias the caller's Spec — a post-Compile, pre-Launch mutation of the
 // caller's own ExtraEnv/Args must NOT change what actually runs, since

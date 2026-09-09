@@ -65,7 +65,14 @@ type CompiledPolicy struct {
 	probeHash   string
 	targetHash  string
 	closurePins map[string]string
-	policyHash  string
+	// roBindIdentities pins each ExtraROBinds entry's device+inode, as
+	// observed at Compile time, keyed by canonical path — Launch passes
+	// this through to probe.Prepare so a directory swapped at the same
+	// path between Compile and Launch is refused (code-review CODE2
+	// codex finding #2; see probe.Spec.ExtraROBindIdentities' doc
+	// comment for what this does and does not detect).
+	roBindIdentities map[string]probe.ROBindIdentity
+	policyHash       string
 }
 
 // PolicyHash is the policy's identity digest (target, argv, workdir,
@@ -237,10 +244,24 @@ func (b *Bwrap) Compile(ctx context.Context, spec Spec, report ProbeReport) (Com
 	if err != nil {
 		return CompiledPolicy{}, fmt.Errorf("sandbox: %w", err)
 	}
+	// Pin each ExtraROBinds entry's device+inode NOW (code-review CODE2
+	// codex finding #2) — using probe's own guard/canonicalization, so
+	// Compile refuses anything Launch's probe.Prepare would refuse
+	// anyway, rather than deferring that failure. Launch passes these
+	// pins through so a directory swapped at the same path between
+	// Compile and Launch is refused (probe.Spec.ExtraROBindIdentities).
+	roBindIdentities := make(map[string]probe.ROBindIdentity, len(spec.ExtraROBinds))
+	for _, b := range spec.ExtraROBinds {
+		canon, identity, err := probe.PinROBindIdentity(b)
+		if err != nil {
+			return CompiledPolicy{}, fmt.Errorf("sandbox: %w", err)
+		}
+		roBindIdentities[canon] = identity
+	}
 	sealed := digest("policy", spec.Target, targetHash, closureDigest(pins),
 		strings.Join(spec.Args, "\x00"),
 		spec.WorkDir, spec.Timeout.String(), report.ProbeHash,
-		roDigest, envDigest(spec.ExtraEnv))
+		roDigest, envDigest(spec.ExtraEnv), roBindIdentitiesDigest(roBindIdentities))
 	// Deep-copy spec's slice/map fields (code-review CODE1 codex finding
 	// #2): a shallow `spec: spec` here would alias the caller's Args/
 	// ExtraROBinds/ExtraEnv — a post-Compile, pre-Launch mutation by the
@@ -248,12 +269,30 @@ func (b *Bwrap) Compile(ctx context.Context, spec Spec, report ProbeReport) (Com
 	// policyHash above still reflects the pre-mutation values, breaking
 	// the attestation binding between the two.
 	return CompiledPolicy{
-		spec:        cloneSpec(spec),
-		probeHash:   report.ProbeHash,
-		targetHash:  targetHash,
-		closurePins: pins,
-		policyHash:  sealed,
+		spec:             cloneSpec(spec),
+		probeHash:        report.ProbeHash,
+		targetHash:       targetHash,
+		closurePins:      pins,
+		roBindIdentities: roBindIdentities,
+		policyHash:       sealed,
 	}, nil
+}
+
+// roBindIdentitiesDigest folds a set of pinned directory identities into
+// one deterministic digest (sorted by canonical path — map iteration is
+// randomized in Go).
+func roBindIdentitiesDigest(identities map[string]probe.ROBindIdentity) string {
+	paths := make([]string, 0, len(identities))
+	for p := range identities {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	parts := []string{"robind-identities"}
+	for _, p := range paths {
+		id := identities[p]
+		parts = append(parts, fmt.Sprintf("%s\x00%d\x00%d", p, id.Dev, id.Ino))
+	}
+	return digest(parts...)
 }
 
 // cloneSpec deep-copies the slice/map fields of Spec so a CompiledPolicy
@@ -383,6 +422,7 @@ func (b *Bwrap) Launch(ctx context.Context, policy CompiledPolicy) (*Process, er
 		Target: policy.spec.Target, Args: policy.spec.Args,
 		WorkDir: policy.spec.WorkDir, Timeout: timeout,
 		ExtraROBinds: policy.spec.ExtraROBinds, ExtraEnv: policy.spec.ExtraEnv,
+		ExtraROBindIdentities: policy.roBindIdentities,
 	})
 	if err != nil {
 		return nil, err

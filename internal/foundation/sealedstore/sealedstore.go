@@ -187,17 +187,32 @@ func (s *Store) Get(digest string) ([]byte, error) {
 // s.mu until GC's critical section ends. Production never sets it.
 var gcPauseHook func()
 
-// GC removes every stored artifact whose digest is neither in liveDigests
-// (the caller's mark pass — every digest still referenced by a durable
-// journal entry) nor currently pinned (an in-flight Put awaiting its
-// journal reference). Mark-and-sweep in one pass under the SAME lock Put
-// holds for its whole operation (see Put's doc comment), never per-file
-// ad hoc deletion, so an artifact referenced by more than one record is
-// never removed while any reference to it still lives.
-func (s *Store) GC(liveDigests map[string]bool) ([]string, error) {
+// GC removes every stored artifact whose digest is neither live (per
+// loadLive, the caller's mark pass — every digest still referenced by a
+// durable journal entry) nor currently pinned (an in-flight Put awaiting
+// its journal reference). Mark-and-sweep in one pass under the SAME lock
+// Put holds for its whole operation (see Put's doc comment), never
+// per-file ad hoc deletion, so an artifact referenced by more than one
+// record is never removed while any reference to it still lives.
+//
+// loadLive is called WHILE s.mu IS HELD, not before GC is invoked
+// (code-review CODE2 codex finding #3, reproduced: GC(liveDigests
+// map[string]bool) took an already-computed snapshot as a plain
+// argument — a concurrent Put that pinned, got its journal reference
+// committed, and released its pin entirely BEFORE GC even started could
+// still be deleted by a GC call whose caller had captured liveDigests
+// before that commit). Calling loadLive under the lock does not, by
+// itself, make ANY possible liveDigests source race-free — that still
+// requires loadLive to perform a FRESH read of whatever durably records
+// references (the journal) on every call, never a memoized/cached
+// snapshot — but it removes the window between "the caller decided what
+// is live" and "GC actually started," which is the part sealedstore
+// itself can control.
+func (s *Store) GC(loadLive func() map[string]bool) ([]string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	liveDigests := loadLive()
 	names, err := s.listNames()
 	if err != nil {
 		return nil, fmt.Errorf("sealedstore: gc: %w", err)

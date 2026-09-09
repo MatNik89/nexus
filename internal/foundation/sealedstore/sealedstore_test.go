@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -161,7 +162,7 @@ func TestGCMarkAndSweep(t *testing.T) {
 	}
 	defer pPinned.Release() // still pinned during GC — must survive
 
-	removed, err := s.GC(map[string]bool{dLive: true})
+	removed, err := s.GC(func() map[string]bool { return map[string]bool{dLive: true} })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +215,7 @@ func TestGCAndPutSerializeUnderOneCriticalSection(t *testing.T) {
 
 	gcDone := make(chan error, 1)
 	go func() {
-		_, gerr := s.GC(map[string]bool{})
+		_, gerr := s.GC(func() map[string]bool { return map[string]bool{} })
 		gcDone <- gerr
 	}()
 	<-gcEntered // GC is inside its critical section, paused mid-operation
@@ -241,6 +242,48 @@ func TestGCAndPutSerializeUnderOneCriticalSection(t *testing.T) {
 	}
 	if err := <-putDone; err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Detector (code-review CODE2 codex finding #3): loadLive is called
+// WHILE s.mu is held, not before GC starts — so a caller whose "live"
+// source is a live reference to a value that changes between "GC is
+// requested" and "GC actually runs" sees the value AS OF the sweep, not
+// as of some earlier point. Simulates codex's exact reproduced failing
+// sequence (mark computed BEFORE Put/commit/Release, GC only entering
+// its critical section AFTER) but with loadLive reading a shared
+// variable the caller updates at "commit time" — the fix is that GC
+// reads it live, under the lock, not a plain pre-computed argument.
+func TestGCLoadLiveIsCalledUnderTheLock(t *testing.T) {
+	s := open(t)
+	var mu sync.Mutex
+	live := map[string]bool{} // stands in for "what the journal currently says is live"
+
+	d, pin, err := s.Put([]byte("committed after mark was requested"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate: journal reference commits, THEN the publication pin is
+	// released — exactly the ordering the Pin doc comment requires.
+	mu.Lock()
+	live[d] = true
+	mu.Unlock()
+	pin.Release()
+
+	loadLive := func() map[string]bool {
+		mu.Lock()
+		defer mu.Unlock()
+		out := make(map[string]bool, len(live))
+		for k := range live {
+			out[k] = true
+		}
+		return out
+	}
+	if _, err := s.GC(loadLive); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Get(d); err != nil {
+		t.Fatalf("GC deleted an artifact that was live by the time loadLive ran under the lock: %v", err)
 	}
 }
 
