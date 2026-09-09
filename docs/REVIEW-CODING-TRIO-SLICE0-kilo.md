@@ -1,57 +1,63 @@
-# Review of 6a6085b — CODE3 narrow re-verification (two findings only)
+# Review of 1f33da2 — CODE4 narrow re-verification (one bypass fix)
 
-- **Reviewed**: commit `6a6085b` (`git diff b227412..6a6085b`) on `main`
-- **Verdict**: PASS — both findings are closed, nothing new.
+- **Reviewed**: commit `1f33da2` (`git diff 6a6085b..1f33da2`) on `main`
+- **Verdict**: PASS — the symlink-retarget bypass is closed, nothing new.
 
 `go build ./...`, `go vet ./...`, and `go test -count=1 ./internal/...` all green.
-`TestLaunchRefusesROBindDirectorySwappedAfterCompile` (real bwrap, 1.2s) and the full
-`sealedstore` suite pass.
+Both new detectors pass against the real bwrap backend.
 
-## Finding #1 — ExtraROBinds swap (path-pinned but not identity-pinned) — CLOSED
+## Fix verification (the three asks)
 
-`guardROBind` now returns `(canon, ROBindIdentity{Dev,Ino}, err)` (`probe.go:587-635`),
-and `PinROBindIdentity` is `guardROBind`'s canonicalize+denylist+ownership+perm check plus
-the dev/inode capture (`probe.go:592-594`). `sandbox.Compile` pins each ExtraROBinds entry
-at compile time and folds `roBindIdentitiesDigest` (sorted by canonical path, dev/inode)
-into `policyHash` (`sandbox.go:244-276,296-312`); the pins are threaded through
-`Spec.ExtraROBindIdentities` into `Launch` (`sandbox.go:425`) and `Prepare`, which re-runs
-`guardROBind` at launch time and refuses when the same canonical path now resolves to a
-different dev/inode (`probe.go:806-809`). The policyHash therefore binds both the path and
-the identity, and the identity is re-verified at the actual launch.
+### 1. The bypass is closed for every case, and no legitimate caller is wrongly refused
 
-The test is non-vacuous and exercises the real attack: it compiles with `ExtraROBinds:
-[dir]` (canary "BEFORE"), then `os.Rename(dir, dir+".old")` and `os.Mkdir(dir)` + writes
-"AFTER", and asserts `Launch` fails (`sandbox_linux_test.go`). The old identity-less code
-would have launched and read "AFTER".
+The old check `if pinned, ok := ...; ok && pinned != identity` failed OPEN on a map miss.
+The new logic (`probe.go:823-832`) is:
 
-## Finding #2 — sealedstore.GC stale liveDigests — CLOSED
+```go
+if spec.ExtraROBindIdentities != nil {
+    pinned, ok := spec.ExtraROBindIdentities[canon]
+    if !ok {
+        return fail(... "no identity pin found for this resolved path — possible symlink-retarget attack since compile")
+    }
+    if pinned != identity {
+        return fail(... "directory identity changed since it was compiled")
+    }
+}
+```
 
-`GC` now takes `loadLive func() map[string]bool` and invokes it **while `s.mu` is held**
-(`sealedstore.go:211-219`), so the "caller decided what is live" → "GC actually started"
-window is removed — the part sealedstore itself controls. The doc comment is honest about
-what remains the caller's job: `loadLive` must perform a FRESH read of the durable
-reference source (the journal) on every call, never a memoized snapshot — a discipline
-sealedstore cannot enforce, and correctly placed on the caller. The pin still covers the
-`[Put → journal-commit → Release]` window, and the post-Release reference is now read
-atomically with the sweep.
+Both the symlink-retarget (resolves to a *different* canonical path → `!ok` → refuse) and
+the plain directory swap (same canonical path, different dev/inode → `pinned != identity` →
+refuse) are now fail-closed. The `!= nil` gate is the correct discriminator: I grepped every
+`ExtraROBindIdentities` construction site — the ONLY producer is `sandbox.Compile`
+(`sandbox.go:252`, threaded at `:425`), which pins every declared `ExtraROBinds` entry, so a
+non-nil map from Compile always has one entry per entry. A direct `probe.Prepare` caller
+(only tests today) passes the nil zero value and correctly skips the check. A non-nil-but-empty
+map alongside non-empty `ExtraROBinds` is an inconsistent Spec that can only arise from a bug
+or a hand-built map — refusing it is the right fail-closed behavior, and nothing legitimate
+constructs it.
 
-The test `TestGCLoadLiveIsCalledUnderTheLock` simulates exactly the
-Put → commit (`live[d]=true`) → `Release` sequence and asserts the artifact survives a
-`GC(loadLive)` whose `loadLive` reads fresh. It is non-vacuous against the old
-`GC(map[string]bool)` API (a pre-committed snapshot would have deleted it).
+### 2. The new detector reproduces the original attack
+
+`TestLaunchRefusesROBindSymlinkRetargetedAfterCompile` compiles with `ExtraROBinds: [link]`
+where `link → beforeDir`, pins `beforeDir`'s identity, then retargets `link → afterDir` and
+asserts `Launch` refuses. The target's arg is deliberately `afterDir/canary` (readable only if
+the bind is — wrongly — `afterDir`), so the OLD fail-open code would have launched, bound
+`afterDir`, and returned "AFTER" (the test's `t.Fatalf("exposed replacement bytes")`). It is a
+faithful reproduction of the bypass. PASS (1.45s, real bwrap).
+
+### 3. `TestGCLoadLiveRunsWhileLockIsHeld` proves its name
+
+`loadLive` blocks on a channel; while it is blocked inside `GC`'s critical section, a
+concurrent `Put` is asserted to NOT complete within 50 ms (it blocks on `s.mu`), then
+`resumeLoadLive` releases and both finish. This directly distinguishes "loadLive is called
+under `s.mu`" from "loadLive is called just before `s.mu.Lock()`" — the mutation-sensitivity
+gap the earlier `TestGCLoadLiveIsCalledUnderTheLock` left open. PASS.
 
 ## Notes (not FAIL reasons)
 
-1. `TestGCLoadLiveIsCalledUnderTheLock` is slightly misnamed — it directly proves "a fresh
-   `loadLive` is honored", not literally "called under the lock"; the lock placement is
-   established by code inspection plus `TestGCAndPutSerializeUnderOneCriticalSection`'s
-   `gcPauseHook`. Harmless.
-2. The `loadLive` doc comment should add "must not call back into the Store (would deadlock
-   under `s.mu`)" — the intended journal-scan caller doesn't re-enter, but a future caller
-   might.
-3. `PinROBindIdentity` is a bounded swap detector (dev+inode, not content); an in-place edit
-   of files *within* an unchanged directory is not detected. This is correctly scoped in the
-   `ExtraROBindIdentities` doc comment as the toolchain-pinning caller's responsibility, not
-   a defect.
+- `TestGCLoadLiveRunsWhileLockIsHeld` uses a 50 ms timing assertion (`time.After`), which is a
+  mild flake risk on an extremely loaded CI, though the blocked-channel design makes a false
+  pass structurally near-impossible (a false pass requires Put to wrongly acquire `s.mu` while
+  GC holds it, which is the very bug under test). Acceptable.
 
 VERDICT: PASS
