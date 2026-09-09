@@ -1031,3 +1031,44 @@ a real hardening gap for Slice 3's real-repository scope, documented, not yet bu
 **Next step before Slice 0's gopls piece is called fully done**: dispatch a re-verification
 round (codex+agy) confirming the 3 HIGH + 1 MEDIUM fixes are correct and asking explicit
 agreement that the two open items are scoped-out-for-now, not launch-blocking.
+
+## Status 2026-09-10 — re-verification round 2: codex FAIL again, real gap found (0204465)
+
+**agy PASS** on the d691f48 fold (re-verified all 4 fixes directly against code+tests,
+ran the full suite itself). **codex FAIL again** — genuinely, not a rubber-stamp
+re-litigation: it stress-ran the new cancellation-classification detector at `-count=10`
+and found the SAME 1ms self-deadline produces TWO DIFFERENT S7 outcomes depending on
+unrelated scheduling — CANCELLED if the deadline fires after `LaunchInteractive` returns
+(the branch fixed in round 1), FailedTerminal if it fires DURING `LaunchInteractive`
+itself (an entirely different branch, never touched in round 1, which never checked
+`context.Cause(execCtx)`). Reproduced 2 of 10 runs on codex's environment.
+
+**Verified this is real and pre-existing, not new**: `run.go`'s own `Run()` has the
+byte-for-byte identical gap in its own `Launch`-error branch — this was already merged
+and CODE1-4-reviewed before this segment, just never exercised by a test with a tight
+enough deadline to expose the race. Fixed BOTH `run.go` and `gopls.go`'s launch-error
+branches (`0204465`) to check `context.Cause(execCtx)` before classifying, exactly
+mirroring the already-correct post-Wait branch.
+
+**Honesty note, not glossed over**: on this host, the launch-time race did not reproduce
+in 120 combined test iterations (bwrap launch preparation appears to consistently finish
+under a 1ms deadline here) — this specific line's regression-catching power rests on
+codex's cross-environment reproduction, not a local RED/GREEN cycle I could perform
+myself. The fix is correct by construction (identical to the sibling branch already
+RED/GREEN-proven), but this is a genuine confidence gap, documented rather than
+overclaimed. `TestRunGoplsRenameClassifiesOwnDeadlineAsCancelled` now iterates 20× and
+asserts the AUTHORITATIVE `s7.Authority.State`, not just the error string, to maximize the
+chance of catching either branch on whichever environment runs it.
+
+**Lesson for this session's memory**: two rounds in a row, codex found a REAL, concrete,
+reproducible defect that agy's PASS missed — this is now the fourth time this session
+(CODE2, CODE3, the run.go flaky-test root cause, and now this) codex's slower, deeper
+adversarial pass caught something a faster reviewer didn't. Continuing to treat codex's
+FAIL as authoritative over agy's PASS when codex's finding is independently, directly
+verifiable against the code — never average, never let "1 PASS + kilo unavailable = ship
+it" become the default just because the round is inconvenient to keep re-running.
+
+Dispatching a third re-verification round now (codex+agy) — if this closes clean, Slice
+0's gopls piece is considered done for its current proof-of-concept scope (single trivial
+module), with the 2 deliberately-deferred items (PATH content-hash pinning,
+server-initiated-request handling) tracked as their own future increments.
