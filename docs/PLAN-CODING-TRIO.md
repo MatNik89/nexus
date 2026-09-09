@@ -507,12 +507,19 @@ and this deployment host's live `go env`, not assumed.
    GOMODCACHE; codex's parallel research found a second `~/.local/go` install on this
    same host as a concrete example of the non-toolchain-managed case) — the runner must
    resolve paths from `go env` output, never hardcode either layout.
-   - **Bind GOMODCACHE (or the resolved GOROOT, if outside GOMODCACHE) via
-     `ExtraROBinds`** — covers stdlib source and downloaded module dependencies.
-     Directory-level identity pinning (`ExtraROBindIdentities`, just converged) is
-     sufficient here: this is a broad, potentially multi-gigabyte tree where full
-     content hashing is unbounded, and the residual gap (an in-place file edit within
-     an unchanged directory) is accepted as the caller's own bounded risk per that
+   - **Bind BOTH `go env GOROOT` and `go env GOMODCACHE` via `ExtraROBinds`**, always,
+     not an either/or decision at implementation time: on a toolchain-managed install
+     (this deployment host — kilo independently confirmed `GOTOOLDIR ⊂ GOROOT ⊂
+     GOMODCACHE` here, so binding both collapses to one effective bind after
+     `Prepare`'s existing canonical-path de-duplication) these nest; on a standalone
+     Go install (codex's parallel research independently found exactly this case on
+     this same host, a separate `~/.local/go`) they don't, and BOTH binds are needed —
+     covers stdlib source and downloaded module dependencies either way, with zero
+     runtime branching. Directory-level identity pinning (`ExtraROBindIdentities`,
+     just converged) is sufficient here: this is a broad, potentially multi-gigabyte
+     tree where full content hashing is unbounded, and the residual gap (an in-place
+     file edit within an unchanged directory) is accepted as the caller's own bounded
+     risk per that
      primitive's documented scope.
    - **Separately content-hash-pin `GOTOOLDIR` specifically** (its own, narrower check,
      owned by `internal/coding/runner`, NOT a probe/sandbox primitive): `GOTOOLDIR`
@@ -564,13 +571,27 @@ and this deployment host's live `go env`, not assumed.
    (PEP's ASK-approval model doesn't apply to a call a human never sees per-attempt;
    coarser policy questions like "is the coding capability enabled at all" belong at
    capability-activation time, matching the existing HARDQ B9 fail-closed-Resolve
-   pattern, not at every subprocess call). **This is a genuine revision of an
-   already-converged decision and must be argued explicitly in the next review round,
-   not adopted by default** — if codex/kilo's still-pending parallel research disagrees,
-   or the review round finds a governance reason I'm missing (audit consistency,
-   profile-scoping enforcement point, something else), the original "route through
-   EffectPath" text stands and this package instead implements a *thin*
-   `effectpath.SandboxBackend`-conformant wrapper solely for coding-runner `ToolID`s.
+   pattern, not at every subprocess call). **Bypassing `EffectPath` does NOT mean
+   bypassing S7** — invariant 2 (every dispatched effect attempt needs a grant) still
+   applies: kilo's independently-dispatched parallel research (converging with this
+   conclusion) specifies the runner calls `s7.Begin(op, target, s7.Policy{Durable:
+   false}) → Next → sandbox.Compile/Launch → Report(Succeeded/Failed)` directly against
+   `internal/kernel/s7`, mirroring exactly how `loop.go:317`'s existing
+   `l.grants.Issue(op, target)` already does for ordinary tool attempts — S7 governance
+   without EffectPath's PEP/ToolCall wrapper around it. Also per kilo's research: the
+   audit-consistency concern this section flags as a possible reason to keep
+   `EffectPath` is served instead by the runner emitting its own closed `coding.run`
+   journal event vocabulary (outcome, snapshot digest, S7 operation/attempt ids,
+   toolchain pin digests), mirroring how `channel`/`s7` already own their own event
+   types rather than borrowing the model-visible tool-call event shape. **This is a
+   genuine revision of an already-converged decision and must be argued explicitly in
+   the next review round, not adopted by default** — if codex's still-pending parallel
+   research disagrees, or the review round finds a governance reason missed here
+   (agy and kilo's independent research both converge on this conclusion; codex's
+   research was still running when this was drafted — fold its verdict before
+   finalizing), the original "route through EffectPath" text stands and this package
+   instead implements a *thin* `effectpath.SandboxBackend`-conformant wrapper solely
+   for coding-runner `ToolID`s.
 
 5. **Package boundary (tentative, pending review):** `internal/coding/runner` owns:
    snapshot creation (§3), toolchain resolution + pinning (§2), the
