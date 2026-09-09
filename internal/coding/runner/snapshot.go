@@ -78,6 +78,23 @@ func CreateSnapshot(sourceDir string) (snap Snapshot, cleanup func(), err error)
 	}
 	cleanup = func() { os.RemoveAll(dstDir) }
 
+	digest, err := copyTreeInto(sourceDir, dstDir)
+	if err != nil {
+		cleanup()
+		return Snapshot{}, nil, err
+	}
+	return Snapshot{Dir: dstDir, Digest: digest}, cleanup, nil
+}
+
+// copyTreeInto copies sourceDir's contents into dstDir (which the caller
+// must already have created, private and empty) and returns the tree's
+// content digest. Split out from CreateSnapshot so a caller that needs
+// the snapshot to live at a SPECIFIC path — e.g. as a sibling of a
+// separate GOCACHE directory, both inside one shared sandbox WorkDir,
+// since sandbox.Spec has only one WorkDir bind point — can lay out that
+// parent directory itself instead of accepting CreateSnapshot's own
+// randomly-named top-level temp dir.
+func copyTreeInto(sourceDir, dstDir string) (digest string, err error) {
 	var entries []string // "relpath\x00hexdigest", sorted before hashing
 	var fileCount int
 	var totalBytes int64
@@ -160,8 +177,7 @@ func CreateSnapshot(sourceDir string) (snap Snapshot, cleanup func(), err error)
 		return nil
 	})
 	if walkErr != nil {
-		cleanup()
-		return Snapshot{}, nil, walkErr
+		return "", walkErr
 	}
 
 	sort.Strings(entries)
@@ -170,7 +186,7 @@ func CreateSnapshot(sourceDir string) (snap Snapshot, cleanup func(), err error)
 		io.WriteString(h, e)
 		io.WriteString(h, "\n")
 	}
-	return Snapshot{Dir: dstDir, Digest: hex.EncodeToString(h.Sum(nil))}, cleanup, nil
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // openRegularNoFollow opens path for reading, refusing outright (never

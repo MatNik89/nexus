@@ -556,7 +556,28 @@ and this deployment host's live `go env`, not assumed.
      toolchain over the network — the plan's existing network-denial requirement),
      `GOCACHE`/`GOTMPDIR` pointed at a location INSIDE the sandbox's disposable
      `WorkDir`, never the snapshot's source tree (already required above) and never a
-     host path outside the sandbox closure.
+     host path outside the sandbox closure. **Implementation correction, verified by a
+     real end-to-end run**: `sandbox.Spec` has exactly ONE `WorkDir` bind point (mapped
+     to `/work` inside the sandbox) — the snapshot and the GOCACHE area must therefore
+     be laid out as SIBLING subdirectories under that ONE bound root (e.g. `/work/src`
+     for the snapshot, `/work/gocache` for the cache), and `GOCACHE`/`GOTMPDIR` must be
+     set to their IN-SANDBOX paths (`/work/gocache`), never the HOST paths used to
+     create them — the sandboxed process cannot resolve a host path it was never bound
+     into. An earlier draft of this implementation set the host path directly and
+     failed with `go: creating work dir: stat ...: no such file or directory` on the
+     first real run; caught immediately by testing against the actual toolchain, not
+     assumed correct from the design alone.
+   - **Operational precondition, discovered on this deployment host**: `guardROBind`
+     correctly refuses a group/world-writable `ExtraROBinds` target (`probe.go`'s
+     `0o022` check) — this deployment host's own `GOMODCACHE`
+     (`/home/matej/go/pkg/mod`) was actually `0775` (group-writable, likely from a
+     permissive umask during `go mod download`), which made the FIRST real end-to-end
+     run fail closed exactly as designed. Fixed by `chmod -R g-w` on the module cache
+     (owner's explicit choice, not a design workaround) — a host operator running the
+     coding-runner for the first time on a similarly-configured host will hit the same
+     refusal and needs the same fix; worth a `nexus doctor` check in a later slice, not
+     required for Slice 0's own correctness (the refusal is the security boundary
+     working, not a bug).
 
 3. **Private workspace snapshot — concrete mechanism.** `probe.go`'s `guardWorkDir`/
    `allowedWorkRoots` (verified by reading the code) constrain `Spec.WorkDir` to a
