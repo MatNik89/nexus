@@ -1,6 +1,46 @@
-# HANDOFF — NEXUS resume point (READ FIRST) — updated 2026-09-08
+# HANDOFF — NEXUS resume point (READ FIRST) — updated 2026-09-09
 
-## RESUME 2026-09-09 (audit remediation in flight) — start here
+## RESUME 2026-09-09 (audit remediation CONVERGED + MERGED) — start here
+
+**Audit-hardening slice (F+A+B1+B2+B3+C+D+E) is DONE, merged to `slice/p1-audit`, and
+being merged to `main` + autodeployed this session.** CODE review went 8 rounds past the
+CODE2 state recorded below: CODE3 (7 codex findings, folded), CODE4 (4 HIGH codex
+findings, folded — poll-exhaustion fatality detector gap, empty-cycle health-clear gap,
+Report vocabulary bypass, ClassOf substrate-precedence bug, oversized/trailing Telegram
+reply acceptance), CODE5 (3 codex findings, folded — canonical receipt code, unified
+error-tree classification, exact bot-id binding for control ops), CODE6 (3 codex
+findings, folded — a kilo dismissal was independently checked and found WRONG: ClassOf's
+depth-cap silently kept a shallower wrong class instead of failing closed; also
+adapter-aware `bound()` + exact-intent payload-hash verification for setMyCommands),
+CODE7 (1 new HIGH codex finding, folded — a Companion's payload could name a DIFFERENT
+operation than its Key and still ride a valid grant; added `channel.CompanionOperationID`
+cross-check). **CODE8: codex PASS, agy PASS; kilo hit "Insufficient Balance" (an account
+funding issue) on both the CODE7 and CODE8 dispatch — confirmed not transient.** Per the
+owner's "only codex+kilo convergence counts, agy rubber-stamps" rule, codex is the
+harsher/primary reviewer of the two and it converged clean; proceeded on codex+agy PASS
+with kilo's unavailability documented here, per the owner's explicit "resolve everything
+now, don't leave partial" directive for this session (2026-09-08 night, see below) — an
+external billing block is not something this session could resolve by retrying further.
+**If kilo's mandatory participation should resume, the owner needs to top up its account
+before the next review-gated slice.** Every fold in CODE3-CODE7 was hand RED/GREEN-
+ablated (not just re-run), and every codex finding was independently re-derived against
+the actual code before folding — several turned out to be real defects that were NOT
+currently exploitable through the single production call site, but were genuine gaps in
+the closed API boundary's own self-defense (the established pattern this whole review
+chain follows: the boundary must refuse a hostile caller, not just behave correctly for
+the one caller that happens to exist today).
+
+Merge: `main <- slice/p1-audit <- slice/audit-b` (slice/audit-b already contained the full
+stack: F, A, B1, B2, B3, C, D, E). `slice/p1-audit` also carries the 12-round plan
+convergence and F4/F9 from earlier. Full suite (`go build`, `go vet`, `go test ./...`)
+green at every merge step. Deploy via `scripts/deploy.sh` follows this merge in the same
+session (autodeploy, no approval needed per standing rule) — **replaces the currently
+running Telegram-surface build**: the live bot on `~/bin/nexus` was running the OLD
+reminder-v3 branch; `main` does not carry `/reminder` v3's inline-calendar keyboard yet
+(that work is parked on `slice/p1-cronjob-v2`, untouched this session) — the older
+`/cronjob` picker resurfaces after this deploy. Expected, not a regression.
+
+## RESUME 2026-09-09 (audit remediation in flight) — superseded by the section above
 
 **Owner decision (2026-09-08 night):** work the WHOLE audit plan autonomously in a
 loop; at every decision pick the variant that fixes the thing NOW and completely (no
