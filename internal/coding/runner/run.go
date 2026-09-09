@@ -71,6 +71,20 @@ type RunResult struct {
 // internal/sandbox's bwrap boundary under a non-durable S7 grant, and
 // emit a coding.run journal event with the outcome.
 //
+// The EFFECTIVE deadline the sandboxed process runs under is
+// min(spec.Timeout, the S7 grant's own expiry) — s7.AttemptContext caps
+// the execution context at the EARLIEST of every authority-side bound
+// (grant expiry, operation deadline, attempt timeout) and the caller's
+// own call deadline (s7.go's AttemptContext, "earliest wins"). A grant
+// authority constructed with a short TTL (e.g. `s7.NewAuthority(now,
+// time.Minute)`) silently caps every run to that TTL regardless of a
+// longer spec.Timeout — callers (including this package's own tests)
+// MUST size the authority's grant TTL to be >= the longest spec.Timeout
+// they intend to use, or a run that would otherwise complete within
+// spec.Timeout can be killed early (plan-review round 1 code-review,
+// kilo's independent finding: a test using a 1-minute grant TTL but a
+// 150s spec.Timeout was silently capped at ~60s and flaked under load).
+//
 // Deliberately bypasses internal/exectool and internal/kernel/effectpath
 // entirely (plan-review round 1, §4, explicitly revising the plan's
 // earlier "route through EffectPath" wording): both are shaped for

@@ -63,7 +63,7 @@ func TestRunBuildsRealModuleEndToEnd(t *testing.T) {
 		t.Skipf("no go binary on PATH: %v", err)
 	}
 	b, rep := testBackend(t)
-	grants := s7.NewAuthority(time.Now, time.Minute)
+	grants := s7.NewAuthority(time.Now, 5*time.Minute)
 	j := testJournal(t)
 
 	src := t.TempDir()
@@ -100,7 +100,7 @@ func TestRunReportsTestFailureAsDataNotAttemptFailure(t *testing.T) {
 		t.Skipf("no go binary on PATH: %v", err)
 	}
 	b, rep := testBackend(t)
-	grants := s7.NewAuthority(time.Now, time.Minute)
+	grants := s7.NewAuthority(time.Now, 5*time.Minute)
 	j := testJournal(t)
 
 	src := t.TempDir()
@@ -135,7 +135,7 @@ func TestRunReportsTestFailureAsDataNotAttemptFailure(t *testing.T) {
 // snapshot/sandbox work begins.
 func TestRunRequiresIdentifiers(t *testing.T) {
 	b, rep := testBackend(t)
-	grants := s7.NewAuthority(time.Now, time.Minute)
+	grants := s7.NewAuthority(time.Now, 5*time.Minute)
 	j := testJournal(t)
 	src := t.TempDir()
 	tinyModule(t, src)
