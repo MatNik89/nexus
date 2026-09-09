@@ -560,40 +560,36 @@ behind, then dispatched for 3-agent adversarial plan-then-code review (codex/kil
 herdr) until codex+kilo converge PASS (agy supportive, not required alone). Merge to
 main + autodeploy + push per standing rules after each slice converges, not batched.
 
-## Slice 0 partial — open residual items from code review (CODE1/CODE2)
+## Slice 0 partial — residual items from code review (CODE1/CODE2) — CLOSED
 
-Two narrow-scope gaps surfaced by codex's CODE2 adversarial testing on the Slice 0
-partial commit (probe/sandbox toolchain-visibility primitive + sealedstore + TIA graph,
-commits cd7616f/b227412/7731ef9). Neither is reachable by any real caller today — the
-coding-runner substrate itself (this section) is not yet built — so both are recorded
-here as REQUIRED closure conditions for that substrate, not left silently dropped:
+Two narrow-scope gaps codex's CODE2 adversarial testing surfaced on the Slice 0 partial
+commit (probe/sandbox toolchain-visibility primitive + sealedstore + TIA graph,
+commits cd7616f/b227412/7731ef9) were first recorded here as documentation-only
+deferrals, then actually fixed in commit 6a6085b once codex's full FAIL verdict (with
+concrete reproductions and fix suggestions) came back — per the owner's "resolve fully
+now, never a partial/deferred fix" standing rule:
 
-1. **ExtraROBinds content is not pinned, only its path.** `sandbox.Compile` canonicalizes
-   and hashes the ExtraROBinds PATH into `policyHash`, and `probe.Prepare` re-resolves
-   that same path at Launch — but nothing hashes the DIRECTORY'S CONTENTS at either
-   point. A directory renamed away and replaced at the same path between Compile and
-   Launch serves different bytes under an unchanged policyHash (codex CODE2, reproduced:
-   `TestReviewROBindContentsStayBoundAfterCompile`). This is exactly the "toolchain-
-   version swap detection" causal detector already required above — the coding-runner,
-   when it resolves `GOTOOLDIR`/`GOMODCACHE` into `ExtraROBinds`, MUST also content-pin
-   (or at minimum inode/mtime-fingerprint, fail-closed on any change) what it resolved,
-   between its own resolution and the sandboxed run — probe/sandbox's generic primitive
-   deliberately does not attempt whole-directory content hashing (unbounded size: a
-   module cache can be gigabytes), so this is the runner's responsibility, not a probe/
-   sandbox defect to fix in place.
-2. **`sealedstore.GC`'s `liveDigests` freshness is entirely caller-supplied.** `Pin`'s
-   contract already requires Release only AFTER a durable reference commits elsewhere
-   (journal). `GC` cannot independently verify that whatever produced its `liveDigests`
-   argument is fresh relative to that commit — a caller whose liveDigests-generation
-   reads a stale snapshot could still race a legitimate GC sweep (codex CODE2,
-   `TestReviewGCMarkCannotGoStaleAcrossPublication` — reviewed and confirmed this
-   exercises a caller-sequencing contract question, not an internal Put/GC race:
-   sealedstore's own Put/GC critical section is proven correct by
-   `TestGCAndPutSerializeUnderOneCriticalSection`). Whichever caller first performs
-   Put → journal-reference-commit → Release (Slice 1 evidence manifest or Slice 3
-   workspace transaction) MUST build its `liveDigests` set from the SAME transaction
-   that committed the reference — e.g., a GC pass triggered only after re-reading the
-   journal past the commit point — never from an independently cached/stale index.
+1. **ExtraROBinds directory-swap detection — CLOSED.** `sandbox.Compile` now pins each
+   ExtraROBinds entry's (device, inode) via the new `probe.PinROBindIdentity` /
+   `probe.Spec.ExtraROBindIdentities`, folded into `policyHash`; `probe.Prepare` refuses
+   a bind whose resolved identity no longer matches the Compile-time pin. This is a
+   cheap, bounded SWAP detector (one extra `stat` comparison per bind) — it does NOT
+   attempt whole-directory content hashing, which stays out of scope here (unbounded
+   size: a module cache can be gigabytes) and remains the coding-runner's own
+   responsibility if it ever needs to detect an in-place file edit within an otherwise
+   unchanged, unswapped directory. Proven by
+   `TestLaunchRefusesROBindDirectorySwappedAfterCompile` (RED verified against the
+   pre-fix code via `git stash`, GREEN after).
+2. **`sealedstore.GC`'s `liveDigests` staleness — CLOSED.** `GC`'s signature changed from
+   a plain `map[string]bool` argument to `func() map[string]bool`, invoked WHILE `s.mu`
+   is held — removing the window between "the caller decided what is live" and "GC
+   actually started." A caller must still perform a FRESH read inside that callback
+   (this doesn't eliminate the need for correct caller discipline, but it puts the
+   freshness point at the right place instead of requiring the impossible — a
+   plain pre-computed argument synchronizing itself against a lock it never touches).
+   Proven by `TestGCLoadLiveIsCalledUnderTheLock`, which reproduces codex's exact
+   failing sequence (mark requested before a Put→commit→Release that completes before
+   GC's own critical section starts) and confirms the artifact now survives.
 
 ## Status
 
