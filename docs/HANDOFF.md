@@ -1,5 +1,70 @@
 # HANDOFF — NEXUS resume point (READ FIRST) — updated 2026-09-09
 
+## RESUME 2026-09-09 (coding-trio Slice 0 partial: CODE1+CODE2 converged) — start here
+
+**PLAN-CODING-TRIO.md converged 2026-09-09** (6 plan-review rounds, codex+kilo+agy all
+PASS) after independent research dispatched to codex/kilo/agy per the owner's explicit
+"research-first, all 3 agents investigate independently, then synthesize" directive.
+Final architecture: `internal/coding/impact` (pure TIA graph), `internal/coding/symedit`
++ `internal/coding/workspace` (two-phase Prepare/Apply via `gopls` stdio JSON-RPC),
+`internal/coding/evidence` (proof-of-done), `internal/foundation/sealedstore`
+(descriptor-relative content-addressed artifact store), new S7 durable policies
+(`PolicyWorkspaceApply`/`PolicyWorkspaceRollback`), `EffectPath.RunDurableTool`. Build
+order: Slice 0 (coding-runner substrate) → 1 (evidence) → 2 (TIA) → 3 (symedit) → 4
+(expansion).
+
+**Slice 0 partial built and code-reviewed to convergence** (commits cd7616f → b227412 →
+7731ef9 → b47a771, all on `main`, pushed): `internal/preflight/probe` gained
+`ExtraROBinds`/`ExtraEnv` (narrowly-scoped, denylist-guarded, reserved-env-key-guarded
+toolchain visibility grant), `internal/sandbox` folds both into `policyHash` with a
+canonicalizing digest and a real deep-copy (`cloneSpec`) so attestation can't be desynced
+by a post-Compile mutation, `internal/foundation/sealedstore` is a NEW package
+(descriptor-relative Put/Get/GC via `golang.org/x/sys/unix` openat/renameat/unlinkat
+against one held directory fd, Put+GC serialize under one critical section), and
+`internal/coding/impact` is a NEW package (pure TIA graph: `prodRdeps` transitive vs.
+`testOwners` terminal edge split). **This is Slice 0's toolchain-visibility PRIMITIVE
+only — the actual coding-runner substrate (private workspace snapshot, GOTOOLDIR
+resolution, `gopls` stdio session, S7 durable lifecycle wiring) is NOT built yet.**
+
+CODE1 (codex FAIL 6 findings, kilo PASS 4 notes, agy PASS 2 notes) fully folded in
+b227412: a self-inflicted `denylistedROBindRoot` bug (the `"/"` deny-root check fired
+unconditionally on every call regardless of the actual path — first-loop-iteration bug),
+`CompiledPolicy` shallow-copy aliasing (fixed via `cloneSpec`), `sealedstore`'s GC/Put
+race (fixed: single critical section for the WHOLE operation, proven by a
+`gcPauseHook`-driven test), pathname-based I/O (rewritten descriptor-relative per the
+plan's explicit requirement), `impact.go`'s test-only-edge-propagates-into-production
+conflation (fixed: `prodRdeps`/`testOwners` split, proven by a real counterexample test),
+and 5 false-green detector fixes. CODE2 (re-review of the fold): kilo PASS (2 notes,
+walked the counterexample by hand), agy PASS (3 notes, all folded — deterministic sort in
+`Affected`, an error-message var fix, `Store.Close` idempotency), codex ran for an
+unusually long time (~3.5h wall clock across two genuine mid-review context-compaction
+stalls, confirmed alive both times via process CPU + a manual interrupt that produced a
+live response) and surfaced two real but narrow-scope residual findings before the
+session moved on without its final formal verdict: (1) `ExtraROBinds` content isn't
+pinned, only its canonicalized path — ties directly to the plan's own pre-existing
+"toolchain-version swap detection" requirement for the not-yet-built coding-runner, not a
+probe/sandbox defect (whole-directory content hashing there is unbounded); (2)
+`sealedstore.GC`'s `liveDigests` freshness is caller-supplied by design — a
+caller-sequencing contract for whichever Slice builds the first real
+Put→journal-commit→Release caller, not an internal race (the internal Put/GC critical
+section IS proven race-free). Both recorded as explicit Slice-0 closure conditions in
+`docs/PLAN-CODING-TRIO.md` (`## Slice 0 partial — open residual items`). One clean,
+independently-converged finding WAS folded from codex's in-flight work: `LD_AUDIT` added
+to `reservedEnvKeys` (both codex and kilo flagged it independently). Full repo test suite
+green at every commit.
+
+**Per the owner's standing "resolve everything now" + "just work in the loop" rules**:
+proceeded on kilo+agy PASS convergence given codex's extended stall, rather than blocking
+indefinitely on a single reviewer pane. If codex's pane (`w8:p2`) eventually produces its
+formal verdict, read it and fold anything new as a CODE3 addendum — check
+`herdr agent read w8:p2 --source recent-unwrapped --lines 300` first.
+
+**Next work**: build the actual coding-runner substrate (private snapshot isolation,
+`GOTOOLDIR` resolution via `go env`, `gopls` stdio session, the causal detectors listed
+under Slice 0 in the plan) — this is a genuinely new, large piece requiring its own
+research(3-agent)→plan→review→code→review cycle per the owner's standing directive, not
+a continuation of the toolchain-visibility primitive just converged above.
+
 ## RESUME 2026-09-09 (audit remediation CONVERGED + MERGED) — start here
 
 **Audit-hardening slice (F+A+B1+B2+B3+C+D+E) is DONE, merged to `slice/p1-audit`, and
