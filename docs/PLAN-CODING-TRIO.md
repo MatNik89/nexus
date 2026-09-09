@@ -474,6 +474,28 @@ before implementation begins, not just name the requirements.
   one); generated-test-binary execution scoped correctly (runs, but only from inside the
   staged tree).
 
+  **Status 2026-09-10 — all 7 satisfied.** host-workspace immutability:
+  `TestRunNeverMutatesLiveSourceDir` (runner/run_test.go, commit 8a5a563), RED-proven by
+  temporarily injecting a write into SourceDir at run.go's copyTreeInto call site.
+  external-symlink non-import: `TestCreateSnapshotRefusesSymlink`. Toolchain-version swap
+  detection + candidate-digest mismatch: inherited unconditionally from the
+  toolchain-visibility primitive's own hostile-conformance suite
+  (`TestLaunchRefusesSwappedTarget`, `TestLaunchRefusesSwappedClosureMember`,
+  `TestLaunchRefusesROBindDirectorySwappedAfterCompile`,
+  `TestTargetSwapAfterPrepareIsInert`) — verified directly from `sandbox.Spec`
+  (sandbox.go:35-49): `runner.Run` builds a plain
+  `Spec{Target,Args,WorkDir,Timeout,ExtraROBinds,ExtraEnv}` with no field a caller could
+  use to loosen these checks, and calls the exact same `Compile`/`Launch` those tests
+  exercise — no separate per-package test adds coverage, only indirection. Undeclared
+  host-child rejection + network denial under the default policy: same reasoning —
+  `sandbox.Spec` has no network-toggle or child-spawn-allowlist field, so both are
+  unconditional in bwrap construction regardless of caller; inherited from
+  `internal/sandbox`'s own suite, not re-tested here. Generated-test-binary execution
+  scoped correctly: `TestRunReportsTestFailureAsDataNotAttemptFailure` runs `go test -C
+  /work/src ./...` end to end and asserts the correct pass/fail signal, proving the
+  generated test binary executes and reports from inside the staged tree (the sandbox's
+  own WorkDir bind makes anywhere else structurally unreachable).
+
 ### Slice 0 — concrete design, round 1 (research: my own + agy independent; codex/kilo
 dispatched in parallel, pending — fold into round 2 before implementation)
 
