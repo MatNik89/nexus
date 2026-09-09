@@ -7,6 +7,7 @@ package doctor
 
 import (
 	"fmt"
+	"github.com/MatNik89/nexus/internal/channel/health"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -182,6 +183,28 @@ func Run(e Env) []Check {
 		checks = append(checks, Check{Name: "scheduler-health", Capability: "obligations",
 			Status: StatusOff, Detail: "health mirror unreadable: " + herr.Error(),
 			Fix: "fix permissions on " + healthPath})
+	}
+
+	// 6c (Slice D): channel runtime health — the adapter's journal-independent
+	// projection. A recorded non-healthy component reports its typed class;
+	// a malformed/unreadable projection is broken observability (OFF).
+	chPath := filepath.Join(e.DataDir, "system", "channel_health.json")
+	if entries, herr := health.Read(chPath); herr != nil {
+		checks = append(checks, Check{Name: "channel-health", Capability: "telegram", Status: StatusOff,
+			Detail: "channel health projection unreadable: " + herr.Error(), Fix: "fix or remove " + chPath})
+	} else {
+		bad := 0
+		for _, en := range entries {
+			if !en.Healthy {
+				bad++
+				checks = append(checks, Check{Name: "channel-health", Capability: "telegram", Status: StatusOff,
+					Detail: fmt.Sprintf("%s %s/%s at %s (stopped=%v): %s", en.Component, en.Class, en.Code, en.At.Format(time.RFC3339), en.Stopped, en.Detail),
+					Fix:    "inspect the daemon log; repair (token/config/journal) then restart the daemon"})
+			}
+		}
+		if bad == 0 {
+			checks = append(checks, Check{Name: "channel-health", Capability: "telegram", Status: StatusOK, Detail: "no unhealthy channel component recorded"})
+		}
 	}
 
 	// 5. Telegram token → telegram capability (the CONFIGURED name).

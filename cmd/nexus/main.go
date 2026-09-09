@@ -26,6 +26,7 @@ import (
 	"github.com/MatNik89/nexus/internal/app/repl"
 	"github.com/MatNik89/nexus/internal/approval"
 	"github.com/MatNik89/nexus/internal/channel"
+	"github.com/MatNik89/nexus/internal/channel/health"
 	"github.com/MatNik89/nexus/internal/channel/telegram"
 	"github.com/MatNik89/nexus/internal/conv"
 	"github.com/MatNik89/nexus/internal/exectool"
@@ -175,6 +176,7 @@ func runDaemon() int {
 				EgressAllow: resolved.Config.EgressAllow,
 				Receipt:     b.egressSink,
 				Authority:   b.authority,
+				Health:      b.health,
 			}, b.chanCore, telegramHandler(b))
 			if aerr != nil {
 				fmt.Fprintf(os.Stderr, "nexus daemon: telegram: %v\n", aerr)
@@ -295,11 +297,24 @@ func runDaemon() int {
 	}
 	if tgAdapter != nil {
 		if snap.On("telegram") {
+			adapterCtx, adapterCancel := context.WithCancel(ctx)
 			go func() {
-				// Slice D owns the health record; until then the stop is at
-				// least LOUD (never a silently dead capability).
-				if err := tgAdapter.Run(ctx, 2*time.Second); err != nil {
-					fmt.Fprintf(os.Stderr, "nexus daemon: telegram adapter STOPPED: %v\n", err)
+				// Supervisor (Slice D): the adapter's typed terminal class is
+				// persisted UNCHANGED (remote_rejected stays remote_rejected);
+				// substrate only for an unclassified return or a recovered
+				// panic. The adapter context is cancelled for prompt teardown.
+				// Sealed-capability rule: health is REPORTED, never a fallback.
+				defer adapterCancel()
+				defer func() {
+					if r := recover(); r != nil {
+						_ = b.health.Report("telegram", health.ClassSubstrate, "panic", fmt.Sprint(r), true)
+						fmt.Fprintf(os.Stderr, "nexus daemon: telegram adapter PANICKED (capability degraded): %v\n", r)
+					}
+				}()
+				if err := tgAdapter.Run(adapterCtx, 2*time.Second); err != nil {
+					cls, code := channel.ClassOf(err)
+					_ = b.health.Report("telegram", cls, code, err.Error(), true)
+					fmt.Fprintf(os.Stderr, "nexus daemon: telegram adapter STOPPED (%s/%s): %v\n", cls, code, err)
 				}
 			}()
 			fmt.Println("nexus daemon: telegram adapter running (sealed capability ON)")
@@ -329,6 +344,7 @@ type daemonBundle struct {
 	obl        *obligation.Manager
 	chanCore   *channel.Core
 	egressSink egress.ReceiptSink
+	health     *health.Owner
 	approvals  *approval.Store
 	profile    contracts.ProfileID
 	cfg        config.Config
@@ -550,6 +566,13 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 	// ONE E11 receipt sink for every outbound component (Slice A): built
 	// right after the journal, BEFORE the provider or any adapter exists.
 	egressSink := channel.EgressSink(j)
+	// ONE channel-health owner (Slice D): a journal-independent projection
+	// under the system dir, so a journal failure is still reportable.
+	healthOwner, err := health.New(filepath.Join(layout.SystemDir(), "channel_health.json"), os.Stderr)
+	if err != nil {
+		j.Close()
+		return nil, fmt.Errorf("health: %w", err)
+	}
 	prov, err := provider.NewAPIKey(resolved.Config, authority, egressSink)
 	if err != nil {
 		j.Close()
@@ -669,7 +692,7 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 		return nil, err
 	}
 	return &daemonBundle{d: d, j: j, sched: sched, obl: oblManager,
-		chanCore: chanCore, egressSink: egressSink, approvals: approvals, profile: profile, cfg: resolved.Config,
+		chanCore: chanCore, egressSink: egressSink, health: healthOwner, approvals: approvals, profile: profile, cfg: resolved.Config,
 		sysPath: sysPath, authority: authority,
 		prov: prov, sandboxOK: execAdapter != nil}, nil
 }
@@ -811,7 +834,7 @@ func runDoctorP0() int {
 
 	// Probe substrate (throwaway journal) — also the E11 receipt sink for the
 	// doctor's live provider/telegram probes.
-	probeCore, probeSink, probeCleanup := mustProbeCore(layout, resolved)
+	probeCore, probeSink, probeHealth, probeCleanup := mustProbeCore(layout, resolved)
 	defer probeCleanup()
 	// 1. conversation — LIVE provider round trip.
 	authority := s7.NewAuthority(nil, 5*time.Minute)
@@ -904,7 +927,7 @@ func runDoctorP0() int {
 	} else if adapter, aerr := telegram.New(telegram.Config{
 		APIBase: resolved.Config.TelegramAPIBase, TokenEnv: resolved.Config.TelegramTokenEnv,
 		Bindings: bindings, Profile: resolved.Config.DefaultProfile,
-		EgressAllow: resolved.Config.EgressAllow, Receipt: probeSink, Authority: authority,
+		EgressAllow: resolved.Config.EgressAllow, Receipt: probeSink, Authority: authority, Health: probeHealth,
 	}, probeCore, func(context.Context, channel.Inbound) (string, error) { return "", nil }); aerr != nil {
 		tgWhy = aerr.Error()
 	} else if pr := adapter.Probe(ctx, resolved); !pr.Passed {
@@ -1175,25 +1198,31 @@ func validateMachineID(id string) error {
 
 // mustProbeCore opens a throwaway channel core for the doctor's live
 // telegram probe (never the production journal).
-func mustProbeCore(layout pathx.Layout, resolved config.Resolved) (*channel.Core, egress.ReceiptSink, func()) {
+func mustProbeCore(layout pathx.Layout, resolved config.Resolved) (*channel.Core, egress.ReceiptSink, *health.Owner, func()) {
 	dir, err := os.MkdirTemp("", "nexus-doctor-")
 	if err != nil {
-		return nil, nil, func() {}
+		return nil, nil, nil, func() {}
 	}
 	cleanup := func() { os.RemoveAll(dir) }
 	j, err := journal.Open(filepath.Join(dir, "probe.db"), resolved.Config.DefaultProfile,
 		redact.None{}, channel.Events(), channel.NewProjection())
 	if err != nil {
 		cleanup()
-		return nil, nil, func() {}
+		return nil, nil, nil, func() {}
 	}
 	c, err := channel.New(j)
 	if err != nil {
 		j.Close()
 		cleanup()
-		return nil, nil, func() {}
+		return nil, nil, nil, func() {}
 	}
-	return c, channel.EgressSink(j), func() { j.Close(); cleanup() }
+	h, err := health.New(filepath.Join(dir, "channel_health.json"), io.Discard)
+	if err != nil {
+		j.Close()
+		cleanup()
+		return nil, nil, nil, func() {}
+	}
+	return c, channel.EgressSink(j), h, func() { j.Close(); cleanup() }
 }
 
 // deliverPendingReminders is ONE pass of the reminder delivery loop:

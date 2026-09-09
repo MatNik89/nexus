@@ -30,6 +30,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/MatNik89/nexus/internal/channel/health"
 	"github.com/MatNik89/nexus/internal/foundation/egress"
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
 	"github.com/MatNik89/nexus/internal/kernel/journal"
@@ -61,7 +62,53 @@ type Failure struct {
 	Code      string
 	Ambiguous bool
 	Retryable bool
+	Status    int // HTTP status when the remote answered (0 otherwise)
 	Cause     error
+}
+
+// ClassifiedError carries the health CLASS the ORIGINATING owner assigned
+// (Slice D): health only renders it — no string matching anywhere. An
+// error without a class is treated as substrate (fatal, fail closed).
+type ClassifiedError struct {
+	Class health.Class
+	Code  string
+	Cause error
+}
+
+func (c *ClassifiedError) Error() string {
+	if c.Cause != nil {
+		return fmt.Sprintf("channel[%s/%s]: %v", c.Class, c.Code, c.Cause)
+	}
+	return fmt.Sprintf("channel[%s/%s]", c.Class, c.Code)
+}
+
+func (c *ClassifiedError) Unwrap() error { return c.Cause }
+
+// ClassOf renders the class of an error tree: the first ClassifiedError
+// found (errors.As walks Join trees); a substrate class anywhere wins;
+// nil -> "" (healthy); an unclassified error -> substrate.
+func ClassOf(err error) (health.Class, string) {
+	if err == nil {
+		return "", ""
+	}
+	var found *ClassifiedError
+	if !errors.As(err, &found) {
+		return health.ClassSubstrate, "unclassified"
+	}
+	// A joined error may carry several classes: substrate dominates.
+	if j, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, e := range j.Unwrap() {
+			var c *ClassifiedError
+			if errors.As(e, &c) && c.Class == health.ClassSubstrate {
+				return c.Class, c.Code
+			}
+		}
+	}
+	return found.Class, found.Code
+}
+
+func substrate(code string, err error) error {
+	return &ClassifiedError{Class: health.ClassSubstrate, Code: code, Cause: err}
 }
 
 func (f *Failure) Error() string {
@@ -803,7 +850,7 @@ func (c *Core) Flush(ctx context.Context, auth *s7.Authority, send Send) error {
 	}
 	pending, err := c.Pending(ctx)
 	if err != nil {
-		return err
+		return substrate("pending_query", err)
 	}
 	// One poisoned head must not starve every later delivery (Phase-5-r2
 	// codex #6): failures are collected and the loop CONTINUES; only a
@@ -812,7 +859,8 @@ func (c *Core) Flush(ctx context.Context, auth *s7.Authority, send Send) error {
 	for _, o := range pending {
 		op, target := OperationFor(o), TargetFor(o)
 		if err := auth.Begin(op, target, s7.PolicyDelivery); err != nil {
-			failures = append(failures, fmt.Errorf("channel: delivery %s: %w", o.DeliveryID, err))
+			failures = append(failures, &ClassifiedError{Class: health.ClassTransport, Code: s7.CodeLocalRefused,
+				Cause: fmt.Errorf("channel: delivery %s: %w", o.DeliveryID, err)})
 			continue
 		}
 		build := c.companionBuilder(o, op)
@@ -821,18 +869,20 @@ func (c *Core) Flush(ctx context.Context, auth *s7.Authority, send Send) error {
 		case errors.Is(err, s7.ErrNotDue):
 			continue // S7 scheduled a later attempt
 		case errors.Is(err, s7.ErrExhausted):
-			failures = append(failures, fmt.Errorf("channel: delivery %s exhausted its S7 budget — parked FAILED: %w", o.DeliveryID, err))
+			failures = append(failures, &ClassifiedError{Class: health.ClassTransport, Code: o.LastCode,
+				Cause: fmt.Errorf("channel: delivery %s exhausted its S7 budget — parked FAILED: %w", o.DeliveryID, err)})
 			continue
 		case err != nil:
 			if strings.Contains(err.Error(), "not durable") {
-				return fmt.Errorf("channel: delivery %s: S7 authorization could not be made durable — not sending: %w", o.DeliveryID, err)
+				return substrate("s7_authorize", fmt.Errorf("channel: delivery %s: S7 authorization could not be made durable — not sending: %w", o.DeliveryID, err))
 			}
-			failures = append(failures, fmt.Errorf("channel: delivery %s: %w", o.DeliveryID, err))
+			failures = append(failures, &ClassifiedError{Class: health.ClassTransport, Code: s7.CodeLocalRefused,
+				Cause: fmt.Errorf("channel: delivery %s: %w", o.DeliveryID, err)})
 			continue
 		}
 		parkParams, perr := c.markParams(EvOutboundUnknown, o.DeliveryID, op, "", time.Time{})
 		if perr != nil {
-			return perr
+			return substrate("params", perr)
 		}
 		sendErr := send(o, g, s7.Companion{Key: op, Params: parkParams})
 		st, _ := auth.State(op)
@@ -840,9 +890,10 @@ func (c *Core) Flush(ctx context.Context, auth *s7.Authority, send Send) error {
 			// Never consumed: a LOCAL refusal (identity mismatch, request
 			// build) — nothing physical ran; cancel + FAILED in one batch.
 			if cerr := auth.Cancel(op, build); cerr != nil {
-				return fmt.Errorf("channel: delivery %s: local refusal could not be landed: %w", o.DeliveryID, errors.Join(sendErr, cerr))
+				return substrate("s7_cancel", fmt.Errorf("channel: delivery %s: local refusal could not be landed: %w", o.DeliveryID, errors.Join(sendErr, cerr)))
 			}
-			failures = append(failures, fmt.Errorf("channel: delivery %s refused locally (FAILED): %w", o.DeliveryID, sendErr))
+			failures = append(failures, &ClassifiedError{Class: health.ClassTransport, Code: s7.CodeLocalRefused,
+				Cause: fmt.Errorf("channel: delivery %s refused locally (FAILED): %w", o.DeliveryID, sendErr)})
 			continue
 		}
 		var outcome s7.Outcome
@@ -866,15 +917,22 @@ func (c *Core) Flush(ctx context.Context, auth *s7.Authority, send Send) error {
 		if c.testFailSentMark && outcome == s7.OutcomeSucceeded {
 			// Simulated death between transport accept and the landing: the
 			// row is already durably UNKNOWN (park) — reconciliation owns it.
-			return fmt.Errorf("channel: delivery %s accepted but the sent-mark failed — stays UNKNOWN for reconciliation: injected sent-mark failure", o.DeliveryID)
+			return substrate("sent_mark", fmt.Errorf("channel: delivery %s accepted but the sent-mark failed — stays UNKNOWN for reconciliation: injected sent-mark failure", o.DeliveryID))
 		}
 		if rerr := auth.Report(op, outcome, code, build); rerr != nil {
 			// The S7 landing + companion did not commit: the row STAYS
 			// UNKNOWN (never claims SENT); the substrate is broken.
-			return fmt.Errorf("channel: delivery %s: landing failed — stays UNKNOWN for reconciliation: %w", o.DeliveryID, errors.Join(sendErr, rerr))
+			return substrate("landing", fmt.Errorf("channel: delivery %s: landing failed — stays UNKNOWN for reconciliation: %w", o.DeliveryID, errors.Join(sendErr, rerr)))
 		}
 		if sendErr != nil {
-			failures = append(failures, fmt.Errorf("channel: delivery %s: %w", o.DeliveryID, sendErr))
+			if f != nil && f.Code == "receipt_not_durable" {
+				return substrate("receipt", fmt.Errorf("channel: delivery %s: %w", o.DeliveryID, sendErr))
+			}
+			cls := health.ClassTransport
+			if f != nil && (f.Status == 401 || f.Status == 403) {
+				cls = health.ClassRemoteRejected
+			}
+			failures = append(failures, &ClassifiedError{Class: cls, Code: code, Cause: fmt.Errorf("channel: delivery %s: %w", o.DeliveryID, sendErr)})
 		}
 	}
 	return errors.Join(failures...)

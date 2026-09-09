@@ -40,6 +40,12 @@ import (
 // failure (the outbox may safely re-pend; never UNKNOWN).
 var ErrPreWire = errors.New("egress refused pre-wire")
 
+// ErrReceiptNotDurable marks a permitted dial refused because the receipt
+// sink (the journal) could not make the receipt durable. It wraps
+// ErrPreWire (nothing left the process) AND identifies a SUBSTRATE failure
+// for health classification (Slice D): the wire is fine, the journal is not.
+var ErrReceiptNotDurable = fmt.Errorf("egress receipt not durable: %w", ErrPreWire)
+
 // Endpoint is the canonical endpoint unit: scheme (for the default port),
 // lowercased hostname and the EFFECTIVE port.
 type Endpoint struct {
@@ -254,7 +260,7 @@ func (d *pinnedDialer) DialContext(ctx context.Context, network, address string)
 	}
 	pinned := norm[0]
 	if err := d.receipt(Decision{Component: d.component, Host: host, Port: d.endpoint.Port, Resolved: norm, Pinned: pinned, Allowed: true}); err != nil {
-		return nil, fmt.Errorf("%s egress: receipt not durable, refusing dial: %v: %w", d.component, err, ErrPreWire)
+		return nil, fmt.Errorf("%s egress: refusing dial: %v: %w", d.component, err, ErrReceiptNotDurable)
 	}
 	return d.dial(ctx, network, net.JoinHostPort(pinned.String(), port))
 }

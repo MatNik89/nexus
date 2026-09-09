@@ -13,6 +13,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -27,6 +28,7 @@ import (
 
 	"github.com/MatNik89/nexus/internal/app/repl"
 	"github.com/MatNik89/nexus/internal/channel"
+	"github.com/MatNik89/nexus/internal/channel/health"
 	"github.com/MatNik89/nexus/internal/channel/telegram"
 	"github.com/MatNik89/nexus/internal/foundation/config"
 	"github.com/MatNik89/nexus/internal/foundation/egress"
@@ -376,7 +378,7 @@ func TestTelegramSpineEndToEnd(t *testing.T) {
 	adapter, err := telegram.New(telegram.Config{
 		APIBase: bot.URL, TokenEnv: "NEXUS_TG_SPINE_TOKEN",
 		Bindings: map[int64]string{42: "private"}, Profile: "private",
-		Receipt: b.egressSink, Authority: b.authority,
+		Receipt: b.egressSink, Authority: b.authority, Health: b.health,
 	}, b.chanCore, telegramHandler(b))
 	if err != nil {
 		t.Fatal(err)
@@ -647,8 +649,9 @@ func TestTelegramProbeGate(t *testing.T) {
 	t.Cleanup(bot.Close)
 	sink := func(egress.Decision) error { return nil }
 	probeAuth := s7.NewAuthority(nil, time.Minute)
+	probeHealth, _ := health.New(filepath.Join(t.TempDir(), "channel_health.json"), io.Discard)
 	live, err := telegram.New(telegram.Config{APIBase: bot.URL, TokenEnv: "NEXUS_TG_PROBE_TOKEN",
-		Bindings: map[int64]string{42: "private"}, Profile: "private", Receipt: sink, Authority: probeAuth}, core, h)
+		Bindings: map[int64]string{42: "private"}, Profile: "private", Receipt: sink, Authority: probeAuth, Health: probeHealth}, core, h)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -665,7 +668,7 @@ func TestTelegramProbeGate(t *testing.T) {
 		t.Fatalf("healthy channel sealed OFF: %s", snapLive.Status("telegram").Reason)
 	}
 	dead, err := telegram.New(telegram.Config{APIBase: "http://127.0.0.1:1", TokenEnv: "NEXUS_TG_PROBE_TOKEN",
-		Bindings: map[int64]string{42: "private"}, Profile: "private", Receipt: sink, Authority: probeAuth}, core, h)
+		Bindings: map[int64]string{42: "private"}, Profile: "private", Receipt: sink, Authority: probeAuth, Health: probeHealth}, core, h)
 	if err != nil {
 		t.Fatal(err)
 	}

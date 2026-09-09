@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/MatNik89/nexus/internal/channel"
+	"github.com/MatNik89/nexus/internal/channel/health"
 	"github.com/MatNik89/nexus/internal/foundation/config"
 	"github.com/MatNik89/nexus/internal/foundation/egress"
 	"github.com/MatNik89/nexus/internal/kernel/closure"
@@ -57,6 +58,9 @@ type Config struct {
 	// (delivery, poll, control, ui) presents and consumes a grant it issued;
 	// the adapter holds no retry loop. MANDATORY.
 	Authority *s7.Authority
+	// Health is the ONE channel-health owner (Slice D): every tick's outcome
+	// is recorded there (redacted); no failure is silently dropped. MANDATORY.
+	Health *health.Owner
 }
 
 // Handler runs one admitted inbound message to a reply (the daemon wires
@@ -73,6 +77,7 @@ type Adapter struct {
 	handle   Handler
 	client   *http.Client
 	auth     *s7.Authority
+	health   *health.Owner
 	// S7 operation identities the adapter is currently driving (B2).
 	pollOp contracts.OperationID
 	pollN  atomic.Int64
@@ -102,6 +107,9 @@ func New(cfg Config, core *channel.Core, h Handler) (*Adapter, error) {
 	if cfg.Authority == nil {
 		return nil, fmt.Errorf("telegram: an S7 authority is required — no ungoverned Bot API call (fail closed)")
 	}
+	if cfg.Health == nil {
+		return nil, fmt.Errorf("telegram: a health owner is required — no silently dropped failure (fail closed)")
+	}
 	token := os.Getenv(cfg.TokenEnv)
 	if token == "" {
 		return nil, fmt.Errorf("telegram: env var %s holds no bot token (fail closed)", cfg.TokenEnv)
@@ -116,7 +124,7 @@ func New(cfg Config, core *channel.Core, h Handler) (*Adapter, error) {
 	}
 	a := &Adapter{
 		base: strings.TrimRight(cfg.APIBase, "/"), token: token,
-		bindings: b, profile: cfg.Profile, core: core, handle: h, auth: cfg.Authority,
+		bindings: b, profile: cfg.Profile, core: core, handle: h, auth: cfg.Authority, health: cfg.Health,
 	}
 	// E11 egress boundary: the SHARED pinned-IP, proxy-sanitized,
 	// redirect-rejecting owner (internal/foundation/egress, Slice A) that talks
@@ -258,6 +266,11 @@ func (a *Adapter) call(ctx context.Context, method string, req any, out any, g s
 		// A dial/DNS-phase or egress refusal is DEFINITE — nothing left the
 		// process (Phase-5-r2 kilo #2); anything after the request may have
 		// been sent is post-write. The token never leaks (codex #9).
+		if errors.Is(err, egress.ErrReceiptNotDurable) {
+			// The JOURNAL could not record the egress receipt: a substrate
+			// failure — terminal for this attempt, fatal for the adapter.
+			return &channel.Failure{Code: "receipt_not_durable", Cause: fmt.Errorf("telegram: %w", a.sanitize(err))}
+		}
 		if isPreWire(err) {
 			return &channel.Failure{Code: s7.CodeTransportPreWire, Retryable: true, Cause: fmt.Errorf("telegram: connect: %w", a.sanitize(err))}
 		}
@@ -266,17 +279,19 @@ func (a *Adapter) call(ctx context.Context, method string, req any, out any, g s
 	defer resp.Body.Close()
 	switch {
 	case resp.StatusCode == 429:
-		return &channel.Failure{Code: s7.CodeHTTP429, Retryable: true, Cause: fmt.Errorf("telegram: %s HTTP 429", method)}
+		return &channel.Failure{Code: s7.CodeHTTP429, Retryable: true, Status: 429, Cause: fmt.Errorf("telegram: %s HTTP 429", method)}
 	case resp.StatusCode >= 500:
-		return postWire(kind, s7.CodeHTTP5xx, fmt.Errorf("telegram: %s HTTP %d", method, resp.StatusCode))
+		f := postWire(kind, s7.CodeHTTP5xx, fmt.Errorf("telegram: %s HTTP %d", method, resp.StatusCode)).(*channel.Failure)
+		f.Status = resp.StatusCode
+		return f
 	case resp.StatusCode < 200 || resp.StatusCode > 299:
 		if kind == kindDelivery && resp.StatusCode == 400 && formatted(req) {
 			// A parse rejection of a FORMATTED first send is definite and
 			// fixable: the next S7-scheduled attempt carries plain text
 			// (tgout self-heal), so the adapter proposes a retry.
-			return &channel.Failure{Code: s7.CodeHTTP400Format, Retryable: true, Cause: fmt.Errorf("telegram: %s HTTP 400 (formatting rejected)", method)}
+			return &channel.Failure{Code: s7.CodeHTTP400Format, Retryable: true, Status: 400, Cause: fmt.Errorf("telegram: %s HTTP 400 (formatting rejected)", method)}
 		}
-		return &channel.Failure{Code: s7.CodeHTTP4xx, Cause: fmt.Errorf("telegram: %s HTTP %d", method, resp.StatusCode)}
+		return &channel.Failure{Code: s7.CodeHTTP4xx, Status: resp.StatusCode, Cause: fmt.Errorf("telegram: %s HTTP %d", method, resp.StatusCode)}
 	}
 	var envelope struct {
 		OK     bool            `json:"ok"`
@@ -407,7 +422,7 @@ func (a *Adapter) PollOnce(ctx context.Context) error {
 		return nil // backoff: nothing to do this tick
 	}
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrPollTerminal, err)
+		return &channel.ClassifiedError{Class: health.ClassTransport, Code: "poll_exhausted", Cause: fmt.Errorf("%w: %v", ErrPollTerminal, err)}
 	}
 	var updates []tgUpdate
 	cerr := a.call(ctx, "getUpdates", map[string]any{"offset": a.offset, "timeout": 0}, &updates, g, kindPoll, a.pollOp, pollTarget)
@@ -418,20 +433,36 @@ func (a *Adapter) PollOnce(ctx context.Context) error {
 	}
 	outcome, code := classify(cerr)
 	if rerr := a.auth.Report(a.pollOp, outcome, code, nil); rerr != nil {
-		return rerr
+		return &channel.ClassifiedError{Class: health.ClassSubstrate, Code: "s7_report", Cause: rerr}
 	}
 	switch st, _ := a.auth.State(a.pollOp); st {
 	case contracts.AttemptSucceeded:
 		a.pollOp = ""
 	case contracts.AttemptFailedRetryable:
-		return cerr
+		return &channel.ClassifiedError{Class: health.ClassTransport, Code: code, Cause: a.sanitize(cerr)}
 	default:
-		return fmt.Errorf("%w: %v", ErrPollTerminal, cerr)
+		// Terminal: a remote refusal of THIS identity (401/403) is
+		// remote_rejected; anything else terminal is transport. Either way
+		// the adapter STOPS (ErrPollTerminal).
+		cls := health.ClassTransport
+		var f *channel.Failure
+		if errors.As(cerr, &f) && (f.Status == 401 || f.Status == 403) {
+			cls = health.ClassRemoteRejected
+		}
+		if f != nil && f.Code == "receipt_not_durable" {
+			cls = health.ClassSubstrate
+		}
+		return &channel.ClassifiedError{Class: cls, Code: code, Cause: fmt.Errorf("%w: %v", ErrPollTerminal, a.sanitize(cerr))}
 	}
 	for _, u := range updates {
 		if err := a.processUpdate(ctx, u); err != nil {
 			// The offset does NOT advance past a failed update: Telegram
-			// redelivers it; T22 dedup keeps it exactly-once.
+			// redelivers it; T22 dedup keeps it exactly-once. A processing
+			// failure is a journal/substrate failure (fatal) unless the
+			// originating owner classified it.
+			if cls, _ := channel.ClassOf(err); cls == health.ClassSubstrate {
+				return &channel.ClassifiedError{Class: health.ClassSubstrate, Code: "process_update", Cause: a.sanitize(err)}
+			}
 			return err
 		}
 		if u.UpdateID >= a.offset {
@@ -618,17 +649,57 @@ func (a *Adapter) Run(ctx context.Context, interval time.Duration) error {
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
-		_ = a.registerCommands(ctx) // S7-scheduled; a durable UNKNOWN is reconciled, never blindly re-registered
-		if err := a.PollOnce(ctx); errors.Is(err, ErrPollTerminal) {
-			return err
+		// Every cycle's outcome is recorded by the health owner (Slice D):
+		// a fatal class (remote_rejected, substrate) STOPS the adapter and is
+		// returned typed to the supervisor; transport failures degrade and
+		// the next tick asks S7 again.
+		for _, step := range []struct {
+			name string
+			run  func(context.Context) error
+		}{{"telegram.register", a.registerCommands}, {"telegram.poll", a.PollOnce}, {"telegram.outbox", a.FlushOutbox}} {
+			if err := a.record(ctx, step.name, step.run(ctx)); err != nil {
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return nil // clean shutdown
+				}
+				return err
+			}
 		}
-		_ = a.FlushOutbox(ctx)
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-t.C:
 		}
 	}
+}
+
+// record renders one cycle outcome into the health owner. It returns the
+// error only when its class is FATAL for the adapter.
+func (a *Adapter) record(ctx context.Context, component string, err error) error {
+	if err == nil {
+		_ = a.health.Healthy(component)
+		return nil
+	}
+	if ctx.Err() != nil {
+		// Shutdown, not a channel failure: no health transition is recorded.
+		return ctx.Err()
+	}
+	cls, code := channel.ClassOf(err)
+	fatal := cls.Fatal()
+	_ = a.health.Report(component, cls, code, clip(a.sanitize(err).Error()), fatal)
+	if fatal {
+		if _, ok := err.(*channel.ClassifiedError); ok {
+			return err
+		}
+		return &channel.ClassifiedError{Class: cls, Code: code, Cause: a.sanitize(err)}
+	}
+	return nil
+}
+
+func clip(s string) string {
+	if len(s) > 240 {
+		return s[:240] + "…"
+	}
+	return s
 }
 
 // commandMenu is the ORDERED desired command set (the exact wire payload

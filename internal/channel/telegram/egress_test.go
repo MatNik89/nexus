@@ -28,7 +28,7 @@ func TestEgressRefusalIsPreWire(t *testing.T) {
 func TestAdapterRequiresReceiptSink(t *testing.T) {
 	h := build(t, map[int64]string{42: "work"})
 	if _, err := New(Config{APIBase: "http://127.0.0.1:1", TokenEnv: "NEXUS_TEST_TG",
-		Bindings: map[int64]string{42: "work"}, Profile: "work", Authority: h.auth}, h.core, h.a.handle); err == nil {
+		Bindings: map[int64]string{42: "work"}, Profile: "work", Authority: h.auth, Health: h.health}, h.core, h.a.handle); err == nil {
 		t.Fatal("adapter built without a receipt sink")
 	}
 }

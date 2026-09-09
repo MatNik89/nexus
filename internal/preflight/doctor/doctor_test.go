@@ -242,3 +242,34 @@ func TestSecretChecksFollowConfiguredNames(t *testing.T) {
 		})
 	}
 }
+
+// Slice D: doctor reads the channel-health projection — an unhealthy
+// component reports its typed class OFF; a healthy or absent projection is
+// OK; a malformed one is broken observability (OFF).
+func TestChannelHealthProjectionReported(t *testing.T) {
+	env := healthyEnv(t)
+	find := func(checks []Check) []Check {
+		var out []Check
+		for _, c := range checks {
+			if c.Name == "channel-health" {
+				out = append(out, c)
+			}
+		}
+		return out
+	}
+	if cs := find(Run(env)); len(cs) != 1 || cs[0].Status != StatusOK {
+		t.Fatalf("absent projection: %+v", cs)
+	}
+	sys := filepath.Join(env.DataDir, "system")
+	os.MkdirAll(sys, 0o700)
+	p := filepath.Join(sys, "channel_health.json")
+	os.WriteFile(p, []byte(`[{"component":"telegram.poll","healthy":false,"class":"remote_rejected","code":"http_4xx","detail":"HTTP 401","stopped":true,"at":"2026-09-09T00:00:00Z"}]`), 0o600)
+	cs := find(Run(env))
+	if len(cs) != 1 || cs[0].Status != StatusOff || !strings.Contains(cs[0].Detail, "remote_rejected") || cs[0].Fix == "" {
+		t.Fatalf("unhealthy projection not reported: %+v", cs)
+	}
+	os.WriteFile(p, []byte(`{broken`), 0o600)
+	if cs := find(Run(env)); len(cs) != 1 || cs[0].Status != StatusOff {
+		t.Fatalf("malformed projection not OFF: %+v", cs)
+	}
+}
