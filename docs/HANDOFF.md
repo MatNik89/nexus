@@ -7,10 +7,16 @@ loop; at every decision pick the variant that fixes the thing NOW and completely
 minimal-then-later). Slice B therefore builds the FULL S7 retry engine (P2 pulled
 forward). Telegram surface is PARKED. Autodeploy after 3xPASS + merge (gated).
 
-**Plan:** `docs/PLAN-AUDIT-FIXES.md` v8 on `slice/p1-audit`. Plan-review rounds 1-7 in
-`docs/REVIEW-AUDIT-PLAN{,2..7}-{codex,kilo,agy}.md`; round 8 dispatched. kilo+agy PASS
-since r3; codex FAILs each round on 2-3 B/D details (all folded). Order:
+**Plan:** `docs/PLAN-AUDIT-FIXES.md` v12 on `slice/p1-audit` — **CONVERGED: round 12 =
+codex+kilo+agy PASS** (rounds 1-12 in `docs/REVIEW-AUDIT-PLAN{,2..12}-*.md`). Order:
 F -> A -> B1 -> B2 -> B3 -> C -> D -> E.
+- `slice/audit-b` (worktree `/home/matej/HARNESS/nexus-b`, stacked on audit-e): **B1 DONE**
+  (4c4011b, `internal/kernel/s7` full engine, s7min deleted, all callers renamed) + **B2
+  coded, uncommitted at the time of writing** (channel Flush under S7 with typed
+  Companion batches, FAILED status + generation, telegram call kinds/poll/registration
+  bot-bound + reconcile, main wiring, tests green for s7/channel/telegram; full suite
+  running). Remaining: B3 (provider Execute + structured ExtractVia), D (health owner),
+  then code reviews, merge chain, autodeploy.
 
 **Code so far — STACKED worktrees (each branch on top of the previous), all suites
 green (vet + go test ./...), each with RED-before/GREEN-after + one ablation RED:**

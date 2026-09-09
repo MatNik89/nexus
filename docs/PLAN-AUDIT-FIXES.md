@@ -337,7 +337,7 @@ existing `test_adapter_cannot_self_retry` family stays valid).
   `s7.Reconcile(op, equal, build)` (codex r9 #1): equal -> SUCCEEDED; different ->
   the SAME operation lands FAILED_RETRYABLE within its budget and `Next` issues the
   replacement grant (or FAILED when the budget is spent — health stays degraded). A
-  rehydrated SUCCEEDED registration for the same hash performs no call at all; a
+  rehydrated SUCCEEDED registration for the same bot id AND payload hash performs no call at all; a
   changed desired set is a new identity. The owner companion
   `channel.control_effect{operation_id, adapter, bot_id, method, payload_hash, state}`
   is validated by the channel PayloadValidator and projection: `operation_id ==
@@ -570,7 +570,7 @@ health state, not an internal counter):
    built from the SAME journal -> ZERO setMyCommands calls before reconciliation; a
    scripted getMyCommands equal to the desired set -> reconciled SUCCEEDED, still zero
    setMyCommands; a scripted different menu -> exactly ONE new setMyCommands under a
-   fresh grant; a rehydrated SUCCEEDED registration for the same hash -> zero calls.
+   fresh grant; a rehydrated SUCCEEDED registration for the same bot id AND hash -> zero calls; after bot B registers, current-bot health recovers while bot A stays UNKNOWN (codex r12 note).
    Ablating the durable recovery guard (blind re-register on start) turns this RED.
    Extended (codex r9 #1): every case asserts the S7 state beside the wire count
    (UNKNOWN / SUCCEEDED / FAILED_RETRYABLE / FAILED); a `control_effect` companion
