@@ -344,13 +344,22 @@ func (a *Adapter) call(ctx context.Context, method string, req any, out any, g s
 		}
 		return &channel.Failure{Code: s7.CodeHTTP4xx, Status: resp.StatusCode, Cause: fmt.Errorf("telegram: %s HTTP %d", method, resp.StatusCode)}
 	}
+	respBody, err := readBoundedReply(resp.Body, maxReplyBytes)
+	if err != nil {
+		// Oversized or unreadable body: the remote ACCEPTED — ambiguous for
+		// effectful methods, a retryable read failure otherwise.
+		return postWire(kind, s7.CodeMalformedReply, fmt.Errorf("telegram: %s reply: %w", method, a.sanitize(err)))
+	}
 	var envelope struct {
 		OK     bool            `json:"ok"`
 		Result json.RawMessage `json:"result"`
 	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&envelope); err != nil {
-		// 2xx but unreadable body: the remote ACCEPTED — ambiguous for
-		// effectful methods, a retryable read failure otherwise.
+	if err := decodeSingleReply(respBody, &envelope); err != nil {
+		// A valid envelope followed by trailing garbage (or a second JSON
+		// value) is malformed too — a 2xx effectful call that accepted the
+		// write must never be treated as clean success on unparsed noise
+		// (code-review CODE4 codex #4; E9: malformed effectful outcomes are
+		// UNKNOWN, never silently accepted).
 		return postWire(kind, s7.CodeMalformedReply, fmt.Errorf("telegram: malformed %s reply: %w", method, a.sanitize(err)))
 	}
 	if !envelope.OK {
@@ -360,6 +369,41 @@ func (a *Adapter) call(ctx context.Context, method string, req any, out any, g s
 		if err := json.Unmarshal(envelope.Result, out); err != nil {
 			return postWire(kind, s7.CodeMalformedReply, fmt.Errorf("telegram: %s result: %w", method, a.sanitize(err)))
 		}
+	}
+	return nil
+}
+
+// maxReplyBytes bounds one Bot API response body. topknot ceiling: a
+// constant, not config — upgrade trigger: a real Telegram reply that
+// exceeds it.
+const maxReplyBytes = 4 << 20
+
+// readBoundedReply reads at most max+1 bytes and REFUSES when more than max
+// were present: reading max+1 (not max) is what makes an oversized body
+// detectable — a plain io.LimitReader(max) would silently hand a
+// truncated-but-valid-looking prefix to the decoder (mirrors
+// provider.readBounded; code-review CODE4 codex #4).
+func readBoundedReply(r io.Reader, max int64) ([]byte, error) {
+	b, err := io.ReadAll(io.LimitReader(r, max+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > max {
+		return nil, fmt.Errorf("reply exceeds %d bytes (refusing, fail closed)", max)
+	}
+	return b, nil
+}
+
+// decodeSingleReply strictly decodes exactly ONE JSON value and requires
+// EOF after it: trailing bytes — a second JSON value or garbage — are
+// refused rather than silently ignored (mirrors provider.decodeSingle).
+func decodeSingleReply(b []byte, out any) error {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	if err := dec.Decode(out); err != nil {
+		return err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return fmt.Errorf("trailing data after the JSON value")
 	}
 	return nil
 }

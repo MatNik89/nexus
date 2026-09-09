@@ -548,6 +548,20 @@ func (a *Authority) Report(op contracts.OperationID, outcome Outcome, code strin
 	default:
 		return fmt.Errorf("s7 report: unknown outcome %d (fail closed)", outcome)
 	}
+	// The closed (outcome, landing, code, next_at) compatibility check is
+	// the S7 API boundary's own invariant, not just the durable journal
+	// event validator's — a non-durable operation must refuse the same
+	// impossible narratives a durable one would (code-review CODE4 codex #1).
+	if code != "" && !knownCodes[code] {
+		return fmt.Errorf("s7 report: code %q outside the closed vocabulary (fail closed)", code)
+	}
+	nextAtUnix := int64(0)
+	if !landing.NextAt.IsZero() {
+		nextAtUnix = landing.NextAt.Unix()
+	}
+	if err := validReport(outcome, landing.Kind, landing.Code, nextAtUnix); err != nil {
+		return fmt.Errorf("s7 report: %w", err)
+	}
 	state, err := a.tbl.Step(rec.state, ev)
 	if err != nil {
 		return fmt.Errorf("s7 report: %w", err)

@@ -9,6 +9,7 @@
 package telegram
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -54,6 +55,8 @@ type fakeBot struct {
 	sawSetCommands  bool
 	lastCommands    string
 	answerCount     int    // answerCallbackQuery calls (spinner cleared)
+	richCalls       int    // sendRichMessage calls
+	editCalls       int    // editMessageText + editMessageReplyMarkup calls
 	lastMarkup      string // last sendMessage reply_markup JSON (calendar)
 	// B2 scripting: bot identity, remote menu for getMyCommands, and a
 	// scripted HTTP status for the next N sendMessage / setMyCommands calls.
@@ -87,9 +90,13 @@ func hijackClose(w http.ResponseWriter) {
 	}
 }
 
-func (f *fakeBot) setCalls() int    { f.mu.Lock(); defer f.mu.Unlock(); return f.setCommandsCalls }
-func (f *fakeBot) polls() int       { f.mu.Lock(); defer f.mu.Unlock(); return f.pollCalls }
-func (f *fakeBot) chatActions() int { f.mu.Lock(); defer f.mu.Unlock(); return f.chatActionCalls }
+func (f *fakeBot) setCalls() int       { f.mu.Lock(); defer f.mu.Unlock(); return f.setCommandsCalls }
+func (f *fakeBot) polls() int          { f.mu.Lock(); defer f.mu.Unlock(); return f.pollCalls }
+func (f *fakeBot) chatActions() int    { f.mu.Lock(); defer f.mu.Unlock(); return f.chatActionCalls }
+func (f *fakeBot) getMyCommandsN() int { f.mu.Lock(); defer f.mu.Unlock(); return f.getMyCommandsCalls }
+func (f *fakeBot) rich() int           { f.mu.Lock(); defer f.mu.Unlock(); return f.richCalls }
+func (f *fakeBot) edits() int          { f.mu.Lock(); defer f.mu.Unlock(); return f.editCalls }
+func (f *fakeBot) answers() int        { f.mu.Lock(); defer f.mu.Unlock(); return f.answerCount }
 
 func mustJSON(v any) string { b, _ := json.Marshal(v); return string(b) }
 
@@ -134,11 +141,13 @@ func (f *fakeBot) handler() http.HandlerFunc {
 			f.lastMethod = "sendRichMessage"
 			f.lastRich = req.RichMessage.Markdown
 			f.sentTo = append(f.sentTo, req.ChatID)
+			f.richCalls++
 			w.Write([]byte(`{"ok":true,"result":{"message_id":1}}`))
 		case strings.HasSuffix(r.URL.Path, "/answerCallbackQuery"):
 			f.answerCount++
 			w.Write([]byte(`{"ok":true,"result":true}`))
 		case strings.HasSuffix(r.URL.Path, "/editMessageText"), strings.HasSuffix(r.URL.Path, "/editMessageReplyMarkup"):
+			f.editCalls++
 			w.Write([]byte(`{"ok":true,"result":{"message_id":1}}`))
 		case strings.HasSuffix(r.URL.Path, "/sendMessage"):
 			var req struct {
@@ -837,5 +846,39 @@ func TestRegisterCommandsPublishesMenu(t *testing.T) {
 	}
 	if !strings.Contains(h.bot.lastCommands, "help") {
 		t.Fatalf("command menu missing entries: %q", h.bot.lastCommands)
+	}
+}
+
+// CODE4 codex #4: a 2xx Bot API reply followed by trailing bytes (a second
+// JSON value, or garbage) must be refused, not silently decoded as the
+// first value; an oversized body must be refused too, not truncated into a
+// spuriously-valid prefix.
+func TestReadBoundedReplyAndDecodeSingleReplyRefuseTrailingAndOversized(t *testing.T) {
+	ok := []byte(`{"ok":true,"result":{"id":1}}`)
+	var env struct {
+		OK     bool            `json:"ok"`
+		Result json.RawMessage `json:"result"`
+	}
+	if err := decodeSingleReply(ok, &env); err != nil {
+		t.Fatalf("clean single value refused: %v", err)
+	}
+
+	trailing := append(append([]byte{}, ok...), []byte(`{"ok":true}`)...)
+	if err := decodeSingleReply(trailing, &env); err == nil {
+		t.Fatal("a second JSON value after the envelope was silently accepted")
+	}
+
+	garbage := append(append([]byte{}, ok...), []byte(" garbage-not-json")...)
+	if err := decodeSingleReply(garbage, &env); err == nil {
+		t.Fatal("trailing non-JSON garbage was silently accepted")
+	}
+
+	small := bytes.NewReader(ok)
+	if _, err := readBoundedReply(small, int64(len(ok))); err != nil {
+		t.Fatalf("body exactly at the ceiling refused: %v", err)
+	}
+	over := bytes.NewReader(append(append([]byte{}, ok...), 'x'))
+	if _, err := readBoundedReply(over, int64(len(ok))); err == nil {
+		t.Fatal("a body one byte over the ceiling was silently accepted")
 	}
 }

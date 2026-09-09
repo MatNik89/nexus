@@ -347,9 +347,13 @@ func init() {
 func TestEveryMethodReuseAndMissingGrantRefused(t *testing.T) {
 	h := build(t, map[int64]string{42: "work"})
 	h.bot.mu.Lock()
+	h.bot.botID = 1
 	h.bot.remoteCommands = mustJSON(commandMenu())
 	h.bot.mu.Unlock()
-	total := func() int { return h.bot.polls() + sends(h) + h.bot.getMes() + h.bot.setCalls() + h.bot.chatActions() }
+	total := func() int {
+		return h.bot.polls() + sends(h) + h.bot.getMes() + h.bot.setCalls() + h.bot.chatActions() +
+			h.bot.getMyCommandsN() + h.bot.rich() + h.bot.edits() + h.bot.answers()
+	}
 	// delivery
 	enqueue(t, h, "plain")
 	rows, _ := h.core.Pending(ctxT())
@@ -360,16 +364,57 @@ func TestEveryMethodReuseAndMissingGrantRefused(t *testing.T) {
 		p, _ := h.core.MarkParamsForTest(channel.EvOutboundUnknown, rows[0].DeliveryID, dOp)
 		return s7.Companion{Key: dOp, Params: p}
 	}
+	// A second, independent delivery row for the sendRichMessage row (each
+	// delivery operation is single-use — the same row cannot host two rows
+	// of this table).
+	enqueue(t, h, "plain")
+	rows2, _ := h.core.Pending(ctxT())
+	var row2 channel.Outbound
+	for _, r := range rows2 {
+		if r.DeliveryID != rows[0].DeliveryID {
+			row2 = r
+			break
+		}
+	}
+	rOp2, rT2 := channel.OperationFor(row2), channel.TargetFor(row2)
+	h.auth.Begin(rOp2, rT2, s7.PolicyDelivery)
+	rG2, _ := h.auth.Next(rOp2, func(s7.Landing) s7.Companion { return s7.Companion{} })
+	parkParams2 := func() s7.Companion {
+		p, _ := h.core.MarkParamsForTest(channel.EvOutboundUnknown, row2.DeliveryID, rOp2)
+		return s7.Companion{Key: rOp2, Params: p}
+	}
 	// poll / control-read / control-effect / ui grants
 	pOp := contracts.OperationID("poll:tg:77")
 	h.auth.Begin(pOp, pollTarget, s7.PolicyPoll)
 	pG, _ := h.auth.Next(pOp, nil)
-	rOp, rT := contracts.OperationID("control:tg:getMe:77"), contracts.TargetID("channel:tg:getMe")
-	h.auth.Begin(rOp, rT, s7.PolicyControlRead)
-	rG, _ := h.auth.Next(rOp, nil)
-	uOp, uT := contracts.OperationID("ui:tg:sendChatAction:77"), contracts.TargetID("channel:tg:chat:42")
-	h.auth.Begin(uOp, uT, s7.PolicyUI)
-	uG, _ := h.auth.Next(uOp, nil)
+	meOp, meT := contracts.OperationID("control:tg:getMe:77"), contracts.TargetID("channel:tg:getMe")
+	h.auth.Begin(meOp, meT, s7.PolicyControlRead)
+	meG, _ := h.auth.Next(meOp, nil)
+	gcOp, gcT := contracts.OperationID("control:tg:getMyCommands:77"), contracts.TargetID("channel:tg:getMyCommands")
+	h.auth.Begin(gcOp, gcT, s7.PolicyControlRead)
+	gcG, _ := h.auth.Next(gcOp, nil)
+	setOp := channel.ControlOperation("tg", 1, "setMyCommands", "deadbeef")
+	setT := channel.ControlTarget("tg", 1, "setMyCommands")
+	setPol := s7.PolicyControlEffect
+	setPol.Durable = true // matches registerCommands' own pol.Durable = registrationPolicyDurable
+	h.auth.Begin(setOp, setT, setPol)
+	setG, _ := h.auth.Next(setOp, func(s7.Landing) s7.Companion { return s7.Companion{} })
+	setParams := func() s7.Companion {
+		_, p, _ := h.core.ControlEffectParams("tg", 1, "setMyCommands", "deadbeef", "UNKNOWN")
+		return s7.Companion{Key: setOp, Params: p}
+	}
+	uiOp := func(method string) contracts.OperationID {
+		return contracts.OperationID(fmt.Sprintf("ui:tg:%s:77", method))
+	}
+	uiT := contracts.TargetID("channel:tg:chat:42")
+	beginUI := func(method string) s7.Grant {
+		op := uiOp(method)
+		h.auth.Begin(op, uiT, s7.PolicyUI)
+		g, _ := h.auth.Next(op, nil)
+		return g
+	}
+	uCA, uSM, uAns, uEditRM, uEditT := beginUI("sendChatAction"), beginUI("sendMessage"), beginUI("answerCallbackQuery"), beginUI("editMessageReplyMarkup"), beginUI("editMessageText")
+
 	cases := []struct {
 		name   string
 		method string
@@ -379,19 +424,31 @@ func TestEveryMethodReuseAndMissingGrantRefused(t *testing.T) {
 		target contracts.TargetID
 		comp   func() []s7.Companion
 	}{
-		{"sendMessage", "sendMessage", kindDelivery, dG, dOp, dT, func() []s7.Companion { return []s7.Companion{parkParams()} }},
-		{"getUpdates", "getUpdates", kindPoll, pG, pOp, pollTarget, func() []s7.Companion { return nil }},
-		{"getMe", "getMe", kindControlRead, rG, rOp, rT, func() []s7.Companion { return nil }},
-		{"sendChatAction", "sendChatAction", kindUI, uG, uOp, uT, func() []s7.Companion { return nil }},
+		{"delivery.sendMessage", "sendMessage", kindDelivery, dG, dOp, dT, func() []s7.Companion { return []s7.Companion{parkParams()} }},
+		{"delivery.sendRichMessage", "sendRichMessage", kindDelivery, rG2, rOp2, rT2, func() []s7.Companion { return []s7.Companion{parkParams2()} }},
+		{"poll.getUpdates", "getUpdates", kindPoll, pG, pOp, pollTarget, func() []s7.Companion { return nil }},
+		{"controlRead.getMe", "getMe", kindControlRead, meG, meOp, meT, func() []s7.Companion { return nil }},
+		{"controlRead.getMyCommands", "getMyCommands", kindControlRead, gcG, gcOp, gcT, func() []s7.Companion { return nil }},
+		{"controlEffect.setMyCommands", "setMyCommands", kindControlEffect, setG, setOp, setT, func() []s7.Companion { return []s7.Companion{setParams()} }},
+		{"ui.sendChatAction", "sendChatAction", kindUI, uCA, uiOp("sendChatAction"), uiT, func() []s7.Companion { return nil }},
+		{"ui.sendMessage", "sendMessage", kindUI, uSM, uiOp("sendMessage"), uiT, func() []s7.Companion { return nil }},
+		{"ui.answerCallbackQuery", "answerCallbackQuery", kindUI, uAns, uiOp("answerCallbackQuery"), uiT, func() []s7.Companion { return nil }},
+		{"ui.editMessageReplyMarkup", "editMessageReplyMarkup", kindUI, uEditRM, uiOp("editMessageReplyMarkup"), uiT, func() []s7.Companion { return nil }},
+		{"ui.editMessageText", "editMessageText", kindUI, uEditT, uiOp("editMessageText"), uiT, func() []s7.Companion { return nil }},
+	}
+	if len(cases) != 11 {
+		t.Fatalf("table has %d rows, want all 11 kind/method pairs in kindMethods", len(cases))
 	}
 	for _, tc := range cases {
 		before := total()
-		req := map[string]any{"chat_id": 42, "text": "x", "offset": 0, "action": "typing"}
+		req := map[string]any{"chat_id": 42, "text": "x", "offset": 0, "action": "typing",
+			"rich_message": map[string]any{"markdown": "x"}, "commands": []map[string]string{{"command": "x", "description": "x"}},
+			"callback_query_id": "1", "message_id": 1}
 		if err := h.a.call(ctxT(), tc.method, req, nil, tc.g, tc.kind, tc.op, tc.target, tc.comp()...); err != nil {
 			t.Fatalf("%s: valid first use failed: %v", tc.name, err)
 		}
 		if total() != before+1 {
-			t.Fatalf("%s: first use made %d wire calls", tc.name, total()-before)
+			t.Fatalf("%s: first use made %d wire calls, want 1", tc.name, total()-before)
 		}
 		if err := h.a.call(ctxT(), tc.method, req, nil, tc.g, tc.kind, tc.op, tc.target, tc.comp()...); !errors.Is(err, s7.ErrAttemptNotAuthorized) {
 			t.Fatalf("%s: same grant reused: %v", tc.name, err)

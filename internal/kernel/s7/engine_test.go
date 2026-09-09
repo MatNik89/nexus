@@ -516,3 +516,49 @@ func TestReconcileExitsUnknownWithinBudget(t *testing.T) {
 		t.Fatalf("rehydrated %s", st)
 	}
 }
+
+// CODE4 codex #1: Report's (outcome, landing, code, next_at) compatibility
+// check is the S7 API boundary's OWN invariant, not just the durable
+// journal event validator's — a non-durable operation must refuse the same
+// impossible narratives a durable one would, leaving state RUNNING (no
+// silent success on garbage input).
+func TestReportRefusesIncompatibleCodeForNonDurableOperation(t *testing.T) {
+	c := &clock{time.Unix(2000, 0)}
+	a := NewAuthority(c.now, time.Minute)
+	pol := Policy{EffectClass: contracts.EffectReadOnly, MaxAttempts: 3, RetryableCodes: []string{CodeHTTP5xx}}
+
+	if err := a.Begin("op1", "t", pol); err != nil {
+		t.Fatal(err)
+	}
+	g, _ := a.Next("op1", nil)
+	consumeOK(t, a, g)
+	// A succeeded outcome can never carry a code (validReport): the closed
+	// (outcome, landing, code, next_at) table must refuse it here, at the
+	// Report() boundary itself — not only inside the durable journal
+	// validator that a non-durable operation never reaches.
+	if err := a.Report("op1", OutcomeSucceeded, CodeHTTP5xx, nil); err == nil {
+		t.Fatal("Report accepted OutcomeSucceeded with a non-empty code")
+	}
+	if st, _ := a.State("op1"); st != contracts.AttemptRunning {
+		t.Fatalf("state after refused report: %s, want RUNNING (untouched)", st)
+	}
+
+	if err := a.Begin("op2", "t", pol); err != nil {
+		t.Fatal(err)
+	}
+	g2, _ := a.Next("op2", nil)
+	consumeOK(t, a, g2)
+	// A code outside the closed vocabulary must be refused regardless of
+	// outcome, for both durable and non-durable operations alike.
+	if err := a.Report("op2", OutcomeFailedTerminal, "not_a_real_code", nil); err == nil {
+		t.Fatal("Report accepted a code outside the closed vocabulary")
+	}
+	if st, _ := a.State("op2"); st != contracts.AttemptRunning {
+		t.Fatalf("state after unknown-code report: %s, want RUNNING (untouched)", st)
+	}
+	// A legitimate terminal report on the same operation still succeeds
+	// afterward — the refusal above left no torn state behind.
+	if err := a.Report("op2", OutcomeFailedTerminal, CodeHTTP4xx, nil); err != nil {
+		t.Fatalf("legitimate report after a refused one: %v", err)
+	}
+}

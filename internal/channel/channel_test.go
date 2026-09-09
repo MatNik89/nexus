@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MatNik89/nexus/internal/channel/health"
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
 	"github.com/MatNik89/nexus/internal/kernel/journal"
 	"github.com/MatNik89/nexus/internal/kernel/s7"
@@ -581,5 +582,34 @@ func TestTwoRowsDistinctGrantsAndReuseRefused(t *testing.T) {
 	}
 	if err := c.Flush(ctxT(), auth, sendVia(auth, func(Outbound) error { t.Fatal("resend"); return nil })); !errors.Is(err, ErrNothingDue) {
 		t.Fatalf("idle flush must be ErrNothingDue, got %v", err)
+	}
+}
+
+// CODE4 codex #2: ClassOf must find substrate dominance even when the join
+// is nested inside a %w wrap (not just a direct top-level join), and must
+// normalize an invalid/unrecognized Class to substrate — both BEFORE the
+// caller computes fatal, so an unknown class can never fail open.
+func TestClassOfNestedJoinAndUnknownClassNormalizeToSubstrate(t *testing.T) {
+	transportErr := &ClassifiedError{Class: health.ClassTransport, Code: "t1"}
+	substrateErr := &ClassifiedError{Class: health.ClassSubstrate, Code: "s1"}
+	nested := fmt.Errorf("outer: %w", errors.Join(transportErr, substrateErr))
+	if cls, code := ClassOf(nested); cls != health.ClassSubstrate || code != "s1" {
+		t.Fatalf("nested-join substrate dominance: got %s/%s, want substrate/s1", cls, code)
+	}
+
+	bogus := &ClassifiedError{Class: health.Class("bogus"), Code: "b1"}
+	cls, _ := ClassOf(bogus)
+	if cls != health.ClassSubstrate {
+		t.Fatalf("unknown class normalized to %s, want substrate (fail closed)", cls)
+	}
+	if cls.Fatal() != true {
+		t.Fatal("substrate-normalized unknown class must be Fatal()")
+	}
+
+	// Precedence when substrate is absent: remote_rejected beats transport.
+	rejErr := &ClassifiedError{Class: health.ClassRemoteRejected, Code: "r1"}
+	mixed := errors.Join(transportErr, rejErr)
+	if cls, code := ClassOf(mixed); cls != health.ClassRemoteRejected || code != "r1" {
+		t.Fatalf("remote_rejected precedence: got %s/%s, want remote_rejected/r1", cls, code)
 	}
 }

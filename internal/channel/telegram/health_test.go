@@ -67,6 +67,46 @@ func TestPoll401RecordsRemoteRejectedAndStops(t *testing.T) {
 	}
 }
 
+// CODE4 codex #3: a persistently-retryable poll failure (HTTP 500, never
+// 401/403) is ClassTransport — cls.Fatal() alone is FALSE for that class —
+// yet S7 exhausting the operation's MaxAttempts still STOPS the adapter,
+// because record()'s fatal decision also carries an explicit
+// errors.Is(err, ErrPollTerminal) arm. Ablating that OR arm must leave this
+// test RED (verified by hand: commenting it out fails the Stopped assertion
+// below, since ClassTransport.Fatal() returns false).
+func TestPollRetryableExhaustionStopsViaErrPollTerminal(t *testing.T) {
+	h := build(t, map[int64]string{42: "work"})
+	h.bot.mu.Lock()
+	h.bot.pollStatus, h.bot.pollStatusLeft = 500, 1000
+	h.bot.mu.Unlock()
+	var last error
+	for i := 0; i < s7.PolicyPoll.MaxAttempts*2; i++ {
+		last = h.a.PollOnce(ctxT())
+		tgClock.advance(time.Hour)
+		if errors.Is(last, ErrPollTerminal) {
+			break
+		}
+	}
+	if !errors.Is(last, ErrPollTerminal) {
+		t.Fatalf("poll never reached terminal exhaustion: %v", last)
+	}
+	var ce *channel.ClassifiedError
+	if !errors.As(last, &ce) || ce.Class != health.ClassTransport {
+		t.Fatalf("exhausted poll classified %v, want ClassTransport (not remote_rejected)", last)
+	}
+	if ce.Class.Fatal() {
+		t.Fatal("precondition broken: ClassTransport must NOT be Fatal() by class alone, or this detector proves nothing")
+	}
+	rerr := h.a.record(ctxT(), "telegram.poll", last)
+	if rerr == nil {
+		t.Fatal("record() did not stop the adapter on a terminal (exhausted, non-remote-rejected) poll")
+	}
+	e := entry(t, h, "telegram.poll")
+	if !e.Stopped || e.Class != health.ClassTransport {
+		t.Fatalf("health entry %+v, want stopped transport", e)
+	}
+}
+
 // D3: an outbox transport failure degrades health (transport, not stopped)
 // and the adapter keeps running; a later success RECOVERS the component.
 func TestOutboxTransportFailureDegradesThenRecovers(t *testing.T) {

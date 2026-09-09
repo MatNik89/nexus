@@ -88,42 +88,77 @@ func (c *ClassifiedError) Error() string {
 
 func (c *ClassifiedError) Unwrap() error { return c.Cause }
 
-// ClassOf renders the class of an error tree: the first ClassifiedError
-// found (errors.As walks Join trees); a substrate class anywhere wins;
-// nil -> "" (healthy); an unclassified error -> substrate.
+// ClassOf renders the class of an error TREE (code-review CODE4 codex #2):
+// walks every node reachable via Unwrap() error / Unwrap() []error (so a
+// join nested inside a %w-wrapped error is found too, not just a direct
+// top-level join), collects every ClassifiedError, and applies explicit
+// precedence substrate > remote_rejected > transport BEFORE any fatality
+// decision is made by the caller — an invalid/unrecognized Class value
+// (a construction bug elsewhere) is normalized to substrate here, at the
+// same point the precedence is computed, so a caller's `cls.Fatal()` can
+// never fail open on it. nil -> "" (healthy); no ClassifiedError anywhere
+// falls back to the typed Failure's own fields; wholly unclassified ->
+// substrate (fail closed).
 func ClassOf(err error) (health.Class, string) {
 	if err == nil {
 		return "", ""
 	}
-	var found *ClassifiedError
-	if !errors.As(err, &found) {
-		// A typed transport Failure without an explicit class is classified
-		// by its own fields (the adapter's call boundary is the originating
-		// owner of that type): 401/403 = remote_rejected, a receipt the
-		// journal could not record = substrate, anything else = transport.
-		var f *Failure
-		if errors.As(err, &f) {
+	var subs, rej, tra *ClassifiedError
+	var walk func(error)
+	walk = func(e error) {
+		if e == nil {
+			return
+		}
+		if ce, ok := e.(*ClassifiedError); ok {
 			switch {
-			case f.Code == "receipt_not_durable":
-				return health.ClassSubstrate, f.Code
-			case f.Status == 401 || f.Status == 403:
-				return health.ClassRemoteRejected, f.Code
+			case ce.Class == health.ClassSubstrate || !ce.Class.Valid():
+				if subs == nil {
+					subs = ce
+				}
+			case ce.Class == health.ClassRemoteRejected:
+				if rej == nil {
+					rej = ce
+				}
 			default:
-				return health.ClassTransport, f.Code
+				if tra == nil {
+					tra = ce
+				}
 			}
 		}
-		return health.ClassSubstrate, "unclassified"
-	}
-	// A joined error may carry several classes: substrate dominates.
-	if j, ok := err.(interface{ Unwrap() []error }); ok {
-		for _, e := range j.Unwrap() {
-			var c *ClassifiedError
-			if errors.As(e, &c) && c.Class == health.ClassSubstrate {
-				return c.Class, c.Code
+		switch x := e.(type) {
+		case interface{ Unwrap() []error }:
+			for _, sub := range x.Unwrap() {
+				walk(sub)
 			}
+		case interface{ Unwrap() error }:
+			walk(x.Unwrap())
 		}
 	}
-	return found.Class, found.Code
+	walk(err)
+	switch {
+	case subs != nil:
+		return health.ClassSubstrate, subs.Code
+	case rej != nil:
+		return rej.Class, rej.Code
+	case tra != nil:
+		return tra.Class, tra.Code
+	}
+	// A typed transport Failure without an explicit class is classified by
+	// its own fields (the adapter's call boundary is the originating owner
+	// of that type): 401/403 = remote_rejected, a receipt the journal could
+	// not record = substrate, anything else = transport.
+	var f *Failure
+	if errors.As(err, &f) {
+		switch {
+		case f.Code == "receipt_not_durable":
+			return health.ClassSubstrate, f.Code
+		case f.Status == 401 || f.Status == 403:
+			return health.ClassRemoteRejected, f.Code
+		default:
+			return health.ClassTransport, f.Code
+		}
+	}
+	return health.ClassSubstrate, "unclassified"
 }
 
 func substrate(code string, err error) error {
