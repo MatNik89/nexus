@@ -206,6 +206,19 @@ func RunGoplsRename(ctx context.Context, backend *sandbox.Bwrap, report sandbox.
 
 	proc, err := backend.LaunchInteractive(execCtx, policy)
 	if err != nil {
+		if execCause := context.Cause(execCtx); execCause != nil {
+			// The deadline can expire DURING launch preparation itself,
+			// before any process ever starts — the same self-deadline
+			// CANCELLED classification applies here as after Wait
+			// (code-review finding, codex: reproduced non-deterministically,
+			// a 1ms deadline landed here in ~2 of 10 runs; classifying it
+			// as FailedTerminal unconditionally, as this branch used to,
+			// makes the SAME deadline produce two different S7 outcomes
+			// depending on unrelated scheduling timing).
+			grants.Cancel(req.OperationID, nil)
+			journalGoplsRenameEvent(ctx, j, req, RenameResult{}, err)
+			return RenameResult{}, fmt.Errorf("runner: launch cancelled by its own deadline: %w", err)
+		}
 		reportOutcome(grants, req.OperationID, s7.OutcomeFailedTerminal, s7.CodeLocalRefused)
 		return RenameResult{}, fmt.Errorf("runner: launch: %w", err)
 	}

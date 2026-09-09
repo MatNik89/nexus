@@ -179,9 +179,23 @@ func Run(ctx context.Context, backend sandbox.Backend, report sandbox.ProbeRepor
 
 	proc, launchErr := backend.Launch(execCtx, policy)
 	if launchErr != nil {
+		launchExecCause := context.Cause(execCtx)
 		cancelExec()
+		partial := RunResult{PolicyHash: policy.PolicyHash(), SnapshotDigest: snapDigest, ToolchainDigest: pin.HashDigest}
+		if launchExecCause != nil {
+			// The deadline can expire DURING launch itself, before any
+			// process ever starts — same self-deadline CANCELLED
+			// classification as a Wait-time kill below (code-review
+			// finding, codex, found via RunGoplsRename's identical
+			// branch: an unconditional FailedTerminal here makes the
+			// SAME deadline produce two different S7 outcomes depending
+			// on unrelated scheduling timing — whether it lands before
+			// or after Launch returns).
+			grants.Cancel(spec.OperationID, nil)
+			return partial, journalRunEvent(ctx, j, spec, partial, fmt.Errorf("launch cancelled by its own deadline: %w", launchErr))
+		}
 		reportOutcome(grants, spec.OperationID, s7.OutcomeFailedTerminal, s7.CodeLocalRefused)
-		return RunResult{}, journalRunEvent(ctx, j, spec, RunResult{PolicyHash: policy.PolicyHash(), SnapshotDigest: snapDigest, ToolchainDigest: pin.HashDigest}, fmt.Errorf("launch: %w", launchErr))
+		return RunResult{}, journalRunEvent(ctx, j, spec, partial, fmt.Errorf("launch: %w", launchErr))
 	}
 	waitErr := proc.Wait()
 	execCause := context.Cause(execCtx)

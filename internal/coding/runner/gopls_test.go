@@ -4,13 +4,15 @@ package runner
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
-	"strings"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/MatNik89/nexus/internal/kernel/contracts"
 	"github.com/MatNik89/nexus/internal/kernel/s7"
 )
 
@@ -222,23 +224,39 @@ func TestRunGoplsRenameClassifiesOwnDeadlineAsCancelled(t *testing.T) {
 	goBin := realGoBinary(t)
 	goplsBin := realGoplsBinary(t)
 	b, rep := testBackend(t)
-	grants := s7.NewAuthority(time.Now, 5*time.Minute) // generous grant TTL: only spec.Timeout should fire
 	j := testJournal(t)
 
 	src := t.TempDir()
 	tinyModule(t, src)
 
-	_, err := RunGoplsRename(ctxT(), b, rep, grants, j, RenameRequest{
-		SourceDir: src, FileRelPath: "main.go",
-		Line: 0, Character: 5, NewName: "Bar",
-		GoBinary: goBin, GoplsBinary: goplsBin, Timeout: time.Millisecond,
-		OperationID: "op-test-rename-deadline", TargetID: "target-test-rename-deadline",
-		RunID: "run-test-rename-deadline", ProfileID: "work",
-	})
-	if err == nil {
-		t.Fatal("expected an error from a 1ms deadline, got none")
-	}
-	if !strings.Contains(err.Error(), "cancelled by its own deadline") {
-		t.Fatalf("expected the error to classify this as a self-deadline cancellation, got: %v", err)
+	// Iterated, not a single shot (code-review finding, codex: a 1ms
+	// deadline can expire either DURING LaunchInteractive itself (before
+	// any process exists) or AFTER it (while waiting on the session) —
+	// these are two DIFFERENT code branches, and a single run only
+	// exercises whichever one wins the race that iteration. Repeating
+	// catches either branch regressing independently; codex's own
+	// -count=10 stress run reproduced the pre-fix launch-time gap in
+	// ~2 of 10 runs, so fewer than ~15 iterations would likely miss it.
+	for i := 0; i < 20; i++ {
+		grants := s7.NewAuthority(time.Now, 5*time.Minute) // generous grant TTL: only spec.Timeout should fire
+		op := contracts.OperationID(fmt.Sprintf("op-test-rename-deadline-%d", i))
+		_, err := RunGoplsRename(ctxT(), b, rep, grants, j, RenameRequest{
+			SourceDir: src, FileRelPath: "main.go",
+			Line: 0, Character: 5, NewName: "Bar",
+			GoBinary: goBin, GoplsBinary: goplsBin, Timeout: time.Millisecond,
+			OperationID: op, TargetID: "target-test-rename-deadline",
+			RunID: contracts.RunID(fmt.Sprintf("run-test-rename-deadline-%d", i)), ProfileID: "work",
+		})
+		if err == nil {
+			t.Fatalf("iteration %d: expected an error from a 1ms deadline, got none", i)
+		}
+		if !strings.Contains(err.Error(), "cancelled by its own deadline") {
+			t.Fatalf("iteration %d: expected the error to classify this as a self-deadline cancellation, got: %v", i, err)
+		}
+		// Authoritative check, not just the error string (codex's
+		// suggestion): S7 itself must record CANCELLED.
+		if state, ok := grants.State(op); !ok || state != contracts.AttemptCancelled {
+			t.Fatalf("iteration %d: S7 state = %v (ok=%v), want AttemptCancelled", i, state, ok)
+		}
 	}
 }
