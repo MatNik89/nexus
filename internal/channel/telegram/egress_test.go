@@ -60,6 +60,9 @@ func TestEgressReceiptJournaled(t *testing.T) {
 		if p.Component != "telegram" {
 			t.Fatalf("receipt not tagged with its component: %+v", p)
 		}
+		if p.Host != strings.ToLower(p.Host) || p.Host == "" {
+			t.Fatalf("receipt host not the canonical lowercase unit: %+v", p)
+		}
 		if p.Allowed && p.Pinned != "" && len(p.Resolved) > 0 {
 			allowed = true
 		}

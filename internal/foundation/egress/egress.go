@@ -233,8 +233,11 @@ func (d *pinnedDialer) DialContext(ctx context.Context, network, address string)
 	if err != nil {
 		return nil, fmt.Errorf("%s egress: malformed dial address: %w", d.component, ErrPreWire)
 	}
+	// Every receipt names the CANONICAL endpoint unit (lowercased host +
+	// effective port), never the transport-supplied spelling (code-review
+	// r1 codex #2): receipt, allowlist and S7 target correlate on one string.
 	refuse := func(reason string, resolved []netip.Addr) (net.Conn, error) {
-		if aerr := d.receipt(Decision{Component: d.component, Host: host, Port: d.endpoint.Port, Resolved: resolved, Reason: reason}); aerr != nil {
+		if aerr := d.receipt(Decision{Component: d.component, Host: d.endpoint.Host, Port: d.endpoint.Port, Resolved: resolved, Reason: reason}); aerr != nil {
 			return nil, fmt.Errorf("%s egress: %s (receipt append failed: %v): %w", d.component, reason, aerr, ErrPreWire)
 		}
 		return nil, fmt.Errorf("%s egress: %s: %w", d.component, reason, ErrPreWire)
@@ -242,7 +245,7 @@ func (d *pinnedDialer) DialContext(ctx context.Context, network, address string)
 	if !strings.EqualFold(host, d.endpoint.Host) || port != strconv.Itoa(d.endpoint.Port) {
 		return refuse("endpoint not permitted", nil)
 	}
-	addrs, err := d.resolve(ctx, host)
+	addrs, err := d.resolve(ctx, d.endpoint.Host)
 	if err != nil {
 		return refuse("resolve failed", nil)
 	}
@@ -259,7 +262,7 @@ func (d *pinnedDialer) DialContext(ctx context.Context, network, address string)
 		}
 	}
 	pinned := norm[0]
-	if err := d.receipt(Decision{Component: d.component, Host: host, Port: d.endpoint.Port, Resolved: norm, Pinned: pinned, Allowed: true}); err != nil {
+	if err := d.receipt(Decision{Component: d.component, Host: d.endpoint.Host, Port: d.endpoint.Port, Resolved: norm, Pinned: pinned, Allowed: true}); err != nil {
 		return nil, fmt.Errorf("%s egress: refusing dial: %v: %w", d.component, err, ErrReceiptNotDurable)
 	}
 	return d.dial(ctx, network, net.JoinHostPort(pinned.String(), port))

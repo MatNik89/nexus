@@ -313,3 +313,37 @@ func TestDialerRejectsForbiddenV4EveryEncoding(t *testing.T) {
 		}
 	}
 }
+
+// Receipts name the CANONICAL unit (code-review r1 codex #2): an uppercase
+// base URL and a mixed-case dial address still journal lowercase host +
+// effective port, for the allowed AND the refused decision.
+func TestReceiptsUseCanonicalEndpoint(t *testing.T) {
+	var rc []Decision
+	c, err := NewPinnedClient("provider", "https://API.Provider.EXAMPLE", []string{"api.provider.example"}, 0,
+		Options{Resolve: staticResolver("149.154.167.220"), Dial: recordDial(new(string))}, collect(&rc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := c.Transport.(*http.Transport)
+	if _, err := tr.DialContext(context.Background(), "tcp", "API.Provider.EXAMPLE:443"); err != nil {
+		t.Fatalf("allowed dial: %v", err)
+	}
+	rc2 := &rc
+	c2, _ := NewPinnedClient("provider", "https://API.Provider.EXAMPLE", []string{"api.provider.example"}, 0,
+		Options{Resolve: staticResolver("10.0.0.1"), Dial: recordDial(new(string))}, collect(rc2))
+	tr2 := c2.Transport.(*http.Transport)
+	if _, err := tr2.DialContext(context.Background(), "tcp", "API.Provider.EXAMPLE:443"); err == nil {
+		t.Fatal("private answer admitted")
+	}
+	if len(rc) != 2 {
+		t.Fatalf("want 2 receipts, got %d", len(rc))
+	}
+	for i, d := range rc {
+		if d.Host != "api.provider.example" || d.Port != 443 {
+			t.Fatalf("receipt %d not canonical: host=%q port=%d", i, d.Host, d.Port)
+		}
+	}
+	if !rc[0].Allowed || rc[1].Allowed {
+		t.Fatalf("receipt decisions: %+v", rc)
+	}
+}

@@ -113,11 +113,18 @@ func TestAcceptReleaseGateBlocksSignAndPublish(t *testing.T) {
 		{"unparsable-version", "devel", 0, true, false},
 		{"clean", "go1.26.6", 0, true, true},
 		{"newer-clean", "go1.27.0", 0, true, true},
+		// The caller environment must NOT be able to lower the floor
+		// (code-review r1 codex #1): a hostile RELEASE_GO_FLOOR with the
+		// audited 1.26.4 binary is still refused.
+		{"env-lowered-floor", "go1.26.4", 0, true, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			shim, marks := gateShims(t, tc.goVersion, tc.vulnExit, tc.withVuln)
 			env := gateEnv(t, shim, marks)
+			if tc.name == "env-lowered-floor" {
+				env = append(env, "RELEASE_GO_FLOOR=1.0.0")
+			}
 			var conf string
 			for _, e := range env {
 				if strings.HasPrefix(e, "XDG_CONFIG_HOME=") {
@@ -166,11 +173,15 @@ func TestDeployReleaseGateBlocksInstallAndRestart(t *testing.T) {
 		{"old-toolchain", "go1.26.4", 0, false},
 		{"scanner-finding", "go1.26.6", 3, false},
 		{"clean", "go1.26.6", 0, true},
+		{"env-lowered-floor", "go1.26.4", 0, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			shim, marks := gateShims(t, tc.goVersion, tc.vulnExit, true)
 			env := gateEnv(t, shim, marks)
+			if tc.name == "env-lowered-floor" {
+				env = append(env, "RELEASE_GO_FLOOR=1.0.0")
+			}
 			out, err := runScript(t, script, env)
 			installed := markReached(marks, "install")
 			restarted := markReached(marks, "systemctl")
@@ -214,9 +225,9 @@ func TestGoModToolchainMeetsGateFloor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("release-gate.sh missing: %v", err)
 	}
-	f := regexp.MustCompile(`RELEASE_GO_FLOOR:-(\d+\.\d+\.\d+)`).FindStringSubmatch(string(gate))
+	f := regexp.MustCompile(`(?m)^readonly RELEASE_GO_FLOOR=(\d+\.\d+\.\d+)\s*$`).FindStringSubmatch(string(gate))
 	if f == nil {
-		t.Fatal("release-gate.sh does not declare RELEASE_GO_FLOOR")
+		t.Fatal("release-gate.sh does not declare an unconditional readonly RELEASE_GO_FLOOR (an env override would lower the floor)")
 	}
 	if f[1] != "1.26.6" {
 		t.Fatalf("gate floor is %s; the audit fix floor is 1.26.6", f[1])

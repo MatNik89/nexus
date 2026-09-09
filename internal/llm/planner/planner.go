@@ -115,6 +115,9 @@ type ChatPlanner struct {
 	// enforced on the FINAL wire messages immediately before every grant
 	// is issued: over budget = the turn is refused, never trimmed.
 	budget budget.Budget
+	// newOp mints the operation id (secure random by default); tests inject a
+	// known id to prove NO operation exists after a budget refusal.
+	newOp func() (contracts.OperationID, error)
 }
 
 // maxStreamTotal bounds the planner's accumulated streamed final (Slice C,
@@ -349,7 +352,11 @@ func (c *ChatPlanner) Plan(ctx context.Context, blocks []contracts.ContextBlock)
 	if _, err := c.budget.EnforceWire(wire); err != nil {
 		return loop.Action{}, fmt.Errorf("planner: %w", err)
 	}
-	op, err := opID()
+	mint := c.newOp
+	if mint == nil {
+		mint = opID
+	}
+	op, err := mint()
 	if err != nil {
 		return loop.Action{}, fmt.Errorf("planner: %w", err)
 	}

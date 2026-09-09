@@ -8,7 +8,9 @@
 #   2. `govulncheck -mode=binary <bin>` must be installed and report nothing.
 # Every failure mode fails CLOSED: unparsable version, missing scanner,
 # scanner error, any finding. Exit codes: 0 ok, 1 gate refused, 2 cannot judge.
-RELEASE_GO_FLOOR="${RELEASE_GO_FLOOR:-1.26.6}"
+# The floor is OWNED here and cannot be lowered by the caller environment
+# (code-review r1 codex #1: an env override let the audited 1.26.4 through).
+readonly RELEASE_GO_FLOOR=1.26.6
 
 # version_ge A B: dotted X.Y.Z integers, A >= B.
 version_ge() {

@@ -29,6 +29,10 @@ func TestPlanRefusesOverBudgetWireBeforeAnyGrant(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A KNOWN operation id proves the refusal happens BEFORE any grant: no S7
+	// operation may exist afterwards (code-review r1 codex #3 — moving Issue
+	// ahead of the budget check turns this RED).
+	p.newOp = func() (contracts.OperationID, error) { return "op-budget-known", nil }
 	if _, err := p.WithTools(map[contracts.ToolID]effectpath.ToolSpec{
 		"echo": {Description: strings.Repeat("a long tool description ", 20)},
 	}, "work"); err != nil {
@@ -41,6 +45,9 @@ func TestPlanRefusesOverBudgetWireBeforeAnyGrant(t *testing.T) {
 	}
 	if fc.calls != 0 {
 		t.Fatalf("provider called %d times despite the refusal", fc.calls)
+	}
+	if _, exists := auth.State("op-budget-known"); exists {
+		t.Fatal("an S7 operation exists after a budget refusal (grant issued before the check)")
 	}
 	// Control: a generous limit lets the same turn through.
 	fc2 := &fakeChat{auth: auth, reply: "ok"}
