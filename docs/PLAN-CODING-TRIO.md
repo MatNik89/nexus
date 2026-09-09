@@ -734,3 +734,19 @@ re-verified against the actual code or the plan's own text before folding (never
 on faith), two factual disagreements with kilo resolved the same way (kilo wrong both
 times, confirmed by reading the code/text directly rather than averaging opinions).
 Ready to begin Slice 0 implementation.
+
+## Status — Slice 0 concrete design, plan-review round 1 (in progress)
+
+The "Slice 0 — concrete design, round 1" section above is drafted from independent
+research (my own reading of `effectpath`/`s7`/`exectool`/`probe` plus a live `go env`
+check on this host; agy's and kilo's independently-dispatched parallel research, both
+returned and folded; codex's independently-dispatched parallel research, an
+exceptionally long run — folded incrementally as findings landed: the `bin/go`/
+`bin/gofmt` pinning gap already folded; its full final report, if it lands after this
+plan-review dispatch, gets folded as an explicit review-round finding instead). Four
+open design questions resolved with cross-agent convergence (S7 non-durability, dual
+GOROOT+GOMODCACHE binding, disposable-snapshot mechanism, direct `sandbox.Backend`+
+non-durable-S7 caller shape bypassing `EffectPath`) — the last one explicitly flagged
+as revising a previously-converged plan sentence, not silently adopted. Dispatched for
+adversarial plan-review (codex/kilo/agy) before implementation begins, per the standing
+discipline.
