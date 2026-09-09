@@ -1,4 +1,4 @@
-# PLAN v2: coding-agent trio (TIA / symbol-edit / proof-of-done)
+# PLAN v3: coding-agent trio (TIA / symbol-edit / proof-of-done)
 
 Repo's own deferred ledger (`docs/tasks-P0.md:410`, "coding trio TIA/symedit/deep evidence
 (P1)") names this as the next P1 priority after audit-hardening. NEXUS currently has ZERO
@@ -8,37 +8,42 @@ actually completed beyond a worker's own prose claim. This is greenfield for the
 codebase. A related Python tool ("symedit") was built for an older, different Python
 harness (NEXUSv2) — not reusable code, but three of its lessons are load-bearing (below).
 
-**v2 change record:** plan-review round 1 (codex FAIL 5 findings — 4 HIGH independently
-re-verified against the actual code before folding, all confirmed real; kilo PASS with 4
-notes; agy PASS-with-findings overlapping kilo+codex's smaller points). Folded: a new
-Slice 0 (coding-runner substrate) inserted before evidence, because codex's HIGH #2 is
-verified true — `internal/exectool`'s `Spec{Target,Args,WorkDir,Timeout}`
-(`internal/sandbox/sandbox.go:33`) and its fresh-empty-`MkdirTemp`-per-call workdir
-(`internal/exectool/exectool.go:116`) genuinely cannot host a real source checkout for
-`go test`, an LSP session for `gopls`, or a governed `go list` call — none of slices 1-3
-are buildable against the CURRENT exec substrate as originally written. Invariant 2
-tightened (HIGH #1: an in-process `workspace.Apply` is still an effect attempt and needs
-an S7 grant, not just subprocess calls). Invariant 3/Slice 3 expanded with concrete
-`WorkspaceEdit`-application and symlink-defense mechanics (HIGH #3). Invariant 4 replaced
-with a durable transaction protocol (HIGH #4). Slice 2 (TIA) given explicit change-mapping
-inputs (MEDIUM). Terminology fixed: "fail-open" → "fail-safe toward closure" throughout
-(kilo Note 2 + agy Finding 5, independently flagged by both).
+**Change record.** v2 folded plan-review round 1 (codex FAIL 5, 4 HIGH re-verified; kilo
+PASS+4 notes; agy PASS-with-findings) — added Slice 0, tightened S7 scope, expanded edit
+mechanics, replaced the recovery invariant, gave TIA explicit inputs, fixed "fail-open"
+terminology. **v3 folds plan-review round 2** (codex FAIL 5 NEW HIGH; kilo PASS+4 notes;
+agy PASS+4 notes). One factual disagreement between reviewers was independently checked
+against the code before folding: kilo claimed "multi-file `workspace.Apply` fits cleanly
+[through the existing companion mechanism]" — checked directly and this is WRONG.
+`loop.go:317` calls `l.grants.Issue(op, target)`, which hardcodes `PolicyTool`
+(non-durable, `internal/kernel/s7/s7.go:393-395`); `EffectPath.RunTool`'s
+`p.grants.Consume(grant)` passes **zero** companions
+(`internal/kernel/effectpath/effectpath.go:445`) and every one of its `Report` calls
+passes a **nil** builder (`effectpath.go:369,516`). The current tool-dispatch pipeline is
+non-durable-only, end to end — codex's HIGH #2 (round 2) is confirmed real; kilo's PASS on
+this specific point did not check past "Consume happens before dispatch" into whether a
+companion could actually be carried. This is why, on a factual disagreement between two
+independent reviewers, the resolution is "read the code," not "average the opinions."
 
-## Research basis (four independent threads, each with primary-source citations)
+## Research basis (four independent research threads before any review; two review rounds
+since)
 
 1. Claude-side fork research (WebSearch-driven).
-2. codex (gpt-5.6-sol) — deepest: read the actual old `/home/matej/NEXUSv2/core/symedit.py`
-   and its test suite for real lessons, not just concept; proposed the most complete
-   package split; explicit build order and fail-closed rule list; round-1 plan review
-   found the exec-substrate gap (HIGH #2) that the other three research/review threads
-   all missed.
-3. kilo (DeepSeek V4 Pro) — verified `x/tools/refactor/rename`'s obsolescence notice
-   directly; strongest citation discipline (marked unverified claims as negatives).
-4. agy (Gemini) — most implementation-eager (jumped to concrete type signatures); useful
-   as a completeness check but its "everything goes through S7" claim is the one point
-   the other three threads disagree with and disprove (see Cross-slice invariant 2).
+2. codex (gpt-5.6-sol) — deepest at every stage: read the actual old
+   `/home/matej/NEXUSv2/core/symedit.py` and its test suite for real lessons; found the
+   exec-substrate gap (round-1 HIGH #2) and the durable-EffectPath gap (round-2 HIGH #2)
+   that every other thread and reviewer missed, both independently re-verified true
+   against the current code before folding.
+3. kilo (DeepSeek V4 Pro) — verified `x/tools/refactor/rename`'s obsolescence directly;
+   strong citation discipline; PASSed both review rounds, and its one factual claim that
+   turned out wrong (above) is the kind of thing a second independent check exists to
+   catch — the process worked as designed, not a reason to discount kilo generally.
+4. agy (Gemini) — most implementation-eager; useful completeness checks each round (e.g.
+   round 2's `gopls` CLI-vs-stdio-JSON-RPC transport finding, folded below) but its
+   original "everything goes through S7" research claim was the one point the other three
+   threads disagreed with and disproved (see invariant 2).
 
-All four independently converged on:
+All four independently converged on (unchanged from v1/v2, still holds):
 - `golang.org/x/tools/refactor/rename` (and `gorename`) is **dead** — its own docs say it
   hasn't worked since Go modules and to use `gopls` instead. Never revive it.
   ([pkg.go.dev/golang.org/x/tools/refactor/rename](https://pkg.go.dev/golang.org/x/tools/refactor/rename))
@@ -47,266 +52,296 @@ All four independently converged on:
   ([bazel.build/query/guide](https://bazel.build/query/guide)) and Microsoft's Azure
   DevOps TIA safe-fallback rule
   ([learn.microsoft.com/azure/devops/pipelines/test/test-impact-analysis](https://learn.microsoft.com/en-us/azure/devops/pipelines/test/test-impact-analysis))),
-  **not** line-level coverage instrumentation (Datadog's approach — needs a baseline that
-  can silently drift stale) and **not** ML predictive selection (Meta's approach — needs a
-  large historical-failure dataset that doesn't exist for a single-user assistant).
-- Mainstream coding agents (Aider, Cursor, Cline, OpenHands/SWE-agent) mostly do **not**
-  do TIA or true symbol-edit today — Aider's tree-sitter repo-map is a **context-selection**
-  tool (what to show the model), not an edit mechanism; it still edits via text
-  search/replace blocks. `gopls` (LSP `workspace/executeCommand` rename, or the `gopls`
-  CLI) is the only maintained, type-safe Go rename engine — built on the same public
-  `go/ast` + `go/types` + `go/packages` stack NEXUS would otherwise have to reimplement.
-- Proof-of-done should **not** be a new file-based system (in-toto link files, SLSA
-  provenance bundles, sigstore signing) — that's supply-chain-grade ceremony
-  disproportionate to a single-user local assistant. It should be a **content-addressed,
-  structured manifest folded through the existing journal** (same shape as `s7.*` and
-  `channel.*` events already are) — NEXUS's append-only, hash-chained journal already IS
-  the tamper-evident substrate in-toto/SLSA bolt on externally. Steal SWE-bench's
-  `FAIL_TO_PASS`/`PASS_TO_PASS` shape (the completion artifact names the *specific tests*,
-  never a prose "all tests pass" claim —
-  [github.com/SWE-bench/SWE-bench/blob/main/docs/reference/harness.md](https://github.com/SWE-bench/SWE-bench/blob/main/docs/reference/harness.md))
-  and in-toto's typed-Statement-per-step discipline (bind subject digest + typed predicate,
-  never free text — [github.com/in-toto/attestation](https://github.com/in-toto/attestation/blob/main/spec/v1/statement.md)).
-- A caution from an agentic-trajectory study (AgentLens/"Lucky Pass",
-  [arxiv.org/html/2605.12925v1](https://arxiv.org/html/2605.12925v1)): ~10.7% of
-  SWE-agent trajectories that "pass tests" are gamed — blind retries, missing
-  verification, or verification happening out of causal order relative to the edit. The
-  proof must bind **ordering** (RED observed → edit applied → GREEN observed, in that
-  order, each with a preimage/postimage digest), not just a final boolean.
-- Lessons from the OLD Python symedit (architecture only, not code —
-  `/home/matej/NEXUSv2/core/symedit.py`):
-  - No language server available → **honest typed refusal**, never a silent textual-rename
-    fallback (`symedit.py:194`).
-  - Authorization must cover the **complete dynamic write-set** a `WorkspaceEdit` touches,
-    not just the file the caller named — a real regression class was a multi-line
-    whole-file `WorkspaceEdit` silently mis-applied by a naive single-line patcher, and a
-    real security finding was a symlink-aliased write-target bypassing a lexical-path gate
-    (`symedit.py:223`; `test_n2_6_mutation_preflight.py:201` — an existing test that
-    rejects a cross-file rename authorized for only ONE of its two destination files).
-  - These are the two invariants this plan's symedit slice must reproduce for Go.
+  **not** line-level coverage instrumentation and **not** ML predictive selection.
+- `gopls` is the only maintained, type-safe Go rename engine — built on the same public
+  `go/ast`+`go/types`+`go/packages` stack NEXUS would otherwise reimplement.
+- Proof-of-done should be a **content-addressed, structured manifest folded through the
+  existing journal** (same shape as `s7.*`/`channel.*` events) — not a new file-based
+  system (in-toto files, SLSA bundles, sigstore signing). Steal SWE-bench's
+  `FAIL_TO_PASS`/`PASS_TO_PASS` shape
+  ([github.com/SWE-bench/SWE-bench](https://github.com/SWE-bench/SWE-bench/blob/main/docs/reference/harness.md))
+  and in-toto's typed-Statement-per-step discipline
+  ([github.com/in-toto/attestation](https://github.com/in-toto/attestation/blob/main/spec/v1/statement.md)).
+- AgentLens/"Lucky Pass" ([arxiv.org/html/2605.12925v1](https://arxiv.org/html/2605.12925v1)):
+  ~10.7% of SWE-agent trajectories that "pass tests" are gamed — the proof must bind
+  **ordering** (RED → edit → GREEN, each with a digest), not just a final boolean.
+- Old Python symedit lessons (architecture only — `/home/matej/NEXUSv2/core/symedit.py`):
+  no-LSP → honest typed refusal, never textual fallback (`:194`); authorization must cover
+  the **complete dynamic write-set**, not just the named file — the historical failures
+  were a multi-line whole-file `WorkspaceEdit` mis-applied by a naive patcher, and a
+  symlink-aliased write-target bypassing a lexical-path gate (`:223`;
+  `test_n2_6_mutation_preflight.py:201`).
 
 ## Cross-slice invariants (bind every slice)
 
-1. **`internal/exectool` remains the sole physical-process-launch owner** — but see
-   Slice 0: it needs new capability first (staged workdir input, closed toolchain
-   child-closure), not just reuse as-is. Nothing in `internal/coding/*` calls `os/exec`
-   directly.
+1. **`internal/exectool` remains the sole physical-process-launch owner** — Slice 0 gives
+   it the new capability this plan needs (staged workdir input, closed toolchain
+   child-closure); nothing in `internal/coding/*` calls `os/exec` directly.
 2. **S7 governs every dispatched effect attempt — subprocess OR in-process — never pure
-   internal computation that performs no effect.** (Corrected in v2, codex plan-review
-   HIGH #1: `EffectPath.RunTool` consumes the S7 grant before execution regardless of
-   which executor it dispatches to — `internal/kernel/effectpath/effectpath.go:431,445`;
-   S7 authorizes one physical *attempt*, not specifically "a subprocess" —
-   `internal/kernel/s7/s7.go:478`. `telegram.call()`'s pattern of consuming the grant
-   immediately before the wire, with all pure work done first, is the model —
-   `internal/channel/telegram/telegram.go:321,375`.) Concretely:
-   - Pure internal calculations that perform NO effect and are not dispatched as a
-     tool/effect (e.g. the reverse-import-graph WALK over an already-loaded
-     `go/packages` result) need no S7 operation.
-   - Every dispatched tool/effect attempt — INCLUDING an in-process
-     `workspace.Apply` filesystem mutation, not just external subprocess calls like
-     `go list`/`gopls`/`go test` — passes through S6.0/S6.9, consumes an S7 grant before
-     its first effect, and reports success/failure/UNKNOWN afterward. Bind the Apply
-     grant and its approval to the prepared-plan hash, the complete canonical write set,
-     workspace identity, profile, and file identities (exact-intent, `AGENTS.md`).
+   internal computation that performs no effect** (`EffectPath.RunTool` consumes the
+   grant regardless of executor — `effectpath.go:431,445`; S7 authorizes one physical
+   *attempt*, not specifically a subprocess — `internal/kernel/s7/s7.go:478`). A pure
+   `go/packages`-style graph WALK over already-loaded data needs no S7 operation; every
+   dispatched effect — including in-process `workspace.Apply` — does.
+   **The current tool pipeline cannot carry this** (v3, codex round-2 HIGH #2, verified
+   against the code — see Change record above): `loop.go` only issues non-durable
+   `PolicyTool` grants with no companion and a nil `Report` builder throughout
+   `EffectPath.RunTool`. `workspace.Apply` needs a genuinely NEW durable lifecycle,
+   specified now:
+   - A new `PolicyWorkspaceApply` (durable, `MaxAttempts` per its own retry policy — a
+     multi-file apply is not "fire once, never retry" like `PolicyTool`).
+   - Operation identity derived from `(profile, canonical workspace identity,
+     prepared-plan hash)` — exact-intent bound, matching the ASK-grant rule in
+     `AGENTS.md`.
+   - `Consume` atomically commits `s7.attempt_started` together with a
+     `workspace.apply_started` companion IN ONE BATCH (the existing paired-companion
+     mechanism `s7.Consume`/`s7.Report` already support for other durable operations —
+     see `internal/channel/telegram/telegram.go`'s `registerCommands` for the working
+     precedent of exactly this pattern applied to a different owner).
+   - `Report`/`Cancel`/`Reconcile` each commit their S7 transition with exactly ONE
+     workspace companion — never a nil builder.
+   - Either extend `EffectPath` with a second, explicitly durable-effect lifecycle
+     method alongside `RunTool` (not overloading `RunTool` itself, which stays the
+     non-durable `PolicyTool` path for ordinary tools), or specify an equally explicit
+     alternate route that still enforces S6.0/S6.9 and never duplicates S7 ownership.
+   - RED-capable detector: injecting a fault into EITHER half of the paired companion
+     batch (the S7 half or the `workspace.apply_started` half) must result in ZERO
+     filesystem writes (mirrors S7's own `SetAppendFault` seam pattern, already used
+     elsewhere in this codebase to prove exactly this class of atomicity).
 3. **Two-phase Prepare/Apply for any mutation, never a one-shot write.** Prepare is
    read-only (resolve symbol, ask `gopls` for the `WorkspaceEdit`, hash every preimage,
    format+type-check the staged result, return a canonical preview: symbol identity +
    old/new name + complete path set + patch hash). Apply re-hashes every preimage
    immediately before writing (any drift invalidates the prepared plan) and applies
-   through the `internal/coding/workspace` owner (Slice 3), never `gopls` writing files
-   itself. **WorkspaceEdit application mechanics** (expanded in v2, codex HIGH #3 + agy
-   Finding 4, both independently required this): define a CLOSED accepted subset of LSP
-   edit shapes up front and reject everything else — no silent best-effort handling of an
-   edit shape not explicitly implemented. Within that closed subset:
-   - Resolve every LSP range from its native UTF-16 code-unit position into a byte offset
-     against the IMMUTABLE preimage (never against a progressively-mutated copy).
+   through `internal/coding/workspace` (Slice 3), never `gopls` writing files itself.
+   **`WorkspaceEdit` shape — DECIDED now, not deferred** (v3, codex round-2 HIGH #4 +
+   agy round-2 Note 4, both independently required a decision rather than an open
+   "state explicitly which shape" placeholder):
+   - v1 supports ONLY plain `WorkspaceEdit.changes` (`map[DocumentURI][]TextEdit]`).
+     Everything else — versioned `documentChanges`, annotated edits, resource
+     rename/create/delete operations — is refused outright with a typed
+     `ErrUnsupportedEditShape`, in v1. This also determines the `gopls` client
+     capabilities NEXUS advertises when it initializes the session (Slice 0), so
+     `gopls` itself is asked to return only the supported shape.
+   - Accept only local `file:` URIs with an empty authority, strictly decoded once
+     (reject anything else — a non-local or malformed URI is a refusal, not a
+     best-effort resolution attempt).
+   - Resolve every LSP range from its native UTF-16 code-unit position into a byte
+     offset against the IMMUTABLE preimage (never a progressively-mutated copy).
    - Reject overlapping ranges, duplicate ranges, out-of-range offsets, and any
      inconsistency between the edit's declared document version and the preimage's own
      version/hash.
-   - Apply all validated edits within one file in DESCENDING byte-offset order so earlier
-     edits never invalidate later ones' offsets.
-   - Preserve CRLF and final-newline exactly as found — never silently normalize
-     line-endings as part of applying an edit.
-   - State explicitly which `WorkspaceEdit` shapes v1 supports (e.g. plain `changes`) and
-     which are refused outright in v1 (versioned `documentChanges`, annotated edits,
-     resource-rename/create/delete operations) rather than left ambiguous.
+   - Canonically sort the complete path set and reject it outright if two lexically
+     distinct paths resolve to the SAME file identity (device+inode) — a duplicate
+     target under two names is refused, not silently deduplicated.
+   - Apply all validated edits within one file in DESCENDING byte-offset order.
+   - Preserve CRLF and final-newline exactly as found — never silently normalize.
 4. **A rename touches MANY files — `atomicwrite` only makes ONE file old-or-new
    (`internal/foundation/atomicwrite/atomicwrite.go:19`).** `internal/coding/workspace`
-   is the multi-file transaction coordinator, and it needs a DURABLE recovery protocol
-   surviving a restart, not just "compare digests after" (v2, codex HIGH #4 — the
-   original v1 wording promised all-or-none without saying where the transaction intent
-   itself survives a crash; `docs/ARCHITECTURE-ESSENTIALS.md:55`'s E4 snapshot-before-
-   effect + byte-identical-rollback requirement applies here too):
-   1. Before the FIRST write: durably persist the complete canonical write set,
-      before/after digests, and sealed before-images (the recovery journal entry, not
-      just an in-memory plan).
-   2. Record a prepared-transaction identity in the journal.
+   is the multi-file transaction coordinator. **The recovery protocol needs a durably
+   RECONSTRUCTABLE after-image, not just an after-image digest** (v3, codex round-2
+   HIGH #3, verified: a digest alone cannot reconstruct the actual bytes after a crash,
+   and re-running `gopls` to regenerate them would violate the no-blind-rerun rule):
+   1. Before the FIRST write: persist ONE sealed transaction bundle containing the
+      COMPLETE before-image AND after-image BYTES (not just digests) for every file in
+      the write set, plus their permissions, canonical identities, and digests. `fsync`
+      this bundle to durable storage.
+   2. Atomically pair `workspace.apply_started{artifact_ref, digest}` with the S7
+      `Consume` companion batch (invariant 2) — the journal entry names the sealed
+      bundle by reference+digest, it does not duplicate the bundle's bytes into the
+      journal itself.
    3. Replace files individually through `atomicwrite`, one at a time.
-   4. On an ordinary mid-transaction failure: restore every already-written file
-      byte-for-byte from its sealed before-image.
-   5. On restart: classify every file in the transaction's write set as BEFORE (matches
-      sealed before-image), AFTER (matches the prepared after-image), or FOREIGN
-      (matches neither).
-   6. Only roll FORWARD to the exact prepared after-images, or roll BACK to the sealed
-      before-images — a FOREIGN file requires refusal + reconciliation, never a silent
-      guess or a blind re-run of the rename.
-   7. Add crash-injection detectors at every individual-file boundary AND at the
-      journal/artifact boundary (mirrors S7's own `SetAppendFault` seam pattern).
-   - **Symlink defense** (v2, codex HIGH #3 + kilo Note 1 + agy Finding 3, all three
-     independently required this — the exact regression class the old Python symedit
-     hit): every candidate path in the write set must be resolved via
-     `filepath.EvalSymlinks` against the canonical workspace root before ANY hash is
-     computed or verified, and re-resolved/re-verified at Apply time (a symlink could be
-     swapped between Prepare and Apply) — refuse the whole operation if any path escapes
-     the canonical workspace root or if a parent-directory symlink changes between the
-     two phases. Digest sets are keyed by canonical (not lexical) path throughout.
-5. **Fail-SAFE toward closure on uncertainty** (v2 terminology fix — "fail-open" was the
-   wrong term for behavior that is actually conservative/fail-closed; kilo Note 2 + agy
-   Finding 5 both flagged this independently):
+   4. On completing ALL per-file replacements: commit a terminal
+      `workspace.mutation_committed` event (agy round-2 finding — this is the explicit
+      "we finished" marker the recovery classification below depends on).
+   5. On an ordinary mid-transaction failure (not a crash): restore every already-written
+      file byte-for-byte from the sealed bundle's before-images.
+   6. On restart, classify EVERY file in the transaction's write set as BEFORE (matches
+      the sealed before-image), AFTER (matches the sealed after-image), or FOREIGN
+      (matches neither) — this table is exhaustive:
+      - `workspace.mutation_committed` exists → verify every file matches AFTER; any
+        mismatch is FOREIGN, not silently accepted.
+      - No commit event, all files BEFORE → transaction never effectively started;
+        reconcile as "not applied," safe to retry the whole operation fresh.
+      - No commit event, mixed BEFORE/AFTER → mid-crash; roll every AFTER-matching file
+        back to its sealed before-image (never roll forward without the commit marker).
+      - Any file FOREIGN (in any of the above) → refuse; manual reconciliation only,
+        never a guess and never a blind re-run.
+      - The recovery journal entry itself missing after a crash → SAFE, because step 1
+        happens before any write: no journal entry means no write could have started
+        (this is the load-bearing "step 1 before step 3" ordering — kilo round-2 verified
+        this explicitly).
+      - The recovery journal entry present but its referenced sealed bundle missing or
+        corrupt → treat as FOREIGN (refuse, manual reconciliation) — a valid journal
+        event pointing at a dead artifact is itself an anomaly, not a decodable state.
+      - A CORRUPT (not missing) journal entry is already caught by the journal's own
+        integrity hash-chain at `Journal.Open` (`internal/kernel/journal/journal.go:307,709`)
+        — do not invent a second, parallel fail-open recovery log; the existing substrate
+        already fails closed on this.
+   7. Crash-injection detectors required, at minimum: fault before the sealed bundle is
+      written; fault between the bundle and the journal pairing; fault at every
+      individual-file boundary; fault after all files are written but before the
+      `mutation_committed` event; a corrupt/missing sealed bundle referenced by a valid
+      journal event.
+   - **Symlink defense — mutation-time guard, not just a pre-check** (v3, codex round-2
+     HIGH #4: `filepath.EvalSymlinks`-then-`rename`-by-pathname alone leaves a TOCTOU
+     window — a parent-directory symlink can be swapped between the last check and the
+     actual write, since `atomicwrite`'s current writer reopens the directory and renames
+     by pathname, `internal/foundation/atomicwrite/atomicwrite.go:19`). Reject any
+     symlink path COMPONENT in the write set outright at Prepare (not just the leaf).
+     Perform the actual create/rename at Apply time descriptor-relatively — `openat2`
+     with `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS` (or an equivalent directory-file-
+     descriptor design) so the checked target and the written target are provably the
+     SAME kernel object, not just the same lexical path re-resolved a second time.
+     Digest sets are keyed by canonical (device+inode-bound) identity throughout, never
+     by lexical path.
+5. **Fail-SAFE toward closure on uncertainty** ("fail-open" was the wrong term in v1 for
+   behavior that is actually conservative/fail-closed — kilo+agy both flagged this
+   independently in round 1):
    - TIA: incomplete graph, unknown file type, unknown build configuration, or graph
      load error → run the FULL suite, never a guessed subset.
    - symedit: `gopls` unavailable, malformed response, or an edit/resource operation
-     outside the closed-subset list in invariant 3 → refuse the whole edit; **never** a
-     regex/text-based fallback rename.
+     outside invariant 3's closed subset → refuse the whole edit; never a regex/text
+     fallback rename.
    - evidence: a test process failure, truncated event stream, undeclared workspace
      mutation, or a manifest that can't be durably written → no completion verdict at
      all (not a downgraded one).
 6. **The worker cannot grade its own output** — `internal/kernel/checker.Grade` already
-   rejects `e.Producer == contract.Worker` (`internal/kernel/checker/checker.go:215`, kilo
-   plan-review verified this directly). Extend it with coding-specific typed evidence
-   kinds rather than inventing a second completion authority.
+   rejects `e.Producer == contract.Worker` (`checker.go:215`, verified directly). Extend
+   it with coding-specific typed evidence kinds; do not invent a second authority.
 7. **Redact before journal, as everywhere else** (`docs/ARCHITECTURE-ESSENTIALS.md`):
    raw test/tool output may contain secrets; only bounded, redacted output (or a typed
    reference + digest into a profile-scoped sealed artifact) goes into the journal.
-8. RED-before/GREEN-after is about a BEHAVIORAL fix; a semantics-preserving refactor
-   (like `RenameSymbol` itself) can legitimately have an EMPTY `FAIL_TO_PASS` set, proven
-   instead by its predeclared structural postcondition (the symbol no longer exists under
-   its old name; every reference now resolves to the new one) plus full `PASS_TO_PASS`
-   preservation (codex plan-review non-blocking note, adopted as an explicit rule so
-   Slice 1's evidence schema doesn't wrongly require a non-empty `FAIL_TO_PASS` for
-   every coding task).
+8. RED-before/GREEN-after governs a BEHAVIORAL fix; a semantics-preserving refactor
+   (`RenameSymbol` itself) can legitimately have an EMPTY `FAIL_TO_PASS` set, proven
+   instead by its predeclared structural postcondition (the old name no longer exists,
+   every reference resolves to the new one) plus full `PASS_TO_PASS` preservation.
 
 ## Build order
 
-### Slice 0 — coding-runner substrate (NEW in v2, prerequisite for everything else)
-Confirmed necessary by re-reading the actual code (codex plan-review HIGH #2, verified):
-`internal/exectool`'s `Spec{Target,Args,WorkDir,Timeout}`
-(`internal/sandbox/sandbox.go:33`) and its `os.MkdirTemp`-fresh-empty-per-call workdir
-with no staged-input mechanism (`internal/exectool/exectool.go:116`) cannot host a real
-source checkout for `go test`, an interactive LSP session for `gopls` (exectool is a
-one-shot Launch→Wait→collect interface, not a transport —
-`internal/exectool/exectool.go:129`), or even a plain governed `go list` call cleanly,
-because `go/packages`' default driver shells out to `go list` internally with NO
-command-runner injection seam
-(`golang.org/x/tools@.../go/packages/packages.go:153`,
-`golang.org/x/tools@.../internal/gocommand/invoke.go:209,248`) — that hidden subprocess
-would bypass NEXUS's effect path entirely if `packages.Load` were called naively. `go
-test`/`go build` also spawn compiler/linker/test-binary children the sandbox's synthetic
-closure deliberately excludes today (`docs/ARCHITECTURE-ESSENTIALS.md:131`).
-Concretely, before Slice 1 can build anything:
+### Slice 0 — coding-runner substrate (prerequisite for everything else)
+Verified necessary against the actual code (round 1) and given a concrete, buildable
+contract (round 2, folding codex HIGH #1 + agy Notes 2/3): define a closed `CodingRunSpec`
+before implementation begins, not just name the requirements.
+- **Isolation.** Always construct a PRIVATE snapshot of the workspace after S7
+  consumption — the live workspace is never exposed read-write to a coding-run process.
+  Define the tree-digest algorithm, the allowed node types (regular files + directories
+  only; no device/socket/fifo nodes), the symlink policy (reject, per invariant 4), and
+  explicit file-count/byte-size caps for the snapshot.
+- **Toolchain pinning.** Pin `GOROOT` host tools and mount the module cache read-only;
+  set `CGO_ENABLED=0`, `GOTOOLCHAIN=local`, and disable module-fetch networking by
+  default (a missing module dependency is a typed refusal or a separately-authorized
+  fetch, never a silent network fallback). Isolate `GOCACHE`/`GOTMPDIR` to a location
+  OUTSIDE the snapshot's source tree (agy round-2 Note 3) so the compiler's own cache
+  writes during `go test`/`go build` never pollute the post-run workspace tree digest.
+- **Child-process closure.** The sandbox-generated test/build binary is explicitly
+  allowed to execute, but ONLY from inside the private staged work/build tree — arbitrary
+  host executables remain absent, matching the existing closure discipline
+  (`docs/ARCHITECTURE-ESSENTIALS.md:131`). The discovery/pinning mechanism for
+  `compile`/`link`/`asm`/`cgo`/test-binary children is Slice 0's own hardest design
+  surface (kilo round-2 Note 1) — treat it as such, not an afterthought.
+- **`gopls` transport — DECIDED now:** a stdio JSON-RPC session
+  (`gopls serve` → `initialize` → `textDocument/rename` → `shutdown`), not the `gopls`
+  CLI (agy round-2 Note 2, verified: the CLI emits unified text diffs or writes files
+  directly with `-w` — it does NOT emit structured `protocol.WorkspaceEdit` JSON, which
+  invariant 3's mechanics require). This is Slice 0's integration; Slice 3 consumes it.
 - Route every coding-related command as a typed `ToolCall` through `EffectPath`, never
-  directly through raw `exectool` (matches invariant 2's grant-before-effect rule).
-- Support a content-addressed staged `/work` directory that CAN be pre-populated with a
-  real (or disposable-copy) source tree before launch, not just an empty temp dir.
-- Define a pinned, closed Go-toolchain child-process closure (compiler/linker/test
-  binaries the toolchain itself spawns) and an explicit network policy for it (deny by
-  default; a missing module dependency is a typed refusal or a separately-authorized
-  fetch, never a silent network fallback).
-- For TIA (Slice 2): call `go list -deps -test -json` EXPLICITLY as a governed
-  subprocess and parse its stdout in-process — do NOT call `packages.Load` with its
-  default driver, since that hides an ungoverned `go list` invocation inside a
-  library call.
-- For symedit (Slice 3): choose and specify ONE gopls integration shape up front — either
-  a governed ONE-SHOT `gopls` CLI/protocol call that returns a structured edit for a
-  single Prepare, or an explicit BOUNDED LSP session with its own lifecycle (start,
-  request, response, terminate) — do not leave this implicit; whichever is chosen becomes
-  the pinned, doctor-probed integration for Slice 3.
+  directly through raw `exectool`.
+- For TIA (Slice 2): call `go list -deps -test -json` EXPLICITLY as a governed subprocess
+  and parse its stdout in-process — never `packages.Load`'s default driver, which hides
+  an ungoverned `go list` invocation inside a library call.
+- **Required causal detectors** (codex round-2 HIGH #1): host-workspace immutability (the
+  live workspace is never mutated by a coding run); external-symlink non-import (a
+  symlink in the snapshot input is rejected, not silently followed); undeclared
+  host-child rejection (any subprocess spawned outside the pinned closure is refused);
+  toolchain-version swap detection; network denial under the default policy;
+  candidate-digest mismatch (the snapshot's measured digest disagrees with its claimed
+  one); generated-test-binary execution scoped correctly (runs, but only from inside the
+  staged tree).
 
 ### Slice 1 — proof-of-done / evidence manifest
-Slice 1 depends only on EXISTING machinery (journal, `checker`) plus Slice 0's governed
-test-runner — it does not depend on TIA or symedit existing (kilo plan-review verified
-the dependency graph directly: `PLAN-CODING-TRIO.md:120-187` in v1).
-- New closed journal event vocabulary in a package under `internal/coding/evidence`
-  (mirrors the `s7.*`/`channel.*` pattern): binds acceptance-contract ID, worker/checker
-  identity, profile + workspace canonical path, base commit/tree + preimage digest,
-  patch digest + complete changed-file before/after digests, exact executable/toolchain
-  digest, argv/cwd/allowlisted-env (never a shell string), S7 operation/attempt IDs,
-  start/finish times + exit status, parsed `go test -json` results (FAIL_TO_PASS /
-  PASS_TO_PASS shape — allowed empty for a proven-by-postcondition refactor per
-  invariant 8), post-run workspace tree digest, explicit proof ceiling + fallback reason,
-  deterministic checker verdict.
+Depends only on EXISTING machinery (journal, `checker`) plus Slice 0's governed
+test-runner — not on TIA or symedit existing (dependency graph verified independently
+twice, round 1 and round 2).
+- New closed journal event vocabulary under `internal/coding/evidence` (mirrors
+  `s7.*`/`channel.*`): acceptance-contract ID, worker/checker identity, profile +
+  workspace canonical path, base commit/tree + preimage digest, patch digest + complete
+  changed-file before/after digests, exact executable/toolchain digest,
+  argv/cwd/allowlisted-env (never a shell string), S7 operation/attempt IDs,
+  start/finish times + exit status, parsed `go test -json` results (FAIL_TO_PASS/
+  PASS_TO_PASS shape, empty allowed per invariant 8), post-run workspace tree digest,
+  explicit proof ceiling + fallback reason, deterministic checker verdict.
 - The completion event must not race the tested source: hash the candidate tree → run
-  tests in a disposable sandboxed copy bound to that hash (via Slice 0's staged-workdir
-  substrate) → hash again after → reject the evidence if undeclared mutation occurred in
-  between → commit through the journal's single-write-owner actor.
-- Extend `internal/kernel/checker` with coding-specific typed evidence kinds; do not
-  create a second completion authority.
-- RED-capable detector: an evidence manifest missing any required field, or one produced
-  out of causal order (GREEN recorded before the RED baseline, or before the edit's
-  postimage digest exists), is refused by the checker.
+  tests in Slice 0's disposable sandboxed snapshot bound to that hash → hash again after
+  → reject the evidence if undeclared mutation occurred in between → commit through the
+  journal's single-write-owner actor.
+- Extend `internal/kernel/checker` with coding-specific typed evidence kinds.
+- RED-capable detector: an evidence manifest missing any required field, or produced out
+  of causal order (GREEN before the RED baseline, or before the edit's postimage digest
+  exists), is refused by the checker.
 
 ### Slice 2 — TIA (`internal/coding/impact`), shadow mode first
-- Change-mapping inputs, made explicit (v2, codex plan-review MEDIUM finding): base and
-  candidate graph identities, per-package `Dir` + compiled/source/test/embed file sets,
-  module/workspace files, active build tags, `GOOS`/`GOARCH`, and a toolchain+environment
-  digest — a deleted or renamed file, or any file the mapping can't classify, MUST trigger
-  full-suite selection (it cannot appear in a post-change-only graph at all).
-- Governed `go list -deps -test -json` (via Slice 0, not `packages.Load`'s default
-  driver) → invert the import graph → transitive closure of dependents of the changed
-  packages → union with their test targets.
-- Change-set source, made explicit (v2, kilo Note 3): in shadow mode, the source is
-  `git diff` against the base commit; once Slice 3 exists, the journal's `coding.edit`
-  events become an equally valid source — state which one is active per invocation.
+- Change-mapping inputs, explicit: base/candidate graph identities, per-package `Dir` +
+  compiled/source/test/embed file sets, module/workspace files, active build tags,
+  `GOOS`/`GOARCH`, toolchain+environment digest — a deleted/renamed or unclassifiable file
+  MUST trigger full-suite selection.
+- **Authoritative change source — corrected in v3** (codex round-2 HIGH #5, verified: a
+  journal `coding.edit` event can only describe a symedit-mediated mutation — it cannot
+  observe user edits, other tools, generated files, or any workspace change after the
+  event was written, so it cannot be an equal ALTERNATIVE source to filesystem reality):
+  the actual base-versus-candidate filesystem/build-input comparison is the ONLY
+  authoritative change source, and it must include untracked-but-build-relevant files
+  found in the candidate package graph (a plain `git diff` alone misses these). Journal
+  `coding.edit` events are provenance ANNOTATIONS that may be unioned in for
+  explanatory/debugging purposes — they never replace the measured comparison. Any
+  unexplained tree-digest difference, unsupported node type, submodule, or
+  unclassifiable file → full suite.
+- Governed `go list -deps -test -json` (Slice 0) → invert the import graph → transitive
+  closure of dependents of the changed packages → union with their test targets.
 - Ship in **shadow mode first**: always run the full suite AND record what TIA would have
-  selected, comparing selected-vs-actual-failures over real runs before ever gating a real
-  test cycle on TIA's output alone. This closes the one gap all four research threads
-  flagged: no cited evidence that package-level Go TIA has been measured for recall in an
-  agentic setting — the honest posture is "iteration accelerator," not "release proof,"
-  until NEXUS has its own measured data. Shadow evidence must record the exact
-  fallback-to-full-suite cause when it happens.
+  selected, comparing selected-vs-actual-failures over real runs before ever gating a
+  real test cycle on TIA's output alone — no cited evidence exists that package-level Go
+  TIA has been measured for recall in an agentic setting; the honest posture is
+  "iteration accelerator," not "release proof," until NEXUS has its own measured data.
+  Shadow evidence records the exact fallback-to-full-suite cause when it happens.
 - Fail-safe rule (invariant 5) applies from day one.
 
 ### Slice 3 — symedit (`internal/coding/symedit` + `internal/coding/workspace`)
-- Start with **only `RenameSymbol`** (matching topknot: ship the minimal-machinery core,
-  not an ambitious API surface) — no arbitrary "safe delete" or AST insertion yet;
-  `gopls`'s own reference-finding only covers the active build configuration and can't
-  rule out reflection/string-based lookup either, so over-promising safety here is itself
-  a correctness risk, not just scope creep.
-- `gopls` runs through Slice 0's pinned, doctor-probed integration (disposable staged
-  workspace, network denied by default).
-- Prepare/Apply per invariant 3 (including the closed edit-shape subset and the UTF-16/
-  overlap/CRLF mechanics); `internal/coding/workspace` multi-file coordinator per
-  invariant 4 (including the durable recovery protocol and canonical-path symlink
-  defense).
-- Reproduce the two symedit lessons from the old Python tool: honest refusal with no LSP
-  available (never textual fallback); authorization covers the COMPLETE dynamic
-  write-set, not just the anchor file — with a RED-capable detector mirroring
-  `test_n2_6_mutation_preflight.py`: a rename touching 2 files, authorized for only 1,
-  must be refused before any write. Additional RED-capable detectors required (v2, codex
-  HIGH #3): multiline whole-file replacement handled correctly; non-BMP UTF-16 columns
-  and CRLF preserved; overlapping/out-of-range edits rejected; a path alias escaping the
-  workspace rejected; a parent/target symlink swapped between Prepare and Apply rejected.
+- Start with **only `RenameSymbol`** (topknot: minimal-machinery core, not an ambitious
+  API surface) — `gopls`'s own reference-finding only covers the active build
+  configuration and can't rule out reflection/string-based lookup either, so
+  over-promising safety here is itself a correctness risk, not just scope creep.
+- `gopls` runs through Slice 0's pinned stdio-JSON-RPC session.
+- Prepare/Apply per invariant 3 (closed edit-shape subset, UTF-16/overlap/CRLF
+  mechanics); `internal/coding/workspace` multi-file coordinator per invariant 4 (durable
+  sealed-bundle recovery protocol, descriptor-relative symlink defense).
+- Required RED-capable detectors: the two historical symedit regressions (multi-line
+  whole-file mis-apply; symlink-aliased write-target — mirroring
+  `test_n2_6_mutation_preflight.py`'s two-file-authorized-for-one refusal); plus (v2/v3)
+  non-BMP UTF-16 columns and CRLF preserved correctly; overlapping/out-of-range edits
+  rejected; a path alias escaping the workspace rejected; a parent/target symlink swapped
+  between Prepare and Apply rejected via the descriptor-relative guard, not just a
+  path-string re-check.
 
 ### Slice 4 — expand symedit's action set, ONE gopls code action at a time
-- Only after slice 3 is deployed and dogfooded — each new action (e.g. a specific safe
-  delete) gets its own RED-capable conformance test before being added, per invariant 5's
-  spirit (don't promise more than what's been proven).
+- Only after Slice 3 is deployed and dogfooded — each new action gets its own
+  RED-capable conformance test before being added.
 - Do not add tree-sitter, SCIP/Sourcegraph-style indexing infrastructure, ML test
-  selection, or full SLSA/sigstore signing "later" speculatively — only if measured use
-  in slices 0-3 demonstrates a real gap they'd close (topknot: no unrequested
-  abstractions).
+  selection, or full SLSA/sigstore signing speculatively — only if measured use in
+  slices 0-3 demonstrates a real gap they'd close.
 
 ## Order + review
 
 Slice 0 → 1 → 2 → 3 (→ 4 opportunistically later, not blocking this plan's closure). Each
 slice: RED observed before / GREEN after at the real boundary, one runnable check left
 behind, then dispatched for 3-agent adversarial plan-then-code review (codex/kilo/agy via
-herdr) until codex+kilo converge PASS (agy supportive, not required alone) — same
-discipline as `PLAN-AUDIT-FIXES.md`. Merge to main + autodeploy + push per standing rules
-after each slice converges, not batched at the end.
+herdr) until codex+kilo converge PASS (agy supportive, not required alone). Merge to
+main + autodeploy + push per standing rules after each slice converges, not batched.
 
 ## Status
 
-v2 — plan-review round 1 folded (codex FAIL 5 findings, all 4 HIGH independently
-re-verified against the code before folding; kilo PASS + 4 notes folded; agy
-PASS-with-findings, overlap folded). Next: dispatch v2 for plan-review round 2.
+v3 — plan-review round 2 folded (codex FAIL 5 NEW HIGH, all re-verified against the code
+— including resolving a factual disagreement with kilo's round-2 PASS by reading the code
+directly, kilo was wrong on that one point; kilo PASS + 4 notes folded; agy PASS + 4 notes
+folded, including the gopls-transport finding that resolved an open question from round 1).
+Next: dispatch v3 for plan-review round 3.
