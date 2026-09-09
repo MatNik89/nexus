@@ -148,3 +148,56 @@ func TestRunRequiresIdentifiers(t *testing.T) {
 		t.Fatal("Run accepted a spec with no OperationID/TargetID/RunID/ProfileID")
 	}
 }
+
+// Detector (plan's "host-workspace immutability" required causal
+// detector, Slice 0): the LIVE workspace (RunSpec.SourceDir) must be
+// byte-for-byte unchanged after Run — the sandboxed go build/go test
+// only ever touches the disposable snapshot copy, never SourceDir
+// itself. Proven by hashing SourceDir (via CreateSnapshot's own tree
+// digest, called against the same tree, never mutating it) before and
+// after a REAL build run and asserting the digests match.
+func TestRunNeverMutatesLiveSourceDir(t *testing.T) {
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skipf("no go binary on PATH: %v", err)
+	}
+	b, rep := testBackend(t)
+	grants := s7.NewAuthority(time.Now, 5*time.Minute)
+	j := testJournal(t)
+
+	src := t.TempDir()
+	tinyModule(t, src)
+
+	before, cleanupBefore, err := CreateSnapshot(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanupBefore()
+
+	result, err := Run(ctxT(), b, rep, grants, j, RunSpec{
+		SourceDir:   src,
+		Args:        []string{"build", "-C", "/work/src", "-o", "/work/out"},
+		GoBinary:    goBin,
+		Timeout:     150 * time.Second,
+		OperationID: "op-test-immutable-1",
+		TargetID:    "target-test-immutable",
+		RunID:       "run-test-immutable",
+		ProfileID:   "work",
+	})
+	if err != nil {
+		t.Fatalf("Run failed: %v\noutput: %s", err, result.Output)
+	}
+	if !result.ExitOK {
+		t.Fatalf("go build exited nonzero: %s", result.Output)
+	}
+
+	after, cleanupAfter, err := CreateSnapshot(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanupAfter()
+
+	if before.Digest != after.Digest {
+		t.Fatalf("live SourceDir was mutated by Run: before=%s after=%s", before.Digest, after.Digest)
+	}
+}
