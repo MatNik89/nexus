@@ -243,6 +243,24 @@ All four independently converged on (unchanged from v1/v2, still holds):
      `ErrUnsupportedEditShape`, in v1. This also determines the `gopls` client
      capabilities NEXUS advertises when it initializes the session (Slice 0), so
      `gopls` itself is asked to return only the supported shape.
+     **CORRECTED 2026-09-10 — empirically FALSE, do not build Slice 3 on this
+     assumption.** Verified twice independently: my own `RunGoplsRename` test
+     against real gopls v0.23.0 (no `documentChanges` capability advertised at
+     all) and codex's code-review round (explicitly advertised
+     `workspace.workspaceEdit.documentChanges: false`) BOTH received
+     `documentChanges` back, never plain `changes`. Root cause, confirmed
+     against the vendored source: gopls's rename handler unconditionally
+     constructs its result through `NewWorkspaceEdit`
+     (`gopls/internal/protocol/edits.go`), which always populates
+     `DocumentChanges` regardless of advertised client capabilities — asking
+     gopls to return the plain shape is not something the real server honors.
+     Slice 3 MUST instead accept a narrow, explicit `documentChanges` subset:
+     `TextDocumentEdit` entries only (no create/rename/delete resource
+     operations, no annotations), local `file:` URIs only, every entry's
+     document version validated — not the `changes` map. This does not
+     change any of Slice 3's other already-converged invariants (immutable
+     preimage rehashing, UTF-16 offset resolution, atomic Prepare/Apply):
+     only the wire shape accepted from `gopls` changes.
    - Accept only local `file:` URIs with an empty authority, strictly decoded once
      (reject anything else — a non-local or malformed URI is a refusal, not a
      best-effort resolution attempt).
@@ -917,3 +935,56 @@ or addressed — this round is considered adjudicated in favor of the existing
 "bypass EffectPath" design.** If codex's full verdict lands with a NEW concrete finding
 not already covered here, fold it as an explicit follow-up commit, not a re-open of the
 architecture question absent a genuinely new argument.
+
+## Status 2026-09-10 — gopls stdio session shipped (e106e4b, e106e4b's follow-up)
+
+Slice 0's gopls stdio JSON-RPC session (`internal/coding/runner.RunGoplsRename`) is built
+and merged: real `gopls serve` driven through `initialize -> initialized -> didOpen ->
+rename -> shutdown -> exit`, returning a correct structured `WorkspaceEdit` end to end
+through the real bwrap sandbox. Two real bugs found and fixed via direct empirical testing
+against the real gopls binary (not assumption): (1) pre-serializing the whole fixed
+request sequence onto stdin races gopls's own async processing (`"server shutdown without
+initialization"`) — only a genuine write-then-read-correlated-response loop works, hence
+the new `sandbox.InteractiveProcess`/`LaunchInteractive`/`AttestInteractive` (deliberately
+separate from `Process`/`Launch` — one-shot go build/test callers never need stdin); (2)
+`InteractiveProcess.Wait()` deadlocked because `os/exec`'s own `Wait` blocks on its
+internal stdout-copy goroutine, which blocks writing into an unread `io.Pipe` once the
+caller stops reading — fixed by draining `Stdout()` into `io.Discard` for the duration of
+`Wait()`. Also found: gopls's own loader (`golang.org/x/tools/internal/gocommand`)
+unconditionally execs a bare `"go"` via PATH lookup with no absolute-path override hook —
+conflicting with the sandbox's `PATH=/nowhere` baseline invariant. Fixed via a new,
+narrow `probe.Spec.ExtraPathDir`/`sandbox.Spec.ExtraPathDir`: PATH may only resolve into a
+directory that is, or is nested under, one of the Spec's own already-guarded
+`ExtraROBinds` entries — never widening visibility, only how a bare name resolves within
+it; folded into `PolicyHash`.
+
+**codex's code-review round (dispatched against commit `eff46cf`, before the fix above
+existed) independently found and empirically proved the SAME PATH/gopls conflict** —
+confirms it's real, not a fluke of my own testing. codex's report is otherwise mostly
+STALE against the actual shipped code (it reviewed research-phase questions, not the
+diff) except for two findings that ARE still live and were folded:
+1. Unbounded LSP header-line reading was a real gap (`lspReadMessage`'s header loop had no
+   line/count cap) — fixed with `maxLSPHeaderLines`/`maxLSPHeaderLineBytes`, marked as a
+   topknot ceiling (a misbehaving-but-terminating PINNED gopls binary, not a hardened
+   defense against a fully adversarial stream — see the comment in gopls.go).
+2. The `WorkspaceEdit.changes`-only assumption for Slice 3 (decided in the "concrete
+   design, round 1" section above) is EMPIRICALLY FALSE against real gopls — corrected
+   inline above; Slice 3 must accept a narrow `documentChanges` subset instead.
+
+**Open question for the next review round, not yet resolved:** codex proposed pinning the
+PATH-exposed `go` binary by CONTENT HASH (memfd-style, like the primary Target) rather
+than my directory-identity check (inherited from `ExtraROBinds`, which pins only
+device+inode, not per-file bytes — see `ExtraROBinds`' own doc comment). This is a real,
+named security tradeoff: my `ExtraPathDir` guarantees PATH can only resolve into an
+already-visibility-granted, ownership/permission-guarded directory, but does NOT
+individually content-hash-verify the specific `go` binary gopls ends up executing via
+PATH lookup — unlike the sandbox's primary Target, which IS memfd-pinned and re-verified
+at Launch. In practice the file that resolves is the SAME `$GOROOT/bin/go` already relied
+on directly as Target for plain `go build`/`go test` runs (not a new exposure), and
+`ResolveToolchain`'s `hashToolchainExecutables` already RECORDS a content digest over
+GOTOOLDIR+bin/go+bin/gofmt — but that digest is evidence/provenance, not an actively
+re-verified launch-time gate the way the primary Target's hash is. Whether this gap is
+worth closing (and at what cost — a second memfd-pinned-closure mechanism duplicating
+Target's own machinery, just for a PATH-resolved child) needs adversarial input before
+Slice 0 is called fully done; not blocking for the current single-trivial-module proof of
+concept, but flag before Slice 3 starts relying on this path for real repositories.

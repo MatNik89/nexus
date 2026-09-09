@@ -404,12 +404,36 @@ func lspWriteMessage(w io.Writer, obj any) error {
 
 // lspReadMessage reads one Content-Length-framed JSON-RPC message,
 // fail-closed on a header claiming more than MaxLSPMessageBytes.
+// maxLSPHeaderLines/maxLSPHeaderLineBytes bound the header section read
+// before Content-Length's body limit even applies — codex's code-review
+// finding: an unbounded number of header lines is its own resource
+// vector, independent of MaxLSPMessageBytes.
+// topknot ceiling: bufio.Reader.ReadString itself still grows unboundedly
+// WHILE searching for a single line's '\n' (this check only fires after
+// it returns), so this is a measured bound against a misbehaving but
+// eventually-terminating PINNED gopls binary (already content-hash
+// verified by sandbox.Compile's target/closure hashing before it ever
+// runs), not a hardened defense against a fully adversarial byte stream.
+// Upgrade trigger: if gopls ever becomes a caller-suppliable/untrusted
+// binary rather than an operator-pinned one, replace with an
+// incrementally-bounded reader (ReadSlice/Peek in a capped loop).
+const (
+	maxLSPHeaderLines     = 64
+	maxLSPHeaderLineBytes = 8 << 10 // 8KB
+)
+
 func lspReadMessage(r *bufio.Reader) (map[string]json.RawMessage, error) {
 	contentLength := -1
-	for {
+	for i := 0; ; i++ {
+		if i >= maxLSPHeaderLines {
+			return nil, fmt.Errorf("runner: LSP message header exceeds %d lines (fail closed)", maxLSPHeaderLines)
+		}
 		line, err := r.ReadString('\n')
 		if err != nil {
 			return nil, err
+		}
+		if len(line) > maxLSPHeaderLineBytes {
+			return nil, fmt.Errorf("runner: LSP message header line exceeds %d bytes (fail closed)", maxLSPHeaderLineBytes)
 		}
 		line = strings.TrimRight(line, "\r\n")
 		if line == "" {
