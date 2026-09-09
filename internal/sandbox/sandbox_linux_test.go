@@ -406,6 +406,20 @@ func TestExtraROBindsAndEnvPropagateThroughFullProtocol(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ExtraROBinds did not propagate through Compile/Launch: %v\n%s", err, out)
 	}
+	// Assert on the ExtraEnv value itself (code-review CODE1 codex finding
+	// #6: an earlier version of this test set ExtraEnv but never actually
+	// checked its value, so an ablation of ExtraEnv propagation would
+	// still leave this test green).
+	envOut, err := runThrough(t, b, rep, Spec{
+		Target: hp, Args: []string{"printenv", "NEXUS_CODING_TEST"}, WorkDir: wdir(t),
+		ExtraEnv: map[string]string{"NEXUS_CODING_TEST": "v1"},
+	})
+	if err != nil {
+		t.Fatalf("ExtraEnv did not propagate through Compile/Launch: %v\n%s", err, envOut)
+	}
+	if !strings.Contains(envOut, "v1") {
+		t.Fatalf("ExtraEnv value did not reach the child process, got %q", envOut)
+	}
 }
 
 // Detector: PolicyHash changes when ExtraROBinds/ExtraEnv change — a
@@ -437,5 +451,84 @@ func TestPolicyHashChangesWithExtraROBindsAndEnv(t *testing.T) {
 	}
 	if polBase.PolicyHash() == polEnv.PolicyHash() {
 		t.Fatal("PolicyHash unchanged after adding an ExtraEnv entry")
+	}
+}
+
+// Detector (code-review CODE1 agy finding #3): two syntactically-different
+// spellings of the SAME effective bind (a trailing slash, a symlink alias)
+// must fold to the SAME PolicyHash — a bind's identity is its canonical
+// resolved path, not the caller's literal string.
+func TestPolicyHashCanonicalizesROBindSpelling(t *testing.T) {
+	b, rep := backend(t)
+	hp := helperPath(t)
+	dir := robindDir(t)
+	link := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(dir, link); err != nil {
+		t.Fatal(err)
+	}
+	wd := wdir(t) // ONE shared WorkDir — WorkDir is also folded into
+	// policyHash, so a fresh wdir(t) per spec would (correctly) change
+	// the hash for an unrelated reason and make this detector vacuous.
+	specA := Spec{Target: hp, Args: []string{"sleep", "0"}, WorkDir: wd, ExtraROBinds: []string{dir}}
+	specB := Spec{Target: hp, Args: []string{"sleep", "0"}, WorkDir: wd, ExtraROBinds: []string{dir + "/"}}
+	specC := Spec{Target: hp, Args: []string{"sleep", "0"}, WorkDir: wd, ExtraROBinds: []string{link}}
+	polA, err := b.Compile(ctxT(), specA, rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	polB, err := b.Compile(ctxT(), specB, rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	polC, err := b.Compile(ctxT(), specC, rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if polA.PolicyHash() != polB.PolicyHash() {
+		t.Fatalf("trailing-slash spelling produced a different PolicyHash: %s vs %s", polA.PolicyHash(), polB.PolicyHash())
+	}
+	if polA.PolicyHash() != polC.PolicyHash() {
+		t.Fatalf("symlink alias produced a different PolicyHash: %s vs %s", polA.PolicyHash(), polC.PolicyHash())
+	}
+}
+
+// Detector (code-review CODE1 codex finding #2): CompiledPolicy must not
+// alias the caller's Spec — a post-Compile, pre-Launch mutation of the
+// caller's own ExtraEnv/Args must NOT change what actually runs, since
+// PolicyHash was already sealed over the pre-mutation values. A shallow
+// `spec: spec` in Compile would let this desync the attested hash from
+// the executed process.
+func TestCompiledPolicyDoesNotAliasCallerSpec(t *testing.T) {
+	b, rep := backend(t)
+	hp := helperPath(t)
+	spec := Spec{
+		Target: hp, Args: []string{"printenv", "NEXUS_ALIAS_TEST"}, WorkDir: wdir(t),
+		ExtraEnv: map[string]string{"NEXUS_ALIAS_TEST": "original"},
+	}
+	pol, err := b.Compile(ctxT(), spec, rep)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	sealedHash := pol.PolicyHash()
+
+	// Mutate the CALLER's spec after Compile returned.
+	spec.ExtraEnv["NEXUS_ALIAS_TEST"] = "mutated"
+	spec.Args[1] = "NOT_SET_AT_ALL"
+
+	if pol.PolicyHash() != sealedHash {
+		t.Fatal("PolicyHash changed after mutating the caller's own Spec post-Compile")
+	}
+	p, err := b.Launch(ctxT(), pol)
+	if err != nil {
+		t.Fatalf("launch: %v", err)
+	}
+	defer p.Close()
+	werr := p.Wait()
+	out := p.Output()
+	if werr != nil {
+		t.Fatalf("launch of the ORIGINAL (pre-mutation) command failed: %v\n%s", werr, out)
+	}
+	if !strings.Contains(out, "original") {
+		t.Fatalf("Launch ran the MUTATED env, not the sealed one: %q", out)
 	}
 }

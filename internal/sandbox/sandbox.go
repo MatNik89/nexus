@@ -233,28 +233,73 @@ func (b *Bwrap) Compile(ctx context.Context, spec Spec, report ProbeReport) (Com
 	if err != nil {
 		return CompiledPolicy{}, fmt.Errorf("sandbox: cannot pin the runtime closure (fail closed): %w", err)
 	}
+	roDigest, err := roBindsDigest(spec.ExtraROBinds)
+	if err != nil {
+		return CompiledPolicy{}, fmt.Errorf("sandbox: %w", err)
+	}
+	sealed := digest("policy", spec.Target, targetHash, closureDigest(pins),
+		strings.Join(spec.Args, "\x00"),
+		spec.WorkDir, spec.Timeout.String(), report.ProbeHash,
+		roDigest, envDigest(spec.ExtraEnv))
+	// Deep-copy spec's slice/map fields (code-review CODE1 codex finding
+	// #2): a shallow `spec: spec` here would alias the caller's Args/
+	// ExtraROBinds/ExtraEnv — a post-Compile, pre-Launch mutation by the
+	// caller would then change what Launch actually runs while
+	// policyHash above still reflects the pre-mutation values, breaking
+	// the attestation binding between the two.
 	return CompiledPolicy{
-		spec:        spec,
+		spec:        cloneSpec(spec),
 		probeHash:   report.ProbeHash,
 		targetHash:  targetHash,
 		closurePins: pins,
-		policyHash: digest("policy", spec.Target, targetHash, closureDigest(pins),
-			strings.Join(spec.Args, "\x00"),
-			spec.WorkDir, spec.Timeout.String(), report.ProbeHash,
-			roBindsDigest(spec.ExtraROBinds), envDigest(spec.ExtraEnv)),
+		policyHash:  sealed,
 	}, nil
+}
+
+// cloneSpec deep-copies the slice/map fields of Spec so a CompiledPolicy
+// can never be desynced from the caller's own Spec value after Compile
+// returns (code-review CODE1 codex finding #2).
+func cloneSpec(spec Spec) Spec {
+	out := spec
+	if spec.Args != nil {
+		out.Args = append([]string(nil), spec.Args...)
+	}
+	if spec.ExtraROBinds != nil {
+		out.ExtraROBinds = append([]string(nil), spec.ExtraROBinds...)
+	}
+	if spec.ExtraEnv != nil {
+		out.ExtraEnv = make(map[string]string, len(spec.ExtraEnv))
+		for k, v := range spec.ExtraEnv {
+			out.ExtraEnv[k] = v
+		}
+	}
+	return out
 }
 
 // roBindsDigest folds a read-only bind list into one deterministic digest
 // (order-independent — the list is sorted first).
-func roBindsDigest(binds []string) string {
-	sorted := append([]string(nil), binds...)
-	sort.Strings(sorted)
+// roBindsDigest canonicalizes each path via EvalSymlinks BEFORE hashing
+// (code-review CODE1 agy finding #3): two Specs naming the same effective
+// bind through different syntactic spellings (a trailing slash, a
+// symlink alias) must fold to the SAME policyHash — Prepare's own
+// guardROBind canonicalizes independently for its security gate, but
+// policyHash's job is to bind approval to the ACTUAL effective boundary,
+// which is the canonical form, not the caller's literal string.
+func roBindsDigest(binds []string) (string, error) {
+	canon := make([]string, 0, len(binds))
+	for _, b := range binds {
+		c, err := filepath.EvalSymlinks(filepath.Clean(b))
+		if err != nil {
+			return "", fmt.Errorf("sandbox: cannot canonicalize ExtraROBinds entry %q: %w", b, err)
+		}
+		canon = append(canon, c)
+	}
+	sort.Strings(canon)
 	h := sha256.New()
-	for _, b := range sorted {
+	for _, b := range canon {
 		fmt.Fprintf(h, "%d:%s", len(b), b)
 	}
-	return hex.EncodeToString(h.Sum(nil))
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // envDigest folds an env map into one deterministic digest (key-sorted).

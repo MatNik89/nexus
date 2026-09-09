@@ -840,7 +840,7 @@ func TestExtraROBindExecSucceedsForBoundChild(t *testing.T) {
 
 // Detector: guardROBind rejects a symlink, mirroring guardWorkDir's own
 // symlink defense (the RO-bind guard must not be a weaker sibling).
-func TestExtraROBindRejectsSymlink(t *testing.T) {
+func TestExtraROBindRejectsDanglingSymlink(t *testing.T) {
 	av := mustDetect(t)
 	hp := helperPath(t)
 	real := robindDir(t)
@@ -859,6 +859,48 @@ func TestExtraROBindRejectsSymlink(t *testing.T) {
 	}
 	if _, err := Prepare(av, Spec{Target: hp, Args: []string{"sleep", "0"}, WorkDir: wdir(t), ExtraROBinds: []string{link}}); err == nil {
 		t.Fatal("a dangling symlink was accepted as an ExtraROBinds target")
+	}
+}
+
+// Detector (code-review CODE1 codex finding #6): a LIVE symlink — one
+// pointing to a directory that actually exists but FAILS a check applied
+// to the resolved target (system-directory denylist, group-writable mode)
+// — must still be refused. This proves EvalSymlinks resolving BEFORE
+// those checks run (guardROBind) actually gates the resolved target, not
+// just the syntactic symlink path itself; the earlier
+// TestExtraROBindRejectsDanglingSymlink only proved a DANGLING target is
+// refused, which is a different (and weaker) code path.
+func TestExtraROBindRejectsLiveSymlinkToDenylistedRoot(t *testing.T) {
+	av := mustDetect(t)
+	hp := helperPath(t)
+	if _, err := os.Stat("/etc"); err != nil {
+		t.Skip("/etc not present on this host")
+	}
+	link := filepath.Join(t.TempDir(), "etc-alias")
+	if err := os.Symlink("/etc", link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Prepare(av, Spec{Target: hp, Args: []string{"sleep", "0"}, WorkDir: wdir(t), ExtraROBinds: []string{link}}); err == nil {
+		t.Fatal("a live symlink resolving to a denylisted system directory was accepted as an ExtraROBinds target")
+	}
+}
+
+// Detector companion: a live symlink to a group-writable (but otherwise
+// unremarkable) directory is refused via the resolved target's mode, not
+// bypassed because the caller only ever saw the symlink's own path.
+func TestExtraROBindRejectsLiveSymlinkToGroupWritableTarget(t *testing.T) {
+	av := mustDetect(t)
+	hp := helperPath(t)
+	real := filepath.Join(t.TempDir(), "gw-real")
+	if err := os.Mkdir(real, 0o775); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "gw-alias")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Prepare(av, Spec{Target: hp, Args: []string{"sleep", "0"}, WorkDir: wdir(t), ExtraROBinds: []string{link}}); err == nil {
+		t.Fatal("a live symlink resolving to a group-writable directory was accepted as an ExtraROBinds target")
 	}
 }
 
@@ -901,5 +943,37 @@ func TestExtraEnvRejectsInvalidKey(t *testing.T) {
 		ExtraEnv: map[string]string{"BAD=KEY": "x"}}
 	if _, err := Prepare(av, spec); err == nil {
 		t.Fatal("an ExtraEnv key containing '=' was accepted")
+	}
+}
+
+// Detector (code-review CODE1 agy finding #2): ExtraEnv can never override
+// the fixed LD_LIBRARY_PATH/LD_PRELOAD/PATH baseline — a caller-controlled
+// LD_LIBRARY_PATH would unseat the memfd-pinned closure's loader path.
+func TestExtraEnvRejectsReservedKeys(t *testing.T) {
+	av := mustDetect(t)
+	hp := helperPath(t)
+	for _, k := range []string{"LD_LIBRARY_PATH", "LD_PRELOAD", "PATH"} {
+		spec := Spec{Target: hp, Args: []string{"sleep", "0"}, WorkDir: wdir(t),
+			ExtraEnv: map[string]string{k: "/hostile"}}
+		if _, err := Prepare(av, spec); err == nil {
+			t.Fatalf("ExtraEnv accepted reserved key %q", k)
+		}
+	}
+}
+
+// Detector (code-review CODE1 codex finding #1, reproduced live):
+// ExtraROBinds must never expose a well-known system directory,
+// regardless of its ownership/permission bits.
+func TestExtraROBindRejectsSystemDirectories(t *testing.T) {
+	av := mustDetect(t)
+	hp := helperPath(t)
+	for _, sys := range []string{"/etc", "/usr", "/bin", "/root", "/var"} {
+		if _, err := os.Stat(sys); err != nil {
+			continue // not present on this host, skip
+		}
+		spec := Spec{Target: hp, Args: []string{"sleep", "0"}, WorkDir: wdir(t), ExtraROBinds: []string{sys}}
+		if _, err := Prepare(av, spec); err == nil {
+			t.Fatalf("ExtraROBinds accepted system directory %q", sys)
+		}
 	}
 }

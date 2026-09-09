@@ -59,15 +59,29 @@ func ParseGoList(r io.Reader) ([]Package, error) {
 	return pkgs, nil
 }
 
-// Graph is the module-scoped reverse import graph: for each package path,
-// the set of packages that directly import it, WITHIN the package set
+// Graph is the module-scoped reverse import graph, WITHIN the package set
 // Graph was built from (an edge to anything outside that set — stdlib, a
 // different module — is never tracked, since it can never be a
-// "dependent" whose tests this module could run).
+// "dependent" whose tests this module could run). Two distinct edge
+// kinds are tracked separately (code-review CODE1 codex finding #5):
+//
+//   - prodRdeps: imp -> importers via that importer's PRODUCTION Imports.
+//     These edges PROPAGATE transitively — a change to imp can affect an
+//     importer's own importers, since production code is compiled in.
+//   - testOwners: imp -> packages whose TestImports/XTestImports name imp.
+//     These edges are TERMINAL — a package that only reaches imp through
+//     its own test file's import is never itself reachable BY anything
+//     upstream of it through imp (its production callers never see
+//     imp), so this edge must never be walked past. Conflating the two
+//     (as an earlier version of this code did) let a test-only import
+//     propagate transitively into unrelated production consumers: for
+//     A <-test- F <-production- G, a change to A would incorrectly also
+//     select G's tests, even though G never depends on A at all.
 type Graph struct {
-	rdeps map[string]map[string]bool
-	tests map[string]bool
-	known map[string]bool
+	prodRdeps  map[string]map[string]bool
+	testOwners map[string]map[string]bool
+	tests      map[string]bool
+	known      map[string]bool
 }
 
 // BuildGraph inverts every package's forward Imports into reverse edges.
@@ -76,9 +90,10 @@ type Graph struct {
 // package's hasTests() flag is recorded.
 func BuildGraph(pkgs []Package) *Graph {
 	g := &Graph{
-		rdeps: map[string]map[string]bool{},
-		tests: map[string]bool{},
-		known: map[string]bool{},
+		prodRdeps:  map[string]map[string]bool{},
+		testOwners: map[string]map[string]bool{},
+		tests:      map[string]bool{},
+		known:      map[string]bool{},
 	}
 	for _, p := range pkgs {
 		if p.ForTest != "" {
@@ -92,33 +107,39 @@ func BuildGraph(pkgs []Package) *Graph {
 			if imp == p.ImportPath {
 				continue
 			}
-			if g.rdeps[imp] == nil {
-				g.rdeps[imp] = map[string]bool{}
+			if g.prodRdeps[imp] == nil {
+				g.prodRdeps[imp] = map[string]bool{}
 			}
-			g.rdeps[imp][p.ImportPath] = true
+			g.prodRdeps[imp][p.ImportPath] = true
 		}
 		for _, imp := range append(append([]string{}, p.TestImports...), p.XTestImports...) {
 			if imp == p.ImportPath {
 				continue
 			}
-			// A test-only import makes p's OWN tests depend on imp, but
-			// does not make p an importer of imp for OTHER packages'
-			// purposes — record it only as a self-referential test edge.
-			if g.rdeps[imp] == nil {
-				g.rdeps[imp] = map[string]bool{}
+			// A test-only import of imp makes p a TERMINAL owner: a
+			// change to imp affects p's own tests, but does not
+			// propagate past p (see the Graph doc comment above).
+			if g.testOwners[imp] == nil {
+				g.testOwners[imp] = map[string]bool{}
 			}
-			g.rdeps[imp][p.ImportPath] = true
+			g.testOwners[imp][p.ImportPath] = true
 		}
 	}
 	return g
 }
 
-// Affected returns the transitive closure of packages (within this
-// Graph's known set) that depend — directly or transitively, including
-// through test-only imports — on any of the changed import paths,
-// intersected with packages that have tests. The changed packages
-// themselves are included when they have tests (a package's own tests
-// are always affected by a change to that package).
+// Affected returns the packages (within this Graph's known set) whose
+// tests must re-run for a change to any of the changed import paths:
+// every package reached by walking PRODUCTION import edges transitively
+// from the changed set (intersected with packages that have tests, so a
+// change to the changed packages themselves is included when they have
+// tests), PLUS — at every node visited along that production walk,
+// including the changed packages themselves — any package that reaches
+// that node only through a test-only import (TestImports/XTestImports).
+// A test-only owner is added directly but never enqueued: it is a
+// TERMINAL edge (see the Graph doc comment) — its own production
+// importers, if any, never see the changed code through it, so the walk
+// must not continue past it via that edge.
 //
 // An import path outside the known set (impact.Graph was built from a
 // different or incomplete package listing) is treated as UNRESOLVABLE —
@@ -128,6 +149,7 @@ func BuildGraph(pkgs []Package) *Graph {
 func (g *Graph) Affected(changed []string) (affected []string, resolved bool) {
 	resolved = true
 	visited := map[string]bool{}
+	result := map[string]bool{}
 	queue := make([]string, 0, len(changed))
 	for _, c := range changed {
 		if !g.known[c] {
@@ -142,17 +164,21 @@ func (g *Graph) Affected(changed []string) (affected []string, resolved bool) {
 	for len(queue) > 0 {
 		cur := queue[0]
 		queue = queue[1:]
-		for dep := range g.rdeps[cur] {
+		if g.tests[cur] {
+			result[cur] = true
+		}
+		for owner := range g.testOwners[cur] {
+			result[owner] = true // terminal: never enqueued
+		}
+		for dep := range g.prodRdeps[cur] {
 			if !visited[dep] {
 				visited[dep] = true
 				queue = append(queue, dep)
 			}
 		}
 	}
-	for pkg := range visited {
-		if g.tests[pkg] {
-			affected = append(affected, pkg)
-		}
+	for pkg := range result {
+		affected = append(affected, pkg)
 	}
 	return affected, resolved
 }

@@ -533,6 +533,40 @@ func guardWorkDir(dir string) (string, error) {
 // user-owned install tree (e.g. $HOME/go/pkg/mod, holding the downloaded
 // Go toolchain) is an acceptable shape here where it would NOT be for a
 // disposable RW workdir.
+// roBindDenyRoots are well-known sensitive system trees no caller may
+// ever expose via ExtraROBinds, regardless of their ownership/permission
+// bits (code-review CODE1 codex finding #1, reproduced live:
+// ExtraROBinds: []string{"/etc"} made /etc/passwd readable — ownership
+// and mode alone are not sufficient discrimination for "a trusted,
+// operator-controlled toolchain install" vs. "the entire system"). This
+// is defense-in-depth: the CALLER (the coding-runner, not yet built)
+// still owns the responsibility of scoping ExtraROBinds to the actual
+// Go toolchain paths it resolved via a trusted `go env` call — this
+// denylist only guarantees probe itself never becomes the party that
+// exposes core system directories, however a caller misuses it.
+var roBindDenyRoots = []string{
+	"/", "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32",
+	"/boot", "/root", "/proc", "/sys", "/dev", "/run", "/var", "/opt",
+}
+
+// denylistedROBindRoot reports whether canon IS, or is nested under, one
+// of roBindDenyRoots — a path-segment-aware check (never a bare string
+// prefix, so "/etcetera" is not mistaken for "/etc").
+func denylistedROBindRoot(canon string) bool {
+	if canon == "/" {
+		return true // ExtraROBinds can never name the filesystem root itself
+	}
+	for _, root := range roBindDenyRoots {
+		if root == "/" {
+			continue // handled above; canon is never "/" past this point
+		}
+		if canon == root || strings.HasPrefix(canon, root+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
 func guardROBind(dir string) (string, error) {
 	canon, err := filepath.EvalSymlinks(filepath.Clean(dir))
 	if err != nil {
@@ -540,6 +574,9 @@ func guardROBind(dir string) (string, error) {
 	}
 	if !filepath.IsAbs(canon) {
 		return "", fmt.Errorf("ro-bind %s: not an absolute path (fail closed)", dir)
+	}
+	if denylistedROBindRoot(canon) {
+		return "", fmt.Errorf("ro-bind %s: a well-known system directory may never be exposed (fail closed)", canon)
 	}
 	st, err := os.Stat(canon)
 	if err != nil {
@@ -564,8 +601,24 @@ func guardROBind(dir string) (string, error) {
 // validEnvKey rejects an environment key that could confuse the child
 // process or an argv-adjacent parser: empty, containing '=' (the KEY=VALUE
 // separator itself), or a NUL byte.
+// reservedEnvKeys are baseline-controlled variables ExtraEnv may never
+// set (code-review CODE1 agy finding #2): bwrap applies --setenv
+// sequentially, and a LATER ExtraEnv entry would silently OVERRIDE the
+// earlier fixed LD_LIBRARY_PATH=/nexus-libs baseline (probe.go's own
+// memfd-pinned-closure loader path), unseating the closure-pinning
+// guarantee — a caller-controlled LD_LIBRARY_PATH or LD_PRELOAD could
+// redirect the dynamic loader to unpinned shared objects. PATH is
+// reserved too: it is deliberately fixed to /nowhere (every exec in this
+// sandbox model uses an absolute path) and ExtraEnv exists to ADD
+// capability, never to override a security-relevant baseline variable.
+var reservedEnvKeys = map[string]bool{
+	"LD_LIBRARY_PATH": true,
+	"LD_PRELOAD":      true,
+	"PATH":            true,
+}
+
 func validEnvKey(k string) bool {
-	return k != "" && !strings.ContainsAny(k, "=\x00")
+	return k != "" && !strings.ContainsAny(k, "=\x00") && !reservedEnvKeys[k]
 }
 
 // Handle is a running (or prepared) sandboxed process. The underlying

@@ -9,29 +9,44 @@
 // between it landing on disk and the reference that will protect it
 // forever after being committed (PLAN-CODING-TRIO.md's GC/write race,
 // codex round-4 HIGH #2).
+//
+// Every read and write is DESCRIPTOR-RELATIVE (PLAN-CODING-TRIO.md's
+// explicit requirement): Open resolves the store directory to a file
+// descriptor exactly ONCE and every subsequent operation is an *at(2)
+// syscall (openat/unlinkat/renameat) against that descriptor, never a
+// fresh pathname lookup through the parent directories. This closes a
+// real attack Open-by-pathname cannot: nothing after Open can swap the
+// directory itself (rename it aside, replace it with a symlink) and
+// redirect subsequent operations elsewhere — the descriptor keeps
+// pointing at the original inode regardless of what happens to the path
+// that named it (code-review CODE1 codex finding #4, reproduced live via
+// a mid-flight directory rename).
 package sealedstore
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
-	"path/filepath"
 	"regexp"
 	"sync"
 
-	"github.com/MatNik89/nexus/internal/foundation/atomicwrite"
+	"golang.org/x/sys/unix"
 )
 
 // digestRE is the closed shape a content digest (and therefore a store
 // filename) may ever take — 64 lowercase hex characters, nothing else.
-// Every path this package touches is built from a digest already matching
-// this pattern; Get/GC refuse any other input outright (fail closed).
+// Every name this package touches is validated against this pattern;
+// Get/GC refuse any other input outright (fail closed).
 var digestRE = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
-// Store owns one profile's sealed-artifact directory. Construct with Open.
+// Store owns one profile's sealed-artifact directory. Construct with
+// Open; release with Close when the store is no longer needed.
 type Store struct {
-	dir string
+	dir   string // for error messages only — never used to build a path
+	dirFd int    // held open for the Store's lifetime; every op is *at(dirFd, ...)
 
 	mu   sync.Mutex
 	pins map[string]int // digest -> live pin count
@@ -41,22 +56,29 @@ type Store struct {
 // a private (0700), non-symlink, caller-owned directory (pathx.EnsureDir)
 // — sealedstore never resolves profile identity itself, matching the
 // existing journal.Open convention (an already-resolved path in, no
-// profile-to-path logic duplicated here).
+// profile-to-path logic duplicated here). The directory is opened exactly
+// once here; every later operation is descriptor-relative to this open.
 func Open(dir string) (*Store, error) {
-	info, err := os.Lstat(dir)
+	fd, err := unix.Open(dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return nil, fmt.Errorf("sealedstore: %w", err)
+		return nil, fmt.Errorf("sealedstore: open %s: %w (fail closed — must be an existing, non-symlink directory)", dir, err)
 	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("sealedstore: %s is a symlink — refused (fail closed)", dir)
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("sealedstore: fstat %s: %w", dir, err)
 	}
-	if !info.IsDir() {
-		return nil, fmt.Errorf("sealedstore: %s is not a directory", dir)
+	if os.FileMode(st.Mode).Perm()&0o077 != 0 {
+		unix.Close(fd)
+		return nil, fmt.Errorf("sealedstore: %s permissions %o are too open (need 0700) — refused", dir, os.FileMode(st.Mode).Perm())
 	}
-	if info.Mode().Perm()&0o077 != 0 {
-		return nil, fmt.Errorf("sealedstore: %s permissions %o are too open (need 0700) — refused", dir, info.Mode().Perm())
-	}
-	return &Store{dir: dir, pins: map[string]int{}}, nil
+	return &Store{dir: dir, dirFd: fd, pins: map[string]int{}}, nil
+}
+
+// Close releases the store's held directory descriptor. The Store must
+// not be used afterward.
+func (s *Store) Close() error {
+	return unix.Close(s.dirFd)
 }
 
 // Pin holds one artifact live against GC. The caller obtained it from Put
@@ -77,12 +99,18 @@ func (p *Pin) Release() {
 	p.once.Do(func() {
 		p.store.mu.Lock()
 		defer p.store.mu.Unlock()
-		if n := p.store.pins[p.digest]; n <= 1 {
-			delete(p.store.pins, p.digest)
-		} else {
-			p.store.pins[p.digest] = n - 1
-		}
+		p.store.releasePinLocked(p.digest)
 	})
+}
+
+// releasePinLocked decrements or clears digest's pin count. Caller must
+// already hold s.mu.
+func (s *Store) releasePinLocked(digest string) {
+	if n := s.pins[digest]; n <= 1 {
+		delete(s.pins, digest)
+	} else {
+		s.pins[digest] = n - 1
+	}
 }
 
 // Put durably writes data, content-addressed by its own SHA-256 digest,
@@ -92,26 +120,39 @@ func (p *Pin) Release() {
 // losing it (to a post-restart GC sweep, which never re-establishes the
 // dead process's in-memory pin) loses nothing a retry can't recreate by
 // calling Put again.
+//
+// Put and GC serialize under the SAME critical section for their ENTIRE
+// operation (code-review CODE1 codex finding #3) — not just a snapshot of
+// the pins map — so a Put that registers a new pin can never race a
+// concurrent GC sweep that already decided, under a now-stale snapshot,
+// that the digest was unpinned.
 func (s *Store) Put(data []byte) (digest string, pin *Pin, err error) {
 	sum := sha256.Sum256(data)
 	digest = hex.EncodeToString(sum[:])
 
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.pins[digest]++
-	s.mu.Unlock()
 	pin = &Pin{store: s, digest: digest}
 
-	path := filepath.Join(s.dir, digest)
-	if _, err := os.Lstat(path); err == nil {
-		// Same digest already stored: content-addressing guarantees
-		// identical bytes, so this is a no-op write, not a conflict.
+	if existing, rerr := s.readAtLocked(digest); rerr == nil {
+		// Same-name entry already exists: verify it ACTUALLY holds the
+		// content its name promises (code-review CODE1 codex finding #4)
+		// — a prior Lstat-only check would treat any file at that name as
+		// "already stored," including a corrupt or foreign one.
+		esum := sha256.Sum256(existing)
+		if hex.EncodeToString(esum[:]) != digest {
+			s.releasePinLocked(digest)
+			return "", nil, fmt.Errorf("sealedstore: put %s: existing entry does not match its own digest (corrupt, fail closed)", digest)
+		}
 		return digest, pin, nil
-	} else if !os.IsNotExist(err) {
-		pin.Release()
-		return "", nil, fmt.Errorf("sealedstore: put %s: %w", digest, err)
+	} else if !os.IsNotExist(rerr) {
+		s.releasePinLocked(digest)
+		return "", nil, fmt.Errorf("sealedstore: put %s: %w", digest, rerr)
 	}
-	if err := atomicwrite.Write(path, data, 0o600); err != nil {
-		pin.Release()
+
+	if err := s.writeAtLocked(digest, data); err != nil {
+		s.releasePinLocked(digest)
 		return "", nil, fmt.Errorf("sealedstore: put %s: %w", digest, err)
 	}
 	return digest, pin, nil
@@ -125,15 +166,7 @@ func (s *Store) Get(digest string) ([]byte, error) {
 	if !digestRE.MatchString(digest) {
 		return nil, fmt.Errorf("sealedstore: %q is not a valid digest (fail closed)", digest)
 	}
-	path := filepath.Join(s.dir, digest)
-	info, err := os.Lstat(path)
-	if err != nil {
-		return nil, fmt.Errorf("sealedstore: get %s: %w", digest, err)
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("sealedstore: %s is a symlink — refused (fail closed)", digest)
-	}
-	data, err := os.ReadFile(path)
+	data, err := s.readAt(digest)
 	if err != nil {
 		return nil, fmt.Errorf("sealedstore: get %s: %w", digest, err)
 	}
@@ -144,37 +177,128 @@ func (s *Store) Get(digest string) ([]byte, error) {
 	return data, nil
 }
 
+// gcPauseHook, when non-nil, runs after GC has listed the directory but
+// BEFORE it deletes anything — still holding s.mu. Test-only seam (mirrors
+// atomicwrite's pauseHook) that proves Put and GC actually serialize: a
+// concurrent Put attempted while the hook blocks must itself block on
+// s.mu until GC's critical section ends. Production never sets it.
+var gcPauseHook func()
+
 // GC removes every stored artifact whose digest is neither in liveDigests
 // (the caller's mark pass — every digest still referenced by a durable
 // journal entry) nor currently pinned (an in-flight Put awaiting its
-// journal reference). Mark-and-sweep in one pass, never per-artifact ad
-// hoc deletion, so an artifact referenced by more than one record is never
-// removed while any reference to it still lives.
+// journal reference). Mark-and-sweep in one pass under the SAME lock Put
+// holds for its whole operation (see Put's doc comment), never per-file
+// ad hoc deletion, so an artifact referenced by more than one record is
+// never removed while any reference to it still lives.
 func (s *Store) GC(liveDigests map[string]bool) ([]string, error) {
-	entries, err := os.ReadDir(s.dir)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	names, err := s.listNames()
 	if err != nil {
 		return nil, fmt.Errorf("sealedstore: gc: %w", err)
 	}
-	s.mu.Lock()
-	pinned := make(map[string]bool, len(s.pins))
-	for d := range s.pins {
-		pinned[d] = true
+	if gcPauseHook != nil {
+		gcPauseHook()
 	}
-	s.mu.Unlock()
-
 	var removed []string
-	for _, e := range entries {
-		name := e.Name()
+	for _, name := range names {
 		if !digestRE.MatchString(name) {
 			continue // never touch a file this store did not itself create
 		}
-		if liveDigests[name] || pinned[name] {
+		if liveDigests[name] || s.pins[name] > 0 {
 			continue
 		}
-		if err := os.Remove(filepath.Join(s.dir, name)); err != nil && !os.IsNotExist(err) {
+		if err := unix.Unlinkat(s.dirFd, name, 0); err != nil && err != unix.ENOENT {
 			return removed, fmt.Errorf("sealedstore: gc remove %s: %w", name, err)
 		}
 		removed = append(removed, name)
 	}
 	return removed, nil
+}
+
+// readAt opens name relative to the store's held directory descriptor,
+// with O_NOFOLLOW — if the final component is a symlink, the open itself
+// fails (fail closed); there is no separate Lstat-then-open TOCTOU window.
+func (s *Store) readAt(name string) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.readAtLocked(name)
+}
+
+// readAtLocked is readAt's body. Caller must already hold s.mu (Put calls
+// it directly to stay inside its own critical section).
+func (s *Store) readAtLocked(name string) ([]byte, error) {
+	fd, err := unix.Openat(s.dirFd, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	f := os.NewFile(uintptr(fd), name)
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !st.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file (fail closed)", name)
+	}
+	return io.ReadAll(f)
+}
+
+// writeAtLocked atomically creates name (content-addressed — this name is
+// never overwritten in place once it exists): a randomly-suffixed temp
+// name is created descriptor-relatively, written, fsynced, then renamed
+// into place descriptor-relatively, then the directory itself is fsynced
+// so the rename is durable. Caller must already hold s.mu.
+func (s *Store) writeAtLocked(name string, data []byte) error {
+	var suffix [16]byte
+	if _, err := rand.Read(suffix[:]); err != nil {
+		return fmt.Errorf("tmp name: %w", err)
+	}
+	tmpName := "." + name + ".tmp-" + hex.EncodeToString(suffix[:])
+
+	fd, err := unix.Openat(s.dirFd, tmpName,
+		unix.O_CREAT|unix.O_EXCL|unix.O_WRONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
+	if err != nil {
+		return fmt.Errorf("create temp: %w", err)
+	}
+	tmp := os.NewFile(uintptr(fd), tmpName)
+	cleanup := func() {
+		tmp.Close()
+		unix.Unlinkat(s.dirFd, tmpName, 0)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		cleanup()
+		return fmt.Errorf("write temp: %w", err)
+	}
+	if err := tmp.Sync(); err != nil { // data durable BEFORE the swap
+		cleanup()
+		return fmt.Errorf("fsync temp: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		unix.Unlinkat(s.dirFd, tmpName, 0)
+		return fmt.Errorf("close temp: %w", err)
+	}
+	if err := unix.Renameat(s.dirFd, tmpName, s.dirFd, name); err != nil {
+		unix.Unlinkat(s.dirFd, tmpName, 0)
+		return fmt.Errorf("rename: %w", err)
+	}
+	if err := unix.Fsync(s.dirFd); err != nil {
+		return fmt.Errorf("fsync dir: %w", err)
+	}
+	return nil
+}
+
+// listNames returns every entry name directly in the store directory, via
+// a fresh descriptor-relative open of "." against dirFd — never a
+// pathname lookup of s.dir. Caller must already hold s.mu.
+func (s *Store) listNames() ([]string, error) {
+	fd, err := unix.Openat(s.dirFd, ".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	f := os.NewFile(uintptr(fd), s.dir)
+	defer f.Close()
+	return f.Readdirnames(-1)
 }

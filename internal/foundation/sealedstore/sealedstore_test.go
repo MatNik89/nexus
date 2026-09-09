@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func open(t *testing.T) *Store {
@@ -20,6 +21,7 @@ func open(t *testing.T) *Store {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { s.Close() })
 	return s
 }
 
@@ -85,17 +87,26 @@ func TestGetRefusesCorruptedContent(t *testing.T) {
 }
 
 // Detector: a symlink at a digest path is refused by Get, never followed.
+// The symlink's name is the TRUE digest of its target's content (code-
+// review CODE1 codex finding #6: an earlier version of this test used an
+// arbitrary fake digest that didn't match the target content, so it
+// passed via the unrelated digest-mismatch path in Get — never actually
+// exercising the symlink-rejection code path at all). Naming it correctly
+// means the ONLY thing that can make Get refuse here is the symlink
+// check itself.
 func TestGetRefusesSymlink(t *testing.T) {
 	s := open(t)
+	outsideData := []byte("outside data")
 	outside := filepath.Join(t.TempDir(), "secret")
-	if err := os.WriteFile(outside, []byte("outside data"), 0o600); err != nil {
+	if err := os.WriteFile(outside, outsideData, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	fakeDigest := "0000000000000000000000000000000000000000000000000000000000aa"
-	if err := os.Symlink(outside, filepath.Join(s.dir, fakeDigest)); err != nil {
+	sum := sha256.Sum256(outsideData)
+	trueDigest := hex.EncodeToString(sum[:])
+	if err := os.Symlink(outside, filepath.Join(s.dir, trueDigest)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Get(fakeDigest); err == nil {
+	if _, err := s.Get(trueDigest); err == nil {
 		t.Fatal("Get followed a symlink — refused expected")
 	}
 }
@@ -178,6 +189,59 @@ func TestPinReleaseIdempotent(t *testing.T) {
 	}
 	pin.Release()
 	pin.Release() // must not panic or corrupt state
+}
+
+// Detector (code-review CODE1 codex finding #3): Put and GC serialize
+// under ONE critical section for their ENTIRE operation, not just a
+// pins-map snapshot — a Put attempted while GC is mid-sweep (paused via
+// the test-only gcPauseHook, still holding s.mu) must itself block until
+// GC's critical section ends, never interleave with it.
+func TestGCAndPutSerializeUnderOneCriticalSection(t *testing.T) {
+	s := open(t)
+	_, pOrphan, err := s.Put([]byte("orphan"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pOrphan.Release()
+
+	resumeGC := make(chan struct{})
+	gcEntered := make(chan struct{})
+	gcPauseHook = func() {
+		close(gcEntered)
+		<-resumeGC
+	}
+	defer func() { gcPauseHook = nil }()
+
+	gcDone := make(chan error, 1)
+	go func() {
+		_, gerr := s.GC(map[string]bool{})
+		gcDone <- gerr
+	}()
+	<-gcEntered // GC is inside its critical section, paused mid-operation
+
+	putDone := make(chan error, 1)
+	go func() {
+		_, pin, perr := s.Put([]byte("during-gc"))
+		if perr == nil {
+			pin.Release()
+		}
+		putDone <- perr
+	}()
+
+	select {
+	case <-putDone:
+		t.Fatal("Put completed while GC held its critical section paused — Put and GC are not serialized")
+	case <-time.After(50 * time.Millisecond):
+		// expected: Put is blocked waiting on s.mu
+	}
+
+	close(resumeGC)
+	if err := <-gcDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-putDone; err != nil {
+		t.Fatal(err)
+	}
 }
 
 // Detector: Open refuses a symlinked directory (fail closed).

@@ -23,17 +23,33 @@ func TestParseGoListRealSample(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var found []string
+	// Assert on every stream object, not just the first (code-review
+	// CODE1 codex finding #6): a parser regression that decoded only the
+	// first concatenated object must fail this test, so it must exercise
+	// package identities that appear LATER in the stream too.
+	var sealedstoreFound, atomicwriteFound []string
 	for _, p := range pkgs {
-		if p.ForTest == "" && strings.HasSuffix(p.ImportPath, "sealedstore") {
-			found = append(found, p.ImportPath)
+		if p.ForTest != "" {
+			continue
+		}
+		switch {
+		case strings.HasSuffix(p.ImportPath, "sealedstore"):
+			sealedstoreFound = append(sealedstoreFound, p.ImportPath)
 			if !p.hasTests() {
 				t.Fatalf("sealedstore package not detected as having tests: %+v", p)
 			}
+		case strings.HasSuffix(p.ImportPath, "atomicwrite"):
+			atomicwriteFound = append(atomicwriteFound, p.ImportPath)
 		}
 	}
-	if len(found) != 1 {
-		t.Fatalf("expected exactly one sealedstore base package entry, got %v", found)
+	if len(sealedstoreFound) != 1 {
+		t.Fatalf("expected exactly one sealedstore base package entry, got %v", sealedstoreFound)
+	}
+	if len(atomicwriteFound) != 1 {
+		t.Fatalf("expected exactly one atomicwrite base package entry (proves the stream was decoded past the first object), got %v", atomicwriteFound)
+	}
+	if len(pkgs) < 2 {
+		t.Fatalf("expected at least 2 decoded stream objects, got %d", len(pkgs))
 	}
 }
 
@@ -124,6 +140,31 @@ func TestBuildGraphIgnoresSelfImport(t *testing.T) {
 	got, resolved := g.Affected([]string{"mod/x"})
 	if !resolved || !equalStrings(sorted(got), []string{"mod/x"}) {
 		t.Fatalf("Affected(mod/x) = %v resolved=%v, want [mod/x] true", got, resolved)
+	}
+}
+
+// Detector (code-review CODE1 codex finding #5): a test-only import edge
+// must not propagate transitively into a production consumer that never
+// depends on the changed package at all. Counterexample: mod/a2 <-test-
+// mod/f2 <-production- mod/g2. mod/g2 imports mod/f2 in PRODUCTION, but
+// mod/g2 has no dependency on mod/a2 whatsoever — mod/f2 only reaches
+// mod/a2 through its own test file. A change to mod/a2 must select
+// mod/f2's tests (mod/f2's test file genuinely imports mod/a2) but must
+// NOT select mod/g2's tests.
+func TestAffectedTestOnlyEdgeDoesNotPropagateTransitively(t *testing.T) {
+	pkgs := []Package{
+		{ImportPath: "mod/a2", GoFiles: []string{"a2.go"}},
+		{ImportPath: "mod/f2", TestImports: []string{"mod/a2"}, GoFiles: []string{"f2.go"}, TestGoFiles: []string{"f2_test.go"}},
+		{ImportPath: "mod/g2", Imports: []string{"mod/f2"}, GoFiles: []string{"g2.go"}, TestGoFiles: []string{"g2_test.go"}},
+	}
+	g := BuildGraph(pkgs)
+	got, resolved := g.Affected([]string{"mod/a2"})
+	if !resolved {
+		t.Fatal("expected resolved=true")
+	}
+	want := []string{"mod/f2"}
+	if s := sorted(got); !equalStrings(s, want) {
+		t.Fatalf("Affected(mod/a2) = %v, want %v (mod/g2 must NOT be included — it never depends on mod/a2)", s, want)
 	}
 }
 
