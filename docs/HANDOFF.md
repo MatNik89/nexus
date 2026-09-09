@@ -21,10 +21,17 @@ F -> A -> B1 -> B2 -> B3 -> C -> D -> E.
   assertion). Full suite (vet + go test ./...) green at 5a004de and f1e443c; the
   f33bc9a run was in flight at the time of writing.
 - **CODE reviews:** round 1 (F/A/C/E @68bdd88) = kilo PASS, agy PASS, codex FAIL 3
-  (all folded in f33bc9a) — `docs/REVIEW-AUDIT-CODE1-*.md`. Round 2 (WHOLE stack
-  @f33bc9a, incl. B1-B3+D) dispatched — files `docs/REVIEW-AUDIT-CODE2-*.md`.
+  (folded in f33bc9a). Round 2 (whole stack @f33bc9a) = kilo PASS, agy FAIL 1
+  (acceptance fake getMe id — fixed 63a02bc), codex FAIL 8 — ALL folded: 63a02bc
+  (bare Failure classification), 9ce4dd0 (S7 AttemptContext in both transports,
+  kind/method-bound grants, UNKNOWN registration park, strict S7 policy/event
+  validation, ErrNothingDue keeps health, health writes fail closed, salvage on final
+  transport error), 457c56d (ErrNotDurable + SetAppendFault seam; full detector
+  matrix: 9d table, D6/D7 tables, D2 Run-level, D2b torn batch, D2d provenance, D4
+  per-mark faults, planner 429/400/stream). Round 3 (whole stack @457c56d)
+  dispatched — `docs/REVIEW-AUDIT-CODE3-*.md`. slice/audit-b HEAD = 457c56d.
 
-**NEXT (in order):** (1) fold CODE2 findings on slice/audit-b -> re-dispatch until
+**NEXT (in order):** (1) fold CODE3 findings on slice/audit-b -> re-dispatch until
 codex+kilo PASS (dispatch script pattern: scratchpad dispatch_code2.sh — absolute
 worktree path + git diff range); (2) merge the chain to main: main <- slice/p1-audit
 (plan docs + F4/F9) <- slice/audit-b (contains f..e..b); resolve nothing else (all
