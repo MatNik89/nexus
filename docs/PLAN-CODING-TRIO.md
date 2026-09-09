@@ -521,15 +521,21 @@ and this deployment host's live `go env`, not assumed.
      file edit within an unchanged directory) is accepted as the caller's own bounded
      risk per that
      primitive's documented scope.
-   - **Separately content-hash-pin `GOTOOLDIR` specifically** (its own, narrower check,
-     owned by `internal/coding/runner`, NOT a probe/sandbox primitive): `GOTOOLDIR`
-     holds only ~8 compiler/linker/asm/cgo binaries (measured ~60MB on this host) — a
-     small, bounded set, and unlike the module cache these binaries actually EXECUTE
-     inside the sandbox, making them a higher-value swap target. Compute
-     `sha256(sorted "name\x00sha256(bytes)")` over `GOTOOLDIR`'s entries at coding-run
-     start (sub-20ms measured), fold into the run's evidence event; this closes the
-     in-place-edit gap `ExtraROBindIdentities` deliberately leaves open, specifically
-     for the one directory where it matters most.
+   - **Separately content-hash-pin the FULL executable set, not just `GOTOOLDIR`**
+     (its own, narrower check, owned by `internal/coding/runner`, NOT a probe/sandbox
+     primitive): `GOTOOLDIR` holds only ~8 compiler/linker/asm/cgo binaries (measured
+     ~60MB on this host) — a small, bounded set, and unlike the module cache these
+     binaries actually EXECUTE inside the sandbox, making them a higher-value swap
+     target. **codex's parallel research found the entry point itself is OUTSIDE
+     `GOTOOLDIR`**: `$GOROOT/bin/go` (and `bin/gofmt`) are the binaries the
+     coding-runner's own `go build`/`go test` invocation actually execs FIRST — pinning
+     only `GOTOOLDIR`'s internal compiler/linker/asm/cgo children while leaving the
+     entry-point binary itself unpinned would be a real gap, not a cosmetic one.
+     Compute `sha256(sorted "name\x00sha256(bytes)")` over `GOTOOLDIR`'s entries PLUS
+     `$GOROOT/bin/go` and `$GOROOT/bin/gofmt` at coding-run start (sub-20ms measured
+     for the GOTOOLDIR set alone; two more files is negligible), fold into the run's
+     evidence event; this closes the in-place-edit gap `ExtraROBindIdentities`
+     deliberately leaves open, specifically for the executables where it matters most.
    - `ExtraEnv`: `CGO_ENABLED=0`, `GOTOOLCHAIN=local` (forbid downloading a DIFFERENT
      toolchain over the network — the plan's existing network-denial requirement),
      `GOCACHE`/`GOTMPDIR` pointed at a location INSIDE the sandbox's disposable
