@@ -11,17 +11,17 @@ import (
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
 	"github.com/MatNik89/nexus/internal/kernel/effectpath"
 	"github.com/MatNik89/nexus/internal/kernel/loop"
-	"github.com/MatNik89/nexus/internal/kernel/s7min"
+	"github.com/MatNik89/nexus/internal/kernel/s7"
 	"github.com/MatNik89/nexus/internal/llm/provider"
 )
 
 type replyChat struct {
-	auth  *s7min.Authority
+	auth  *s7.Authority
 	reply string
 	calls int
 }
 
-func (f *replyChat) Chat(ctx context.Context, msgs []provider.ChatMessage, g s7min.Grant) (provider.ChatOutput, error) {
+func (f *replyChat) Chat(ctx context.Context, msgs []provider.ChatMessage, g s7.Grant) (provider.ChatOutput, error) {
 	if err := f.auth.Consume(g); err != nil {
 		return provider.ChatOutput{}, err
 	}
@@ -31,9 +31,9 @@ func (f *replyChat) Chat(ctx context.Context, msgs []provider.ChatMessage, g s7m
 
 func driftPlanner(t *testing.T, reply string) (*ChatPlanner, *replyChat) {
 	t.Helper()
-	auth := s7min.NewAuthority(nil, time.Minute)
+	auth := s7.NewAuthority(nil, time.Minute)
 	fc := &replyChat{auth: auth, reply: reply}
-	p, err := New(fc, auth, "provider:test")
+	p, err := New(fc, auth, "provider:test", 64000)
 	if err != nil {
 		t.Fatal(err)
 	}

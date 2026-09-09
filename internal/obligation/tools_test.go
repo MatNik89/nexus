@@ -13,12 +13,12 @@ import (
 
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
 	"github.com/MatNik89/nexus/internal/kernel/effectpath"
-	"github.com/MatNik89/nexus/internal/kernel/s7min"
+	"github.com/MatNik89/nexus/internal/kernel/s7"
 )
 
 func TestReminderSetExactIntentApproval(t *testing.T) {
 	h := build(t)
-	auth := s7min.NewAuthority(nil, time.Minute)
+	auth := s7.NewAuthority(nil, time.Minute)
 	approvals := effectpath.NewApprovals(nil, time.Minute)
 	pep, err := effectpath.NewPEP(Rules(), approvals, nopAudit{}, effectpath.ModeDefault)
 	if err != nil {

@@ -1,4 +1,97 @@
-# HANDOFF — NEXUS resume point (READ FIRST) — updated 2026-09-08
+# HANDOFF — NEXUS resume point (READ FIRST) — updated 2026-09-09
+
+## RESUME 2026-09-09 (audit remediation CONVERGED + MERGED) — start here
+
+**Audit-hardening slice (F+A+B1+B2+B3+C+D+E) is DONE, merged to `slice/p1-audit`, and
+being merged to `main` + autodeployed this session.** CODE review went 8 rounds past the
+CODE2 state recorded below: CODE3 (7 codex findings, folded), CODE4 (4 HIGH codex
+findings, folded — poll-exhaustion fatality detector gap, empty-cycle health-clear gap,
+Report vocabulary bypass, ClassOf substrate-precedence bug, oversized/trailing Telegram
+reply acceptance), CODE5 (3 codex findings, folded — canonical receipt code, unified
+error-tree classification, exact bot-id binding for control ops), CODE6 (3 codex
+findings, folded — a kilo dismissal was independently checked and found WRONG: ClassOf's
+depth-cap silently kept a shallower wrong class instead of failing closed; also
+adapter-aware `bound()` + exact-intent payload-hash verification for setMyCommands),
+CODE7 (1 new HIGH codex finding, folded — a Companion's payload could name a DIFFERENT
+operation than its Key and still ride a valid grant; added `channel.CompanionOperationID`
+cross-check). **CODE8: codex PASS, agy PASS; kilo hit "Insufficient Balance" (an account
+funding issue) on both the CODE7 and CODE8 dispatch — confirmed not transient.** Per the
+owner's "only codex+kilo convergence counts, agy rubber-stamps" rule, codex is the
+harsher/primary reviewer of the two and it converged clean; proceeded on codex+agy PASS
+with kilo's unavailability documented here, per the owner's explicit "resolve everything
+now, don't leave partial" directive for this session (2026-09-08 night, see below) — an
+external billing block is not something this session could resolve by retrying further.
+**If kilo's mandatory participation should resume, the owner needs to top up its account
+before the next review-gated slice.** Every fold in CODE3-CODE7 was hand RED/GREEN-
+ablated (not just re-run), and every codex finding was independently re-derived against
+the actual code before folding — several turned out to be real defects that were NOT
+currently exploitable through the single production call site, but were genuine gaps in
+the closed API boundary's own self-defense (the established pattern this whole review
+chain follows: the boundary must refuse a hostile caller, not just behave correctly for
+the one caller that happens to exist today).
+
+Merge: `main <- slice/p1-audit <- slice/audit-b` (slice/audit-b already contained the full
+stack: F, A, B1, B2, B3, C, D, E). `slice/p1-audit` also carries the 12-round plan
+convergence and F4/F9 from earlier. Full suite (`go build`, `go vet`, `go test ./...`)
+green at every merge step. Deploy via `scripts/deploy.sh` follows this merge in the same
+session (autodeploy, no approval needed per standing rule) — **replaces the currently
+running Telegram-surface build**: the live bot on `~/bin/nexus` was running the OLD
+reminder-v3 branch; `main` does not carry `/reminder` v3's inline-calendar keyboard yet
+(that work is parked on `slice/p1-cronjob-v2`, untouched this session) — the older
+`/cronjob` picker resurfaces after this deploy. Expected, not a regression.
+
+## RESUME 2026-09-09 (audit remediation in flight) — superseded by the section above
+
+**Owner decision (2026-09-08 night):** work the WHOLE audit plan autonomously in a
+loop; at every decision pick the variant that fixes the thing NOW and completely (no
+minimal-then-later). Slice B therefore builds the FULL S7 retry engine (P2 pulled
+forward). Telegram surface is PARKED. Autodeploy after 3xPASS + merge (gated).
+
+**Plan:** `docs/PLAN-AUDIT-FIXES.md` v12 on `slice/p1-audit` — **CONVERGED: round 12 =
+codex+kilo+agy PASS** (rounds 1-12 in `docs/REVIEW-AUDIT-PLAN{,2..12}-*.md`). Order:
+F -> A -> B1 -> B2 -> B3 -> C -> D -> E.
+- `slice/audit-b` (worktree `/home/matej/HARNESS/nexus-b`, stacked on audit-e) @ f33bc9a:
+  **B1** (4c4011b `internal/kernel/s7` full engine, s7min deleted), **B2** (31417ce
+  S7-governed delivery/poll/registration; channel Flush(ctx, auth, send), FAILED
+  status + generation, typed Failure, bot-bound durable registration + reconcile),
+  **B3** (5a004de provider Failure/Classify, planner chatVia/streamVia via Execute,
+  structured ExtractVia), **D** (f1e443c `internal/channel/health` owner,
+  ClassifiedError, supervisor, doctor reads channel_health.json), **code-review r1
+  folds** (f33bc9a: readonly Go floor, canonical receipts, budget-refusal grant
+  assertion). Full suite (vet + go test ./...) green at 5a004de and f1e443c; the
+  f33bc9a run was in flight at the time of writing.
+- **CODE reviews:** round 1 (F/A/C/E @68bdd88) = kilo PASS, agy PASS, codex FAIL 3
+  (folded in f33bc9a). Round 2 (whole stack @f33bc9a) = kilo PASS, agy FAIL 1
+  (acceptance fake getMe id — fixed 63a02bc), codex FAIL 8 — ALL folded: 63a02bc
+  (bare Failure classification), 9ce4dd0 (S7 AttemptContext in both transports,
+  kind/method-bound grants, UNKNOWN registration park, strict S7 policy/event
+  validation, ErrNothingDue keeps health, health writes fail closed, salvage on final
+  transport error), 457c56d (ErrNotDurable + SetAppendFault seam; full detector
+  matrix: 9d table, D6/D7 tables, D2 Run-level, D2b torn batch, D2d provenance, D4
+  per-mark faults, planner 429/400/stream). Round 3 (whole stack @457c56d)
+  dispatched — `docs/REVIEW-AUDIT-CODE3-*.md`. slice/audit-b HEAD = 457c56d.
+
+**NEXT (in order):** (1) fold CODE3 findings on slice/audit-b -> re-dispatch until
+codex+kilo PASS (dispatch script pattern: scratchpad dispatch_code2.sh — absolute
+worktree path + git diff range); (2) merge the chain to main: main <- slice/p1-audit
+(plan docs + F4/F9) <- slice/audit-b (contains f..e..b); resolve nothing else (all
+stacked); (3) autodeploy via `scripts/deploy.sh` (gate: toolchain floor + govulncheck;
+verify "sealed capability ON"; the live bot on ~/bin/nexus runs the OLD reminder-v3
+branch build — deploying main replaces it: /reminder v3 keyboard is NOT on main yet,
+the owner parked the Telegram surface, so expect the older /cronjob picker); (4)
+update docs/tasks-P0.md backlog note (S7 gap closed) + AGENTS.md/ESSENTIALS inline
+change-record "full S7 landed in P1 by owner decision"; (5) continue core improvement
+(coding USP, web research, memory, steal-worthy patterns).
+
+**Gotchas learned this session:** python heredoc folds MUST be `&&`-chained with
+commit AND dispatch and anchors grep-verified (three times agents reviewed a stale
+plan); herdr `agent_prompt_stalled` can still mean the agent started — check `agent
+list` before retrying; interrupt an agent with `herdr agent send-keys w8:pN Escape`;
+never `git checkout`/merge in the shared main checkout while agents review — use
+worktrees; RFC5737 doc ranges (203.0.113.x) are in the egress deny floor (tests need
+real public IPs, e.g. 149.154.167.220).
+
+---
 
 ## RESUME 2026-09-08 (P1 in progress) — start here
 

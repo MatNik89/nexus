@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/MatNik89/nexus/internal/preflight/probe"
@@ -24,6 +25,7 @@ func healthyEnv(t *testing.T) Env {
 	}
 	return Env{
 		LookupEnv: func(k string) (string, bool) { v, ok := env[k]; return v, ok },
+		Secrets:   Secrets{ProviderKeyEnv: "NEXUS_API_KEY", TelegramTokenEnv: "NEXUS_TELEGRAM_TOKEN"},
 		DataDir:   dir,
 		Detect: func() (probe.Availability, error) {
 			return probe.Availability{BwrapPath: "/usr/bin/bwrap", BwrapVersion: "bubblewrap test"}, nil
@@ -183,5 +185,91 @@ func TestLiveDaemonMissingHealthMirrorIsOff(t *testing.T) {
 	}
 	if got.Status != StatusOff {
 		t.Fatalf("live daemon without a health mirror reported %v", got)
+	}
+}
+
+// Slice E (AUDIT-FULL F7): doctor reads the CONFIGURED secret names. The three
+// causal cases: custom names + custom populated + defaults absent -> ON (the
+// audited false negative); custom names + custom ABSENT + defaults POPULATED ->
+// OFF (the false positive: reading the default name would say ON); default
+// names + defaults populated -> ON (regression guard). Plus: an empty
+// configured name is OFF, never a fallback to the default name.
+func TestSecretChecksFollowConfiguredNames(t *testing.T) {
+	find := func(checks []Check, name string) Check {
+		for _, c := range checks {
+			if c.Name == name {
+				return c
+			}
+		}
+		t.Fatalf("check %q missing", name)
+		return Check{}
+	}
+	cases := []struct {
+		name    string
+		secrets Secrets
+		env     map[string]string
+		wantOK  bool
+	}{
+		{"custom-configured-custom-populated", Secrets{"CUSTOM_PROVIDER_KEY", "CUSTOM_TG"},
+			map[string]string{"CUSTOM_PROVIDER_KEY": "sk-secret-value-9f3a", "CUSTOM_TG": "123456:tokenvalue-7b2c"}, true},
+		{"custom-configured-default-populated", Secrets{"CUSTOM_PROVIDER_KEY", "CUSTOM_TG"},
+			map[string]string{"NEXUS_API_KEY": "sk-secret-value-9f3a", "NEXUS_TELEGRAM_TOKEN": "123456:tokenvalue-7b2c"}, false},
+		{"default-configured-default-populated", Secrets{"NEXUS_API_KEY", "NEXUS_TELEGRAM_TOKEN"},
+			map[string]string{"NEXUS_API_KEY": "sk-secret-value-9f3a", "NEXUS_TELEGRAM_TOKEN": "123456:tokenvalue-7b2c"}, true},
+		{"empty-name-never-falls-back", Secrets{"", ""},
+			map[string]string{"NEXUS_API_KEY": "sk-secret-value-9f3a", "NEXUS_TELEGRAM_TOKEN": "123456:tokenvalue-7b2c"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := healthyEnv(t)
+			env.Secrets = tc.secrets
+			env.LookupEnv = func(k string) (string, bool) { v, ok := tc.env[k]; return v, ok }
+			checks := Run(env)
+			for _, name := range []string{"provider-key", "telegram-token"} {
+				c := find(checks, name)
+				if (c.Status == StatusOK) != tc.wantOK {
+					t.Fatalf("%s: status %v, want ok=%v (%s)", name, c.Status, tc.wantOK, c.Detail)
+				}
+				if c.Status != StatusOK && c.Fix == "" {
+					t.Fatalf("%s: OFF without a fix", name)
+				}
+				for _, v := range tc.env {
+					if strings.Contains(c.Detail, v) || strings.Contains(c.Fix, v) {
+						t.Fatalf("%s: secret value echoed in doctor output", name)
+					}
+				}
+			}
+		})
+	}
+}
+
+// Slice D: doctor reads the channel-health projection — an unhealthy
+// component reports its typed class OFF; a healthy or absent projection is
+// OK; a malformed one is broken observability (OFF).
+func TestChannelHealthProjectionReported(t *testing.T) {
+	env := healthyEnv(t)
+	find := func(checks []Check) []Check {
+		var out []Check
+		for _, c := range checks {
+			if c.Name == "channel-health" {
+				out = append(out, c)
+			}
+		}
+		return out
+	}
+	if cs := find(Run(env)); len(cs) != 1 || cs[0].Status != StatusOK {
+		t.Fatalf("absent projection: %+v", cs)
+	}
+	sys := filepath.Join(env.DataDir, "system")
+	os.MkdirAll(sys, 0o700)
+	p := filepath.Join(sys, "channel_health.json")
+	os.WriteFile(p, []byte(`[{"component":"telegram.poll","healthy":false,"class":"remote_rejected","code":"http_4xx","detail":"HTTP 401","stopped":true,"at":"2026-09-09T00:00:00Z"}]`), 0o600)
+	cs := find(Run(env))
+	if len(cs) != 1 || cs[0].Status != StatusOff || !strings.Contains(cs[0].Detail, "remote_rejected") || cs[0].Fix == "" {
+		t.Fatalf("unhealthy projection not reported: %+v", cs)
+	}
+	os.WriteFile(p, []byte(`{broken`), 0o600)
+	if cs := find(Run(env)); len(cs) != 1 || cs[0].Status != StatusOff {
+		t.Fatalf("malformed projection not OFF: %+v", cs)
 	}
 }

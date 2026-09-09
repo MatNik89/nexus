@@ -461,7 +461,10 @@ Croatian-output directive in the system prompt (owner order). All folds
 ablation-proven RED. Verdicts: codex FAILx3->PASS, kilo FAILx3->PASS,
 agy FAILx1->PASSx3.
 
-### Backlog item (architectural, surfaced by tgout plan review r9)
+### Backlog item (architectural, surfaced by tgout plan review r9) — CLOSED 2026-09-09
+Closed by audit remediation Slice B (full S7 engine + S7-governed delivery, poll and
+command registration; `docs/PLAN-AUDIT-FIXES.md` v12, branch slice/audit-b). Kept for
+history:
 The outbox tick re-flush path (Adapter.Run -> FlushOutbox ->
 Core.Flush) performs physical delivery attempts WITHOUT an S7
 AttemptGrant, while ARCHITECTURE-ESSENTIALS and Annex P0.2 assign

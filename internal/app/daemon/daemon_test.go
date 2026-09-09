@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -32,12 +33,13 @@ import (
 	"github.com/MatNik89/nexus/internal/conv"
 	"github.com/MatNik89/nexus/internal/foundation/clockid"
 	"github.com/MatNik89/nexus/internal/foundation/config"
+	"github.com/MatNik89/nexus/internal/foundation/egress"
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
 	"github.com/MatNik89/nexus/internal/kernel/effectpath"
 	"github.com/MatNik89/nexus/internal/kernel/journal"
 	"github.com/MatNik89/nexus/internal/kernel/loop"
 	"github.com/MatNik89/nexus/internal/kernel/machine"
-	"github.com/MatNik89/nexus/internal/kernel/s7min"
+	"github.com/MatNik89/nexus/internal/kernel/s7"
 	"github.com/MatNik89/nexus/internal/llm/planner"
 	"github.com/MatNik89/nexus/internal/llm/provider"
 	"github.com/MatNik89/nexus/internal/security/redact"
@@ -113,7 +115,7 @@ func testDaemonRedact(t *testing.T, planner loop.Planner, audit effectpath.Audit
 	d, err := New(Deps{
 		Journal:        j,
 		PlannerFactory: func(deliver func(string) error) (loop.Planner, error) { return planner, nil },
-		Authority:      s7min.NewAuthority(nil, time.Minute),
+		Authority:      s7.NewAuthority(nil, time.Minute),
 		Profile:        "work",
 		Rules:          map[contracts.ToolID]effectpath.Decision{"asker": effectpath.DecisionAsk},
 		Tools: map[contracts.ToolID]effectpath.InProcFunc{
@@ -306,8 +308,8 @@ func TestLiveProviderSmoke(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	auth := s7min.NewAuthority(nil, time.Minute)
-	p, err := provider.NewAPIKey(res.Config, auth)
+	auth := s7.NewAuthority(nil, time.Minute)
+	p, err := provider.NewAPIKey(res.Config, auth, func(egress.Decision) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -351,15 +353,15 @@ func TestFullSpineDeterministicTransport(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { j.Close() })
-	authority := s7min.NewAuthority(nil, time.Minute)
-	prov, err := provider.NewAPIKey(cfg, authority)
+	authority := s7.NewAuthority(nil, time.Minute)
+	prov, err := provider.NewAPIKey(cfg, authority, func(egress.Decision) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
 	d, err := New(Deps{
 		Journal: j,
 		PlannerFactory: func(deliver func(string) error) (loop.Planner, error) {
-			return planner.NewStreaming(prov, prov, authority, prov.Target(), deliver)
+			return planner.NewStreaming(prov, prov, authority, prov.Target(), deliver, 64000)
 		},
 		Authority: authority, Profile: "work",
 		Rules: map[contracts.ToolID]effectpath.Decision{},
@@ -491,7 +493,7 @@ func TestRecoveryFailsClosedOnCorruptJournal(t *testing.T) {
 	d, err := New(Deps{
 		Journal:        j,
 		PlannerFactory: func(deliver func(string) error) (loop.Planner, error) { return p, nil },
-		Authority:      s7min.NewAuthority(nil, time.Minute),
+		Authority:      s7.NewAuthority(nil, time.Minute),
 		Profile:        "work",
 		Rules:          map[contracts.ToolID]effectpath.Decision{},
 		Tools:          map[contracts.ToolID]effectpath.InProcFunc{},
@@ -1200,5 +1202,51 @@ func TestOtherFailureCodeStaysGeneric(t *testing.T) {
 	var de loop.DriftError
 	if errors.As(err, &de) {
 		t.Fatalf("OTHER_FAILURE reconstructed as DriftError: %v", err)
+	}
+}
+
+// Slice C detector 3 (AUDIT-FULL F8): an over-long UDS frame is refused and the
+// connection CLOSED — for the hello frame and for a chat frame whose tail is an
+// aligned, valid-looking second frame that must never run.
+func TestOversizedFramesRefusedAndConnectionClosed(t *testing.T) {
+	_, sock, _ := testDaemon(t, &echoPlanner{}, nil)
+	readOne := func(t *testing.T, r *bufio.Reader) (string, string) {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			t.Fatalf("no reply frame: %v", err)
+		}
+		var f struct{ Type, Text string }
+		json.Unmarshal([]byte(line), &f)
+		return f.Type, f.Text
+	}
+	pad := strings.Repeat("a", maxFrameBytes+16)
+	// 1. hello too large.
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.Write([]byte(`{"type":"hello","junk":"` + pad + `"}` + "\n"))
+	if typ, text := readOne(t, bufio.NewReader(conn)); typ != "error" || !strings.Contains(text, "too large") {
+		t.Fatalf("oversized hello: got %s %q", typ, text)
+	}
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("connection stayed open after an oversized hello")
+	}
+	// 2. chat too large with an aligned valid suffix: refused, closed, and
+	// the suffix NEVER echoed as a second turn.
+	c := dial(t, sock, false)
+	c.conn.Write([]byte(`{"type":"chat","text":"` + pad + `"}` + "\n" + `{"type":"chat","text":"smuggled"}` + "\n"))
+	if typ, text := readOne(t, c.r); typ != "error" || !strings.Contains(text, "too large") {
+		t.Fatalf("oversized chat: got %s %q", typ, text)
+	}
+	rest, _ := io.ReadAll(c.r) // connection must be closed by the daemon
+	if strings.Contains(string(rest), "smuggled") {
+		t.Fatalf("aligned suffix ran as a second frame: %q", rest)
+	}
+	// Control: a normal-sized chat still round-trips on a fresh connection.
+	c2 := dial(t, sock, false)
+	if out, e := c2.chat(t, "hello nexus"); e != "" || out != "echo: hello nexus" {
+		t.Fatalf("control turn broken: %q %q", out, e)
 	}
 }

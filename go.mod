@@ -2,6 +2,8 @@ module github.com/MatNik89/nexus
 
 go 1.26
 
+toolchain go1.26.6
+
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect

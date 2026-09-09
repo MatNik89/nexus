@@ -11,6 +11,9 @@
 # rename. A failed or killed run never mutates the installed trust set.
 set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Release gate (AUDIT-FULL F3): toolchain floor + govulncheck on the EXACT
+# graded binary, BEFORE grading/signing/publishing. Shared with deploy.sh.
+. "$ROOT/scripts/lib/release-gate.sh"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 # --- PUBLISH: the trust SET (anchor + attestation + signature) is ONE
@@ -64,6 +67,7 @@ printf 'owner %s\n' "$PUB" > "$SIGNERS_STAGE"
 FP="$(sha256sum "$SIGNERS_STAGE" | cut -d' ' -f1)"
 BIN="$WORK/nexus"
 CGO_ENABLED=0 go build -buildvcs=false -ldflags "-X main.acceptanceSignerFingerprint=$FP" -o "$BIN" "$ROOT/cmd/nexus"
+release_gate "$BIN"
 DIGEST="$(sha256sum "$BIN" | cut -d' ' -f1)"
 echo "acceptance: grading binary sha256=$DIGEST"
 cd "$ROOT"

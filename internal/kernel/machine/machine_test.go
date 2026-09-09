@@ -214,8 +214,8 @@ func TestEventTypesCoverAllTables(t *testing.T) {
 		}
 		names[n] = true
 	}
-	if len(names) != 27 {
-		t.Fatalf("want 27 distinct event types, got %d", len(names))
+	if len(names) != 32 { // 27 P0 edges + 5 full-S7 attempt edges (Slice B1)
+		t.Fatalf("want 32 distinct event types, got %d", len(names))
 	}
 }
 
@@ -288,16 +288,22 @@ func TestExhaustiveAttemptEdgeMatrix(t *testing.T) {
 		EvAttemptStarted:          {contracts.AttemptAuthorized: contracts.AttemptRunning},
 		EvAttemptSucceeded:        {contracts.AttemptRunning: contracts.AttemptSucceeded},
 		EvAttemptFailed:           {contracts.AttemptRunning: contracts.AttemptFailed},
-		EvAttemptCancelled:        {contracts.AttemptPlanned: contracts.AttemptCancelled, contracts.AttemptAuthorized: contracts.AttemptCancelled, contracts.AttemptRunning: contracts.AttemptCancelled},
+		EvAttemptCancelled:        {contracts.AttemptPlanned: contracts.AttemptCancelled, contracts.AttemptAuthorized: contracts.AttemptCancelled, contracts.AttemptRunning: contracts.AttemptCancelled, contracts.AttemptFailedRetryable: contracts.AttemptCancelled},
 		EvAttemptLost:             {contracts.AttemptRunning: contracts.AttemptUnknown},
 		EvAttemptReconciledOK:     {contracts.AttemptUnknown: contracts.AttemptSucceeded},
 		EvAttemptReconciledFailed: {contracts.AttemptUnknown: contracts.AttemptFailed},
 		EvAttemptManual:           {contracts.AttemptUnknown: contracts.AttemptManualRecovery},
+		EvAttemptFailedRetryable:  {contracts.AttemptRunning: contracts.AttemptFailedRetryable},
+		EvAttemptRetryAuthorized:  {contracts.AttemptFailedRetryable: contracts.AttemptAuthorized},
+		EvAttemptExhausted:        {contracts.AttemptFailedRetryable: contracts.AttemptFailed, contracts.AttemptPlanned: contracts.AttemptFailed},
+		EvAttemptLeaseRevoked:     {contracts.AttemptAuthorized: contracts.AttemptPlanned},
+		EvAttemptReconciledRetry:  {contracts.AttemptUnknown: contracts.AttemptFailedRetryable},
 	}
 	states := []contracts.AttemptState{
 		contracts.AttemptInvalid, contracts.AttemptPlanned, contracts.AttemptAuthorized,
 		contracts.AttemptRunning, contracts.AttemptSucceeded, contracts.AttemptFailed,
 		contracts.AttemptCancelled, contracts.AttemptUnknown, contracts.AttemptManualRecovery,
+		contracts.AttemptFailedRetryable,
 	}
 	for ev, froms := range legal {
 		for _, st := range states {

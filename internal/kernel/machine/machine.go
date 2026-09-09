@@ -193,6 +193,16 @@ const (
 	EvAttemptReconciledOK     = "attempt.reconciled_ok"
 	EvAttemptReconciledFailed = "attempt.reconciled_failed"
 	EvAttemptManual           = "attempt.manual_recovery"
+	// Full-S7 edges (Slice B1): a retryable failure, the S7-only re-grant,
+	// exhaustion of the attempt cap / deadline, and revocation of an
+	// unconsumed authorization lease (crash/expiry recovery).
+	EvAttemptFailedRetryable = "attempt.failed_retryable"
+	EvAttemptRetryAuthorized = "attempt.retry_authorized"
+	EvAttemptExhausted       = "attempt.exhausted"
+	EvAttemptLeaseRevoked    = "attempt.lease_revoked"
+	// Reconciliation proved the remote effect ABSENT: the same operation
+	// becomes retryable (only S7 re-grants, within its budget).
+	EvAttemptReconciledRetry = "attempt.reconciled_retry"
 )
 
 // AttemptTable returns the canonical tool-attempt table (P0.1:
@@ -211,6 +221,13 @@ func AttemptTable() *Table[contracts.AttemptState] {
 		{EvAttemptReconciledOK, contracts.AttemptUnknown, contracts.AttemptSucceeded},
 		{EvAttemptReconciledFailed, contracts.AttemptUnknown, contracts.AttemptFailed},
 		{EvAttemptManual, contracts.AttemptUnknown, contracts.AttemptManualRecovery},
+		{EvAttemptFailedRetryable, contracts.AttemptRunning, contracts.AttemptFailedRetryable},
+		{EvAttemptRetryAuthorized, contracts.AttemptFailedRetryable, contracts.AttemptAuthorized},
+		{EvAttemptExhausted, contracts.AttemptFailedRetryable, contracts.AttemptFailed},
+		{EvAttemptExhausted, contracts.AttemptPlanned, contracts.AttemptFailed},
+		{EvAttemptCancelled, contracts.AttemptFailedRetryable, contracts.AttemptCancelled},
+		{EvAttemptLeaseRevoked, contracts.AttemptAuthorized, contracts.AttemptPlanned},
+		{EvAttemptReconciledRetry, contracts.AttemptUnknown, contracts.AttemptFailedRetryable},
 	})
 	if err != nil {
 		panic(err)
@@ -229,5 +246,7 @@ func EventTypes() []string {
 		EvAttemptPlanned, EvAttemptAuthorized, EvAttemptStarted, EvAttemptSucceeded,
 		EvAttemptFailed, EvAttemptCancelled, EvAttemptLost, EvAttemptReconciledOK,
 		EvAttemptReconciledFailed, EvAttemptManual,
+		EvAttemptFailedRetryable, EvAttemptRetryAuthorized, EvAttemptExhausted, EvAttemptLeaseRevoked,
+		EvAttemptReconciledRetry,
 	}
 }

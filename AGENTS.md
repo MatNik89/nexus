@@ -58,6 +58,12 @@ Everything you produce here is **English** — code, comments, docs, review file
   contracts: `s7-min` = AttemptGrant + cancel + no-retry (retryable → FAILED_TERMINAL),
   `s5-min` = AtomicWriter; full S7 taxonomy/budgets/fencing = P2, full S5
   shadow-git/worktree = P3 (HARDQ A2).
+  **CHANGE-RECORD 2026-09-09 (owner decision, audit remediation Slice B):** the FULL S7
+  engine (`internal/kernel/s7`: ExecutionPolicy, retry/backoff/deadline, FAILED_RETRYABLE,
+  durable operations + lease recovery, Reconcile, Execute) landed in P1 — the `s7-min`
+  no-retry collapse no longer applies; S7 remains the SOLE owner of retry/deadline/cancel
+  (adapters, loops and planners hold no retry loop; they ask S7 for the next grant).
+  Fencing/queue-lease (S7.2) still P2.
 - Stuck-detection only WITHIN one interactive turn; scheduled/polling iterations exempt
   via continuous-loop policy (HARDQ C3).
 - YOLO mode (`nexus --yolo`, HARDQ F2): ASK → ALLOW only (journaled `ALLOWED_BY_YOLO`);

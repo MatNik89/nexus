@@ -20,6 +20,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -50,6 +51,12 @@ type Config struct {
 	// LoadLocation, "Local"/"" rejected (the reminder occurrences keep
 	// their own zone — this is only the chat clock).
 	Timezone string `json:"timezone"`
+	// ContextHardLimitTokens is the ONE configured ContextBudget hard limit
+	// (Slice C, AUDIT-FULL F5): the planner measures the FINAL wire messages
+	// against it before every provider attempt and REFUSES over budget
+	// (never trims). Default 64000; zero/negative is rejected at Resolve —
+	// "unlimited" does not exist.
+	ContextHardLimitTokens int `json:"context_hard_limit_tokens"`
 }
 
 // Origin records which layer supplied each key.
@@ -89,19 +96,21 @@ const (
 	kindString keyKind = iota
 	kindStringList
 	kindBool
+	kindInt
 )
 
 var keySchema = map[string]keyKind{
-	"provider_base_url":  kindString,
-	"provider_key_env":   kindString,
-	"provider_model":     kindString,
-	"telegram_token_env": kindString,
-	"telegram_api_base":  kindString,
-	"default_profile":    kindString,
-	"egress_allow":       kindStringList,
-	"exec_allow":         kindStringList,
-	"sandbox_disabled":   kindBool,
-	"timezone":           kindString,
+	"provider_base_url":         kindString,
+	"provider_key_env":          kindString,
+	"provider_model":            kindString,
+	"telegram_token_env":        kindString,
+	"telegram_api_base":         kindString,
+	"default_profile":           kindString,
+	"egress_allow":              kindStringList,
+	"exec_allow":                kindStringList,
+	"sandbox_disabled":          kindBool,
+	"timezone":                  kindString,
+	"context_hard_limit_tokens": kindInt,
 }
 
 // value is one typed, presence-aware layer entry.
@@ -109,6 +118,7 @@ type value struct {
 	str  string
 	list []string
 	b    bool
+	n    int
 	kind keyKind
 }
 
@@ -119,12 +129,23 @@ type layer struct {
 
 func defaults() Config {
 	return Config{
-		ProviderKeyEnv:   "NEXUS_API_KEY",
-		TelegramTokenEnv: "NEXUS_TELEGRAM_TOKEN",
-		TelegramAPIBase:  "https://api.telegram.org",
-		DefaultProfile:   "private",
-		Timezone:         "Europe/Zagreb",
+		ProviderKeyEnv:         "NEXUS_API_KEY",
+		TelegramTokenEnv:       "NEXUS_TELEGRAM_TOKEN",
+		TelegramAPIBase:        "https://api.telegram.org",
+		DefaultProfile:         "private",
+		Timezone:               "Europe/Zagreb",
+		ContextHardLimitTokens: 64000,
 	}
+}
+
+// parseIntStrict accepts only a plain decimal integer (no sign-less floats,
+// no exponents, no whitespace) — a typo must fail closed, never parse to 0.
+func parseIntStrict(origin Origin, key, raw string) (int, error) {
+	n, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || strings.TrimSpace(raw) != raw {
+		return 0, fmt.Errorf("config %s: %s must be a decimal integer (rejected)", origin, key)
+	}
+	return n, nil
 }
 
 // parseList validates a host list: trimmed, non-empty entries only
@@ -168,6 +189,12 @@ func parseFileLayer(path string, origin Origin) (layer, error) {
 	if err != nil {
 		return l, fmt.Errorf("config %s: %w", origin, err)
 	}
+	// Reject duplicate JSON member names BEFORE decoding into the map (F9):
+	// Go's map unmarshal is silently last-value-wins, which makes a
+	// security-sensitive config key ambiguous. Reuse the kernel detector.
+	if contracts.HasDuplicateJSONKeys(b) {
+		return l, fmt.Errorf("config %s: duplicate JSON keys (ambiguous, fail closed)", origin)
+	}
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(b, &raw); err != nil {
 		return l, fmt.Errorf("config %s: invalid JSON: %w", origin, err)
@@ -200,6 +227,18 @@ func parseFileLayer(path string, origin Origin) (layer, error) {
 				return l, fmt.Errorf("config %s: %s must be a JSON boolean (rejected)", origin, k)
 			}
 			l.values[k] = value{kind: kindBool, b: bv}
+		case kindInt:
+			// A JSON number is only accepted as an INTEGER literal
+			// (64000, not 64000.0 / 6.4e4): json.Number keeps the text.
+			var num json.Number
+			if err := json.Unmarshal(v, &num); err != nil {
+				return l, fmt.Errorf("config %s: %s must be a JSON integer (rejected)", origin, k)
+			}
+			n, err := parseIntStrict(origin, k, num.String())
+			if err != nil {
+				return l, err
+			}
+			l.values[k] = value{kind: kindInt, n: n}
 		}
 	}
 	return l, nil
@@ -261,6 +300,12 @@ func parseRawLayerValue(origin Origin, key string, kind keyKind, raw string) (va
 			return value{}, err
 		}
 		return value{kind: kindBool, b: bv}, nil
+	case kindInt:
+		n, err := parseIntStrict(origin, key, raw)
+		if err != nil {
+			return value{}, err
+		}
+		return value{kind: kindInt, n: n}, nil
 	}
 	return value{}, fmt.Errorf("config %s: %s has an unknown schema kind", origin, key)
 }
@@ -313,6 +358,8 @@ func applyValue(c *Config, key string, v value) error {
 		c.ExecAllow = v.list
 	case "sandbox_disabled":
 		c.SandboxDisabled = v.b
+	case "context_hard_limit_tokens":
+		c.ContextHardLimitTokens = v.n
 	default:
 		return fmt.Errorf("unknown key %q", key)
 	}
@@ -322,6 +369,12 @@ func applyValue(c *Config, key string, v value) error {
 // ValidateBounds enforces the kernel floor: configuration only NARROWS.
 func ValidateBounds(c Config) error {
 	var errs []error
+	// The context hard limit must be a positive, bounded token count: zero or
+	// negative would silently mean "unlimited" downstream (F5), and an absurd
+	// ceiling is a typo, not a policy.
+	if c.ContextHardLimitTokens <= 0 || c.ContextHardLimitTokens > 2_000_000 {
+		errs = append(errs, fmt.Errorf("context_hard_limit_tokens: %d is outside (0, 2000000] (rejected — unlimited context does not exist)", c.ContextHardLimitTokens))
+	}
 	for _, h := range c.EgressAllow {
 		if strings.Contains(h, "*") {
 			errs = append(errs, fmt.Errorf("egress_allow: wildcard %q widens the kernel floor (rejected)", h))

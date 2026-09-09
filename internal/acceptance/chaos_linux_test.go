@@ -139,7 +139,7 @@ func TestChaosKillSurvival(t *testing.T) {
 		}
 		return "echo: " + last
 	}
-	stop, _ := w.daemon()
+	stop := w.daemon()
 	if _, err := w.chat("remind me please", true); err != nil {
 		t.Fatal(err)
 	}
@@ -275,7 +275,7 @@ func TestChaosKillSurvival(t *testing.T) {
 	acceptedBefore := bot.countSent(wantReply)
 	// CALM drain: EVERY pushed id terminal AND the reminder DELIVERED —
 	// no fixed-sleep correctness (prep3 codex #5).
-	stopF, _ := w.daemon()
+	stopF := w.daemon()
 	// OBSERVATION INTERVAL first (prep3-r3 codex #1): give the restarted
 	// daemon two full flush ticks with NO owner command — the phase-D
 	// row must stay UNKNOWN and its acceptance count unchanged (an
@@ -649,7 +649,7 @@ func verifyJournalProduction(w *world, profile string) error {
 // verifier.
 func TestChaosCheckerDetectsCorruption(t *testing.T) {
 	w := newWorld(t, nil)
-	stop, _ := w.daemon()
+	stop := w.daemon()
 	if _, err := w.chat("hello checker", false); err != nil {
 		t.Fatal(err)
 	}

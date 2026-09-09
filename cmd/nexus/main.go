@@ -26,12 +26,14 @@ import (
 	"github.com/MatNik89/nexus/internal/app/repl"
 	"github.com/MatNik89/nexus/internal/approval"
 	"github.com/MatNik89/nexus/internal/channel"
+	"github.com/MatNik89/nexus/internal/channel/health"
 	"github.com/MatNik89/nexus/internal/channel/telegram"
 	"github.com/MatNik89/nexus/internal/conv"
 	"github.com/MatNik89/nexus/internal/exectool"
 	"github.com/MatNik89/nexus/internal/foundation/atomicwrite"
 	"github.com/MatNik89/nexus/internal/foundation/clockid"
 	"github.com/MatNik89/nexus/internal/foundation/config"
+	"github.com/MatNik89/nexus/internal/foundation/egress"
 	"github.com/MatNik89/nexus/internal/foundation/pathx"
 	"github.com/MatNik89/nexus/internal/kernel/closure"
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
@@ -39,7 +41,7 @@ import (
 	"github.com/MatNik89/nexus/internal/kernel/journal"
 	"github.com/MatNik89/nexus/internal/kernel/loop"
 	"github.com/MatNik89/nexus/internal/kernel/machine"
-	"github.com/MatNik89/nexus/internal/kernel/s7min"
+	"github.com/MatNik89/nexus/internal/kernel/s7"
 	"github.com/MatNik89/nexus/internal/llm/planner"
 	"github.com/MatNik89/nexus/internal/llm/provider"
 	"github.com/MatNik89/nexus/internal/memory"
@@ -80,6 +82,10 @@ func main() {
 	}
 	fmt.Fprintf(os.Stdout, "nexus %s\nusage: nexus <daemon|chat [--yolo]|doctor>\n", version)
 }
+
+// s7Now is the S7 clock (nil = time.Now); tests pin it to drive backoff
+// deterministically through the real composition.
+var s7Now func() time.Time
 
 // resolveEnv loads layout + configuration (global file only in P0;
 // project layer joins with the workspace slice).
@@ -168,6 +174,9 @@ func runDaemon() int {
 				Bindings:    bindings,
 				Profile:     b.profile,
 				EgressAllow: resolved.Config.EgressAllow,
+				Receipt:     b.egressSink,
+				Authority:   b.authority,
+				Health:      b.health,
 			}, b.chanCore, telegramHandler(b))
 			if aerr != nil {
 				fmt.Fprintf(os.Stderr, "nexus daemon: telegram: %v\n", aerr)
@@ -288,7 +297,30 @@ func runDaemon() int {
 	}
 	if tgAdapter != nil {
 		if snap.On("telegram") {
-			go tgAdapter.Run(ctx, 2*time.Second)
+			adapterCtx, adapterCancel := context.WithCancel(ctx)
+			go func() {
+				// Supervisor (Slice D): the adapter's typed terminal class is
+				// persisted UNCHANGED (remote_rejected stays remote_rejected);
+				// substrate only for an unclassified return or a recovered
+				// panic. The adapter context is cancelled for prompt teardown.
+				// Sealed-capability rule: health is REPORTED, never a fallback.
+				defer adapterCancel()
+				defer func() {
+					if r := recover(); r != nil {
+						_ = b.health.Report("telegram", health.ClassSubstrate, "panic", fmt.Sprint(r), true)
+						fmt.Fprintf(os.Stderr, "nexus daemon: telegram adapter PANICKED (capability degraded): %v\n", r)
+					}
+				}()
+				if err := tgAdapter.Run(adapterCtx, 2*time.Second); err != nil {
+					cls, code := channel.ClassOf(err)
+					// The stderr line is the final fallback when even the health
+					// projection cannot be written (never a silent stop).
+					if herr := b.health.Report("telegram", cls, code, err.Error(), true); herr != nil {
+						fmt.Fprintf(os.Stderr, "nexus daemon: health projection write FAILED: %v\n", herr)
+					}
+					fmt.Fprintf(os.Stderr, "nexus daemon: telegram adapter STOPPED (%s/%s): %v\n", cls, code, err)
+				}
+			}()
 			fmt.Println("nexus daemon: telegram adapter running (sealed capability ON)")
 		} else {
 			fmt.Fprintf(os.Stderr, "nexus daemon: telegram capability OFF (%s) — adapter not started (fail closed)\n",
@@ -310,18 +342,20 @@ func runDaemon() int {
 // against a custom layout (Phase-2-r2 codex #13).
 // daemonBundle is everything the composition root wires together.
 type daemonBundle struct {
-	d         *daemon.Daemon
-	j         *journal.Journal
-	sched     *schedule.Scheduler
-	obl       *obligation.Manager
-	chanCore  *channel.Core
-	approvals *approval.Store
-	profile   contracts.ProfileID
-	cfg       config.Config
-	sysPath   *effectpath.EffectPath
-	authority *s7min.Authority
-	prov      *provider.APIKey
-	sandboxOK bool
+	d          *daemon.Daemon
+	j          *journal.Journal
+	sched      *schedule.Scheduler
+	obl        *obligation.Manager
+	chanCore   *channel.Core
+	egressSink egress.ReceiptSink
+	health     *health.Owner
+	approvals  *approval.Store
+	profile    contracts.ProfileID
+	cfg        config.Config
+	sysPath    *effectpath.EffectPath
+	authority  *s7.Authority
+	prov       *provider.APIKey
+	sandboxOK  bool
 	// picker is the shared /cronjob calendar store: the adapter drives the
 	// ephemeral UI, the handler turns a completed pick into a durable reminder.
 	picker *telegram.PickerStore
@@ -512,18 +546,38 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 	for n, v := range approval.Events() {
 		events[n] = v
 	}
+	for n, v := range s7.Events() {
+		events[n] = v
+	}
 
 	journalPath, _ := layout.ProfileJournal(profile)
 	redactor := redact.NewKnownRefs(knownSecretRefs(resolved.Config))
 	// The ONE profile database: journal + memory projection together
 	// (Annex P0.3 — facts are journal events folded in the same
 	// transaction; no second SQLite file exists).
-	j, err := journal.Open(journalPath, profile, redactor, events, memory.NewProjection(), schedule.NewProjection(), obligation.NewProjection(), channel.NewProjection(), approval.NewProjection(), conv.NewProjection())
+	j, err := journal.Open(journalPath, profile, redactor, events, memory.NewProjection(), schedule.NewProjection(), obligation.NewProjection(), channel.NewProjection(), approval.NewProjection(), conv.NewProjection(), s7.NewProjection())
 	if err != nil {
 		return nil, fmt.Errorf("journal: %w", err)
 	}
-	authority := s7min.NewAuthority(nil, 5*time.Minute)
-	prov, err := provider.NewAPIKey(resolved.Config, authority)
+	// Full S7 (Slice B1): the durable-capable authority bound to the profile
+	// journal — it rehydrates every non-terminal durable operation
+	// (deliveries, command registration) before anything can ask for a grant.
+	authority, err := s7.New(j, s7Now, 5*time.Minute)
+	if err != nil {
+		j.Close()
+		return nil, fmt.Errorf("s7: %w", err)
+	}
+	// ONE E11 receipt sink for every outbound component (Slice A): built
+	// right after the journal, BEFORE the provider or any adapter exists.
+	egressSink := channel.EgressSink(j)
+	// ONE channel-health owner (Slice D): a journal-independent projection
+	// under the system dir, so a journal failure is still reportable.
+	healthOwner, err := health.New(filepath.Join(layout.SystemDir(), "channel_health.json"), os.Stderr)
+	if err != nil {
+		j.Close()
+		return nil, fmt.Errorf("health: %w", err)
+	}
+	prov, err := provider.NewAPIKey(resolved.Config, authority, egressSink)
 	if err != nil {
 		j.Close()
 		return nil, fmt.Errorf("provider: %w (conversation is a P0 core capability — fix the config and restart)", err)
@@ -600,7 +654,7 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 			// incomplete stream). With tools enabled the planner buffers
 			// (a tool-call JSON never streams raw) and delivers finals in
 			// one piece.
-			pl, err := planner.NewStreaming(prov, prov, authority, target, deliver)
+			pl, err := planner.NewStreaming(prov, prov, authority, target, deliver, resolved.Config.ContextHardLimitTokens)
 			if err != nil {
 				return nil, err
 			}
@@ -642,7 +696,7 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 		return nil, err
 	}
 	return &daemonBundle{d: d, j: j, sched: sched, obl: oblManager,
-		chanCore: chanCore, approvals: approvals, profile: profile, cfg: resolved.Config,
+		chanCore: chanCore, egressSink: egressSink, health: healthOwner, approvals: approvals, profile: profile, cfg: resolved.Config,
 		sysPath: sysPath, authority: authority,
 		prov: prov, sandboxOK: execAdapter != nil}, nil
 }
@@ -715,12 +769,7 @@ func runDoctor(args []string) int {
 		return runDoctorP0()
 	}
 	strict := len(args) > 0 && args[0] == "--strict"
-	env, err := doctor.DefaultEnv()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "doctor: %v\n", err)
-		return 2
-	}
-	checks := doctor.Run(env)
+	checks := doctorChecks()
 	for _, c := range checks {
 		if c.Status == doctor.StatusOK {
 			fmt.Printf("OK   %-16s %s\n", c.Name, c.Detail)
@@ -738,6 +787,30 @@ func runDoctor(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+// doctorChecks runs the ordinary doctor against the RESOLVED configuration
+// (Slice E, AUDIT-FULL F7): the secret-reference names come from the same
+// resolver the daemon uses, so a custom provider_key_env / telegram_token_env
+// is checked by ITS name. A configuration that does not resolve is itself a
+// finding (the daemon would refuse it too), never a crash and never a silent
+// fallback to the default names.
+func doctorChecks() []doctor.Check {
+	var pre []doctor.Check
+	secrets := doctor.Secrets{}
+	if _, resolved, err := resolveEnv(); err != nil {
+		pre = append(pre, doctor.Check{Name: "config", Capability: "stateful-startup", Status: doctor.StatusOff,
+			Detail: "configuration does not resolve: " + err.Error(),
+			Fix:    "fix config.json / NEXUS_CFG_* (the daemon refuses the same configuration)"})
+	} else {
+		secrets = doctor.Secrets{ProviderKeyEnv: resolved.Config.ProviderKeyEnv, TelegramTokenEnv: resolved.Config.TelegramTokenEnv}
+	}
+	env, err := doctor.DefaultEnv(secrets)
+	if err != nil {
+		return append(pre, doctor.Check{Name: "host", Capability: "stateful-startup", Status: doctor.StatusOff,
+			Detail: err.Error(), Fix: "set HOME or XDG_CONFIG_HOME to a writable directory"})
+	}
+	return append(pre, doctor.Run(env)...)
 }
 
 // runDoctorP0 grants the P0-capable label from LIVE criteria (T27): each
@@ -763,9 +836,13 @@ func runDoctorP0() int {
 	add := func(name string, ok bool, why string) { criteria = append(criteria, crit{name, ok, "LIVE", why}) }
 	addReady := func(name string, ok bool, why string) { criteria = append(criteria, crit{name, ok, "READY", why}) }
 
+	// Probe substrate (throwaway journal) — also the E11 receipt sink for the
+	// doctor's live provider/telegram probes.
+	probeCore, probeSink, probeHealth, probeCleanup := mustProbeCore(layout, resolved)
+	defer probeCleanup()
 	// 1. conversation — LIVE provider round trip.
-	authority := s7min.NewAuthority(nil, 5*time.Minute)
-	if prov, perr := provider.NewAPIKey(resolved.Config, authority); perr != nil {
+	authority := s7.NewAuthority(nil, 5*time.Minute)
+	if prov, perr := provider.NewAPIKey(resolved.Config, authority, probeSink); perr != nil {
 		add("conversation", false, perr.Error())
 	} else if pr := prov.Probe(ctx, resolved); !pr.Passed {
 		add("conversation", false, pr.Detail)
@@ -844,8 +921,6 @@ func runDoctorP0() int {
 	rOK, rState, rWhy := reminderReadiness(health, hbAge, hbExists, profilesOK)
 	criteria = append(criteria, crit{"reminders", rOK, rState, rWhy})
 	// 4. telegram — token + strict bindings + LIVE getMe.
-	probeCore, probeCleanup := mustProbeCore(layout, resolved)
-	defer probeCleanup()
 	tgOK, tgWhy := false, ""
 	if tok := os.Getenv(resolved.Config.TelegramTokenEnv); tok == "" {
 		tgWhy = "no bot token in " + resolved.Config.TelegramTokenEnv
@@ -856,7 +931,7 @@ func runDoctorP0() int {
 	} else if adapter, aerr := telegram.New(telegram.Config{
 		APIBase: resolved.Config.TelegramAPIBase, TokenEnv: resolved.Config.TelegramTokenEnv,
 		Bindings: bindings, Profile: resolved.Config.DefaultProfile,
-		EgressAllow: resolved.Config.EgressAllow,
+		EgressAllow: resolved.Config.EgressAllow, Receipt: probeSink, Authority: authority, Health: probeHealth,
 	}, probeCore, func(context.Context, channel.Inbound) (string, error) { return "", nil }); aerr != nil {
 		tgWhy = aerr.Error()
 	} else if pr := adapter.Probe(ctx, resolved); !pr.Passed {
@@ -1127,25 +1202,31 @@ func validateMachineID(id string) error {
 
 // mustProbeCore opens a throwaway channel core for the doctor's live
 // telegram probe (never the production journal).
-func mustProbeCore(layout pathx.Layout, resolved config.Resolved) (*channel.Core, func()) {
+func mustProbeCore(layout pathx.Layout, resolved config.Resolved) (*channel.Core, egress.ReceiptSink, *health.Owner, func()) {
 	dir, err := os.MkdirTemp("", "nexus-doctor-")
 	if err != nil {
-		return nil, func() {}
+		return nil, nil, nil, func() {}
 	}
 	cleanup := func() { os.RemoveAll(dir) }
 	j, err := journal.Open(filepath.Join(dir, "probe.db"), resolved.Config.DefaultProfile,
 		redact.None{}, channel.Events(), channel.NewProjection())
 	if err != nil {
 		cleanup()
-		return nil, func() {}
+		return nil, nil, nil, func() {}
 	}
 	c, err := channel.New(j)
 	if err != nil {
 		j.Close()
 		cleanup()
-		return nil, func() {}
+		return nil, nil, nil, func() {}
 	}
-	return c, func() { j.Close(); cleanup() }
+	h, err := health.New(filepath.Join(dir, "channel_health.json"), io.Discard)
+	if err != nil {
+		j.Close()
+		cleanup()
+		return nil, nil, nil, func() {}
+	}
+	return c, channel.EgressSink(j), h, func() { j.Close(); cleanup() }
 }
 
 // deliverPendingReminders is ONE pass of the reminder delivery loop:
@@ -1439,18 +1520,33 @@ func telegramHandler(b *daemonBundle) telegram.Handler {
 			if err != nil {
 				return "", err
 			}
-			if len(rows) == 0 {
+			failed, err := b.chanCore.FailedFor(ctx, "telegram", in.ChannelIdentity)
+			if err != nil {
+				return "", err
+			}
+			if len(rows) == 0 && len(failed) == 0 {
 				return "Outbox clean: no deliveries awaiting reconciliation.", nil
 			}
-			out := "Deliveries with UNKNOWN outcome (may or may not have arrived):\n"
-			for _, r := range rows {
-				txt := r.Text
+			clip := func(txt string) string {
 				if len(txt) > 80 {
-					txt = txt[:80] + "…"
+					return txt[:80] + "…"
 				}
-				out += r.DeliveryID + ": " + txt + "\n"
+				return txt
 			}
-			out += "Reply redeliver <dlv-id> to resend one (it MAY arrive twice)."
+			out := ""
+			if len(rows) > 0 {
+				out += "Deliveries with UNKNOWN outcome (may or may not have arrived):\n"
+				for _, r := range rows {
+					out += r.DeliveryID + ": " + clip(r.Text) + "\n"
+				}
+			}
+			if len(failed) > 0 {
+				out += "Deliveries FAILED (S7 gave up: budget spent or a definite rejection):\n"
+				for _, r := range failed {
+					out += r.DeliveryID + " [" + r.LastCode + "]: " + clip(r.Text) + "\n"
+				}
+			}
+			out += "Reply redeliver <dlv-id> to resend one as a NEW delivery attempt (an UNKNOWN one MAY arrive twice)."
 			return out, nil
 		case strings.HasPrefix(lower, "redeliver ") && deliveryIDRe.MatchString(strings.TrimSpace(text[len("redeliver "):])):
 			// HUMAN-confirmed E9 reconciliation: the owner accepts the

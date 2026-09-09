@@ -24,7 +24,7 @@ import (
 	"github.com/MatNik89/nexus/internal/kernel/effectpath"
 	"github.com/MatNik89/nexus/internal/kernel/journal"
 	"github.com/MatNik89/nexus/internal/kernel/machine"
-	"github.com/MatNik89/nexus/internal/kernel/s7min"
+	"github.com/MatNik89/nexus/internal/kernel/s7"
 	"github.com/MatNik89/nexus/internal/security/redact"
 )
 
@@ -59,7 +59,7 @@ type Suspender func(ctx context.Context, turn contracts.TurnID, run contracts.Ru
 type Loop struct {
 	planner   Planner
 	path      *effectpath.EffectPath
-	grants    *s7min.Authority
+	grants    *s7.Authority
 	journal   *journal.Journal
 	redactor  redact.Redactor
 	policy    Policy
@@ -76,7 +76,7 @@ type Loop struct {
 // the user gets the challenge) instead of failing it.
 func (l *Loop) SetSuspender(s Suspender) { l.suspender = s }
 
-func New(p Planner, path *effectpath.EffectPath, grants *s7min.Authority, j *journal.Journal,
+func New(p Planner, path *effectpath.EffectPath, grants *s7.Authority, j *journal.Journal,
 	r redact.Redactor, policy Policy, maxIters, breakerN int) (*Loop, error) {
 	if p == nil || path == nil || grants == nil || j == nil || r == nil {
 		return nil, fmt.Errorf("loop: all collaborators are required (fail closed)")
@@ -337,7 +337,7 @@ func (l *Loop) iterate(ctx context.Context, turn contracts.TurnID, run contracts
 			// Pre-execution refusal: the grant was never consumed —
 			// nothing physically ran. Cancel the operation and record the
 			// honest terminal.
-			l.grants.Cancel(op)
+			l.grants.Cancel(op, nil)
 			if jerr := l.append(ctx, run, profile, turn, machine.EvAttemptCancelled, next(), &tcID); jerr != nil {
 				return "", jerr
 			}

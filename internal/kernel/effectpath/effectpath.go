@@ -22,7 +22,7 @@ import (
 	"time"
 
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
-	"github.com/MatNik89/nexus/internal/kernel/s7min"
+	"github.com/MatNik89/nexus/internal/kernel/s7"
 )
 
 // Decision is the closed S6.0 policy outcome; zero = INVALID (fail closed).
@@ -323,7 +323,7 @@ type EffectPath struct {
 	mw     Middleware
 	inproc *InProcessExecutor
 	sbproc *SandboxedProcessExecutor
-	grants *s7min.Authority
+	grants *s7.Authority
 	// onStarted (optional) runs AFTER a successful grant consume and
 	// BEFORE dispatch — the journal owner appends attempt.started here, so
 	// the durable record proves consumption preceded any effect (Phase-2-
@@ -337,7 +337,7 @@ func (p *EffectPath) SetStartObserver(fn func(ctx context.Context, op contracts.
 	p.onStarted = fn
 }
 
-func NewEffectPath(pep *PEP, mw Middleware, inproc *InProcessExecutor, sbproc *SandboxedProcessExecutor, grants *s7min.Authority) (*EffectPath, error) {
+func NewEffectPath(pep *PEP, mw Middleware, inproc *InProcessExecutor, sbproc *SandboxedProcessExecutor, grants *s7.Authority) (*EffectPath, error) {
 	if pep == nil || mw == nil || inproc == nil || sbproc == nil || grants == nil {
 		return nil, fmt.Errorf("effectpath: all collaborators are required (fail closed)")
 	}
@@ -359,20 +359,20 @@ func (p *EffectPath) onErr(ctx context.Context, err error) error {
 // EFFECTFUL call whose receipt does not prove BEFORE_COMMIT parks
 // UNKNOWN — something durable may exist; only READ_ONLY (or a receipt
 // proving nothing committed) is safely terminal (Phase-2 codex #4).
-func failureOutcome(call contracts.ToolCall, out contracts.ToolResult) s7min.Outcome {
+func failureOutcome(call contracts.ToolCall, out contracts.ToolResult) s7.Outcome {
 	if ClassifyEffectPhase(call, out) == contracts.PhaseBeforeCommit {
-		return s7min.OutcomeFailedTerminal
+		return s7.OutcomeFailedTerminal
 	}
-	return s7min.OutcomeUnknown
+	return s7.OutcomeUnknown
 }
 
 // report lands the outcome and, for UNKNOWN, tags the returned error with
 // ErrEffectUnknown so callers must reconcile, never continue blind.
-func (p *EffectPath) report(ctx context.Context, op contracts.OperationID, outcome s7min.Outcome, cause error) error {
-	if rerr := p.grants.Report(op, outcome); rerr != nil {
+func (p *EffectPath) report(ctx context.Context, op contracts.OperationID, outcome s7.Outcome, cause error) error {
+	if rerr := p.grants.Report(op, outcome, "", nil); rerr != nil {
 		cause = errors.Join(cause, rerr)
 	}
-	if outcome == s7min.OutcomeUnknown {
+	if outcome == s7.OutcomeUnknown {
 		cause = errors.Join(cause, ErrEffectUnknown)
 	}
 	return cause
@@ -382,7 +382,7 @@ func (p *EffectPath) report(ctx context.Context, op contracts.OperationID, outco
 // grant bound+consumed (s7, BEFORE execute) → sealed-kind executor →
 // result validation → S6.9 After/OnError → s7 outcome. Every refusal
 // returns an explicitly empty ToolResult.
-func (p *EffectPath) RunTool(ctx context.Context, call contracts.ToolCall, grant s7min.Grant) (contracts.ToolResult, error) {
+func (p *EffectPath) RunTool(ctx context.Context, call contracts.ToolCall, grant s7.Grant) (contracts.ToolResult, error) {
 	// 0) The call itself must be CONTRACT-VALID and alive (Phase-2 codex
 	// #3): an expired deadline, broken correlation, or missing idempotency
 	// key never reaches policy, let alone an executor.
@@ -395,7 +395,7 @@ func (p *EffectPath) RunTool(ctx context.Context, call contracts.ToolCall, grant
 	// The grant must have been minted FOR this call (target binding) and
 	// this attempt — a grant for another call is a replay.
 	if grant.TargetID != ToolTarget(call) || grant.AttemptNo != call.AttemptNo {
-		return contracts.ToolResult{}, fmt.Errorf("effectpath: grant is not bound to this call: %w", s7min.ErrAttemptNotAuthorized)
+		return contracts.ToolResult{}, fmt.Errorf("effectpath: grant is not bound to this call: %w", s7.ErrAttemptNotAuthorized)
 	}
 	// 1) S6.0 total switch, default-deny; ASK != ALLOW.
 	switch p.pep.Decide(call) {
@@ -455,7 +455,7 @@ func (p *EffectPath) RunTool(ctx context.Context, call contracts.ToolCall, grant
 	if p.onStarted != nil {
 		if serr := p.onStarted(ctx, op); serr != nil {
 			cause := fmt.Errorf("effectpath: attempt start not durable — dispatch refused, attempt cancelled: %w", serr)
-			if cerr := p.grants.Cancel(op); cerr != nil {
+			if cerr := p.grants.Cancel(op, nil); cerr != nil {
 				cause = errors.Join(cause, cerr)
 			}
 			return contracts.ToolResult{}, p.onErr(ctx, cause)
@@ -466,7 +466,7 @@ func (p *EffectPath) RunTool(ctx context.Context, call contracts.ToolCall, grant
 	// earlier of the call deadline and the grant expiry).
 	execCtx, cancelExec, cerr := p.grants.AttemptContext(ctx, op, call.Deadline)
 	if cerr != nil {
-		return contracts.ToolResult{}, p.report(ctx, op, s7min.OutcomeUnknown, p.onErr(ctx, cerr))
+		return contracts.ToolResult{}, p.report(ctx, op, s7.OutcomeUnknown, p.onErr(ctx, cerr))
 	}
 	out, err := exec.Execute(execCtx, call)
 	execCause := context.Cause(execCtx) // read BEFORE our own cancel below
@@ -476,7 +476,7 @@ func (p *EffectPath) RunTool(ctx context.Context, call contracts.ToolCall, grant
 		// (nothing durable can exist); an effectful one still parks
 		// UNKNOWN. Other executor errors classify by effect (codex #4).
 		if execCause != nil && call.Effect == contracts.EffectReadOnly {
-			p.grants.Cancel(op)
+			p.grants.Cancel(op, nil)
 			return contracts.ToolResult{}, p.onErr(ctx, fmt.Errorf("effectpath: tool %q cancelled by deadline: %w", call.ToolID, err))
 		}
 		return contracts.ToolResult{}, p.report(ctx, op, failureOutcome(call, contracts.ToolResult{}), p.onErr(ctx, err))
@@ -510,10 +510,10 @@ func (p *EffectPath) RunTool(ctx context.Context, call contracts.ToolCall, grant
 			if phase != contracts.PhaseBeforeCommit && phase != contracts.PhaseAfterCommit {
 				// Effectful "success" without a valid receipt is a CLAIM.
 				cause := fmt.Errorf("effectpath: effectful result carries no valid commit receipt")
-				return contracts.ToolResult{}, p.report(ctx, op, s7min.OutcomeUnknown, p.onErr(ctx, cause))
+				return contracts.ToolResult{}, p.report(ctx, op, s7.OutcomeUnknown, p.onErr(ctx, cause))
 			}
 		}
-		if rerr := p.grants.Report(op, s7min.OutcomeSucceeded); rerr != nil {
+		if rerr := p.grants.Report(op, s7.OutcomeSucceeded, "", nil); rerr != nil {
 			return contracts.ToolResult{}, p.onErr(ctx, rerr)
 		}
 		return out, nil
@@ -522,7 +522,7 @@ func (p *EffectPath) RunTool(ctx context.Context, call contracts.ToolCall, grant
 		return contracts.ToolResult{}, p.report(ctx, op, failureOutcome(call, out), p.onErr(ctx, cause))
 	default: // ResultUnknown
 		cause := fmt.Errorf("effectpath: tool %q reported UNKNOWN", call.ToolID)
-		return contracts.ToolResult{}, p.report(ctx, op, s7min.OutcomeUnknown, p.onErr(ctx, cause))
+		return contracts.ToolResult{}, p.report(ctx, op, s7.OutcomeUnknown, p.onErr(ctx, cause))
 	}
 }
 

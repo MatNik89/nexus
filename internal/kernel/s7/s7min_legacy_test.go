@@ -2,7 +2,7 @@
 // + no-retry policy (retryable → FAILED_TERMINAL in P0). Anchored to
 // HARNESS-SPEC P0.2 (grant MUST-fields, ATTEMPT_NOT_AUTHORIZED literal,
 // sole-issuer invariant) and HARDQ A2.
-package s7min
+package s7
 
 import (
 	"context"
@@ -100,7 +100,7 @@ func TestNoRetryOneGrantPerOperation(t *testing.T) {
 	if err := a.Consume(g); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.Report("op-1", OutcomeFailedRetryable); err != nil {
+	if err := a.Report("op-1", OutcomeFailedRetryable, "", nil); err != nil {
 		t.Fatal(err)
 	}
 	if st, _ := a.State("op-1"); st != contracts.AttemptFailed {
@@ -124,7 +124,7 @@ func TestNoRetryOneGrantPerOperation(t *testing.T) {
 func TestCancelIsTerminal(t *testing.T) {
 	a := NewAuthority(fixedClock(time.Unix(1000, 0)), time.Minute)
 	// Cancel BEFORE any grant: token registered, issue refused.
-	if err := a.Cancel("op-pre"); err != nil {
+	if err := a.Cancel("op-pre", nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := a.Issue("op-pre", "provider-a"); err == nil {
@@ -132,7 +132,7 @@ func TestCancelIsTerminal(t *testing.T) {
 	}
 	// Cancel with an OUTSTANDING grant: consume refused.
 	g, _ := a.Issue("op-1", "provider-a")
-	if err := a.Cancel("op-1"); err != nil {
+	if err := a.Cancel("op-1", nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := a.Consume(g); !errors.Is(err, ErrAttemptNotAuthorized) {
@@ -142,7 +142,7 @@ func TestCancelIsTerminal(t *testing.T) {
 		t.Fatalf("state %v, want CANCELLED", st)
 	}
 	// CANCELLED is terminal: no outcome report lands.
-	if err := a.Report("op-1", OutcomeSucceeded); err == nil {
+	if err := a.Report("op-1", OutcomeSucceeded, "", nil); err == nil {
 		t.Fatal("outcome reported onto a CANCELLED operation")
 	}
 	if st, _ := a.State("op-1"); st != contracts.AttemptCancelled {
@@ -170,12 +170,12 @@ func TestGrantHygiene(t *testing.T) {
 	if _, err := a.Issue("op-3", ""); err == nil {
 		t.Fatal("empty target accepted")
 	}
-	if err := a.Report("op-never", OutcomeSucceeded); err == nil {
+	if err := a.Report("op-never", OutcomeSucceeded, "", nil); err == nil {
 		t.Fatal("outcome for an unknown operation accepted")
 	}
 	// Report is only legal from RUNNING: an issued-but-unconsumed operation
 	// cannot succeed (nothing physically ran).
-	if err := a.Report("op-1", OutcomeSucceeded); err == nil {
+	if err := a.Report("op-1", OutcomeSucceeded, "", nil); err == nil {
 		t.Fatal("outcome accepted without a consumed grant")
 	}
 }
@@ -188,13 +188,13 @@ func TestUnknownOutcomeParksForReconciliation(t *testing.T) {
 	if err := a.Consume(g); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.Report("op-1", OutcomeUnknown); err != nil {
+	if err := a.Report("op-1", OutcomeUnknown, "", nil); err != nil {
 		t.Fatal(err)
 	}
 	if st, _ := a.State("op-1"); st != contracts.AttemptUnknown {
 		t.Fatalf("state %v, want UNKNOWN", st)
 	}
-	if err := a.Report("op-1", OutcomeSucceeded); err == nil {
+	if err := a.Report("op-1", OutcomeSucceeded, "", nil); err == nil {
 		t.Fatal("Report exited UNKNOWN (reconciliation-only exit violated)")
 	}
 }
@@ -216,7 +216,7 @@ func TestCancelPropagatesIntoLiveAttemptContext(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cancel()
-	if err := a.Cancel("op-1"); err != nil {
+	if err := a.Cancel("op-1", nil); err != nil {
 		t.Fatal(err)
 	}
 	select {
