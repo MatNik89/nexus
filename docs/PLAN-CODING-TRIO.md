@@ -560,6 +560,41 @@ behind, then dispatched for 3-agent adversarial plan-then-code review (codex/kil
 herdr) until codex+kilo converge PASS (agy supportive, not required alone). Merge to
 main + autodeploy + push per standing rules after each slice converges, not batched.
 
+## Slice 0 partial — open residual items from code review (CODE1/CODE2)
+
+Two narrow-scope gaps surfaced by codex's CODE2 adversarial testing on the Slice 0
+partial commit (probe/sandbox toolchain-visibility primitive + sealedstore + TIA graph,
+commits cd7616f/b227412/7731ef9). Neither is reachable by any real caller today — the
+coding-runner substrate itself (this section) is not yet built — so both are recorded
+here as REQUIRED closure conditions for that substrate, not left silently dropped:
+
+1. **ExtraROBinds content is not pinned, only its path.** `sandbox.Compile` canonicalizes
+   and hashes the ExtraROBinds PATH into `policyHash`, and `probe.Prepare` re-resolves
+   that same path at Launch — but nothing hashes the DIRECTORY'S CONTENTS at either
+   point. A directory renamed away and replaced at the same path between Compile and
+   Launch serves different bytes under an unchanged policyHash (codex CODE2, reproduced:
+   `TestReviewROBindContentsStayBoundAfterCompile`). This is exactly the "toolchain-
+   version swap detection" causal detector already required above — the coding-runner,
+   when it resolves `GOTOOLDIR`/`GOMODCACHE` into `ExtraROBinds`, MUST also content-pin
+   (or at minimum inode/mtime-fingerprint, fail-closed on any change) what it resolved,
+   between its own resolution and the sandboxed run — probe/sandbox's generic primitive
+   deliberately does not attempt whole-directory content hashing (unbounded size: a
+   module cache can be gigabytes), so this is the runner's responsibility, not a probe/
+   sandbox defect to fix in place.
+2. **`sealedstore.GC`'s `liveDigests` freshness is entirely caller-supplied.** `Pin`'s
+   contract already requires Release only AFTER a durable reference commits elsewhere
+   (journal). `GC` cannot independently verify that whatever produced its `liveDigests`
+   argument is fresh relative to that commit — a caller whose liveDigests-generation
+   reads a stale snapshot could still race a legitimate GC sweep (codex CODE2,
+   `TestReviewGCMarkCannotGoStaleAcrossPublication` — reviewed and confirmed this
+   exercises a caller-sequencing contract question, not an internal Put/GC race:
+   sealedstore's own Put/GC critical section is proven correct by
+   `TestGCAndPutSerializeUnderOneCriticalSection`). Whichever caller first performs
+   Put → journal-reference-commit → Release (Slice 1 evidence manifest or Slice 3
+   workspace transaction) MUST build its `liveDigests` set from the SAME transaction
+   that committed the reference — e.g., a GC pass triggered only after re-reading the
+   journal past the commit point — never from an independently cached/stale index.
+
 ## Status
 
 **CONVERGED — plan-review round 6: codex PASS, kilo PASS, agy PASS.** Finding count
