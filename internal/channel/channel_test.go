@@ -633,3 +633,33 @@ func TestClassOfMixedFailureAndClassifiedErrorJoinPrefersSubstrate(t *testing.T)
 		t.Fatalf("mixed 401 Failure+transport ClassifiedError join: got %s/%s, want remote_rejected/http_4xx", cls, code)
 	}
 }
+
+// CODE6 codex #2: a shallow non-substrate node must NOT win when the walk
+// is truncated by the depth ceiling before it can rule out a deeper
+// substrate node — truncation itself must fail closed to substrate, never
+// silently keep whatever lesser class was already found before the
+// ceiling was hit.
+func TestClassOfDeepTreeBeyondCeilingFailsClosed(t *testing.T) {
+	// A shallow transport node joined with a chain far deeper than
+	// classOfMaxDepth (no classified node anywhere reachable in the deep
+	// chain): the walk cannot rule out a substrate node past the ceiling,
+	// so it must return substrate, NOT the shallow transport class.
+	shallow := &ClassifiedError{Class: health.ClassTransport, Code: "shallow"}
+	var deep error = errors.New("bottom")
+	for i := 0; i < classOfMaxDepth+8; i++ {
+		deep = fmt.Errorf("wrap %d: %w", i, deep)
+	}
+	tree := errors.Join(shallow, deep)
+	if cls, code := ClassOf(tree); cls != health.ClassSubstrate || code != "traversal_overflow" {
+		t.Fatalf("overflow with a shallow transport sibling: got %s/%s, want substrate/traversal_overflow (never the shallow transport class)", cls, code)
+	}
+
+	// A REAL substrate node found before the overflow is truncation still
+	// wins the class AND keeps its own code (overflow does not need to
+	// discard a classification it already legitimately made).
+	subsShallow := &ClassifiedError{Class: health.ClassSubstrate, Code: "real-substrate"}
+	tree2 := errors.Join(subsShallow, deep)
+	if cls, code := ClassOf(tree2); cls != health.ClassSubstrate || code != "real-substrate" {
+		t.Fatalf("overflow with a real shallow substrate sibling: got %s/%s, want substrate/real-substrate", cls, code)
+	}
+}

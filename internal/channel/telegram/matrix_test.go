@@ -2,6 +2,9 @@ package telegram
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -350,6 +353,7 @@ func TestEveryMethodReuseAndMissingGrantRefused(t *testing.T) {
 	h.bot.botID = 1
 	h.bot.remoteCommands = mustJSON(commandMenu())
 	h.bot.mu.Unlock()
+	h.a.botID = 1 // bound() now requires the adapter's own resolved bot to match (CODE6 codex #3)
 	total := func() int {
 		return h.bot.polls() + sends(h) + h.bot.getMes() + h.bot.setCalls() + h.bot.chatActions() +
 			h.bot.getMyCommandsN() + h.bot.rich() + h.bot.edits() + h.bot.answers()
@@ -397,11 +401,22 @@ func TestEveryMethodReuseAndMissingGrantRefused(t *testing.T) {
 	gcOp, gcT := contracts.OperationID("control:tg:1:getMyCommands:77"), contracts.TargetID("channel:tg:bot:1:getMyCommands")
 	h.auth.Begin(gcOp, gcT, s7.PolicyControlRead)
 	gcG, _ := h.auth.Next(gcOp, nil)
-	// setMyCommands' payload hash grammar requires 64 lowercase hex
-	// characters — the real sha256 shape production always builds
-	// (code-review CODE5 codex, new finding #1: a short placeholder like
-	// "deadbeef" no longer proves anything about the tightened bound()).
-	const setHash = "6f06dd0e26608013eff30bb1e951cda7de3fdd9e78e907470e0dd5c0ed25e273"
+	// setMyCommands' payload hash is now bound to the ACTUAL marshaled
+	// wire body (code-review CODE6 codex #3: call() recomputes and
+	// compares the real request's sha256 against the operation's hash) —
+	// derive it from the exact same request map the loop below sends,
+	// not an arbitrary placeholder.
+	testReq := func() map[string]any {
+		return map[string]any{"chat_id": 42, "text": "x", "offset": 0, "action": "typing",
+			"rich_message": map[string]any{"markdown": "x"}, "commands": []map[string]string{{"command": "x", "description": "x"}},
+			"callback_query_id": "1", "message_id": 1}
+	}
+	reqBytes, err := json.Marshal(testReq())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(reqBytes)
+	setHash := hex.EncodeToString(sum[:])
 	setOp := channel.ControlOperation("tg", 1, "setMyCommands", setHash)
 	setT := channel.ControlTarget("tg", 1, "setMyCommands")
 	setPol := s7.PolicyControlEffect
@@ -450,9 +465,7 @@ func TestEveryMethodReuseAndMissingGrantRefused(t *testing.T) {
 	}
 	for _, tc := range cases {
 		before := total()
-		req := map[string]any{"chat_id": 42, "text": "x", "offset": 0, "action": "typing",
-			"rich_message": map[string]any{"markdown": "x"}, "commands": []map[string]string{{"command": "x", "description": "x"}},
-			"callback_query_id": "1", "message_id": 1}
+		req := testReq()
 		if err := h.a.call(ctxT(), tc.method, req, nil, tc.g, tc.kind, tc.op, tc.target, tc.comp()...); err != nil {
 			t.Fatalf("%s: valid first use failed: %v", tc.name, err)
 		}
@@ -585,5 +598,60 @@ func TestControlBotIDMismatchRefusedBeforeWire(t *testing.T) {
 	if h.bot.getMyCommandsCalls != before || h.bot.setCommandsCalls != beforeSet {
 		t.Fatalf("a mismatched/malformed control identity reached the wire: getMyCommands=%d(want %d) setMyCommands=%d(want %d)",
 			h.bot.getMyCommandsCalls, before, h.bot.setCommandsCalls, beforeSet)
+	}
+}
+
+// Detector (code-review CODE6 codex #3): bound() is adapter-aware — an
+// op/target pair that is INTERNALLY consistent with each other (same bot
+// id on both sides) but names a DIFFERENT bot than the adapter's own
+// resolved a.botID must still be refused; and setMyCommands' declared
+// payload hash must match the ACTUAL marshaled wire body, not just look
+// like a well-formed hash.
+func TestControlCurrentBotAndPayloadHashEnforced(t *testing.T) {
+	h := build(t, map[int64]string{42: "work"})
+	h.a.botID = 7 // the adapter believes it is talking to bot 7
+
+	// getMyCommands: op and target both consistently name bot 3 (not 7).
+	op := contracts.OperationID("control:tg:3:getMyCommands:1")
+	target := contracts.TargetID("channel:tg:bot:3:getMyCommands")
+	h.auth.Begin(op, target, s7.PolicyControlRead)
+	g, _ := h.auth.Next(op, nil)
+	if err := h.a.call(ctxT(), "getMyCommands", map[string]any{}, nil, g, kindControlRead, op, target); !errors.Is(err, s7.ErrAttemptNotAuthorized) {
+		t.Fatalf("op/target for a DIFFERENT bot than a.botID accepted: %v", err)
+	}
+	if h.bot.getMyCommandsCalls != 0 {
+		t.Fatalf("wire touched for a different-bot grant: %d calls", h.bot.getMyCommandsCalls)
+	}
+
+	// setMyCommands: op/target consistently name a.botID (7), but the
+	// operation's declared hash does not match the ACTUAL request body.
+	wrongReq := map[string]any{"commands": []map[string]string{{"command": "x", "description": "different payload"}}}
+	rightReq := map[string]any{"commands": []map[string]string{{"command": "x", "description": "declared payload"}}}
+	rb, _ := json.Marshal(rightReq)
+	sum := sha256.Sum256(rb)
+	declaredHash := hex.EncodeToString(sum[:])
+	sOp := channel.ControlOperation("tg", 7, "setMyCommands", declaredHash)
+	sT := channel.ControlTarget("tg", 7, "setMyCommands")
+	sPol := s7.PolicyControlEffect
+	sPol.Durable = true
+	h.auth.Begin(sOp, sT, sPol)
+	sg, _ := h.auth.Next(sOp, func(s7.Landing) s7.Companion { return s7.Companion{} })
+	_, park, _ := h.core.ControlEffectParams("tg", 7, "setMyCommands", declaredHash, "UNKNOWN")
+	if err := h.a.call(ctxT(), "setMyCommands", wrongReq, nil, sg, kindControlEffect, sOp, sT, s7.Companion{Key: sOp, Params: park}); !errors.Is(err, s7.ErrAttemptNotAuthorized) {
+		t.Fatalf("a payload NOT matching the operation's declared hash was accepted: %v", err)
+	}
+	if h.bot.setCommandsCalls != 0 {
+		t.Fatalf("wire touched for a payload/hash mismatch: %d calls", h.bot.setCommandsCalls)
+	}
+	// The grant was never consumed by the refusal — it is still usable for
+	// the RIGHT payload.
+	if st, _ := h.auth.State(sOp); st != contracts.AttemptAuthorized {
+		t.Fatalf("grant consumed by a refused payload mismatch: %s", st)
+	}
+	if err := h.a.call(ctxT(), "setMyCommands", rightReq, nil, sg, kindControlEffect, sOp, sT, s7.Companion{Key: sOp, Params: park}); err != nil {
+		t.Fatalf("the matching payload was refused: %v", err)
+	}
+	if h.bot.setCommandsCalls != 1 {
+		t.Fatalf("matching payload did not reach the wire: %d calls", h.bot.setCommandsCalls)
 	}
 }

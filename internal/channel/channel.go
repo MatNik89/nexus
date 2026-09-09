@@ -138,9 +138,19 @@ func ClassOf(err error) (health.Class, string) {
 		return "", ""
 	}
 	var subs, rej, tra *ClassifiedError
+	overflow := false
 	var walk func(error, int)
 	walk = func(e error, depth int) {
-		if e == nil || depth > classOfMaxDepth {
+		if e == nil {
+			return
+		}
+		if depth > classOfMaxDepth {
+			// A tree deeper than the ceiling is refused to inspect further
+			// — NOT ignored: an unreached node could be substrate, so
+			// truncation itself must fail closed to substrate rather than
+			// silently keeping whatever shallower (possibly lesser) class
+			// was already found (code-review CODE6 codex #2).
+			overflow = true
 			return
 		}
 		if lc := localClass(e); lc != nil {
@@ -169,6 +179,15 @@ func ClassOf(err error) (health.Class, string) {
 		}
 	}
 	walk(err, 0)
+	if overflow {
+		// A truncated walk may have missed a deeper substrate node: never
+		// trust a shallower, lesser classification found before the
+		// ceiling was hit.
+		if subs != nil {
+			return subs.Class, subs.Code
+		}
+		return health.ClassSubstrate, "traversal_overflow"
+	}
 	switch {
 	case subs != nil:
 		return subs.Class, subs.Code

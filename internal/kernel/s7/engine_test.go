@@ -562,3 +562,25 @@ func TestReportRefusesIncompatibleCodeForNonDurableOperation(t *testing.T) {
 		t.Fatalf("legitimate report after a refused one: %v", err)
 	}
 }
+
+// CODE6 codex #1: CodeReceiptNotDurable must be an accepted member of the
+// closed vocabulary at the Report() boundary itself (not just recognized
+// by a caller's own fallback classification) — a terminal report carrying
+// it must be accepted and land the operation terminal (never left RUNNING
+// on a legitimate substrate-failure code).
+func TestReportAcceptsCodeReceiptNotDurable(t *testing.T) {
+	c := &clock{time.Unix(3000, 0)}
+	a := NewAuthority(c.now, time.Minute)
+	pol := Policy{EffectClass: contracts.EffectIrreversible, MaxAttempts: 1}
+	if err := a.Begin("op", "t", pol); err != nil {
+		t.Fatal(err)
+	}
+	g, _ := a.Next("op", nil)
+	consumeOK(t, a, g)
+	if err := a.Report("op", OutcomeFailedTerminal, CodeReceiptNotDurable, nil); err != nil {
+		t.Fatalf("Report refused the canonical receipt-durability code: %v", err)
+	}
+	if st, _ := a.State("op"); st != contracts.AttemptFailed {
+		t.Fatalf("state after receipt-durability report: %s, want FAILED", st)
+	}
+}

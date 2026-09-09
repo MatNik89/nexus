@@ -235,8 +235,14 @@ var kindMethods = map[callKind]map[string]bool{
 
 // bound verifies the (method, kind, op, target) tuple against the kind's
 // operation/target GRAMMAR, so a valid grant minted for one kind can never
-// be presented under another kind or method (cross-kind substitution).
-func bound(method string, kind callKind, op contracts.OperationID, target contracts.TargetID) bool {
+// be presented under another kind or method (cross-kind substitution). It
+// is an ADAPTER method (not a free function) because bot-bound control
+// kinds must also verify the parsed bot id against a.botID — the identity
+// the physical call ACTUALLY targets, not just internal op/target
+// self-consistency (code-review CODE6 codex #3: a grant whose op and
+// target agree with EACH OTHER but not with the adapter's own resolved
+// bot must still be refused).
+func (a *Adapter) bound(method string, kind callKind, op contracts.OperationID, target contracts.TargetID) bool {
 	if !kindMethods[kind][method] {
 		return false
 	}
@@ -250,9 +256,7 @@ func bound(method string, kind callKind, op contracts.OperationID, target contra
 		// getMe discovers the bot: it is NEVER bound to a bot id (there is
 		// none yet). Every other control-read method IS bound, and the bot
 		// id embedded in the operation must equal the one embedded in the
-		// target exactly — a loose prefix/suffix/contains check would also
-		// accept a bot-id MISMATCH between op and target (code-review
-		// CODE5 codex, new finding #1).
+		// target exactly, AND equal the adapter's own resolved bot.
 		if method == "getMe" {
 			m := ctrlUnboundOp.FindStringSubmatch(o)
 			return m != nil && m[1] == "getMe" && t == "channel:tg:getMe"
@@ -262,20 +266,31 @@ func bound(method string, kind callKind, op contracts.OperationID, target contra
 			return false
 		}
 		tm := ctrlBoundTarget.FindStringSubmatch(t)
-		return tm != nil && tm[1] == m[1] && tm[2] == method
+		return tm != nil && tm[1] == m[1] && tm[2] == method && boundBotID(m[1], a.botID)
 	case kindControlEffect:
 		// setMyCommands is bot-bound AND payload-hash-bound; the bot id in
-		// the operation must equal the one in the target exactly.
+		// the operation must equal the one in the target AND the adapter's
+		// own resolved bot (the payload-hash-vs-actual-body check happens
+		// in call(), after the request is marshaled).
 		m := ctrlEffectOp.FindStringSubmatch(o)
 		if m == nil || m[2] != "setMyCommands" {
 			return false
 		}
 		tm := ctrlBoundTarget.FindStringSubmatch(t)
-		return tm != nil && tm[1] == m[1] && tm[2] == "setMyCommands"
+		return tm != nil && tm[1] == m[1] && tm[2] == "setMyCommands" && boundBotID(m[1], a.botID)
 	case kindUI:
 		return strings.HasPrefix(o, "ui:tg:"+method+":") && strings.HasPrefix(t, "channel:tg:chat:")
 	}
 	return false
+}
+
+// boundBotID requires the operation/target's captured bot id to parse as a
+// positive integer equal to the adapter's own resolved bot — never 0
+// (unresolved) and never a DIFFERENT bot, however internally consistent
+// the op/target pair looks with each other.
+func boundBotID(captured string, current int64) bool {
+	n, err := strconv.ParseInt(captured, 10, 64)
+	return err == nil && n > 0 && n == current
 }
 
 var pollTarget = contracts.TargetID("channel:tg:getUpdates")
@@ -291,7 +306,7 @@ var (
 	ctrlUnboundOp   = regexp.MustCompile(`^control:tg:([A-Za-z]+):\d+$`)
 	ctrlBoundOp     = regexp.MustCompile(`^control:tg:(\d+):([A-Za-z]+):\d+$`)
 	ctrlBoundTarget = regexp.MustCompile(`^channel:tg:bot:(\d+):([A-Za-z]+)$`)
-	ctrlEffectOp    = regexp.MustCompile(`^control:tg:(\d+):([A-Za-z]+):[0-9a-f]{64}$`)
+	ctrlEffectOp    = regexp.MustCompile(`^control:tg:(\d+):([A-Za-z]+):([0-9a-f]{64})$`)
 )
 
 // postWire classifies an outcome after the request may have reached the
@@ -312,7 +327,7 @@ func postWire(kind callKind, code string, cause error) error {
 // caller sees the operation still AUTHORIZED and cancels it.
 func (a *Adapter) call(ctx context.Context, method string, req any, out any, g s7.Grant, kind callKind,
 	op contracts.OperationID, target contracts.TargetID, companions ...s7.Companion) error {
-	if g.OperationID != op || g.TargetID != target || !bound(method, kind, op, target) {
+	if g.OperationID != op || g.TargetID != target || !a.bound(method, kind, op, target) {
 		return &channel.Failure{Code: s7.CodeLocalRefused,
 			Cause: fmt.Errorf("telegram: grant %s/%s is not bound to %s %s/%s: %w", g.OperationID, g.TargetID, method, op, target, s7.ErrAttemptNotAuthorized)}
 	}
@@ -323,6 +338,18 @@ func (a *Adapter) call(ctx context.Context, method string, req any, out any, g s
 	body, err := json.Marshal(req)
 	if err != nil {
 		return &channel.Failure{Code: s7.CodeLocalRefused, Cause: err}
+	}
+	if kind == kindControlEffect {
+		// Exact-intent (AGENTS.md: an approval hashes the EXACT effect; any
+		// payload change invalidates it): the operation names a payload
+		// hash, but nothing verified the ACTUAL marshaled body matches it
+		// before now — a caller could mint an operation for payload X and
+		// physically send payload Y (code-review CODE6 codex #3).
+		sum := sha256.Sum256(body)
+		if m := ctrlEffectOp.FindStringSubmatch(string(op)); m == nil || m[3] != hex.EncodeToString(sum[:]) {
+			return &channel.Failure{Code: s7.CodeLocalRefused,
+				Cause: fmt.Errorf("telegram: %s payload does not match the operation's bound hash: %w", method, s7.ErrAttemptNotAuthorized)}
+		}
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		a.base+"/bot"+a.token+"/"+method, bytes.NewReader(body))
