@@ -10,42 +10,31 @@ forward). Telegram surface is PARKED. Autodeploy after 3xPASS + merge (gated).
 **Plan:** `docs/PLAN-AUDIT-FIXES.md` v12 on `slice/p1-audit` — **CONVERGED: round 12 =
 codex+kilo+agy PASS** (rounds 1-12 in `docs/REVIEW-AUDIT-PLAN{,2..12}-*.md`). Order:
 F -> A -> B1 -> B2 -> B3 -> C -> D -> E.
-- `slice/audit-b` (worktree `/home/matej/HARNESS/nexus-b`, stacked on audit-e): **B1 DONE**
-  (4c4011b, `internal/kernel/s7` full engine, s7min deleted, all callers renamed) + **B2
-  coded, uncommitted at the time of writing** (channel Flush under S7 with typed
-  Companion batches, FAILED status + generation, telegram call kinds/poll/registration
-  bot-bound + reconcile, main wiring, tests green for s7/channel/telegram; full suite
-  running). Remaining: B3 (provider Execute + structured ExtractVia), D (health owner),
-  then code reviews, merge chain, autodeploy.
+- `slice/audit-b` (worktree `/home/matej/HARNESS/nexus-b`, stacked on audit-e) @ f33bc9a:
+  **B1** (4c4011b `internal/kernel/s7` full engine, s7min deleted), **B2** (31417ce
+  S7-governed delivery/poll/registration; channel Flush(ctx, auth, send), FAILED
+  status + generation, typed Failure, bot-bound durable registration + reconcile),
+  **B3** (5a004de provider Failure/Classify, planner chatVia/streamVia via Execute,
+  structured ExtractVia), **D** (f1e443c `internal/channel/health` owner,
+  ClassifiedError, supervisor, doctor reads channel_health.json), **code-review r1
+  folds** (f33bc9a: readonly Go floor, canonical receipts, budget-refusal grant
+  assertion). Full suite (vet + go test ./...) green at 5a004de and f1e443c; the
+  f33bc9a run was in flight at the time of writing.
+- **CODE reviews:** round 1 (F/A/C/E @68bdd88) = kilo PASS, agy PASS, codex FAIL 3
+  (all folded in f33bc9a) — `docs/REVIEW-AUDIT-CODE1-*.md`. Round 2 (WHOLE stack
+  @f33bc9a, incl. B1-B3+D) dispatched — files `docs/REVIEW-AUDIT-CODE2-*.md`.
 
-**Code so far — STACKED worktrees (each branch on top of the previous), all suites
-green (vet + go test ./...), each with RED-before/GREEN-after + one ablation RED:**
-- `slice/audit-f` @ 9cb335b (`/home/matej/HARNESS/nexus-f`): F3 release gate —
-  `go.mod toolchain go1.26.6` (GOTOOLCHAIN=auto downloads it; NO host Go upgrade
-  needed), `scripts/lib/release-gate.sh` (binary Go version >= 1.26.6 + `govulncheck
-  -mode=binary`, fail closed), `p0-accept.sh` gated before grade/sign, new
-  `scripts/deploy.sh` (build -> gate -> stop -> install -> start -> verify "sealed
-  capability ON"). govulncheck at ~/go/bin. Real binary under 1.26.6: clean.
-- `slice/audit-a` @ 32ae84f (`/home/matej/HARNESS/nexus-a`): F1+F8(provider) —
-  `internal/foundation/egress` shared E11 owner (canonical Endpoint host:port,
-  mandatory ReceiptSink, ErrPreWire), provider + telegram rewired (telegram/dialer.go
-  deleted), `channel.EgressSink(j)` at the composition root, Chat body cap (max+1 +
-  strict single JSON value), Stream transport ceiling.
-- `slice/audit-c` @ ccd2d79 (`/home/matej/HARNESS/nexus-c`): F5+F8(reads) — config
-  `context_hard_limit_tokens` (default 64000; 0/neg/float rejected), budget EnforceWire
-  on the FINAL messages before any grant, planner New/NewStreaming require a positive
-  limit, stream accumulator ceiling, daemon bounded frames (close on breach).
-- `slice/audit-e` @ 68bdd88 (`/home/matej/HARNESS/nexus-e`): F7 — doctor.Secrets from
-  the resolved config, doctorChecks() in main (unresolvable config = finding).
-- F4 + F9 landed earlier on `slice/p1-audit` (96b0c49).
-
-**NEXT (in order):** (1) fold round 8 -> re-dispatch until codex+kilo PASS; (2)
-CODE review of F+A+C+E by the 3 agents (revision 68bdd88, diff base fdb39dc, read at
-`/home/matej/HARNESS/nexus-e`) -> fold -> 3xPASS; (3) build Slice B (B1 engine
-`internal/kernel/s7`, B2 delivery wiring, B3 provider + structured via Execute) then
-D on top of B; each 3xPASS; (4) merge the chain to main, autodeploy via
-`scripts/deploy.sh`; (5) continue core improvement (coding USP, web research,
-memory, steal-worthy patterns).
+**NEXT (in order):** (1) fold CODE2 findings on slice/audit-b -> re-dispatch until
+codex+kilo PASS (dispatch script pattern: scratchpad dispatch_code2.sh — absolute
+worktree path + git diff range); (2) merge the chain to main: main <- slice/p1-audit
+(plan docs + F4/F9) <- slice/audit-b (contains f..e..b); resolve nothing else (all
+stacked); (3) autodeploy via `scripts/deploy.sh` (gate: toolchain floor + govulncheck;
+verify "sealed capability ON"; the live bot on ~/bin/nexus runs the OLD reminder-v3
+branch build — deploying main replaces it: /reminder v3 keyboard is NOT on main yet,
+the owner parked the Telegram surface, so expect the older /cronjob picker); (4)
+update docs/tasks-P0.md backlog note (S7 gap closed) + AGENTS.md/ESSENTIALS inline
+change-record "full S7 landed in P1 by owner decision"; (5) continue core improvement
+(coding USP, web research, memory, steal-worthy patterns).
 
 **Gotchas learned this session:** python heredoc folds MUST be `&&`-chained with
 commit AND dispatch and anchors grep-verified (three times agents reviewed a stale
