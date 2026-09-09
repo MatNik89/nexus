@@ -48,8 +48,9 @@ type Store struct {
 	dir   string // for error messages only — never used to build a path
 	dirFd int    // held open for the Store's lifetime; every op is *at(dirFd, ...)
 
-	mu   sync.Mutex
-	pins map[string]int // digest -> live pin count
+	mu        sync.Mutex
+	pins      map[string]int // digest -> live pin count
+	closeOnce sync.Once
 }
 
 // Open binds a Store to dir, which the CALLER must already have created as
@@ -78,7 +79,9 @@ func Open(dir string) (*Store, error) {
 // Close releases the store's held directory descriptor. The Store must
 // not be used afterward.
 func (s *Store) Close() error {
-	return unix.Close(s.dirFd)
+	var err error
+	s.closeOnce.Do(func() { err = unix.Close(s.dirFd) })
+	return err
 }
 
 // Pin holds one artifact live against GC. The caller obtained it from Put

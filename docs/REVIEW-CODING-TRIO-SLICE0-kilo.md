@@ -1,92 +1,94 @@
-# Review of coding-trio Slice 0 (partial) — code review round 1
+# Review of coding-trio Slice 0 fold (b227412) — code review round 2
 
-- **Reviewed**: commit `cd7616f` (`git diff 2c05079..HEAD`) on `main`
+- **Reviewed**: commit `b227412` (`git diff cd7616f..b227412`) on `main`
 - **Verdict**: PASS
 
-The four pieces are correct against their claims. I verified the security-critical
-probe/sandbox changes against the actual code and ran the four packages
-(`probe`, `sandbox`, `sealedstore`, `impact`) — all green, with `probe` (32.8s) and
-`sandbox` (14.6s) exercising the REAL bwrap backend, not mocks. Four notes below;
-none is a correctness/security defect.
+All six CODE1 findings plus the notes are folded correctly. I re-verified each
+against the actual code (not the commit message) and ran the four packages —
+`probe` 35.2s, `sandbox` 17.3s, `sealedstore`, `impact` all green, against the
+real bwrap backend.
 
-## Verification (as asked)
+## Re-verification (the five asks)
 
-### 1. probe.go ExtraROBinds/ExtraEnv — no weakening of existing protections
+### 1. probe.go denylistedROBindRoot — bug fixed correctly for every entry
 
-For a caller passing NEITHER field, the new blocks are gated on
-`len(spec.ExtraROBinds) > 0` / `len(spec.ExtraEnv) > 0` (`probe.go:698,714`), so the
-argv is byte-identical to the pre-change path. For a caller that DOES pass them: each
-guard is `guardROBind` (EvalSymlinks canonicalize, absolute, is-dir, owned-by-user-or-root,
-reject 0o022 group/world-writable) and the bind is `--ro-bind <canon> <canon>` — read-only,
-and the later `--remount-ro /` (`probe.go:730`) applies on top. Network/pid/seccomp/memfd
-closure are all appended AFTER, unchanged. No write access, no isolation bypass. The
-policy-hash fold is separate (piece 2). The "narrowly-scoped" phrasing in the Spec doc
-comment overstates the guard (Note 1).
+The old unconditional `return true` is gone. The new `denylistedROBindRoot`
+(`probe.go:555-572`) special-cases `/` (`canon == "/"`) and, for every other
+root, does a path-segment-aware check (`canon == root ||
+strings.HasPrefix(canon, root+"/")`), so `/etc` and `/etc/passwd` are denied while
+`/etcetera` is not. It runs in `guardROBind` BEFORE the ownership/mode checks. The
+denylist is a fixed set of core system trees, correctly documented as
+defense-in-depth with the caller still owning the toolchain-path scoping.
 
-### 2. sandbox.go policyHash fold — correct, collision-free
+### 2. sandbox.go cloneSpec — real deep copy, all three fields
 
-`roBindsDigest`/`envDigest` (`sandbox.go:245-269`) sort before hashing and length-prefix
-each element (`%d:%s`), so two Specs differing only in ExtraROBinds/ExtraEnv order produce
-identical digests, and two differing in CONTENT produce distinct digests — no
-concatenation-ambiguity collision, no boundary collision. The raw (not canonicalized) binds
-are hashed, which is conservative: two Specs that canonicalize to the same bind still get
-distinct hashes (fail toward MORE distinct policies, never fewer). The digests are folded
-into `policyHash` (`sandbox.go:240-244`), and `Launch` threads both fields into
-`probe.Spec` (`sandbox.go:340-342`). An approval/attestation is now bound to the effective
-ro-bind/env boundary.
+`cloneSpec` (`sandbox.go:252-270`) deep-copies `Args` (`append([]string(nil), …)`),
+`ExtraROBinds` (same), and `ExtraEnv` (a fresh map with each k/v copied); `loosen`
+is a value field and copies with the struct. The `CompiledPolicy` now holds this
+independent copy, so a post-Compile mutation of the caller's Spec cannot desync
+Launch from the attested policyHash. `roBindsDigest` now canonicalizes
+(`EvalSymlinks`) before hashing and returns an error, folding the effective
+boundary (not the literal spelling) into the hash.
 
-### 3. sealedstore — race-free Pin/GC, sound Get, no path injection
+### 3. sealedstore descriptor-relative rewrite — no leak, no TOCTOU, no deadlock
 
-- **(a) Pin/Release/GC race.** `Put` registers the pin (`s.mu` held) BEFORE writing
-  (`sealedstore.go:99-113`); `GC` does `ReadDir` FIRST, THEN snapshots `pins` under `s.mu`
-  (`:154-163`). So any artifact present in `entries` was written after its pin was
-  registered, which is before the snapshot — `pinned[d]` always covers it. No TOCTOU
-  between "check pins" and "delete file". `Release` is `sync.Once`-idempotent (`:76-86`).
-- **(b) Get defenses.** `digestRE` gate (`:125`), `Lstat` (no follow) + explicit symlink
-  refusal (`:129-135`), then re-hash-and-compare (`:140-143`) — a corrupted blob never
-  returns bytes. Note 2 on the Lstat→ReadFile step vs the plan's "descriptor-relative"
-  wording.
-- **(c) Path injection.** Every path is `filepath.Join(s.dir, digest)` with `digest`
-  always `^[0-9a-f]{64}$` (Put derives it from sha256; Get/GC refuse anything else). No
-  `..`, `/`, or traversal is expressible.
+- **fd**: `dirFd` opened once (`Open`, O_CLOEXEC) and released by `Close`; every
+  `readAtLocked`/`listNames` fd is `os.NewFile` + `defer Close`; `writeAtLocked`'s
+  temp fd is closed exactly once (the `cleanup` closure runs only on the
+  Write/Sync error paths, before the explicit `Close` at `:279`; the post-close
+  paths use `unix.Unlinkat` directly, never a second Close).
+- **TOCTOU**: all ops are `openat`/`renameat`/`unlinkat` against the held `dirFd`
+  with `O_NOFOLLOW` on the final component, so there is no Lstat-then-open window
+  and no parent-path re-resolution (a mid-flight directory rename can't redirect
+  the already-open fd). `f.Stat()` + `io.ReadAll(f)` act on the open fd.
+- **Put+GC single critical section**: `Put` holds `s.mu` for its whole body and
+  calls the `*Locked` helpers; `GC` holds `s.mu` across `listNames` + the sweep
+  and reads `s.pins[name]` directly (`:210`) rather than a snapshot. `readAt` and
+  `Release` each lock once and call the non-locking variants — no re-lock, no
+  deadlock. `gcPauseHook` runs inside GC's critical section, proving Put blocks.
+- **Symlink safety**: `writeAtLocked` creates the temp with `O_CREAT|O_EXCL|
+  O_NOFOLLOW` and `renameat`s it into place (replaces, never follows); `Put`'s
+  existing-digest shortcut now re-verifies content via `readAtLocked` + hash
+  (`:138-148`) instead of trusting Lstat success.
 
-### 4. impact.go — graph walk correct; test-import handling is safe-but-imprecise
+### 4. impact.go prodRdeps/testOwners split — correct, no under-inclusion
 
-`ParseGoList` uses a `json.Decoder` `More()` loop (`:49-60`), correctly decoding the
-concatenated-JSON-objects stream `go list` emits (a plain `json.Unmarshal` would only see
-the first object). `BuildGraph` skips `ForTest != ""` entries (avoiding double-count of the
-`.test` main and `[p.test]` variants), records reverse edges from both `Imports` and
-`TestImports`/`XTestImports`, and skips self-imports. `Affected` walks the transitive
-closure, marks `resolved=false` for any changed path outside `known` (fail-safe full-suite
-fallback), and intersects with `tests`. Self-import, dedup, and transitive dependents are
-all handled. Note 3 on the test-import edge semantics.
+`BuildGraph` puts production imports in `prodRdeps` and test imports in
+`testOwners`. `Affected` walks `prodRdeps` transitively and, at each visited node
+including the changed set, adds `testOwners[cur]` to the result WITHOUT enqueueing
+(terminal). I walked `TestAffectedTestOnlyEdgeDoesNotPropagateTransitively`:
+`a2 <-test- f2 <-production- g2` → `Affected(a2) = {f2}` (g2 excluded), which the
+old conflated graph would have gotten wrong (g2 included). The terminal edge is
+correct because a package that reaches `imp` only through its test file has no
+production dependency on `imp`, so its production callers never see `imp` — no
+legitimate case becomes under-inclusive, and a package that is BOTH a production
+and a test importer gets the `prodRdeps` edge (transitive) plus the `testOwners`
+edge (terminal), so its own dependents are still walked. A `testOwners` member
+always has tests (`TestImports` non-empty implies `TestGoFiles` non-empty), so the
+unconditional `result[owner]=true` never selects a non-testable package.
+
+### 5. False-green test fixes — now non-vacuous
+
+`TestGetRefusesSymlink` names the symlink by the outside data's TRUE digest, so a
+symlink-following Get would return matching bytes — the test can only pass via the
+refusal path. `TestAffectedTestOnlyEdgeDoesNotPropagateTransitively` is the real
+counterexample above. `TestParseGoListRealSample` asserts on both `sealedstore`
+and `atomicwrite` (later stream objects), so a decode-first-only regression fails.
+The `printenv` probehelper subcommand (`cmd/probehelper/main.go:84-89`) lets
+`TestExtraROBindsAndEnvPropagateThroughFullProtocol` assert the env value, not
+just its non-error presence.
 
 ## Notes (not FAIL reasons)
 
-1. **`guardROBind` does not enforce "narrowly-scoped".** It checks ownership + write bits
-   only, so `ExtraROBinds: []string{"/"}` (or `/home/user`, `/etc`, which are all
-   0755/root- or user-owned) would pass and grant read-only visibility of the entire host.
-   This is safe (read-only + `--remount-ro`, and the caller is NEXUS's own trusted
-   coding-runner passing toolchain paths, not untrusted input), but the Spec doc comment
-   ("narrowly-scoped") overstates what the guard guarantees. Consider wording it as
-   "operator-owned read-only visibility grants" and/or adding a caller-side allowlist of
-   permitted toolchain prefixes in Slice 0's own review.
-2. **`Get` is path-based, not descriptor-relative.** The plan (invariant 4) says "all reads
-   and writes are descriptor-relative"; `Get` does `os.Lstat` then `os.ReadFile`, leaving a
-   theoretical swap-to-symlink window between the two. Practically unreachable (0700
-   daemon-owned dir; `Put`/`GC` never create symlinks; no concurrent writer) and the
-   post-read digest check is the real gate (a symlink target fails the hash, so no data is
-   ever returned). A `os.OpenFile(…, O_NOFOLLOW)` + `fstat` + `ReadAll` would close the gap
-   and match the plan wording.
-3. **`impact.go` treats test-only imports as base imports.** `TestImports`/`XTestImports`
-   create the same `rdeps[imp][p]` edge as `Imports`, so a change to a test-only dependency
-   of `p` is (transitively) attributed to packages that import `p` — safe over-inclusion,
-   never under-inclusion. The comment "record it only as a self-referential test edge"
-   (`impact.go:104-106`) doesn't match the code (which records a normal dependent edge) and
-   is misleading. Correct behavior for shadow-mode TIA (precision is measured, not assumed),
-   but the comment should be fixed or the edge distinguished.
-4. **No concurrent Pin/GC test.** `TestGCMarkAndSweep` is sequential; there is no test
-   racing `Put` against `GC` under `-race`. The code is race-free by inspection (see
-   finding 3a), but a concurrent detector would guard a future regression.
+1. `reservedEnvKeys` (`probe.go:611-615`) covers `LD_LIBRARY_PATH`/`LD_PRELOAD`/
+   `PATH` — the three that unseat the closure-pinning baseline. `LD_AUDIT` (another
+   loader variable) is not reserved; low risk since the audit library would still
+   have to resolve inside the sandbox's pinned closure + ro-binds, but worth adding
+   if the caller surface ever exposes arbitrary env.
+2. `denylistedROBindRoot` is a fixed list; a non-standard sensitive mount (e.g. a
+   custom `/data`) would not be denied by probe itself. The doc comment correctly
+   assigns that scoping to the future coding-runner via `go env` resolution — a
+   layered design, but the caller-side allowlist should be a named Slice-0 deliverable
+   so it isn't deferred indefinitely.
 
 VERDICT: PASS

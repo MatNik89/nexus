@@ -580,7 +580,7 @@ func guardROBind(dir string) (string, error) {
 	}
 	st, err := os.Stat(canon)
 	if err != nil {
-		return "", fmt.Errorf("ro-bind %s: %w", dir, err)
+		return "", fmt.Errorf("ro-bind %s: %w", canon, err)
 	}
 	if !st.IsDir() {
 		return "", fmt.Errorf("ro-bind %s: not a directory (fail closed)", canon)
@@ -611,9 +611,14 @@ func guardROBind(dir string) (string, error) {
 // reserved too: it is deliberately fixed to /nowhere (every exec in this
 // sandbox model uses an absolute path) and ExtraEnv exists to ADD
 // capability, never to override a security-relevant baseline variable.
+// LD_AUDIT is reserved for the same reason (code-review CODE2, codex +
+// kilo independently flagged it): it makes the dynamic loader invoke an
+// attacker-named audit library's callbacks during symbol resolution — a
+// second loader-hijack vector alongside LD_PRELOAD.
 var reservedEnvKeys = map[string]bool{
 	"LD_LIBRARY_PATH": true,
 	"LD_PRELOAD":      true,
+	"LD_AUDIT":        true,
 	"PATH":            true,
 }
 

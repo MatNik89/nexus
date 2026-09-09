@@ -952,7 +952,7 @@ func TestExtraEnvRejectsInvalidKey(t *testing.T) {
 func TestExtraEnvRejectsReservedKeys(t *testing.T) {
 	av := mustDetect(t)
 	hp := helperPath(t)
-	for _, k := range []string{"LD_LIBRARY_PATH", "LD_PRELOAD", "PATH"} {
+	for _, k := range []string{"LD_LIBRARY_PATH", "LD_PRELOAD", "LD_AUDIT", "PATH"} {
 		spec := Spec{Target: hp, Args: []string{"sleep", "0"}, WorkDir: wdir(t),
 			ExtraEnv: map[string]string{k: "/hostile"}}
 		if _, err := Prepare(av, spec); err == nil {

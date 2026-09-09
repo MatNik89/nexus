@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 )
 
 // Package is one Go package's identity and direct forward imports, as
@@ -180,5 +181,6 @@ func (g *Graph) Affected(changed []string) (affected []string, resolved bool) {
 	for pkg := range result {
 		affected = append(affected, pkg)
 	}
+	sort.Strings(affected) // deterministic order (code-review CODE2 agy note 1) — map iteration is randomized in Go
 	return affected, resolved
 }
