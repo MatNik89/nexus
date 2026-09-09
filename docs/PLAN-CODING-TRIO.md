@@ -988,3 +988,46 @@ worth closing (and at what cost — a second memfd-pinned-closure mechanism dupl
 Target's own machinery, just for a PATH-resolved child) needs adversarial input before
 Slice 0 is called fully done; not blocking for the current single-trivial-module proof of
 concept, but flag before Slice 3 starts relying on this path for real repositories.
+
+## Status 2026-09-10 — codex FAIL on gopls diff, 3 HIGH + 1 MEDIUM folded (d691f48)
+
+Dispatched codex+agy code-review against the shipped gopls session (e6f2da9). **agy PASS,
+codex FAIL** — a real disagreement, not resolved by averaging: each of codex's 3 HIGH
+findings was independently verified directly against the actual code before fixing (agy's
+PASS had missed all three). Folded in `d691f48`:
+1. `LaunchInteractive`'s cancel-watch goroutine called the raw `probe.Handle.Kill()`, never
+   `InteractiveProcess.Kill()` — on real ctx-deadline cancellation the pipe endpoints were
+   never closed, so a caller blocked mid-conversation at that moment would hang forever.
+   The existing detector only covered an explicit `p.Kill()` call, not this production
+   seam. Fixed; `TestLaunchInteractiveContextCancelUnblocksStdoutRead` RED-proven.
+2. `RunGoplsRename` classified every session/wait error as `FailedTerminal`, never
+   checking `context.Cause(execCtx)` the way `Run` already does — a self-deadline kill was
+   misreported as a failed attempt instead of CANCELLED. Fixed to mirror `Run`'s exact
+   classification; RED-proven.
+3. The success-path `grants.Report(...)` error was discarded — a caller could receive a
+   "successful" rename result S7 never actually accepted. Fixed to propagate, mirroring
+   `Run`'s own handling.
+Plus 1 MEDIUM: `fileURI` built by raw string concatenation, not `net/url` — a filename
+with `#`/`?`/space/`%` changes URI semantics. **Note on proof quality**: the
+gopls-integration test alone did NOT catch this (gopls tolerated a raw `#`+space in
+practice) — only a pure deterministic unit test on the extracted `fileURIFor` function,
+RED-proven against the reverted string-concat version, actually detects a regression here.
+
+**Still open, deliberately NOT fixed in this round — tracked for its own focused
+increment**: codex's PATH-content-hash-pinning finding (the `go` binary PATH exposes is
+identity-pinned via `ExtraROBinds`, not content-hash-pinned+re-verified at Launch the way
+the primary Target is). Real TOCTOU gap (concrete attack: swap `GOROOT/bin/go`'s bytes in
+place between Compile and Launch — the directory identity check on `GOROOT` itself doesn't
+change, and `ExtraPathDir`'s own guard only re-checks ownership/permission, not content).
+Fixing this properly means extending `internal/preflight/probe`'s promoted-executable
+pinning (today: exactly ONE Target) to support a second, PATH-exposed pinned executable —
+a bigger, security-critical change to an already-hardened package that deserves its own
+research→plan→review cycle, not a rushed addition inside this fix batch. Also open,
+explicitly agreed non-blocking by both reviewers for this trivial-single-module
+proof-of-concept scope: server-initiated JSON-RPC requests (e.g. `workspace/configuration`)
+are silently discarded by `lspAwaitResponse` rather than answered with `MethodNotFound` —
+a real hardening gap for Slice 3's real-repository scope, documented, not yet built.
+
+**Next step before Slice 0's gopls piece is called fully done**: dispatch a re-verification
+round (codex+agy) confirming the 3 HIGH + 1 MEDIUM fixes are correct and asking explicit
+agreement that the two open items are scoped-out-for-now, not launch-blocking.
