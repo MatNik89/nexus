@@ -138,7 +138,26 @@ type Spec struct {
 	// PATH=/nowhere + LD_LIBRARY_PATH baseline (still --clearenv first —
 	// this ADDS named variables, it does not restore the ambient
 	// environment). Keys must be non-empty and contain no '=' or NUL.
+	// PATH itself stays permanently rejected here (reservedEnvKeys) — see
+	// ExtraPathDir for the one sanctioned way to change it.
 	ExtraEnv map[string]string
+	// ExtraPathDir, when set, is what PATH resolves to inside the
+	// sandbox instead of the fixed /nowhere baseline — the ONLY
+	// sanctioned way to make a bare-name exec resolve
+	// (PLAN-CODING-TRIO.md Slice 0: gopls's own loader, by upstream
+	// design, unconditionally execs a bare "go" with no absolute-path
+	// override hook — verified directly against the vendored
+	// golang.org/x/tools/internal/gocommand source, not assumed; every
+	// OTHER exec in this sandbox model still uses an absolute path).
+	// Fail-closed at Prepare: it is separately guarded exactly like an
+	// ExtraROBinds entry AND must be, or be nested under, one of the
+	// Spec's own (already-guarded) ExtraROBinds entries — PATH can
+	// therefore only ever resolve into a directory ALREADY granted
+	// read-only visibility, never widen what's visible, only how a bare
+	// name resolves within it. A distinct, narrower, self-documenting
+	// field (not folded into ExtraEnv) precisely so "a caller changed
+	// PATH" is always this one grep-able line.
+	ExtraPathDir string
 
 	loosen loosen
 }
@@ -685,6 +704,18 @@ func (h *Handle) ClosureHashes() map[string]string {
 	return out
 }
 
+// SetInput wires stdin; only valid before Start. Nil leaves the child's
+// stdin at exec.Cmd's own default (reads as immediate EOF) — the ordinary
+// run-to-completion callers never need this; only an interactive stdio
+// session (PLAN-CODING-TRIO.md Slice 0's gopls session) does.
+func (h *Handle) SetInput(stdin io.Reader) error {
+	if h.started {
+		return fmt.Errorf("SetInput after Start")
+	}
+	h.cmd.Stdin = stdin
+	return nil
+}
+
 // SetOutput wires stdout/stderr; only valid before Start.
 func (h *Handle) SetOutput(stdout, stderr io.Writer) error {
 	if h.started {
@@ -770,7 +801,7 @@ func Prepare(av Availability, spec Spec) (*Handle, error) {
 		"--dev", "/dev",
 		"--tmpfs", "/tmp",
 		"--dir", "/work",
-		"--clearenv", "--setenv", "PATH", "/nowhere",
+		"--clearenv",
 		// The inside loader replays its OWN search ($ORIGIN points at
 		// /nexus-target, not the host location), so every pinned library
 		// lands in the single RO dir /nexus-libs and LD_LIBRARY_PATH points
@@ -790,6 +821,7 @@ func Prepare(av Availability, spec Spec) (*Handle, error) {
 	if spec.loosen.roBind != "" {
 		args = append(args, "--ro-bind", spec.loosen.roBind, spec.loosen.roBind)
 	}
+	var canonROBinds []string
 	if len(spec.ExtraROBinds) > 0 {
 		// Deterministic order: two Specs differing only in ExtraROBinds
 		// ordering must compile to the SAME bwrap argv (and therefore the
@@ -806,6 +838,7 @@ func Prepare(av Availability, spec Spec) (*Handle, error) {
 				continue // de-duplicate after canonicalization
 			}
 			seen[canon] = true
+			canonROBinds = append(canonROBinds, canon)
 			// A non-nil ExtraROBindIdentities means this Spec came through
 			// sandbox.Compile, which pins EVERY declared ExtraROBinds entry
 			// (code-review CODE3 codex finding: a symlink-retargeting
@@ -832,6 +865,25 @@ func Prepare(av Availability, spec Spec) (*Handle, error) {
 			args = append(args, "--ro-bind", canon, canon)
 		}
 	}
+	pathValue := "/nowhere"
+	if spec.ExtraPathDir != "" {
+		canon, _, err := guardROBind(spec.ExtraPathDir)
+		if err != nil {
+			return fail(fmt.Errorf("ExtraPathDir: %w", err))
+		}
+		nested := false
+		for _, b := range canonROBinds {
+			if canon == b || strings.HasPrefix(canon, b+string(filepath.Separator)) {
+				nested = true
+				break
+			}
+		}
+		if !nested {
+			return fail(fmt.Errorf("ExtraPathDir %s is not one of, or nested under, the declared ExtraROBinds — refusing to make PATH resolve somewhere not already granted read-only visibility (fail closed)", canon))
+		}
+		pathValue = canon
+	}
+	args = append(args, "--setenv", "PATH", pathValue)
 	if len(spec.ExtraEnv) > 0 {
 		keys := make([]string, 0, len(spec.ExtraEnv))
 		for k := range spec.ExtraEnv {

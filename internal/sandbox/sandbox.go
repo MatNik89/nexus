@@ -46,6 +46,10 @@ type Spec struct {
 	// visibility under an already-approved policy hash).
 	ExtraROBinds []string
 	ExtraEnv     map[string]string
+	// ExtraPathDir threads through to probe.Spec.ExtraPathDir unchanged —
+	// see its doc comment. Folded into policyHash below like
+	// ExtraROBinds/ExtraEnv.
+	ExtraPathDir string
 }
 
 // ProbeReport is the live host measurement a policy compiles against.
@@ -261,7 +265,8 @@ func (b *Bwrap) Compile(ctx context.Context, spec Spec, report ProbeReport) (Com
 	sealed := digest("policy", spec.Target, targetHash, closureDigest(pins),
 		strings.Join(spec.Args, "\x00"),
 		spec.WorkDir, spec.Timeout.String(), report.ProbeHash,
-		roDigest, envDigest(spec.ExtraEnv), roBindIdentitiesDigest(roBindIdentities))
+		roDigest, envDigest(spec.ExtraEnv), roBindIdentitiesDigest(roBindIdentities),
+		spec.ExtraPathDir)
 	// Deep-copy spec's slice/map fields (code-review CODE1 codex finding
 	// #2): a shallow `spec: spec` here would alias the caller's Args/
 	// ExtraROBinds/ExtraEnv — a post-Compile, pre-Launch mutation by the
@@ -387,7 +392,13 @@ func hashFile(path string) (string, error) {
 // policy must originate from THIS backend's current probe (S1.2 process
 // identity is the child pid inside the prepared handle; the probe layer
 // owns setpgid + die-with-parent + kill-tree).
-func (b *Bwrap) Launch(ctx context.Context, policy CompiledPolicy) (*Process, error) {
+// prepareLaunch runs every pre-launch fail-closed verification shared by
+// Launch and LaunchInteractive — cancellation, TOCTOU re-hash of the
+// backend binary, stale-probe detection, deadline computation, and
+// closure-hash re-verification against the compiled policy — and returns
+// a Prepared, not-yet-started probe.Handle. Pure extraction, no behavior
+// change: Launch's own tests are the regression proof.
+func (b *Bwrap) prepareLaunch(ctx context.Context, policy CompiledPolicy) (*probe.Handle, error) {
 	// S7 owns cancellation (Phase-6 codex #4): an already-cancelled
 	// attempt context must never start a process, and a later cancel
 	// kills the whole tree.
@@ -423,6 +434,7 @@ func (b *Bwrap) Launch(ctx context.Context, policy CompiledPolicy) (*Process, er
 		WorkDir: policy.spec.WorkDir, Timeout: timeout,
 		ExtraROBinds: policy.spec.ExtraROBinds, ExtraEnv: policy.spec.ExtraEnv,
 		ExtraROBindIdentities: policy.roBindIdentities,
+		ExtraPathDir:          policy.spec.ExtraPathDir,
 	})
 	if err != nil {
 		return nil, err
@@ -443,6 +455,14 @@ func (b *Bwrap) Launch(ctx context.Context, policy CompiledPolicy) (*Process, er
 			h.Close()
 			return nil, fmt.Errorf("sandbox: closure member %s changed since Compile — refused (fail closed)", dest)
 		}
+	}
+	return h, nil
+}
+
+func (b *Bwrap) Launch(ctx context.Context, policy CompiledPolicy) (*Process, error) {
+	h, err := b.prepareLaunch(ctx, policy)
+	if err != nil {
+		return nil, err
 	}
 	// One buffer for BOTH streams is safe WITHOUT a mutex: os/exec
 	// documents that when Stdout and Stderr are the same ==-comparable
@@ -471,6 +491,123 @@ func (b *Bwrap) Launch(ctx context.Context, policy CompiledPolicy) (*Process, er
 	return proc, nil
 }
 
+// InteractiveProcess is a launched sandboxed process wired for a live,
+// bidirectional stdio conversation (PLAN-CODING-TRIO.md Slice 0's gopls
+// session) — unlike Process, which captures combined output for a
+// process that runs to completion and is inspected afterward, the caller
+// here reads/writes framed messages as the process runs. Deliberately a
+// SEPARATE type from Process/Launch rather than an extension of them:
+// the ordinary one-shot go build/go test callers never need stdin, and
+// giving every caller stdin access would widen Process's blast radius
+// for no reason (topknot: don't force two shapes into one concept).
+type InteractiveProcess struct {
+	handle     *probe.Handle
+	policyHash string
+	closure    map[string]string
+	stdin      *io.PipeWriter
+	stdout     *io.PipeReader
+	stderr     *boundedBuffer
+	started    bool
+	done       chan struct{}
+	doneOnce   sync.Once
+}
+
+// Stdin is the write end of the sandboxed process's stdin; closing it
+// signals EOF to the child.
+func (p *InteractiveProcess) Stdin() io.WriteCloser { return p.stdin }
+
+// Stdout is the read end of the sandboxed process's stdout, readable
+// incrementally as bytes arrive — never buffered to completion.
+func (p *InteractiveProcess) Stdout() io.Reader { return p.stdout }
+
+// Stderr returns whatever diagnostic output the process has written so
+// far (bounded, same 1MiB cap as Process.Output).
+func (p *InteractiveProcess) Stderr() string { return p.stderr.String() }
+
+// Wait blocks until exit or timeout kill, then unblocks any pending
+// Stdout read with EOF (a plain io.Pipe never signals EOF on its own —
+// only an explicit Close/CloseWithError does).
+//
+// A background drain runs for the DURATION of the wait, not just after:
+// os/exec's own Wait blocks until its internal stdout-copying goroutine
+// finishes, and that goroutine writes into our stdout pipe — if the
+// caller has already stopped reading Stdout() (e.g. it got every
+// response it needed via request/response correlation and doesn't care
+// about trailing output), that goroutine blocks on a full, unread pipe
+// FOREVER, and Wait never returns. Draining concurrently — never
+// requiring the caller to keep reading to EOF itself — lets the
+// process actually finish exiting.
+func (p *InteractiveProcess) Wait() error {
+	drained := make(chan struct{})
+	go func() {
+		io.Copy(io.Discard, p.stdout)
+		close(drained)
+	}()
+	err := p.handle.Wait()
+	p.stdout.CloseWithError(io.EOF)
+	<-drained
+	p.finish()
+	return err
+}
+
+func (p *InteractiveProcess) finish() {
+	if p.done != nil {
+		p.doneOnce.Do(func() { close(p.done) })
+	}
+}
+
+// Kill terminates the whole tree and unblocks any pending Stdout read.
+func (p *InteractiveProcess) Kill() {
+	p.handle.Kill()
+	p.stdout.CloseWithError(fmt.Errorf("sandbox: process killed"))
+}
+
+// Close releases resources; safe on every failure path.
+func (p *InteractiveProcess) Close() {
+	p.finish()
+	p.stdin.Close()
+	p.stdout.CloseWithError(io.EOF)
+	p.handle.Close()
+}
+
+// LaunchInteractive is Launch's counterpart for a live stdio session:
+// identical fail-closed pre-launch verification (prepareLaunch), but
+// wires a live stdin/stdout pipe pair instead of a combined captured
+// buffer. Concrete on *Bwrap, not part of the Backend interface — only
+// the gopls session (today's sole interactive caller) needs it.
+func (b *Bwrap) LaunchInteractive(ctx context.Context, policy CompiledPolicy) (*InteractiveProcess, error) {
+	h, err := b.prepareLaunch(ctx, policy)
+	if err != nil {
+		return nil, err
+	}
+	stdinR, stdinW := io.Pipe()
+	stdoutR, stdoutW := io.Pipe()
+	stderrBuf := &boundedBuffer{limit: 1 << 20}
+	if err := h.SetInput(stdinR); err != nil {
+		h.Close()
+		return nil, err
+	}
+	if err := h.SetOutput(stdoutW, stderrBuf); err != nil {
+		h.Close()
+		return nil, err
+	}
+	if err := h.Start(); err != nil {
+		h.Close()
+		return nil, err
+	}
+	proc := &InteractiveProcess{handle: h, policyHash: policy.policyHash,
+		closure: h.ClosureHashes(), stdin: stdinW, stdout: stdoutR,
+		stderr: stderrBuf, started: true, done: make(chan struct{})}
+	go func() {
+		select {
+		case <-ctx.Done():
+			h.Kill()
+		case <-proc.done:
+		}
+	}()
+	return proc, nil
+}
+
 // Attest binds the process to its policy and content-pinned closure. A
 // process launched under a different policy fails here — the caller must
 // treat its result as UNTRUSTED (T25 RED: attestation mismatch).
@@ -481,21 +618,40 @@ func (b *Bwrap) Attest(ctx context.Context, p *Process, policy CompiledPolicy) (
 	if p.policyHash != policy.policyHash {
 		return Attestation{}, fmt.Errorf("sandbox: ATTESTATION_MISMATCH — the process did not launch under this policy; its result is untrusted")
 	}
-	keys := make([]string, 0, len(p.closure))
-	for k := range p.closure {
+	return closureAttestation(p.closure, policy), nil
+}
+
+// AttestInteractive is Attest's counterpart for an InteractiveProcess —
+// same policy-binding check and closure digest, factored through the
+// same closureAttestation so the two can never silently diverge.
+func (b *Bwrap) AttestInteractive(ctx context.Context, p *InteractiveProcess, policy CompiledPolicy) (Attestation, error) {
+	if p == nil || !p.started {
+		return Attestation{}, fmt.Errorf("sandbox: nothing to attest (fail closed)")
+	}
+	if p.policyHash != policy.policyHash {
+		return Attestation{}, fmt.Errorf("sandbox: ATTESTATION_MISMATCH — the process did not launch under this policy; its result is untrusted")
+	}
+	return closureAttestation(p.closure, policy), nil
+}
+
+// closureAttestation computes the content-pinned closure digest shared by
+// Attest and AttestInteractive.
+func closureAttestation(closure map[string]string, policy CompiledPolicy) Attestation {
+	keys := make([]string, 0, len(closure))
+	for k := range closure {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 	h := sha256.New()
 	for _, k := range keys {
-		fmt.Fprintf(h, "%d:%s%d:%s", len(k), k, len(p.closure[k]), p.closure[k])
+		fmt.Fprintf(h, "%d:%s%d:%s", len(k), k, len(closure[k]), closure[k])
 	}
 	return Attestation{
 		PolicyHash:    policy.policyHash,
 		ClosureDigest: hex.EncodeToString(h.Sum(nil)),
 		ProbeHash:     policy.probeHash,
 		AttestedAt:    time.Now().UTC(),
-	}, nil
+	}
 }
 
 // randomHex returns n random bytes hex-encoded (canary naming).

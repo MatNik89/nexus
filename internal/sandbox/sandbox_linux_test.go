@@ -9,7 +9,10 @@
 package sandbox
 
 import (
+	"bufio"
 	"context"
+	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -628,5 +631,155 @@ func TestCompiledPolicyDoesNotAliasCallerSpec(t *testing.T) {
 	}
 	if !strings.Contains(out, "original") {
 		t.Fatalf("Launch ran the MUTATED env, not the sealed one: %q", out)
+	}
+}
+
+// Detector (PLAN-CODING-TRIO.md Slice 0, gopls session prerequisite):
+// LaunchInteractive actually delivers a LIVE, bidirectional stdio
+// conversation — a write to Stdin() reaches the sandboxed child, and its
+// reply is observable on Stdout() BEFORE the process exits (never just a
+// combined buffer inspected after Wait, which is what Process/Launch
+// gives). Uses probehelper's cat-stdin fixture, not gopls, to keep this
+// package's own test suite independent of any external toolchain.
+func TestLaunchInteractiveLiveStdioRoundTrip(t *testing.T) {
+	b, rep := backend(t)
+	bin := helperPath(t)
+	spec := Spec{Target: bin, Args: []string{"cat-stdin"}, WorkDir: wdir(t), Timeout: 15 * time.Second}
+	pol, err := b.Compile(ctxT(), spec, rep)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	p, err := b.LaunchInteractive(ctxT(), pol)
+	if err != nil {
+		t.Fatalf("launch interactive: %v", err)
+	}
+	defer p.Close()
+
+	reader := bufio.NewReader(p.Stdout())
+	for i := 0; i < 3; i++ {
+		line := fmt.Sprintf("ping-%d\n", i)
+		if _, err := io.WriteString(p.Stdin(), line); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+		got, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read reply %d: %v", i, err)
+		}
+		want := fmt.Sprintf("echo: ping-%d\n", i)
+		if got != want {
+			t.Fatalf("reply %d: got %q, want %q", i, got, want)
+		}
+	}
+	p.Stdin().Close() // signal EOF; the child exits cleanly
+	if err := p.Wait(); err != nil {
+		t.Fatalf("wait: %v\nstderr: %s", err, p.Stderr())
+	}
+	att, err := b.AttestInteractive(ctxT(), p, pol)
+	if err != nil {
+		t.Fatalf("attest interactive: %v", err)
+	}
+	if att.PolicyHash != pol.PolicyHash() || att.ClosureDigest == "" {
+		t.Fatalf("attestation does not bind policy+closure: %+v", att)
+	}
+}
+
+// Detector: killing an InteractiveProcess unblocks a pending Stdout read
+// (never hangs a caller mid-conversation) — a plain io.Pipe never
+// signals EOF on its own, only an explicit Close/CloseWithError does.
+func TestLaunchInteractiveKillUnblocksStdoutRead(t *testing.T) {
+	b, rep := backend(t)
+	bin := helperPath(t)
+	spec := Spec{Target: bin, Args: []string{"hang"}, WorkDir: wdir(t), Timeout: 15 * time.Second}
+	pol, err := b.Compile(ctxT(), spec, rep)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	p, err := b.LaunchInteractive(ctxT(), pol)
+	if err != nil {
+		t.Fatalf("launch interactive: %v", err)
+	}
+	defer p.Close()
+
+	readDone := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 1)
+		_, err := p.Stdout().Read(buf)
+		readDone <- err
+	}()
+	time.Sleep(200 * time.Millisecond) // let the read block first
+	p.Kill()
+
+	select {
+	case err := <-readDone:
+		if err == nil {
+			t.Fatal("expected a non-nil error unblocking the read after Kill")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Stdout read never unblocked after Kill")
+	}
+}
+
+// Detector (PLAN-CODING-TRIO.md Slice 0, gopls session): ExtraPathDir is
+// folded into PolicyHash like ExtraROBinds/ExtraEnv — two Specs differing
+// only in ExtraPathDir must compile to DIFFERENT policies.
+func TestPolicyHashChangesWithExtraPathDir(t *testing.T) {
+	b, rep := backend(t)
+	hp := helperPath(t)
+	dir := robindDir(t)
+	base := Spec{Target: hp, Args: []string{"sleep", "0"}, WorkDir: wdir(t), ExtraROBinds: []string{dir}}
+	polBase, err := b.Compile(ctxT(), base, rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withPath := base
+	withPath.ExtraPathDir = dir
+	polPath, err := b.Compile(ctxT(), withPath, rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if polBase.PolicyHash() == polPath.PolicyHash() {
+		t.Fatal("PolicyHash unchanged after setting ExtraPathDir")
+	}
+}
+
+// Detector: ExtraPathDir naming a directory NOT covered by the Spec's own
+// ExtraROBinds is refused fail-closed at Launch (probe.Prepare) — PATH
+// can only ever resolve into a directory already granted read-only
+// visibility, never widen what's visible.
+func TestLaunchRefusesExtraPathDirOutsideROBinds(t *testing.T) {
+	b, rep := backend(t)
+	hp := helperPath(t)
+	outside := robindDir(t) // NOT added to ExtraROBinds below
+	spec := Spec{Target: hp, Args: []string{"printenv", "PATH"}, WorkDir: wdir(t),
+		ExtraPathDir: outside}
+	pol, err := b.Compile(ctxT(), spec, rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Launch(ctxT(), pol); err == nil {
+		t.Fatal("Launch accepted an ExtraPathDir not covered by ExtraROBinds")
+	}
+}
+
+// Detector: ExtraPathDir nested UNDER an ExtraROBinds entry (not equal to
+// it) is accepted, and PATH inside the sandbox actually resolves there —
+// the real shape gopls needs (GOROOT is the ExtraROBinds entry,
+// GOROOT/bin is ExtraPathDir).
+func TestLaunchAcceptsExtraPathDirNestedUnderROBinds(t *testing.T) {
+	b, rep := backend(t)
+	hp := helperPath(t)
+	parent := robindDir(t)
+	child := filepath.Join(parent, "bin")
+	if err := os.Mkdir(child, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	spec := Spec{Target: hp, Args: []string{"printenv", "PATH"}, WorkDir: wdir(t),
+		ExtraROBinds: []string{parent}, ExtraPathDir: child}
+	out, werr := runThrough(t, b, rep, spec)
+	if werr != nil {
+		t.Fatalf("launch: %v\n%s", werr, out)
+	}
+	if !strings.Contains(out, child) {
+		t.Fatalf("PATH did not resolve to the nested ExtraPathDir: %q", out)
 	}
 }

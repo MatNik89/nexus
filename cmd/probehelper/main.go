@@ -6,6 +6,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"net"
@@ -87,6 +88,16 @@ func main() {
 			fail("env %s not set", arg(2))
 		}
 		fmt.Println(v)
+	case "cat-stdin": // cat-stdin — echoes each stdin line back on stdout,
+		// prefixed "echo: ", until EOF (InteractiveProcess fixture: proves
+		// a live stdin write is actually visible to the sandboxed child,
+		// and a live stdout read sees each reply before EOF, not just a
+		// buffer inspected after the process exits).
+		scanner := bufio.NewScanner(os.Stdin)
+		for scanner.Scan() {
+			fmt.Printf("echo: %s\n", scanner.Text())
+			os.Stdout.Sync()
+		}
 	case "hang": // never exits — timeout/cleanup fixture. NOT select{}: an
 		// empty select trips Go's deadlock detector and self-terminates,
 		// making the timeout test vacuous (Phase-0 r2 kilo #1).
