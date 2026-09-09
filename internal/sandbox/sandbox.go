@@ -559,7 +559,11 @@ func (p *InteractiveProcess) finish() {
 // Kill terminates the whole tree and unblocks any pending Stdout read.
 func (p *InteractiveProcess) Kill() {
 	p.handle.Kill()
-	p.stdout.CloseWithError(fmt.Errorf("sandbox: process killed"))
+	killErr := fmt.Errorf("sandbox: process killed")
+	p.stdout.CloseWithError(killErr)
+	// A blocked protocol WRITE (Stdin()) must unblock too — closing only
+	// Stdout() left a writer stuck forever (code-review finding, codex).
+	p.stdin.CloseWithError(killErr)
 }
 
 // Close releases resources; safe on every failure path.
@@ -601,7 +605,13 @@ func (b *Bwrap) LaunchInteractive(ctx context.Context, policy CompiledPolicy) (*
 	go func() {
 		select {
 		case <-ctx.Done():
-			h.Kill()
+			// proc.Kill(), NOT h.Kill() (code-review finding, codex):
+			// h.Kill() alone kills the process tree but never closes the
+			// pipe endpoints — a caller blocked reading Stdout()/writing
+			// Stdin() at the moment of cancellation would never unblock,
+			// since a plain io.Pipe only signals EOF/error on an
+			// explicit Close/CloseWithError call. proc.Kill() does both.
+			proc.Kill()
 		case <-proc.done:
 		}
 	}()

@@ -783,3 +783,47 @@ func TestLaunchAcceptsExtraPathDirNestedUnderROBinds(t *testing.T) {
 		t.Fatalf("PATH did not resolve to the nested ExtraPathDir: %q", out)
 	}
 }
+
+// Detector (code-review finding, codex): the PRODUCTION cancellation path
+// — the caller's ctx being cancelled/expiring while LaunchInteractive's
+// own cancel-watch goroutine reacts — must unblock a pending Stdout()
+// read, exactly like an explicit p.Kill() does. The earlier
+// TestLaunchInteractiveKillUnblocksStdoutRead only covered the explicit
+// call; this covers the actual ctx.Done() seam every real caller
+// (RunGoplsRename) goes through, which is a MEANINGFULLY DIFFERENT code
+// path (the watch goroutine, not the caller's own Kill call) and was the
+// one still calling the raw handle's Kill() instead of proc.Kill(),
+// leaving the pipes never closed.
+func TestLaunchInteractiveContextCancelUnblocksStdoutRead(t *testing.T) {
+	b, rep := backend(t)
+	bin := helperPath(t)
+	spec := Spec{Target: bin, Args: []string{"hang"}, WorkDir: wdir(t), Timeout: 15 * time.Second}
+	pol, err := b.Compile(ctxT(), spec, rep)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	ctx, cancel := context.WithCancel(ctxT())
+	p, err := b.LaunchInteractive(ctx, pol)
+	if err != nil {
+		t.Fatalf("launch interactive: %v", err)
+	}
+	defer p.Close()
+
+	readDone := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 1)
+		_, err := p.Stdout().Read(buf)
+		readDone <- err
+	}()
+	time.Sleep(200 * time.Millisecond) // let the read block first
+	cancel()                           // the production seam: caller cancels ctx, NOT p.Kill() directly
+
+	select {
+	case err := <-readDone:
+		if err == nil {
+			t.Fatal("expected a non-nil error unblocking the read after ctx cancellation")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Stdout read never unblocked after ctx cancellation — the cancel-watch goroutine did not reach the pipes")
+	}
+}

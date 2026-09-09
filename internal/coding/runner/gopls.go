@@ -8,7 +8,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -83,6 +85,36 @@ type RenameResult struct {
 // "server shutdown without initialization" and never answering the
 // rename request. Only a genuine write-then-read-the-correlated-response
 // loop (per request) works.
+// validateFileRelPath fail-closed rejects anything but a clean,
+// slash-separated, relative path: empty, absolute (leading '/'), or
+// containing a '..' path component after cleaning (code-review finding,
+// codex: a substring check on the raw string, as this used to be, does
+// not use the same normalization path.Clean applies, so it is not
+// provably equivalent to what actually gets joined into a URI/host
+// path).
+func validateFileRelPath(p string) error {
+	if p == "" {
+		return fmt.Errorf("FileRelPath is required (fail closed)")
+	}
+	if path.IsAbs(p) {
+		return fmt.Errorf("FileRelPath must be relative, got %q (fail closed)", p)
+	}
+	clean := path.Clean(p)
+	if clean == ".." || strings.HasPrefix(clean, "../") {
+		return fmt.Errorf("FileRelPath escapes its root: %q (fail closed)", p)
+	}
+	return nil
+}
+
+// fileURIFor builds the in-sandbox file: URI for relPath (already
+// validated by validateFileRelPath) via net/url, not string
+// concatenation — a valid Go filename can contain '#', '?', a space, or
+// a literal '%', all of which change or break URI syntax if pasted in
+// raw (code-review finding, codex).
+func fileURIFor(relPath string) string {
+	return (&url.URL{Scheme: "file", Path: "/work/src/" + relPath}).String()
+}
+
 func RunGoplsRename(ctx context.Context, backend *sandbox.Bwrap, report sandbox.ProbeReport, grants *s7.Authority, j *journal.Journal, req RenameRequest) (RenameResult, error) {
 	if req.GoBinary == "" || req.GoplsBinary == "" {
 		return RenameResult{}, fmt.Errorf("runner: GoBinary and GoplsBinary are both required")
@@ -90,8 +122,8 @@ func RunGoplsRename(ctx context.Context, backend *sandbox.Bwrap, report sandbox.
 	if !req.OperationID.Valid() || !req.TargetID.Valid() || !req.RunID.Valid() || !req.ProfileID.Valid() {
 		return RenameResult{}, fmt.Errorf("runner: OperationID/TargetID/RunID/ProfileID are all required (fail closed)")
 	}
-	if req.FileRelPath == "" || strings.Contains(req.FileRelPath, "..") {
-		return RenameResult{}, fmt.Errorf("runner: FileRelPath is required and must not contain '..' (fail closed)")
+	if err := validateFileRelPath(req.FileRelPath); err != nil {
+		return RenameResult{}, fmt.Errorf("runner: %w", err)
 	}
 
 	pin, err := ResolveToolchain(req.GoBinary)
@@ -182,8 +214,18 @@ func RunGoplsRename(ctx context.Context, backend *sandbox.Bwrap, report sandbox.
 	renameResp, sessionErr := runGoplsSession(proc, req, fileContent)
 
 	waitErr := proc.Wait()
+	execCause := context.Cause(execCtx)
 	if sessionErr == nil {
 		sessionErr = waitErr
+	}
+	if sessionErr != nil && execCause != nil {
+		// Killed by ITS OWN deadline/cancel (mirrors Run's identical
+		// classification, run.go): the attempt itself never completed,
+		// nothing durable happened downstream of it, so this is
+		// CANCELLED, not a failed attempt.
+		grants.Cancel(req.OperationID, nil)
+		journalGoplsRenameEvent(ctx, j, req, RenameResult{}, sessionErr)
+		return RenameResult{}, fmt.Errorf("runner: gopls session cancelled by its own deadline: %w", sessionErr)
 	}
 	if sessionErr != nil {
 		reportOutcome(grants, req.OperationID, s7.OutcomeFailedTerminal, s7.CodeLocalRefused)
@@ -196,7 +238,16 @@ func RunGoplsRename(ctx context.Context, backend *sandbox.Bwrap, report sandbox.
 		journalGoplsRenameEvent(ctx, j, req, RenameResult{}, err)
 		return RenameResult{}, fmt.Errorf("runner: attest: %w", err)
 	}
-	_ = grants.Report(req.OperationID, s7.OutcomeSucceeded, "", nil)
+	// A rename result the caller can act on requires S7 to have actually
+	// ACCEPTED the success landing — Report can legitimately refuse
+	// (operation no longer RUNNING, invalid transition, durability
+	// failure), and a discarded refusal here would let a caller trust a
+	// result S7 never recorded as succeeded (code-review finding, codex;
+	// mirrors run.go's own propagation of this same Report call).
+	if err := grants.Report(req.OperationID, s7.OutcomeSucceeded, "", nil); err != nil {
+		journalGoplsRenameEvent(ctx, j, req, RenameResult{}, err)
+		return RenameResult{}, fmt.Errorf("runner: %w", err)
+	}
 
 	result := RenameResult{
 		SnapshotDigest:  snapDigest,
@@ -284,7 +335,12 @@ func journalGoplsRenameEvent(ctx context.Context, j *journal.Journal, req Rename
 func runGoplsSession(proc *sandbox.InteractiveProcess, req RenameRequest, fileContent []byte) (map[string]json.RawMessage, error) {
 	reader := bufio.NewReader(proc.Stdout())
 	rootURI := "file:///work/src"
-	fileURI := rootURI + "/" + req.FileRelPath
+	// net/url, not string concatenation (code-review finding, codex): a
+	// valid Go filename can contain '#', '?', a space, or non-ASCII
+	// bytes, all of which change URI semantics if pasted in raw —
+	// validateFileRelPath already rejected '..'/absolute paths, so
+	// url.URL only needs to percent-encode what's left.
+	fileURI := fileURIFor(req.FileRelPath)
 
 	if err := lspWriteMessage(proc.Stdin(), map[string]any{
 		"jsonrpc": "2.0", "id": 1, "method": "initialize",
