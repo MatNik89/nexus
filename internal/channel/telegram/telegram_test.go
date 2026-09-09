@@ -66,6 +66,23 @@ type fakeBot struct {
 	pollStatusLeft     int
 	pollStatus         int
 	pollCalls          int
+	// post-write faults: hijack + close the connection after the request
+	// was read (the client sees a reset/EOF, never a status).
+	pollCloseLeft   int
+	getMeStatus     int
+	getMeStatusLeft int
+	getMeCloseLeft  int
+	getMeCalls      int
+}
+
+func (f *fakeBot) getMes() int { f.mu.Lock(); defer f.mu.Unlock(); return f.getMeCalls }
+
+func hijackClose(w http.ResponseWriter) {
+	if hj, ok := w.(http.Hijacker); ok {
+		if c, _, err := hj.Hijack(); err == nil {
+			c.Close()
+		}
+	}
 }
 
 func (f *fakeBot) setCalls() int { f.mu.Lock(); defer f.mu.Unlock(); return f.setCommandsCalls }
@@ -80,6 +97,11 @@ func (f *fakeBot) handler() http.HandlerFunc {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/getUpdates"):
 			f.pollCalls++
+			if f.pollCloseLeft > 0 {
+				f.pollCloseLeft--
+				hijackClose(w)
+				return
+			}
 			if f.pollStatusLeft > 0 {
 				f.pollStatusLeft--
 				w.WriteHeader(f.pollStatus)
@@ -166,6 +188,18 @@ func (f *fakeBot) handler() http.HandlerFunc {
 			}
 			w.Write([]byte(`{"ok":true,"result":` + remote + `}`))
 		case strings.HasSuffix(r.URL.Path, "/getMe"):
+			f.getMeCalls++
+			if f.getMeCloseLeft > 0 {
+				f.getMeCloseLeft--
+				hijackClose(w)
+				return
+			}
+			if f.getMeStatusLeft > 0 {
+				f.getMeStatusLeft--
+				w.WriteHeader(f.getMeStatus)
+				w.Write([]byte(`{"ok":false}`))
+				return
+			}
 			id := f.botID
 			if id == 0 {
 				id = 1

@@ -89,6 +89,9 @@ var (
 	// ErrCompanion: the companion is missing, foreign (Key != op) or supplied
 	// to a non-durable operation.
 	ErrCompanion = fmt.Errorf("s7: companion missing, foreign or not allowed: %w", ErrAttemptNotAuthorized)
+	// ErrNotDurable wraps every failed durable append: the journal (substrate)
+	// refused the paired batch — nothing transitioned, no grant exists.
+	ErrNotDurable = errors.New("s7: durable append failed (substrate)")
 )
 
 // BackoffPolicy is exponential with optional full jitter: attempt n (1-based
@@ -272,6 +275,16 @@ type Authority struct {
 	ops  map[contracts.OperationID]*operation
 	j    *journal.Journal // nil: in-memory only (no Durable operations)
 	rand func() float64
+	// appendFault is a FAULT SEAM for detectors (inert unless set): it sees
+	// the event types of a batch about to be appended and may refuse it.
+	appendFault func(types []string) error
+}
+
+// SetAppendFault installs the append fault seam (tests). nil clears it.
+func (a *Authority) SetAppendFault(f func(types []string) error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.appendFault = f
 }
 
 // NewAuthority builds an IN-MEMORY authority (turn-scoped operations only;

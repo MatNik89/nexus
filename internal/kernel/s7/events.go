@@ -219,10 +219,21 @@ func (a *Authority) evTerminal(op contracts.OperationID, state contracts.Attempt
 // with a.mu held; the journal actor serializes independently.
 func (a *Authority) appendLocked(ctx context.Context, params ...contracts.EnvelopeParams) error {
 	if a.j == nil {
-		return fmt.Errorf("s7: no journal bound")
+		return fmt.Errorf("%w: no journal bound", ErrNotDurable)
 	}
-	_, err := a.j.AppendBatch(ctx, params)
-	return err
+	if a.appendFault != nil {
+		types := make([]string, 0, len(params))
+		for _, p := range params {
+			types = append(types, p.EventType)
+		}
+		if err := a.appendFault(types); err != nil {
+			return fmt.Errorf("%w: %v", ErrNotDurable, err)
+		}
+	}
+	if _, err := a.j.AppendBatch(ctx, params); err != nil {
+		return fmt.Errorf("%w: %v", ErrNotDurable, err)
+	}
+	return nil
 }
 
 // Projection is the durable s7_operations fold (SyncProjection).

@@ -894,7 +894,7 @@ func (c *Core) Flush(ctx context.Context, auth *s7.Authority, send Send) error {
 				Cause: fmt.Errorf("channel: delivery %s exhausted its S7 budget — parked FAILED: %w", o.DeliveryID, err)})
 			continue
 		case err != nil:
-			if strings.Contains(err.Error(), "not durable") {
+			if errors.Is(err, s7.ErrNotDurable) {
 				return substrate("s7_authorize", fmt.Errorf("channel: delivery %s: S7 authorization could not be made durable — not sending: %w", o.DeliveryID, err))
 			}
 			failures = append(failures, &ClassifiedError{Class: health.ClassTransport, Code: s7.CodeLocalRefused,
@@ -908,6 +908,12 @@ func (c *Core) Flush(ctx context.Context, auth *s7.Authority, send Send) error {
 		sendErr := send(o, g, s7.Companion{Key: op, Params: parkParams})
 		st, _ := auth.State(op)
 		if st == contracts.AttemptAuthorized {
+			if errors.Is(sendErr, s7.ErrNotDurable) {
+				// The STARTED+park batch could not be journaled: substrate,
+				// not a local refusal — the lease stays and recovers on the
+				// next tick once the journal is back; the adapter STOPS.
+				return substrate("started_park", fmt.Errorf("channel: delivery %s: %w", o.DeliveryID, sendErr))
+			}
 			// Never consumed: a LOCAL refusal (identity mismatch, request
 			// build) — nothing physical ran; cancel + FAILED in one batch.
 			if cerr := auth.Cancel(op, build); cerr != nil {
