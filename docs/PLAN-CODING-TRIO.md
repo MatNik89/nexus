@@ -474,6 +474,112 @@ before implementation begins, not just name the requirements.
   one); generated-test-binary execution scoped correctly (runs, but only from inside the
   staged tree).
 
+### Slice 0 — concrete design, round 1 (research: my own + agy independent; codex/kilo
+dispatched in parallel, pending — fold into round 2 before implementation)
+
+Verified against the actual code (`internal/kernel/effectpath/effectpath.go`,
+`internal/kernel/s7/s7.go`, `internal/exectool/exectool.go`, `internal/preflight/probe`)
+and this deployment host's live `go env`, not assumed.
+
+1. **S7 durability — NOT needed for Slice 0 (verified from the state machine, not
+   intuition).** `s7.Policy.Durable` gates journal-binding (`Begin` requires `a.j != nil`
+   only when `policy.Durable`, s7.go:363-365) and requires a `Companion`/`Builder` on
+   every `Consume`/`Report`/`Reconcile`. That machinery exists for operations with a
+   genuine UNKNOWN-outcome-on-crash problem: Slice 3's multi-file `workspace.Apply`
+   mutates the LIVE workspace, so a crash mid-apply leaves real files in an unknown
+   state that must be reconciled before any retry. Slice 0's operations (`go list` for
+   TIA, `go build`/`go test` for evidence capture) run entirely inside a PRIVATE,
+   DISPOSABLE snapshot — the live workspace is never touched — so a crash mid-run loses
+   nothing durable; discarding the snapshot and re-running is the correct recovery,
+   identical to any other transient computation. `effectpath.RunTool`'s existing
+   non-durable path already reflects this: it hardcodes `Consume` with zero companions
+   and `Report` with a nil `Builder` (effectpath.go:446, :372) — the ONLY lifecycle
+   method today literally cannot express a companion even if asked. Conclusion:
+   Slice 0 needs `s7.PolicyTool`-shaped (non-durable) grants at most, not a new durable
+   policy or `EffectPath.RunDurableTool`. That machinery is Slice 3's, not Slice 0's —
+   confirms the plan's own existing build-order split, doesn't change it.
+
+2. **Toolchain pinning — concrete mechanism.** On this deployment host (Pi, Kali
+   arm64), `go env` shows `GOROOT` and `GOTOOLDIR` BOTH live inside `GOMODCACHE`'s
+   downloaded-toolchain path (`GOMODCACHE=/home/matej/go/pkg/mod`, `GOROOT=<GOMODCACHE>/
+   golang.org/toolchain@.../`, `GOTOOLDIR=<GOROOT>/pkg/tool/linux_arm64`) — this is
+   NOT universal (a plain non-toolchain-managed Go install keeps GOROOT outside
+   GOMODCACHE; codex's parallel research found a second `~/.local/go` install on this
+   same host as a concrete example of the non-toolchain-managed case) — the runner must
+   resolve paths from `go env` output, never hardcode either layout.
+   - **Bind GOMODCACHE (or the resolved GOROOT, if outside GOMODCACHE) via
+     `ExtraROBinds`** — covers stdlib source and downloaded module dependencies.
+     Directory-level identity pinning (`ExtraROBindIdentities`, just converged) is
+     sufficient here: this is a broad, potentially multi-gigabyte tree where full
+     content hashing is unbounded, and the residual gap (an in-place file edit within
+     an unchanged directory) is accepted as the caller's own bounded risk per that
+     primitive's documented scope.
+   - **Separately content-hash-pin `GOTOOLDIR` specifically** (its own, narrower check,
+     owned by `internal/coding/runner`, NOT a probe/sandbox primitive): `GOTOOLDIR`
+     holds only ~8 compiler/linker/asm/cgo binaries (measured ~60MB on this host) — a
+     small, bounded set, and unlike the module cache these binaries actually EXECUTE
+     inside the sandbox, making them a higher-value swap target. Compute
+     `sha256(sorted "name\x00sha256(bytes)")` over `GOTOOLDIR`'s entries at coding-run
+     start (sub-20ms measured), fold into the run's evidence event; this closes the
+     in-place-edit gap `ExtraROBindIdentities` deliberately leaves open, specifically
+     for the one directory where it matters most.
+   - `ExtraEnv`: `CGO_ENABLED=0`, `GOTOOLCHAIN=local` (forbid downloading a DIFFERENT
+     toolchain over the network — the plan's existing network-denial requirement),
+     `GOCACHE`/`GOTMPDIR` pointed at a location INSIDE the sandbox's disposable
+     `WorkDir`, never the snapshot's source tree (already required above) and never a
+     host path outside the sandbox closure.
+
+3. **Private workspace snapshot — concrete mechanism.** `probe.go`'s `guardWorkDir`/
+   `allowedWorkRoots` (verified by reading the code) constrain `Spec.WorkDir` to a
+   root-sticky temp root or an `XDG_RUNTIME_DIR`-style 0700 user-owned root — a plain
+   `os.MkdirTemp(os.TempDir(), "nexus-coding-snap-*")` satisfies this without new
+   sandbox-side plumbing. Tree copy + digest: `filepath.WalkDir` the source tree,
+   reject any non-regular-file/non-directory node (device/socket/fifo — `fail closed`
+   per invariant 4), reject symlinks outright (never resolve-and-follow), enforce a
+   file-count and total-byte cap (values TBD by the review round — no existing NEXUS
+   precedent to reuse verbatim; propose 20,000 files / 500MB as a starting point,
+   generous for any real Go module, tight enough to bound resource use), copy each
+   regular file's bytes while hashing them, then `TreeDigest = sha256(sorted
+   "relpath\x00sha256(bytes)" lines joined by newline)` — a plain Merkle-style content
+   digest, no new dependency, ~50 LOC against stdlib `io/fs`/`crypto/sha256`.
+
+4. **OPEN QUESTION — revises a previously-converged plan sentence, needs explicit
+   re-review, not silent adoption:** the existing Slice 0 text above says "Route every
+   coding-related command as a typed `ToolCall` through `EffectPath`, never directly
+   through raw `exectool`" (already converged in the original 6-round plan review).
+   This round's research (independently, both my own reading and agy's) found a
+   structural reason to question routing through `EffectPath.RunTool` specifically,
+   NOT just avoiding `exectool`: `RunTool`'s `ExecProcess` dispatch goes through exactly
+   ONE bound `effectpath.SandboxBackend` implementation regardless of `ToolID`
+   (`p.sbproc`, effectpath.go:437-438) — today that's `exectool.Adapter`. Routing
+   Slice 0 through `EffectPath.RunTool` would require EITHER extending
+   `exectool.Adapter` itself to also handle coding-runner `ToolID`s (re-coupling the
+   model-visible, hardcoded-ASK-approval tool with internal-initiative governed calls —
+   exactly the anti-pattern the plan's own text elsewhere warns against) OR rebinding
+   `EffectPath` to a NEW combined `SandboxBackend` that handles both (invasive, touches
+   existing exectool wiring for no clear benefit). Calling `internal/sandbox.Backend`'s
+   `Probe→Compile→Launch→Attest` protocol DIRECTLY from a new `internal/coding/runner`
+   package — bypassing `contracts.ToolCall`/PEP entirely for these internal-initiative,
+   never-per-call-approved calls — sidesteps this without losing any real governance
+   (PEP's ASK-approval model doesn't apply to a call a human never sees per-attempt;
+   coarser policy questions like "is the coding capability enabled at all" belong at
+   capability-activation time, matching the existing HARDQ B9 fail-closed-Resolve
+   pattern, not at every subprocess call). **This is a genuine revision of an
+   already-converged decision and must be argued explicitly in the next review round,
+   not adopted by default** — if codex/kilo's still-pending parallel research disagrees,
+   or the review round finds a governance reason I'm missing (audit consistency,
+   profile-scoping enforcement point, something else), the original "route through
+   EffectPath" text stands and this package instead implements a *thin*
+   `effectpath.SandboxBackend`-conformant wrapper solely for coding-runner `ToolID`s.
+
+5. **Package boundary (tentative, pending review):** `internal/coding/runner` owns:
+   snapshot creation (§3), toolchain resolution + pinning (§2), the
+   `sandbox.Backend` call (or `EffectPath` call, pending §4's resolution), bounded
+   output capture, and `journal.Append` for a new `coding.run` evidence event
+   (`journal.Journal.Append(ctx, contracts.EnvelopeParams)` already supports an
+   arbitrary typed payload — no new journal API needed, confirmed by reading
+   journal.go:593).
+
 ### Slice 1 — proof-of-done / evidence manifest
 Depends only on EXISTING machinery (journal, `checker`) plus Slice 0's governed
 test-runner — not on TIA or symedit existing (dependency graph verified independently
