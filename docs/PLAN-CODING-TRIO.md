@@ -1,4 +1,4 @@
-# PLAN v5: coding-agent trio (TIA / symbol-edit / proof-of-done)
+# PLAN v6: coding-agent trio (TIA / symbol-edit / proof-of-done)
 
 Repo's own deferred ledger (`docs/tasks-P0.md:410`, "coding trio TIA/symedit/deep evidence
 (P1)") names this as the next P1 priority after audit-hardening. NEXUS currently has ZERO
@@ -54,7 +54,20 @@ an artifact in the window between its own fsync and the journal reference that n
 is closed with an owner-held live pin through the journal-append step plus mark-and-sweep
 GC. Two of agy's round-4 notes were also folded (name the store
 `internal/foundation/sealedstore`, built in Slice 0 directly; name the durable EffectPath
-method `RunDurableTool`).
+method `RunDurableTool`). **v6 folds plan-review round 5** (codex FAIL 1 NEW HIGH —
+finding count 5→5→3→2→1, still converging; kilo PASS+3 notes; agy PASS+3 notes). codex
+found a genuinely subtle self-consistency gap neither reviewer's PASS caught: after a
+crash, S7 has already rehydrated the original durable Apply operation to `UNKNOWN`
+(the existing durable-rehydration rule) — its grant is dead. The recovery-time rollback
+writes (restoring files from the sealed bundle) happen in a NEW process, AFTER that
+rehydration, so they are themselves a NEW physical effect attempt with NO grant,
+directly violating the plan's own invariant 2 ("every dispatched effect needs an S7
+grant"). Folded: a new `PolicyWorkspaceRollback` durable operation, governed through the
+same `RunDurableTool`/S6/S7 path as `PolicyWorkspaceApply` itself, that the restart-time
+rollback path must go through — the original Apply operation only gets to
+`Reconcile(false)`/`Next` again AFTER the rollback operation's own `Reconcile` succeeds.
+Also folded two agy notes (nested descriptor-relative path walk; `RunDurableTool`
+signature shape).
 
 ## Research basis (four independent research threads before any review; two review rounds
 since)
@@ -177,6 +190,35 @@ All four independently converged on (unchanged from v1/v2, still holds):
        - On restart, no commit event, all-BEFORE or mixed BEFORE/AFTER: identical
          rollback treatment — restore to all-BEFORE, `Reconcile(false)`, `Next` on the
          SAME operation only.
+     - **Restart-time rollback itself needs its OWN grant — added in v6** (codex round-5
+       HIGH #1, verified: on restart, S7 has already rehydrated the durable RUNNING
+       original Apply operation to `UNKNOWN` per the existing durable-rehydration rule
+       (`s7/events.go:462` — "durable RUNNING-no-report → UNKNOWN, never re-granted");
+       its ORIGINAL grant is dead. The rollback writes above happen in a NEW process,
+       AFTER that rehydration — restoring files from the sealed bundle is therefore a
+       NEW physical effect attempt with no `AttemptGrant` of its own, directly
+       contradicting invariant 2's own "every dispatched effect needs S7 grant" rule.
+       The SAME-process rollback in step 5 (an ordinary, non-crash failure, still inside
+       the original Apply's own consumed attempt) is unaffected — only the RESTART
+       compensation path lacked authority):
+       - A new durable, exact-intent `PolicyWorkspaceRollback` operation, run through
+         the same `RunDurableTool`/S6/S7 path as `PolicyWorkspaceApply` itself. Its
+         identity binds the ORIGINAL operation's identity, profile, workspace identity,
+         the sealed-bundle digest, and the desired all-BEFORE target state.
+       - The original Apply operation remains `UNKNOWN` throughout the rollback — the
+         rollback is a SEPARATE operation, not a resurrection of the dead one.
+       - The rollback operation consumes its OWN grant before performing any write.
+       - Its own reconciliation predicate is "the complete write set now equals the
+         sealed BEFORE state": all-BEFORE achieved → rollback `Reconcile(true)`; a
+         mixed BEFORE/AFTER state remaining → rollback `Reconcile(false)` then `Next`
+         on that SAME rollback operation (not the original Apply); any FOREIGN file →
+         both the rollback and the original Apply operation stay `UNKNOWN`/manual.
+       - ONLY after the rollback operation itself succeeds may the ORIGINAL Apply
+         operation call `Reconcile(false)` and become eligible for `Next` again.
+       - Required detector: crash `Apply` into a mixed state, restart, ABLATE the
+         rollback operation's own grant, and prove zero recovery writes occur (the
+         restart-compensation path must be just as ungovernable-without-a-grant as any
+         other effect in this codebase).
      - Any FOREIGN classification stays `Unknown`/manual reconciliation — it never
        receives a new grant, under any circumstance.
      - Required detector (v5): a successfully closed transaction, followed by a later
@@ -296,13 +338,16 @@ All four independently converged on (unchanged from v1/v2, still holds):
         `Reconcile(false)` then `Next` the SAME operation, safe to retry fresh.
       - No commit event, ALL files AFTER (v5: this case was missing from v4's table
         despite step 7 already requiring its own crash detector — codex round-4 HIGH #1)
-        → mid-crash: every file replaced but the transaction never committed. Roll every
-        file back to its sealed before-image, verify all-BEFORE achieved, then
-        `Reconcile(false)` then `Next` the SAME operation. NEVER treat this as a
-        completed transaction merely because every file happens to match AFTER.
-      - No commit event, mixed BEFORE/AFTER → mid-crash; roll every AFTER-matching file
-        back to its sealed before-image, then `Reconcile(false)` then `Next` the SAME
-        operation (never roll forward without the commit marker).
+        → mid-crash: every file replaced but the transaction never committed. Roll back
+        through the GOVERNED `PolicyWorkspaceRollback` operation (v6, invariant 2 —
+        this is a NEW physical write in a NEW process; it needs its own grant, not a
+        bare filesystem restore), then, once rollback succeeds, `Reconcile(false)` then
+        `Next` the SAME original operation. NEVER treat this as a completed transaction
+        merely because every file happens to match AFTER.
+      - No commit event, mixed BEFORE/AFTER → mid-crash; roll back through the SAME
+        governed `PolicyWorkspaceRollback` operation, then `Reconcile(false)` then
+        `Next` the SAME original operation (never roll forward without the commit
+        marker).
       - Any file FOREIGN (in any of the above) → refuse; manual reconciliation only,
         never a guess and never a blind re-run.
       - The recovery journal entry itself missing after a crash → SAFE, because step 1
@@ -320,7 +365,8 @@ All four independently converged on (unchanged from v1/v2, still holds):
       written; fault between the bundle and the journal pairing; fault at every
       individual-file boundary; fault after all files are written but before the
       `mutation_committed` event; a corrupt/missing sealed bundle referenced by a valid
-      journal event.
+      journal event; (v6) ablating the `PolicyWorkspaceRollback` operation's own grant
+      during restart-time recovery proves zero rollback writes occur.
    - **Symlink defense — mutation-time guard, not just a pre-check** (v3, codex round-2
      HIGH #4: `filepath.EvalSymlinks`-then-`rename`-by-pathname alone leaves a TOCTOU
      window — a parent-directory symlink can be swapped between the last check and the
@@ -331,7 +377,11 @@ All four independently converged on (unchanged from v1/v2, still holds):
      with `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS` (or an equivalent directory-file-
      descriptor design), against a `internal/coding/workspace`-owned helper (NOT the
      plain `atomicwrite.WriteFile` path-string API — agy round-3 weakest-point #1) so the
-     checked target and the written target are provably the SAME kernel object.
+     checked target and the written target are provably the SAME kernel object. For a
+     nested relative path, walk and open each intermediate directory component
+     descriptor-relatively via `openat2` in turn (agy round-5 weakest-point #3) — never
+     fall back to a path-string API partway through a deep path just because the
+     leading components were already validated.
    - **Identity model — corrected in v4** (codex round-3 HIGH #3: "device+inode identity
      throughout" as originally worded literally contradicts atomic replacement itself —
      `atomicwrite` creates a temp file and renames it OVER the destination
@@ -509,7 +559,7 @@ main + autodeploy + push per standing rules after each slice converges, not batc
 
 ## Status
 
-v5 — plan-review round 4 folded (codex FAIL 2 NEW HIGH, both re-verified — one against a
-second kilo factual disagreement, checked directly against the plan text and confirmed
-kilo wrong again; kilo PASS + 3 notes folded; agy PASS + 3 notes folded). Finding count
-converging: 5 → 5 → 3 → 2 across four rounds. Next: dispatch v5 for plan-review round 5.
+v6 — plan-review round 5 folded (codex FAIL 1 NEW HIGH, re-verified against the existing
+durable-rehydration rule; kilo PASS + 3 notes folded; agy PASS + 3 notes folded).
+Finding count converging: 5 → 5 → 3 → 2 → 1 across five rounds. Next: dispatch v6 for
+plan-review round 6.
