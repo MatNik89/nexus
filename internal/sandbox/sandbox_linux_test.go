@@ -532,6 +532,64 @@ func TestLaunchRefusesROBindDirectorySwappedAfterCompile(t *testing.T) {
 	}
 }
 
+// Detector (code-review CODE3 codex finding: a real bypass of the identity
+// pin, reproduced live): the identity-pin check silently SKIPPED when the
+// canonical path resolved at Launch has no entry in ExtraROBindIdentities
+// (a symlink retargeted between Compile and Launch resolves to a
+// DIFFERENT canonical path than what Compile pinned — the old code's
+// `ok && mismatch` check treated the resulting map miss as "no check",
+// fail OPEN). ExtraROBinds names a SYMLINK whose target changes between
+// Compile and Launch — the retargeted bind must be refused, not silently
+// accepted under the new target's bytes.
+func TestLaunchRefusesROBindSymlinkRetargetedAfterCompile(t *testing.T) {
+	b, rep := backend(t)
+	hp := helperPath(t)
+	parent := t.TempDir()
+	beforeDir := filepath.Join(parent, "before")
+	afterDir := filepath.Join(parent, "after")
+	if err := os.Mkdir(beforeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(afterDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beforeDir, "canary"), []byte("BEFORE"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(afterDir, "canary"), []byte("AFTER"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(parent, "toolchain")
+	if err := os.Symlink(beforeDir, link); err != nil {
+		t.Fatal(err)
+	}
+	pol, err := b.Compile(ctxT(), Spec{
+		Target: hp, Args: []string{"readfile", filepath.Join(afterDir, "canary")}, WorkDir: wdir(t),
+		ExtraROBinds: []string{link},
+	}, rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(afterDir, link); err != nil {
+		t.Fatal(err)
+	}
+	p, err := b.Launch(ctxT(), pol)
+	if err != nil {
+		return // refused at Launch — the desired outcome
+	}
+	defer p.Close()
+	werr := p.Wait()
+	if werr == nil && strings.Contains(p.Output(), "AFTER") {
+		t.Fatalf("retargeted symlink bind was accepted and exposed replacement bytes: %q", p.Output())
+	}
+	if werr == nil {
+		t.Fatalf("retargeted symlink bind was accepted (launch succeeded with no identity-mismatch refusal): output=%q", p.Output())
+	}
+}
+
 // Detector (code-review CODE1 codex finding #2): CompiledPolicy must not
 // alias the caller's Spec — a post-Compile, pre-Launch mutation of the
 // caller's own ExtraEnv/Args must NOT change what actually runs, since

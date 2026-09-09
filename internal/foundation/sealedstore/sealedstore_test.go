@@ -287,6 +287,63 @@ func TestGCLoadLiveIsCalledUnderTheLock(t *testing.T) {
 	}
 }
 
+// Detector (code-review CODE3 codex finding, mutation-sensitivity gap):
+// TestGCLoadLiveIsCalledUnderTheLock above proves GC USES a fresh
+// loadLive's result correctly, but does not actually prove loadLive runs
+// WHILE s.mu is held — moving the `loadLive()` call to just before
+// `s.mu.Lock()` would leave that test green too. This test closes that
+// gap directly: loadLive itself blocks until released, and a concurrent
+// Put attempted while it's blocked must itself block on s.mu — proving
+// GC's lock is held for the ENTIRE loadLive call, not just the sweep
+// that follows it.
+func TestGCLoadLiveRunsWhileLockIsHeld(t *testing.T) {
+	s := open(t)
+	_, pOrphan, err := s.Put([]byte("orphan"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pOrphan.Release()
+
+	loadLiveEntered := make(chan struct{})
+	resumeLoadLive := make(chan struct{})
+	loadLive := func() map[string]bool {
+		close(loadLiveEntered)
+		<-resumeLoadLive
+		return map[string]bool{}
+	}
+
+	gcDone := make(chan error, 1)
+	go func() {
+		_, gerr := s.GC(loadLive)
+		gcDone <- gerr
+	}()
+	<-loadLiveEntered // GC has entered loadLive
+
+	putDone := make(chan error, 1)
+	go func() {
+		_, pin, perr := s.Put([]byte("during-loadLive"))
+		if perr == nil {
+			pin.Release()
+		}
+		putDone <- perr
+	}()
+
+	select {
+	case <-putDone:
+		t.Fatal("Put completed while loadLive was still blocked — loadLive is not called under s.mu")
+	case <-time.After(50 * time.Millisecond):
+		// expected: Put is blocked waiting on s.mu
+	}
+
+	close(resumeLoadLive)
+	if err := <-gcDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-putDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
 // Detector: Open refuses a symlinked directory (fail closed).
 func TestOpenRefusesSymlinkedDir(t *testing.T) {
 	real := t.TempDir()

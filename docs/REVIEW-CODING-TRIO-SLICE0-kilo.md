@@ -1,94 +1,57 @@
-# Review of coding-trio Slice 0 fold (b227412) — code review round 2
+# Review of 6a6085b — CODE3 narrow re-verification (two findings only)
 
-- **Reviewed**: commit `b227412` (`git diff cd7616f..b227412`) on `main`
-- **Verdict**: PASS
+- **Reviewed**: commit `6a6085b` (`git diff b227412..6a6085b`) on `main`
+- **Verdict**: PASS — both findings are closed, nothing new.
 
-All six CODE1 findings plus the notes are folded correctly. I re-verified each
-against the actual code (not the commit message) and ran the four packages —
-`probe` 35.2s, `sandbox` 17.3s, `sealedstore`, `impact` all green, against the
-real bwrap backend.
+`go build ./...`, `go vet ./...`, and `go test -count=1 ./internal/...` all green.
+`TestLaunchRefusesROBindDirectorySwappedAfterCompile` (real bwrap, 1.2s) and the full
+`sealedstore` suite pass.
 
-## Re-verification (the five asks)
+## Finding #1 — ExtraROBinds swap (path-pinned but not identity-pinned) — CLOSED
 
-### 1. probe.go denylistedROBindRoot — bug fixed correctly for every entry
+`guardROBind` now returns `(canon, ROBindIdentity{Dev,Ino}, err)` (`probe.go:587-635`),
+and `PinROBindIdentity` is `guardROBind`'s canonicalize+denylist+ownership+perm check plus
+the dev/inode capture (`probe.go:592-594`). `sandbox.Compile` pins each ExtraROBinds entry
+at compile time and folds `roBindIdentitiesDigest` (sorted by canonical path, dev/inode)
+into `policyHash` (`sandbox.go:244-276,296-312`); the pins are threaded through
+`Spec.ExtraROBindIdentities` into `Launch` (`sandbox.go:425`) and `Prepare`, which re-runs
+`guardROBind` at launch time and refuses when the same canonical path now resolves to a
+different dev/inode (`probe.go:806-809`). The policyHash therefore binds both the path and
+the identity, and the identity is re-verified at the actual launch.
 
-The old unconditional `return true` is gone. The new `denylistedROBindRoot`
-(`probe.go:555-572`) special-cases `/` (`canon == "/"`) and, for every other
-root, does a path-segment-aware check (`canon == root ||
-strings.HasPrefix(canon, root+"/")`), so `/etc` and `/etc/passwd` are denied while
-`/etcetera` is not. It runs in `guardROBind` BEFORE the ownership/mode checks. The
-denylist is a fixed set of core system trees, correctly documented as
-defense-in-depth with the caller still owning the toolchain-path scoping.
+The test is non-vacuous and exercises the real attack: it compiles with `ExtraROBinds:
+[dir]` (canary "BEFORE"), then `os.Rename(dir, dir+".old")` and `os.Mkdir(dir)` + writes
+"AFTER", and asserts `Launch` fails (`sandbox_linux_test.go`). The old identity-less code
+would have launched and read "AFTER".
 
-### 2. sandbox.go cloneSpec — real deep copy, all three fields
+## Finding #2 — sealedstore.GC stale liveDigests — CLOSED
 
-`cloneSpec` (`sandbox.go:252-270`) deep-copies `Args` (`append([]string(nil), …)`),
-`ExtraROBinds` (same), and `ExtraEnv` (a fresh map with each k/v copied); `loosen`
-is a value field and copies with the struct. The `CompiledPolicy` now holds this
-independent copy, so a post-Compile mutation of the caller's Spec cannot desync
-Launch from the attested policyHash. `roBindsDigest` now canonicalizes
-(`EvalSymlinks`) before hashing and returns an error, folding the effective
-boundary (not the literal spelling) into the hash.
+`GC` now takes `loadLive func() map[string]bool` and invokes it **while `s.mu` is held**
+(`sealedstore.go:211-219`), so the "caller decided what is live" → "GC actually started"
+window is removed — the part sealedstore itself controls. The doc comment is honest about
+what remains the caller's job: `loadLive` must perform a FRESH read of the durable
+reference source (the journal) on every call, never a memoized snapshot — a discipline
+sealedstore cannot enforce, and correctly placed on the caller. The pin still covers the
+`[Put → journal-commit → Release]` window, and the post-Release reference is now read
+atomically with the sweep.
 
-### 3. sealedstore descriptor-relative rewrite — no leak, no TOCTOU, no deadlock
-
-- **fd**: `dirFd` opened once (`Open`, O_CLOEXEC) and released by `Close`; every
-  `readAtLocked`/`listNames` fd is `os.NewFile` + `defer Close`; `writeAtLocked`'s
-  temp fd is closed exactly once (the `cleanup` closure runs only on the
-  Write/Sync error paths, before the explicit `Close` at `:279`; the post-close
-  paths use `unix.Unlinkat` directly, never a second Close).
-- **TOCTOU**: all ops are `openat`/`renameat`/`unlinkat` against the held `dirFd`
-  with `O_NOFOLLOW` on the final component, so there is no Lstat-then-open window
-  and no parent-path re-resolution (a mid-flight directory rename can't redirect
-  the already-open fd). `f.Stat()` + `io.ReadAll(f)` act on the open fd.
-- **Put+GC single critical section**: `Put` holds `s.mu` for its whole body and
-  calls the `*Locked` helpers; `GC` holds `s.mu` across `listNames` + the sweep
-  and reads `s.pins[name]` directly (`:210`) rather than a snapshot. `readAt` and
-  `Release` each lock once and call the non-locking variants — no re-lock, no
-  deadlock. `gcPauseHook` runs inside GC's critical section, proving Put blocks.
-- **Symlink safety**: `writeAtLocked` creates the temp with `O_CREAT|O_EXCL|
-  O_NOFOLLOW` and `renameat`s it into place (replaces, never follows); `Put`'s
-  existing-digest shortcut now re-verifies content via `readAtLocked` + hash
-  (`:138-148`) instead of trusting Lstat success.
-
-### 4. impact.go prodRdeps/testOwners split — correct, no under-inclusion
-
-`BuildGraph` puts production imports in `prodRdeps` and test imports in
-`testOwners`. `Affected` walks `prodRdeps` transitively and, at each visited node
-including the changed set, adds `testOwners[cur]` to the result WITHOUT enqueueing
-(terminal). I walked `TestAffectedTestOnlyEdgeDoesNotPropagateTransitively`:
-`a2 <-test- f2 <-production- g2` → `Affected(a2) = {f2}` (g2 excluded), which the
-old conflated graph would have gotten wrong (g2 included). The terminal edge is
-correct because a package that reaches `imp` only through its test file has no
-production dependency on `imp`, so its production callers never see `imp` — no
-legitimate case becomes under-inclusive, and a package that is BOTH a production
-and a test importer gets the `prodRdeps` edge (transitive) plus the `testOwners`
-edge (terminal), so its own dependents are still walked. A `testOwners` member
-always has tests (`TestImports` non-empty implies `TestGoFiles` non-empty), so the
-unconditional `result[owner]=true` never selects a non-testable package.
-
-### 5. False-green test fixes — now non-vacuous
-
-`TestGetRefusesSymlink` names the symlink by the outside data's TRUE digest, so a
-symlink-following Get would return matching bytes — the test can only pass via the
-refusal path. `TestAffectedTestOnlyEdgeDoesNotPropagateTransitively` is the real
-counterexample above. `TestParseGoListRealSample` asserts on both `sealedstore`
-and `atomicwrite` (later stream objects), so a decode-first-only regression fails.
-The `printenv` probehelper subcommand (`cmd/probehelper/main.go:84-89`) lets
-`TestExtraROBindsAndEnvPropagateThroughFullProtocol` assert the env value, not
-just its non-error presence.
+The test `TestGCLoadLiveIsCalledUnderTheLock` simulates exactly the
+Put → commit (`live[d]=true`) → `Release` sequence and asserts the artifact survives a
+`GC(loadLive)` whose `loadLive` reads fresh. It is non-vacuous against the old
+`GC(map[string]bool)` API (a pre-committed snapshot would have deleted it).
 
 ## Notes (not FAIL reasons)
 
-1. `reservedEnvKeys` (`probe.go:611-615`) covers `LD_LIBRARY_PATH`/`LD_PRELOAD`/
-   `PATH` — the three that unseat the closure-pinning baseline. `LD_AUDIT` (another
-   loader variable) is not reserved; low risk since the audit library would still
-   have to resolve inside the sandbox's pinned closure + ro-binds, but worth adding
-   if the caller surface ever exposes arbitrary env.
-2. `denylistedROBindRoot` is a fixed list; a non-standard sensitive mount (e.g. a
-   custom `/data`) would not be denied by probe itself. The doc comment correctly
-   assigns that scoping to the future coding-runner via `go env` resolution — a
-   layered design, but the caller-side allowlist should be a named Slice-0 deliverable
-   so it isn't deferred indefinitely.
+1. `TestGCLoadLiveIsCalledUnderTheLock` is slightly misnamed — it directly proves "a fresh
+   `loadLive` is honored", not literally "called under the lock"; the lock placement is
+   established by code inspection plus `TestGCAndPutSerializeUnderOneCriticalSection`'s
+   `gcPauseHook`. Harmless.
+2. The `loadLive` doc comment should add "must not call back into the Store (would deadlock
+   under `s.mu`)" — the intended journal-scan caller doesn't re-enter, but a future caller
+   might.
+3. `PinROBindIdentity` is a bounded swap detector (dev+inode, not content); an in-place edit
+   of files *within* an unchanged directory is not detected. This is correctly scoped in the
+   `ExtraROBindIdentities` doc comment as the toolchain-pinning caller's responsibility, not
+   a defect.
 
 VERDICT: PASS

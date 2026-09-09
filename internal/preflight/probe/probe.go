@@ -806,8 +806,28 @@ func Prepare(av Availability, spec Spec) (*Handle, error) {
 				continue // de-duplicate after canonicalization
 			}
 			seen[canon] = true
-			if pinned, ok := spec.ExtraROBindIdentities[canon]; ok && pinned != identity {
-				return fail(fmt.Errorf("ro-bind %s: directory identity changed since it was compiled (dev/ino %v now, %v pinned) — possible swap attack (fail closed)", canon, identity, pinned))
+			// A non-nil ExtraROBindIdentities means this Spec came through
+			// sandbox.Compile, which pins EVERY declared ExtraROBinds entry
+			// (code-review CODE3 codex finding: a symlink-retargeting
+			// bypass). A caller's original bind string can be a symlink
+			// (e.g. a toolchain alias); Compile pins the identity under
+			// the canonical path IT resolved. If the symlink is retargeted
+			// between Compile and Launch, guardROBind resolves a
+			// DIFFERENT canonical path here — a plain "ok && mismatch"
+			// check silently SKIPS the comparison on a map miss, fail
+			// OPEN. A missing entry when the map is non-nil is therefore
+			// refused outright, not treated as "no check requested" —
+			// that meaning is reserved for a nil map (a caller that never
+			// went through Compile at all, e.g. probe.Prepare called
+			// directly in tests).
+			if spec.ExtraROBindIdentities != nil {
+				pinned, ok := spec.ExtraROBindIdentities[canon]
+				if !ok {
+					return fail(fmt.Errorf("ro-bind %s: no identity pin found for this resolved path — possible symlink-retarget attack since compile (fail closed)", canon))
+				}
+				if pinned != identity {
+					return fail(fmt.Errorf("ro-bind %s: directory identity changed since it was compiled (dev/ino %v now, %v pinned) — possible swap attack (fail closed)", canon, identity, pinned))
+				}
 			}
 			args = append(args, "--ro-bind", canon, canon)
 		}
