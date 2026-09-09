@@ -93,6 +93,21 @@ func ClassOf(err error) (health.Class, string) {
 	}
 	var found *ClassifiedError
 	if !errors.As(err, &found) {
+		// A typed transport Failure without an explicit class is classified
+		// by its own fields (the adapter's call boundary is the originating
+		// owner of that type): 401/403 = remote_rejected, a receipt the
+		// journal could not record = substrate, anything else = transport.
+		var f *Failure
+		if errors.As(err, &f) {
+			switch {
+			case f.Code == "receipt_not_durable":
+				return health.ClassSubstrate, f.Code
+			case f.Status == 401 || f.Status == 403:
+				return health.ClassRemoteRejected, f.Code
+			default:
+				return health.ClassTransport, f.Code
+			}
+		}
 		return health.ClassSubstrate, "unclassified"
 	}
 	// A joined error may carry several classes: substrate dominates.

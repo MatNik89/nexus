@@ -144,6 +144,11 @@ func TestClassOfTable(t *testing.T) {
 		{fmt.Errorf("wrapped: %w", &channel.ClassifiedError{Class: health.ClassTransport, Code: "http_429"}), health.ClassTransport, false},
 		{fmt.Errorf("deep: %w", fmt.Errorf("er: %w", &channel.ClassifiedError{Class: health.ClassRemoteRejected, Code: "http_4xx"})), health.ClassRemoteRejected, true},
 		{errors.Join(&channel.ClassifiedError{Class: health.ClassTransport}, &channel.ClassifiedError{Class: health.ClassSubstrate, Code: "landing"}), health.ClassSubstrate, true},
+		// A bare typed Failure classifies by its own fields (a 404 on
+		// setMyCommands degrades, it never stops the adapter).
+		{&channel.Failure{Code: "http_4xx", Status: 404}, health.ClassTransport, false},
+		{&channel.Failure{Code: "http_4xx", Status: 401}, health.ClassRemoteRejected, true},
+		{&channel.Failure{Code: "receipt_not_durable"}, health.ClassSubstrate, true},
 	}
 	for i, tc := range cases {
 		cls, _ := channel.ClassOf(tc.err)

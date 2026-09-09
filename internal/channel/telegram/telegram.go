@@ -740,7 +740,11 @@ func (a *Adapter) registerCommands(ctx context.Context) error {
 			return err
 		}
 		if !me.IsBot || me.ID == 0 {
-			return fmt.Errorf("telegram: token does not identify a bot (fail closed)")
+			// A remote that does not identify the bot cannot anchor a durable
+			// registration: degraded (transport), retried on a later tick —
+			// never a reason to stop polling/delivery.
+			return &channel.ClassifiedError{Class: health.ClassTransport, Code: "getme_no_id",
+				Cause: fmt.Errorf("telegram: getMe did not identify a bot (id/is_bot)")}
 		}
 		a.botID = me.ID
 	}
