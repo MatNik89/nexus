@@ -1,0 +1,718 @@
+package telegram
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/MatNik89/nexus/internal/channel"
+	"github.com/MatNik89/nexus/internal/channel/health"
+	"github.com/MatNik89/nexus/internal/kernel/contracts"
+	"github.com/MatNik89/nexus/internal/kernel/s7"
+)
+
+func faultOn(types ...string) func([]string) error {
+	return func(batch []string) error {
+		for _, b := range batch {
+			for _, t := range types {
+				if b == t {
+					return errors.New("injected append fault")
+				}
+			}
+		}
+		return nil
+	}
+}
+
+// Detector 9d (full table): a valid grant minted for one kind presented under
+// another kind/method — or a method outside its kind — never reaches the
+// wire (refused BEFORE Consume; the grant stays usable for its real kind).
+func TestGrantKindMethodSubstitutionTable(t *testing.T) {
+	h := build(t, map[int64]string{42: "work"})
+	// A real UI grant and a real delivery grant.
+	uiOp, uiTarget := contracts.OperationID("ui:tg:sendChatAction:1"), contracts.TargetID("channel:tg:chat:42")
+	if err := h.auth.Begin(uiOp, uiTarget, s7.PolicyUI); err != nil {
+		t.Fatal(err)
+	}
+	uiGrant, _ := h.auth.Next(uiOp, nil)
+	pollOp := contracts.OperationID("poll:tg:1")
+	h.auth.Begin(pollOp, pollTarget, s7.PolicyPoll)
+	pollGrant, _ := h.auth.Next(pollOp, nil)
+	id := enqueue(t, h, "x")
+	rows, _ := h.core.Pending(ctxT())
+	dOp, dTarget := channel.OperationFor(rows[0]), channel.TargetFor(rows[0])
+	h.auth.Begin(dOp, dTarget, s7.PolicyDelivery)
+	dGrant, _ := h.auth.Next(dOp, func(s7.Landing) s7.Companion { return s7.Companion{} })
+	_ = id
+	cases := []struct {
+		name   string
+		g      s7.Grant
+		method string
+		kind   callKind
+		op     contracts.OperationID
+		target contracts.TargetID
+	}{
+		{"ui-grant-as-delivery-sendMessage", uiGrant, "sendMessage", kindDelivery, uiOp, uiTarget},
+		{"ui-grant-as-control-effect", uiGrant, "setMyCommands", kindControlEffect, uiOp, uiTarget},
+		{"ui-grant-wrong-method", uiGrant, "getUpdates", kindUI, uiOp, uiTarget},
+		{"poll-grant-as-delivery", pollGrant, "sendMessage", kindDelivery, pollOp, pollTarget},
+		{"poll-grant-as-control-read", pollGrant, "getMe", kindControlRead, pollOp, pollTarget},
+		{"delivery-grant-as-poll", dGrant, "getUpdates", kindPoll, dOp, dTarget},
+		{"delivery-grant-as-ui", dGrant, "sendMessage", kindUI, dOp, dTarget},
+		{"delivery-grant-wrong-method", dGrant, "getMe", kindDelivery, dOp, dTarget},
+		{"delivery-without-companion", dGrant, "sendMessage", kindDelivery, dOp, dTarget},
+	}
+	for _, tc := range cases {
+		before := h.bot.polls() + sends(h) + h.bot.getMes() + h.bot.setCalls()
+		err := h.a.call(ctxT(), tc.method, map[string]any{"chat_id": 42, "text": "x", "offset": 0}, nil, tc.g, tc.kind, tc.op, tc.target)
+		if !errors.Is(err, s7.ErrAttemptNotAuthorized) {
+			t.Fatalf("%s: not refused: %v", tc.name, err)
+		}
+		if after := h.bot.polls() + sends(h) + h.bot.getMes() + h.bot.setCalls(); after != before {
+			t.Fatalf("%s: wire touched", tc.name)
+		}
+	}
+	// The grants were never consumed by the refusals.
+	for _, op := range []contracts.OperationID{uiOp, pollOp, dOp} {
+		if st, _ := h.auth.State(op); st != contracts.AttemptAuthorized {
+			t.Fatalf("%s consumed by a refused substitution: %s", op, st)
+		}
+	}
+}
+
+// Detector D6 table: every transient poll failure class — pre-wire (dead
+// endpoint), 429, 5xx, post-write reset — lands FAILED_RETRYABLE, produces
+// ZERO polls before next_attempt_at, then exactly one fresh-grant poll when
+// due which succeeds.
+func TestPollTransientTable(t *testing.T) {
+	cases := []struct {
+		name string
+		arm  func(h *harness)
+		code string
+	}{
+		{"pre-wire", func(h *harness) { h.a.base = "http://127.0.0.1:1" }, s7.CodeTransportPreWire},
+		{"http-429", func(h *harness) { h.bot.mu.Lock(); h.bot.pollStatus, h.bot.pollStatusLeft = 429, 1; h.bot.mu.Unlock() }, s7.CodeHTTP429},
+		{"http-5xx", func(h *harness) { h.bot.mu.Lock(); h.bot.pollStatus, h.bot.pollStatusLeft = 503, 1; h.bot.mu.Unlock() }, s7.CodeHTTP5xx},
+		{"post-write-reset", func(h *harness) { h.bot.mu.Lock(); h.bot.pollCloseLeft = 1; h.bot.mu.Unlock() }, s7.CodeTransportPostWrite},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := build(t, map[int64]string{42: "work"})
+			live := h.a.base
+			tc.arm(h)
+			err := h.a.PollOnce(ctxT())
+			var ce *channel.ClassifiedError
+			if !errors.As(err, &ce) || ce.Class != health.ClassTransport || ce.Code != tc.code {
+				t.Fatalf("classification: %v", err)
+			}
+			if st, _ := h.auth.State(h.a.pollOp); st != contracts.AttemptFailedRetryable {
+				t.Fatalf("S7 state %s, want FAILED_RETRYABLE", st)
+			}
+			h.a.base = live
+			before := h.bot.polls()
+			if err := h.a.PollOnce(ctxT()); !errors.Is(err, channel.ErrNothingDue) {
+				t.Fatalf("poll before due: %v", err)
+			}
+			if h.bot.polls() != before {
+				t.Fatal("polled before S7 said due")
+			}
+			tgClock.advance(time.Hour)
+			if err := h.a.PollOnce(ctxT()); err != nil {
+				t.Fatalf("due poll: %v", err)
+			}
+			if h.bot.polls() != before+1 {
+				t.Fatalf("expected exactly one poll when due, got %d", h.bot.polls()-before)
+			}
+		})
+	}
+}
+
+// Detector D7 table: getMe (control-read) 5xx and post-write reset are
+// retried by S7's Execute exactly once due (the fake clock is advanced during
+// the S7-owned wait), total two calls; the same failures on setMyCommands
+// land UNKNOWN with zero retries (D2, effectful).
+func TestControlReadRetryTable(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		arm  func(h *harness)
+	}{
+		{"getMe-5xx", func(h *harness) {
+			h.bot.mu.Lock()
+			h.bot.getMeStatus, h.bot.getMeStatusLeft = 503, 1
+			h.bot.mu.Unlock()
+		}},
+		{"getMe-post-write", func(h *harness) { h.bot.mu.Lock(); h.bot.getMeCloseLeft = 1; h.bot.mu.Unlock() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := build(t, map[int64]string{42: "work"})
+			tc.arm(h)
+			done := make(chan error, 1)
+			var me struct {
+				ID int64 `json:"id"`
+			}
+			go func() { done <- h.a.controlRead(ctxT(), "getMe", map[string]any{}, &me) }()
+			time.Sleep(400 * time.Millisecond)
+			if h.bot.getMes() != 1 {
+				t.Fatalf("retried before S7 backoff elapsed: %d calls", h.bot.getMes())
+			}
+			tgClock.advance(time.Hour) // the S7-owned wait observes the due time
+			select {
+			case err := <-done:
+				if err != nil || me.ID != 1 || h.bot.getMes() != 2 {
+					t.Fatalf("retry when due: err=%v id=%d calls=%d", err, me.ID, h.bot.getMes())
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("controlRead did not complete")
+			}
+		})
+	}
+	// Effectful control: 5xx on setMyCommands -> UNKNOWN, zero retries across
+	// any number of due ticks (the only exit is reconciliation).
+	h := build(t, map[int64]string{42: "work"})
+	h.bot.mu.Lock()
+	h.bot.setStatus, h.bot.setStatusLeft = 503, 1
+	h.bot.mu.Unlock()
+	_ = h.a.registerCommands(ctxT())
+	op := channel.ControlOperation("tg", 1, "setMyCommands", menuHash())
+	if st, _ := h.auth.State(op); st != contracts.AttemptUnknown {
+		t.Fatalf("effectful 5xx landed %s, want UNKNOWN", st)
+	}
+	h.bot.mu.Lock()
+	h.bot.remoteCommands = `[{"command":"stale","description":"x"}]`
+	h.bot.mu.Unlock()
+	// Reconciliation (remote differs) is the honest path: it does NOT blindly
+	// re-send; it lands the same operation retryable and S7 schedules it.
+	_ = h.a.registerCommands(ctxT())
+	if h.bot.setCalls() != 1 {
+		t.Fatalf("blind re-send after UNKNOWN: %d", h.bot.setCalls())
+	}
+}
+
+// Detector D2 (Run level): a setMyCommands 5xx degrades telegram.register
+// (transport, UNKNOWN in S7) while polling and delivery CONTINUE; with the
+// remote menu equal to the desired set, reconciliation succeeds read-only.
+func TestRegistration5xxDegradesButAdapterContinues(t *testing.T) {
+	h := build(t, map[int64]string{42: "work"})
+	h.bot.mu.Lock()
+	h.bot.setStatus, h.bot.setStatusLeft = 502, 1
+	h.bot.remoteCommands = mustJSON(commandMenu())
+	h.bot.batches = [][]map[string]any{{textUpdate(1, 42, "hi")}}
+	h.bot.mu.Unlock()
+	if err := runUntilStop(t, h, 250*time.Millisecond); err != nil {
+		t.Fatalf("transport degradation stopped the adapter: %v", err)
+	}
+	if h.bot.polls() == 0 || len(h.got) != 1 {
+		t.Fatalf("polling/handling did not continue: polls=%d got=%d", h.bot.polls(), len(h.got))
+	}
+	if h.bot.setCalls() != 1 {
+		t.Fatalf("setMyCommands retried blindly: %d", h.bot.setCalls())
+	}
+	op := channel.ControlOperation("tg", 1, "setMyCommands", menuHash())
+	if st, _ := h.auth.State(op); st != contracts.AttemptSucceeded {
+		t.Fatalf("reconciliation did not land SUCCEEDED: %s", st)
+	}
+	entries, _ := health.Read(h.hpath)
+	seen := false
+	for _, e := range entries {
+		if e.Component == "telegram.register" {
+			seen = true
+		}
+	}
+	if !seen {
+		t.Fatalf("register component never recorded: %+v", entries)
+	}
+}
+
+// Detector D2b (torn batch) + D2d (provenance): a faulted reconcile batch
+// leaves S7 UNKNOWN and the control_effect row UNKNOWN (nothing torn); after
+// the journal recovers reconciliation lands. Bot A's UNKNOWN registration is
+// never resolved by bot B: B registers exactly once under its own operation.
+func TestReconcileTornBatchAndProvenance(t *testing.T) {
+	dir := t.TempDir()
+	h, _ := buildAt(t, dir, map[int64]string{42: "work"})
+	h.bot.mu.Lock()
+	h.bot.botID = 6
+	h.bot.setStatus, h.bot.setStatusLeft = 502, 1
+	h.bot.remoteCommands = mustJSON(commandMenu())
+	h.bot.mu.Unlock()
+	_ = h.a.registerCommands(ctxT())
+	opA := channel.ControlOperation("tg", 6, "setMyCommands", menuHash())
+	if st, _ := h.auth.State(opA); st != contracts.AttemptUnknown {
+		t.Fatalf("A not UNKNOWN: %s", st)
+	}
+	h.auth.SetAppendFault(faultOn(s7.EvOperationReconcile))
+	if err := h.a.registerCommands(ctxT()); !errors.Is(err, s7.ErrNotDurable) {
+		t.Fatalf("torn reconcile not surfaced: %v", err)
+	}
+	if st, _ := h.auth.State(opA); st != contracts.AttemptUnknown {
+		t.Fatalf("S7 moved without the companion: %s", st)
+	}
+	if st, _ := h.core.ControlEffectState(ctxT(), opA); st != "UNKNOWN" {
+		t.Fatalf("control_effect row moved without S7: %s", st)
+	}
+	h.auth.SetAppendFault(nil)
+	if err := h.a.registerCommands(ctxT()); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := h.auth.State(opA); st != contracts.AttemptSucceeded || h.bot.setCalls() != 1 {
+		t.Fatalf("recovered reconcile: %s set=%d", st, h.bot.setCalls())
+	}
+	// Provenance: bot 8 lands UNKNOWN; restart as bot 9 with the remote menu
+	// equal to the desired set -> 8 stays UNKNOWN (no Reconcile), 9 makes ONE call.
+	h.j.Close()
+	h2, _ := buildAt(t, dir, map[int64]string{42: "work"})
+	h2.bot.mu.Lock()
+	h2.bot.botID = 8
+	h2.bot.setStatus, h2.bot.setStatusLeft = 502, 1
+	h2.bot.mu.Unlock()
+	_ = h2.a.registerCommands(ctxT())
+	op8 := channel.ControlOperation("tg", 8, "setMyCommands", menuHash())
+	h2.j.Close()
+	h3, _ := buildAt(t, dir, map[int64]string{42: "work"})
+	h3.bot.mu.Lock()
+	h3.bot.botID = 9
+	h3.bot.remoteCommands = mustJSON(commandMenu())
+	h3.bot.mu.Unlock()
+	if err := h3.a.registerCommands(ctxT()); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := h3.auth.State(op8); st != contracts.AttemptUnknown {
+		t.Fatalf("bot 8's UNKNOWN was touched by bot 9: %s", st)
+	}
+	if h3.bot.setCalls() != 1 || h3.bot.getMyCommandsCalls != 0 {
+		t.Fatalf("bot 9: set=%d getMyCommands=%d (want 1/0)", h3.bot.setCalls(), h3.bot.getMyCommandsCalls)
+	}
+}
+
+// Detector D4 (per mark): a fault on EACH outbox mark batch — the STARTED+park
+// (outbound_unknown), the SENT landing, the re-pend and the FAILED landing —
+// is a SUBSTRATE failure: Flush returns it typed, the row is never half-landed,
+// and Run stops.
+func TestOutboxMarkFaultsAreSubstrate(t *testing.T) {
+	cases := []struct {
+		name  string
+		event string
+		arm   func(h *harness)
+		row   string // expected outbox status after the faulted cycle
+	}{
+		{"park", channel.EvOutboundUnknown, func(*harness) {}, "PENDING"},
+		{"sent", channel.EvOutboundSent, func(*harness) {}, "UNKNOWN"},
+		{"repend", channel.EvOutboundRepend, func(h *harness) { h.bot.mu.Lock(); h.bot.sendStatus, h.bot.sendStatusLeft = 429, 1; h.bot.mu.Unlock() }, "UNKNOWN"},
+		{"failed", channel.EvOutboundFailed, func(h *harness) { h.bot.mu.Lock(); h.bot.sendStatus, h.bot.sendStatusLeft = 400, 1; h.bot.mu.Unlock() }, "UNKNOWN"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := build(t, map[int64]string{42: "work"})
+			enqueue(t, h, "plain")
+			tc.arm(h)
+			h.auth.SetAppendFault(faultOn(tc.event))
+			// Driven THROUGH Run: the faulted outbox cycle is substrate and
+			// STOPS the adapter (typed return), the row is never half-landed.
+			err := runUntilStop(t, h, 2*time.Second)
+			cls, _ := channel.ClassOf(err)
+			if err == nil || cls != health.ClassSubstrate {
+				t.Fatalf("mark fault did not stop the adapter as substrate: %v", err)
+			}
+			e := entry(t, h, "telegram.outbox")
+			if e.Healthy || e.Class != health.ClassSubstrate || !e.Stopped {
+				t.Fatalf("health entry %+v", e)
+			}
+			status := "SENT"
+			if p, _ := h.core.Pending(ctxT()); len(p) == 1 {
+				status = "PENDING"
+			} else if u, _ := h.core.Unreconciled(ctxT()); len(u) == 1 {
+				status = "UNKNOWN"
+			} else if f, _ := h.core.FailedFor(ctxT(), "telegram", "chat-42"); len(f) == 1 {
+				status = "FAILED"
+			}
+			if status != tc.row {
+				t.Fatalf("row status %s after faulted %s, want %s", status, tc.name, tc.row)
+			}
+		})
+	}
+}
+
+func init() {
+	_ = fmt.Sprint
+	_ = context.Background
+}
+
+// Detector 9d (per method, first-use then reuse / zero grant): for every Bot
+// API method a VALID first call happens under its own grant; presenting the
+// SAME grant again, or no grant at all, is refused before the wire (exactly
+// one wire call per method).
+func TestEveryMethodReuseAndMissingGrantRefused(t *testing.T) {
+	h := build(t, map[int64]string{42: "work"})
+	h.bot.mu.Lock()
+	h.bot.botID = 1
+	h.bot.remoteCommands = mustJSON(commandMenu())
+	h.bot.mu.Unlock()
+	h.a.botID = 1 // bound() now requires the adapter's own resolved bot to match (CODE6 codex #3)
+	total := func() int {
+		return h.bot.polls() + sends(h) + h.bot.getMes() + h.bot.setCalls() + h.bot.chatActions() +
+			h.bot.getMyCommandsN() + h.bot.rich() + h.bot.edits() + h.bot.answers()
+	}
+	// delivery
+	enqueue(t, h, "plain")
+	rows, _ := h.core.Pending(ctxT())
+	dOp, dT := channel.OperationFor(rows[0]), channel.TargetFor(rows[0])
+	h.auth.Begin(dOp, dT, s7.PolicyDelivery)
+	dG, _ := h.auth.Next(dOp, func(s7.Landing) s7.Companion { return s7.Companion{} })
+	parkParams := func() s7.Companion {
+		p, _ := h.core.MarkParamsForTest(channel.EvOutboundUnknown, rows[0].DeliveryID, dOp)
+		return s7.Companion{Key: dOp, Params: p}
+	}
+	// A second, independent delivery row for the sendRichMessage row (each
+	// delivery operation is single-use — the same row cannot host two rows
+	// of this table).
+	enqueue(t, h, "plain")
+	rows2, _ := h.core.Pending(ctxT())
+	var row2 channel.Outbound
+	for _, r := range rows2 {
+		if r.DeliveryID != rows[0].DeliveryID {
+			row2 = r
+			break
+		}
+	}
+	rOp2, rT2 := channel.OperationFor(row2), channel.TargetFor(row2)
+	h.auth.Begin(rOp2, rT2, s7.PolicyDelivery)
+	rG2, _ := h.auth.Next(rOp2, func(s7.Landing) s7.Companion { return s7.Companion{} })
+	parkParams2 := func() s7.Companion {
+		p, _ := h.core.MarkParamsForTest(channel.EvOutboundUnknown, row2.DeliveryID, rOp2)
+		return s7.Companion{Key: rOp2, Params: p}
+	}
+	// poll / control-read / control-effect / ui grants
+	pOp := contracts.OperationID("poll:tg:77")
+	h.auth.Begin(pOp, pollTarget, s7.PolicyPoll)
+	pG, _ := h.auth.Next(pOp, nil)
+	meOp, meT := contracts.OperationID("control:tg:getMe:77"), contracts.TargetID("channel:tg:getMe")
+	h.auth.Begin(meOp, meT, s7.PolicyControlRead)
+	meG, _ := h.auth.Next(meOp, nil)
+	// getMyCommands is bot-bound in production (registerCommands only calls
+	// it once a.botID is resolved): the bot id in the operation must match
+	// the bot id in the target exactly (code-review CODE5 codex, new
+	// finding #1) — an unbound identity is refused by bound() now.
+	gcOp, gcT := contracts.OperationID("control:tg:1:getMyCommands:77"), contracts.TargetID("channel:tg:bot:1:getMyCommands")
+	h.auth.Begin(gcOp, gcT, s7.PolicyControlRead)
+	gcG, _ := h.auth.Next(gcOp, nil)
+	// setMyCommands' payload hash is now bound to the ACTUAL marshaled
+	// wire body (code-review CODE6 codex #3: call() recomputes and
+	// compares the real request's sha256 against the operation's hash) —
+	// derive it from the exact same request map the loop below sends,
+	// not an arbitrary placeholder.
+	testReq := func() map[string]any {
+		return map[string]any{"chat_id": 42, "text": "x", "offset": 0, "action": "typing",
+			"rich_message": map[string]any{"markdown": "x"}, "commands": []map[string]string{{"command": "x", "description": "x"}},
+			"callback_query_id": "1", "message_id": 1}
+	}
+	reqBytes, err := json.Marshal(testReq())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(reqBytes)
+	setHash := hex.EncodeToString(sum[:])
+	setOp := channel.ControlOperation("tg", 1, "setMyCommands", setHash)
+	setT := channel.ControlTarget("tg", 1, "setMyCommands")
+	setPol := s7.PolicyControlEffect
+	setPol.Durable = true // matches registerCommands' own pol.Durable = registrationPolicyDurable
+	h.auth.Begin(setOp, setT, setPol)
+	setG, _ := h.auth.Next(setOp, func(s7.Landing) s7.Companion { return s7.Companion{} })
+	setParams := func() s7.Companion {
+		_, p, _ := h.core.ControlEffectParams("tg", 1, "setMyCommands", setHash, "UNKNOWN")
+		return s7.Companion{Key: setOp, Params: p}
+	}
+	uiOp := func(method string) contracts.OperationID {
+		return contracts.OperationID(fmt.Sprintf("ui:tg:%s:77", method))
+	}
+	uiT := contracts.TargetID("channel:tg:chat:42")
+	beginUI := func(method string) s7.Grant {
+		op := uiOp(method)
+		h.auth.Begin(op, uiT, s7.PolicyUI)
+		g, _ := h.auth.Next(op, nil)
+		return g
+	}
+	uCA, uSM, uAns, uEditRM, uEditT := beginUI("sendChatAction"), beginUI("sendMessage"), beginUI("answerCallbackQuery"), beginUI("editMessageReplyMarkup"), beginUI("editMessageText")
+
+	cases := []struct {
+		name   string
+		method string
+		kind   callKind
+		g      s7.Grant
+		op     contracts.OperationID
+		target contracts.TargetID
+		comp   func() []s7.Companion
+	}{
+		{"delivery.sendMessage", "sendMessage", kindDelivery, dG, dOp, dT, func() []s7.Companion { return []s7.Companion{parkParams()} }},
+		{"delivery.sendRichMessage", "sendRichMessage", kindDelivery, rG2, rOp2, rT2, func() []s7.Companion { return []s7.Companion{parkParams2()} }},
+		{"poll.getUpdates", "getUpdates", kindPoll, pG, pOp, pollTarget, func() []s7.Companion { return nil }},
+		{"controlRead.getMe", "getMe", kindControlRead, meG, meOp, meT, func() []s7.Companion { return nil }},
+		{"controlRead.getMyCommands", "getMyCommands", kindControlRead, gcG, gcOp, gcT, func() []s7.Companion { return nil }},
+		{"controlEffect.setMyCommands", "setMyCommands", kindControlEffect, setG, setOp, setT, func() []s7.Companion { return []s7.Companion{setParams()} }},
+		{"ui.sendChatAction", "sendChatAction", kindUI, uCA, uiOp("sendChatAction"), uiT, func() []s7.Companion { return nil }},
+		{"ui.sendMessage", "sendMessage", kindUI, uSM, uiOp("sendMessage"), uiT, func() []s7.Companion { return nil }},
+		{"ui.answerCallbackQuery", "answerCallbackQuery", kindUI, uAns, uiOp("answerCallbackQuery"), uiT, func() []s7.Companion { return nil }},
+		{"ui.editMessageReplyMarkup", "editMessageReplyMarkup", kindUI, uEditRM, uiOp("editMessageReplyMarkup"), uiT, func() []s7.Companion { return nil }},
+		{"ui.editMessageText", "editMessageText", kindUI, uEditT, uiOp("editMessageText"), uiT, func() []s7.Companion { return nil }},
+	}
+	if len(cases) != 11 {
+		t.Fatalf("table has %d rows, want all 11 kind/method pairs in kindMethods", len(cases))
+	}
+	for _, tc := range cases {
+		before := total()
+		req := testReq()
+		if err := h.a.call(ctxT(), tc.method, req, nil, tc.g, tc.kind, tc.op, tc.target, tc.comp()...); err != nil {
+			t.Fatalf("%s: valid first use failed: %v", tc.name, err)
+		}
+		if total() != before+1 {
+			t.Fatalf("%s: first use made %d wire calls, want 1", tc.name, total()-before)
+		}
+		if err := h.a.call(ctxT(), tc.method, req, nil, tc.g, tc.kind, tc.op, tc.target, tc.comp()...); !errors.Is(err, s7.ErrAttemptNotAuthorized) {
+			t.Fatalf("%s: same grant reused: %v", tc.name, err)
+		}
+		if err := h.a.call(ctxT(), tc.method, req, nil, s7.Grant{}, tc.kind, tc.op, tc.target, tc.comp()...); !errors.Is(err, s7.ErrAttemptNotAuthorized) {
+			t.Fatalf("%s: zero grant accepted: %v", tc.name, err)
+		}
+		if total() != before+1 {
+			t.Fatalf("%s: reuse/zero grant reached the wire", tc.name)
+		}
+	}
+}
+
+// Detector D2 (immediate, ablation-capable): after the registration cycle
+// that receives a 5xx, telegram.register is ALREADY degraded (transport,
+// http_5xx) with S7 UNKNOWN — observed before any reconciliation; a
+// registration pre-wire refusal is retried exactly when due.
+func TestRegistrationDegradedImmediatelyAndPreWireRetry(t *testing.T) {
+	h := build(t, map[int64]string{42: "work"})
+	h.bot.mu.Lock()
+	h.bot.setStatus, h.bot.setStatusLeft = 503, 1
+	h.bot.remoteCommands = `[{"command":"stale","description":"x"}]`
+	h.bot.mu.Unlock()
+	if err := h.a.record(ctxT(), "telegram.register", h.a.registerCommands(ctxT())); err != nil {
+		t.Fatalf("5xx registration classified fatal: %v", err)
+	}
+	e := entry(t, h, "telegram.register")
+	if e.Healthy || e.Class != health.ClassTransport || e.Code != s7.CodeHTTP5xx {
+		t.Fatalf("register not degraded immediately: %+v", e)
+	}
+	if st, _ := h.auth.State(channel.ControlOperation("tg", 1, "setMyCommands", menuHash())); st != contracts.AttemptUnknown {
+		t.Fatalf("S7 %s, want UNKNOWN", st)
+	}
+	// Pre-wire refusal on a fresh bot: retried exactly when due.
+	h2 := build(t, map[int64]string{42: "work"})
+	h2.bot.mu.Lock()
+	h2.bot.botID = 11
+	h2.bot.mu.Unlock()
+	live := h2.a.base
+	// getMe must succeed first (bot id), then the effect call hits a dead base.
+	var me struct {
+		ID int64 `json:"id"`
+	}
+	if err := h2.a.controlRead(ctxT(), "getMe", map[string]any{}, &me); err != nil {
+		t.Fatal(err)
+	}
+	h2.a.botID = me.ID
+	h2.a.base = "http://127.0.0.1:1"
+	err := h2.a.registerCommands(ctxT())
+	op := channel.ControlOperation("tg", 11, "setMyCommands", menuHash())
+	if err == nil {
+		t.Fatal("pre-wire refusal reported success")
+	}
+	if st, _ := h2.auth.State(op); st != contracts.AttemptFailedRetryable {
+		t.Fatalf("pre-wire registration landed %s, want FAILED_RETRYABLE", st)
+	}
+	h2.a.base = live
+	if err := h2.a.registerCommands(ctxT()); !errors.Is(err, channel.ErrNothingDue) || h2.bot.setCalls() != 0 {
+		t.Fatalf("re-registered before due: err=%v set=%d", err, h2.bot.setCalls())
+	}
+	tgClock.advance(time.Hour)
+	if err := h2.a.registerCommands(ctxT()); err != nil || h2.bot.setCalls() != 1 {
+		t.Fatalf("registration when due: err=%v set=%d", err, h2.bot.setCalls())
+	}
+}
+
+// Detector D (health substrate): when the health projection itself cannot be
+// written, the cycle is a SUBSTRATE failure and Run stops (never a silent
+// health blackout).
+func TestHealthProjectionWriteFailureStopsAdapter(t *testing.T) {
+	h := build(t, map[int64]string{42: "work"})
+	// Make the projection path unwritable: a directory where the file goes.
+	if err := os.MkdirAll(h.hpath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	err := runUntilStop(t, h, 500*time.Millisecond)
+	var ce *channel.ClassifiedError
+	if !errors.As(err, &ce) || ce.Class != health.ClassSubstrate || ce.Code != "health_write" {
+		t.Fatalf("health write failure not fatal substrate: %v", err)
+	}
+}
+
+// Detector (code-review CODE5 codex, new finding #1): bound() must require
+// EXACT bot-id agreement between the operation and the target for every
+// bot-bound control method — a mismatched bot id (grant minted for bot 1,
+// presented against bot 2's target, or vice versa) is refused before the
+// wire, for both control-read (getMyCommands) and control-effect
+// (setMyCommands).
+func TestControlBotIDMismatchRefusedBeforeWire(t *testing.T) {
+	h := build(t, map[int64]string{42: "work"})
+	before := h.bot.getMyCommandsCalls
+	beforeSet := h.bot.setCommandsCalls
+
+	// getMyCommands: op names bot 1, target names bot 2.
+	op1 := contracts.OperationID("control:tg:1:getMyCommands:1")
+	t2 := contracts.TargetID("channel:tg:bot:2:getMyCommands")
+	h.auth.Begin(op1, t2, s7.PolicyControlRead)
+	g1, _ := h.auth.Next(op1, nil)
+	if err := h.a.call(ctxT(), "getMyCommands", map[string]any{}, nil, g1, kindControlRead, op1, t2); !errors.Is(err, s7.ErrAttemptNotAuthorized) {
+		t.Fatalf("bot-id mismatch (getMyCommands) accepted: %v", err)
+	}
+
+	// setMyCommands: op names bot 1, target names bot 2 (same hash on both).
+	const hash = "6f06dd0e26608013eff30bb1e951cda7de3fdd9e78e907470e0dd5c0ed25e273"
+	sOp := channel.ControlOperation("tg", 1, "setMyCommands", hash)
+	sT := channel.ControlTarget("tg", 2, "setMyCommands")
+	sPol := s7.PolicyControlEffect
+	sPol.Durable = true
+	h.auth.Begin(sOp, sT, sPol)
+	sg, _ := h.auth.Next(sOp, func(s7.Landing) s7.Companion { return s7.Companion{} })
+	_, park, _ := h.core.ControlEffectParams("tg", 1, "setMyCommands", hash, "UNKNOWN")
+	if err := h.a.call(ctxT(), "setMyCommands", map[string]any{}, nil, sg, kindControlEffect, sOp, sT, s7.Companion{Key: sOp, Params: park}); !errors.Is(err, s7.ErrAttemptNotAuthorized) {
+		t.Fatalf("bot-id mismatch (setMyCommands) accepted: %v", err)
+	}
+
+	// getMe presented with a bot-bound target: refused (getMe is never bound).
+	op3 := contracts.OperationID("control:tg:1:getMe:1")
+	t3 := contracts.TargetID("channel:tg:bot:1:getMe")
+	h.auth.Begin(op3, t3, s7.PolicyControlRead)
+	g3, _ := h.auth.Next(op3, nil)
+	if err := h.a.call(ctxT(), "getMe", map[string]any{}, nil, g3, kindControlRead, op3, t3); !errors.Is(err, s7.ErrAttemptNotAuthorized) {
+		t.Fatalf("bot-bound target accepted for getMe: %v", err)
+	}
+
+	if h.bot.getMyCommandsCalls != before || h.bot.setCommandsCalls != beforeSet {
+		t.Fatalf("a mismatched/malformed control identity reached the wire: getMyCommands=%d(want %d) setMyCommands=%d(want %d)",
+			h.bot.getMyCommandsCalls, before, h.bot.setCommandsCalls, beforeSet)
+	}
+}
+
+// Detector (code-review CODE6 codex #3): bound() is adapter-aware — an
+// op/target pair that is INTERNALLY consistent with each other (same bot
+// id on both sides) but names a DIFFERENT bot than the adapter's own
+// resolved a.botID must still be refused; and setMyCommands' declared
+// payload hash must match the ACTUAL marshaled wire body, not just look
+// like a well-formed hash.
+func TestControlCurrentBotAndPayloadHashEnforced(t *testing.T) {
+	h := build(t, map[int64]string{42: "work"})
+	h.a.botID = 7 // the adapter believes it is talking to bot 7
+
+	// getMyCommands: op and target both consistently name bot 3 (not 7).
+	op := contracts.OperationID("control:tg:3:getMyCommands:1")
+	target := contracts.TargetID("channel:tg:bot:3:getMyCommands")
+	h.auth.Begin(op, target, s7.PolicyControlRead)
+	g, _ := h.auth.Next(op, nil)
+	if err := h.a.call(ctxT(), "getMyCommands", map[string]any{}, nil, g, kindControlRead, op, target); !errors.Is(err, s7.ErrAttemptNotAuthorized) {
+		t.Fatalf("op/target for a DIFFERENT bot than a.botID accepted: %v", err)
+	}
+	if h.bot.getMyCommandsCalls != 0 {
+		t.Fatalf("wire touched for a different-bot grant: %d calls", h.bot.getMyCommandsCalls)
+	}
+
+	// setMyCommands: op/target consistently name a.botID (7), but the
+	// operation's declared hash does not match the ACTUAL request body.
+	wrongReq := map[string]any{"commands": []map[string]string{{"command": "x", "description": "different payload"}}}
+	rightReq := map[string]any{"commands": []map[string]string{{"command": "x", "description": "declared payload"}}}
+	rb, _ := json.Marshal(rightReq)
+	sum := sha256.Sum256(rb)
+	declaredHash := hex.EncodeToString(sum[:])
+	sOp := channel.ControlOperation("tg", 7, "setMyCommands", declaredHash)
+	sT := channel.ControlTarget("tg", 7, "setMyCommands")
+	sPol := s7.PolicyControlEffect
+	sPol.Durable = true
+	h.auth.Begin(sOp, sT, sPol)
+	sg, _ := h.auth.Next(sOp, func(s7.Landing) s7.Companion { return s7.Companion{} })
+	_, park, _ := h.core.ControlEffectParams("tg", 7, "setMyCommands", declaredHash, "UNKNOWN")
+	if err := h.a.call(ctxT(), "setMyCommands", wrongReq, nil, sg, kindControlEffect, sOp, sT, s7.Companion{Key: sOp, Params: park}); !errors.Is(err, s7.ErrAttemptNotAuthorized) {
+		t.Fatalf("a payload NOT matching the operation's declared hash was accepted: %v", err)
+	}
+	if h.bot.setCommandsCalls != 0 {
+		t.Fatalf("wire touched for a payload/hash mismatch: %d calls", h.bot.setCommandsCalls)
+	}
+	// The grant was never consumed by the refusal — it is still usable for
+	// the RIGHT payload.
+	if st, _ := h.auth.State(sOp); st != contracts.AttemptAuthorized {
+		t.Fatalf("grant consumed by a refused payload mismatch: %s", st)
+	}
+	if err := h.a.call(ctxT(), "setMyCommands", rightReq, nil, sg, kindControlEffect, sOp, sT, s7.Companion{Key: sOp, Params: park}); err != nil {
+		t.Fatalf("the matching payload was refused: %v", err)
+	}
+	if h.bot.setCommandsCalls != 1 {
+		t.Fatalf("matching payload did not reach the wire: %d calls", h.bot.setCommandsCalls)
+	}
+}
+
+// Detector (code-review CODE7 codex, new finding): S7 validates only
+// Companion.Key == Grant.OperationID and never interprets Companion.Params
+// (by design — s7.Companion's own doc comment). A companion that is
+// internally self-consistent but names a DIFFERENT operation than the one
+// being consumed must still be refused BEFORE the wire, for both durable
+// kinds that carry a companion (control-effect and delivery).
+func TestForeignCompanionOperationIDRefusedBeforeWire(t *testing.T) {
+	h := build(t, map[int64]string{42: "work"})
+	h.a.botID = 1
+
+	// control-effect: a valid grant for operation A (whose declared hash
+	// matches the ACTUAL request body, so the CODE6 payload-hash check
+	// does not itself refuse this call), but the companion's payload is
+	// self-consistent for a DIFFERENT operation B.
+	const hashB = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	pol := s7.PolicyControlEffect
+	pol.Durable = true
+	reqBody := map[string]any{"commands": []map[string]string{{"command": "probe-a", "description": "x"}}}
+	rb, _ := json.Marshal(reqBody)
+	sum := sha256.Sum256(rb)
+	hashA := hex.EncodeToString(sum[:])
+	opA := channel.ControlOperation("tg", 1, "setMyCommands", hashA)
+	tA := channel.ControlTarget("tg", 1, "setMyCommands")
+	h.auth.Begin(opA, tA, pol)
+	gA, _ := h.auth.Next(opA, func(s7.Landing) s7.Companion { return s7.Companion{} })
+	_, paramsB, _ := h.core.ControlEffectParams("tg", 1, "setMyCommands", hashB, "UNKNOWN")
+	if err := h.a.call(ctxT(), "setMyCommands", reqBody, nil, gA, kindControlEffect, opA, tA, s7.Companion{Key: opA, Params: paramsB}); !errors.Is(err, s7.ErrAttemptNotAuthorized) {
+		t.Fatalf("foreign companion (control-effect) accepted: %v", err)
+	}
+	if h.bot.setCommandsCalls != 0 {
+		t.Fatalf("wire touched for a foreign control-effect companion: %d calls", h.bot.setCommandsCalls)
+	}
+	if st, _ := h.auth.State(opA); st != contracts.AttemptAuthorized {
+		t.Fatalf("grant consumed by a refused foreign companion: %s", st)
+	}
+
+	// delivery: a valid grant for delivery row A, but the companion's park
+	// payload names delivery row B's operation.
+	enqueue(t, h, "row-a")
+	enqueue(t, h, "row-b")
+	rows, _ := h.core.Pending(ctxT())
+	if len(rows) < 2 {
+		t.Fatalf("expected at least 2 pending rows, got %d", len(rows))
+	}
+	rowA, rowB := rows[0], rows[1]
+	dOpA, dTA := channel.OperationFor(rowA), channel.TargetFor(rowA)
+	dOpB := channel.OperationFor(rowB)
+	h.auth.Begin(dOpA, dTA, s7.PolicyDelivery)
+	dgA, _ := h.auth.Next(dOpA, func(s7.Landing) s7.Companion { return s7.Companion{} })
+	paramsRowB, _ := h.core.MarkParamsForTest(channel.EvOutboundUnknown, rowB.DeliveryID, dOpB)
+	if err := h.a.call(ctxT(), "sendMessage", map[string]any{"chat_id": 42, "text": rowA.Text}, nil, dgA, kindDelivery, dOpA, dTA, s7.Companion{Key: dOpA, Params: paramsRowB}); !errors.Is(err, s7.ErrAttemptNotAuthorized) {
+		t.Fatalf("foreign companion (delivery) accepted: %v", err)
+	}
+	if sends(h) != 0 {
+		t.Fatalf("wire touched for a foreign delivery companion: %d sends", sends(h))
+	}
+	if st, _ := h.auth.State(dOpA); st != contracts.AttemptAuthorized {
+		t.Fatalf("delivery grant consumed by a refused foreign companion: %s", st)
+	}
+}

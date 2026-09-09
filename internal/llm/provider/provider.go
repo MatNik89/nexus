@@ -18,18 +18,20 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/MatNik89/nexus/internal/foundation/config"
+	"github.com/MatNik89/nexus/internal/foundation/egress"
 	"github.com/MatNik89/nexus/internal/kernel/closure"
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
-	"github.com/MatNik89/nexus/internal/kernel/s7min"
+	"github.com/MatNik89/nexus/internal/kernel/s7"
 )
 
 // ChatMessage is the provider-local wire shape (the T16 loop adapts
@@ -59,37 +61,23 @@ type DataDescriptor struct {
 // The key value lives ONLY in the private field, read once from the
 // configured env var; it never appears in errors or descriptors.
 //
-// topknot ceiling (Phase-2 kilo #3): the egress boundary here is a
-// host-string allowlist enforced at construction, with EVERY redirect
-// categorically refused (one grant = one physical request) — resolved-IP
-// pinning / DNS-rebinding defense (E11) is owned by the S6.3 dialer when
-// it lands; until then this provider talks only to allowlisted hosts over
-// TLS (or explicit loopback for tests). Upgrade trigger: S6.3.
+// Egress (E11, Slice A): the client is built ONLY through the shared
+// pinned-IP owner (internal/foundation/egress) — allowlisted canonical
+// endpoint, resolved-IP policy on EVERY answer, Proxy:nil, reject-all
+// redirects (one grant = one physical request), durable receipt before
+// every permitted dial. There is no default-transport fallback.
 type APIKey struct {
 	baseURL string
-	host    string
-	model   string
-	key     string
-	allowed map[string]bool
-	auth    *s7min.Authority
-	client  *http.Client
-}
-
-// loopbackHost reports whether the host part names the local machine —
-// the only place plaintext HTTP is tolerated (test/local providers). The
-// address CLASS is decided by parsing an IP literal, never by hostname
-// prefix (Phase-2-r2 codex #11: "127.attacker.example" is a remote DNS
-// name, not loopback).
-func loopbackHost(host string) bool {
-	h := host
-	if hp, _, err := net.SplitHostPort(host); err == nil {
-		h = hp
-	}
-	if h == "localhost" {
-		return true
-	}
-	ip := net.ParseIP(strings.Trim(h, "[]"))
-	return ip != nil && ip.IsLoopback()
+	// host is the canonical endpoint unit "host:port" (egress.Endpoint) —
+	// the S7 target and the data descriptor use the same string.
+	host   string
+	model  string
+	key    string
+	auth   *s7.Authority
+	client *http.Client
+	// egressOpts is the test seam for the resolver/dialer (empty in
+	// production); set by newAPIKeyWithEgress before the client is built.
+	egressOpts egress.Options
 }
 
 // NewAPIKey builds the provider FAIL-CLOSED: https only (plaintext only
@@ -97,23 +85,26 @@ func loopbackHost(host string) bool {
 // the egress allowlist (config only narrows the kernel floor), key env
 // var must be set and non-empty, model is required, and an S7 authority
 // is mandatory — there is no ungoverned transport.
-func NewAPIKey(cfg config.Config, auth *s7min.Authority) (*APIKey, error) {
+func NewAPIKey(cfg config.Config, auth *s7.Authority, sink egress.ReceiptSink) (*APIKey, error) {
+	return (&APIKey{}).build(cfg, auth, sink)
+}
+
+func (p *APIKey) build(cfg config.Config, auth *s7.Authority, sink egress.ReceiptSink) (*APIKey, error) {
 	if auth == nil {
 		return nil, fmt.Errorf("provider: an S7 authority is required — no ungoverned transport (fail closed)")
 	}
-	u, err := url.Parse(cfg.ProviderBaseURL)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return nil, fmt.Errorf("provider: base URL must be http(s) with a host (fail closed)")
+	if sink == nil {
+		return nil, fmt.Errorf("provider: an egress receipt sink is required — no unreceipted transport (fail closed)")
 	}
-	if u.Scheme == "http" && !loopbackHost(u.Host) {
+	ep, err := egress.ParseEndpoint(cfg.ProviderBaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("provider: %w", err)
+	}
+	if ep.Scheme == "http" && !ep.Loopback() {
 		return nil, fmt.Errorf("provider: plaintext http to a non-loopback host would expose the bearer key (fail closed)")
 	}
-	allowed := map[string]bool{}
-	for _, h := range cfg.EgressAllow {
-		allowed[h] = true
-	}
-	if !allowed[u.Host] {
-		return nil, fmt.Errorf("provider: host %q is not on the egress allowlist (kernel floor, fail closed)", u.Host)
+	if !egress.Admitted(ep, cfg.EgressAllow) {
+		return nil, fmt.Errorf("provider: endpoint %q is not on the egress allowlist (kernel floor, fail closed)", ep.Canonical())
 	}
 	if cfg.ProviderKeyEnv == "" {
 		return nil, fmt.Errorf("provider: no key env var configured (fail closed)")
@@ -125,21 +116,57 @@ func NewAPIKey(cfg config.Config, auth *s7min.Authority) (*APIKey, error) {
 	if cfg.ProviderModel == "" {
 		return nil, fmt.Errorf("provider: a model is required (fail closed)")
 	}
-	p := &APIKey{
-		baseURL: cfg.ProviderBaseURL, host: u.Host, model: cfg.ProviderModel, key: key,
-		allowed: allowed, auth: auth,
+	p.baseURL, p.host, p.model, p.key, p.auth = strings.TrimRight(cfg.ProviderBaseURL, "/"), ep.Canonical(), cfg.ProviderModel, key, auth
+	// The shared E11 owner: pinned dial, Proxy:nil, reject-all redirects
+	// (one grant authorizes exactly one physical request — an in-client
+	// redirect would be a second request under the same consumed grant),
+	// receipt before every permitted dial. opts is empty in production;
+	// newAPIKeyWithEgress injects resolver/dialer seams for tests.
+	client, err := egress.NewPinnedClient("provider", cfg.ProviderBaseURL, cfg.EgressAllow, 120*time.Second, p.egressOpts, sink)
+	if err != nil {
+		return nil, fmt.Errorf("provider: %w", err)
 	}
-	p.client = &http.Client{
-		Timeout: 120 * time.Second,
-		// P0 refuses EVERY redirect (Phase-2-r3 codex #2): one grant
-		// authorizes exactly one physical request — an in-client redirect
-		// would be a second, differently-targeted request under the same
-		// consumed grant, even to an allowlisted host.
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return fmt.Errorf("provider: redirects refused — one grant, one physical request (fail closed)")
-		},
-	}
+	p.client = client
 	return p, nil
+}
+
+// maxBodyBytes bounds a buffered (non-streaming) upstream reply BEFORE any
+// allocation-then-decode (AUDIT-FULL F8). maxStreamBytes bounds the total
+// bytes a streaming reply may deliver at the TRANSPORT layer; it sits above
+// the planner's own accumulation ceiling so that ceiling is observable
+// independently. topknot ceiling: constants, not config — upgrade trigger: a
+// real provider reply that exceeds them.
+const (
+	maxBodyBytes   = 8 << 20
+	maxStreamBytes = 32 << 20
+)
+
+// readBounded reads at most max+1 bytes and REFUSES when more than max were
+// present. Reading max+1 (not max) is what makes an oversized body
+// detectable: a plain io.LimitReader(max) would hand a truncated-but-valid
+// prefix to the decoder (plan-review r1 codex #4).
+func readBounded(r io.Reader, max int64) ([]byte, error) {
+	b, err := io.ReadAll(io.LimitReader(r, max+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > max {
+		return nil, fmt.Errorf("provider: upstream body exceeds %d bytes (refusing, fail closed)", max)
+	}
+	return b, nil
+}
+
+// decodeSingle strictly decodes exactly ONE JSON value and requires EOF after
+// it (trailing bytes — even whitespace-padded garbage — are refused).
+func decodeSingle(b []byte, out any) error {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	if err := dec.Decode(out); err != nil {
+		return err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return fmt.Errorf("trailing data after the JSON value")
+	}
+	return nil
 }
 
 type chatRequest struct {
@@ -160,37 +187,109 @@ func (p *APIKey) Target() contracts.TargetID {
 	return contracts.TargetID("provider:" + p.host)
 }
 
+// Failure is the provider's TYPED classification of one physical attempt
+// in the closed s7 code vocabulary (Slice B3): Retryable is a PROPOSAL —
+// S7's PolicyProvider decides. A chat completion is read-only (cost aside),
+// so a 429, a 5xx (status only, no body consumed) and a pre-wire refusal
+// propose a retry; anything else is terminal.
+type Failure struct {
+	Code      string
+	Retryable bool
+	Cause     error
+}
+
+func (f *Failure) Error() string {
+	if f.Cause != nil {
+		return fmt.Sprintf("provider: %s: %v", f.Code, f.Cause)
+	}
+	return "provider: " + f.Code
+}
+
+func (f *Failure) Unwrap() error { return f.Cause }
+
+// Classify maps an attempt error to the S7 outcome proposal.
+func Classify(err error) (s7.Outcome, string) {
+	if err == nil {
+		return s7.OutcomeSucceeded, ""
+	}
+	var f *Failure
+	if errors.As(err, &f) {
+		if f.Retryable {
+			return s7.OutcomeFailedRetryable, f.Code
+		}
+		return s7.OutcomeFailedTerminal, f.Code
+	}
+	return s7.OutcomeFailedTerminal, ""
+}
+
+func isPreWire(err error) bool {
+	if errors.Is(err, egress.ErrPreWire) {
+		return true
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+	var opErr *net.OpError
+	return errors.As(err, &opErr) && opErr.Op == "dial"
+}
+
 // transport performs ONE governed HTTP attempt: the grant is consumed
 // HERE, immediately before the wire — a second call on the same grant
 // fails ATTEMPT_NOT_AUTHORIZED before any bytes leave the process.
-func (p *APIKey) transport(ctx context.Context, g s7min.Grant, body []byte) (*http.Response, error) {
+// transport returns the response together with the S7 attempt context's
+// cancel: the caller MUST defer it after the body is consumed (the attempt
+// spans the whole physical exchange, not only the request).
+func (p *APIKey) transport(ctx context.Context, g s7.Grant, body []byte) (*http.Response, context.CancelFunc, error) {
+	nop := func() {}
 	if g.TargetID != p.Target() {
-		return nil, fmt.Errorf("provider: grant is not bound to this provider target: %w", s7min.ErrAttemptNotAuthorized)
+		return nil, nop, fmt.Errorf("provider: grant is not bound to this provider target: %w", s7.ErrAttemptNotAuthorized)
 	}
 	if err := p.auth.Consume(g); err != nil {
-		return nil, fmt.Errorf("provider: %w", err)
+		return nil, nop, fmt.Errorf("provider: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		p.baseURL+"/v1/chat/completions", bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("provider: %w", err)
+		return nil, nop, fmt.Errorf("provider: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+p.key)
 	req.Header.Set("Content-Type", "application/json")
+	// S7 OWNS the attempt deadline/cancel (code-review r2 codex #2): the
+	// physical request runs under the authority's attempt context — grant
+	// expiry, AttemptTimeout, operation deadline and Cancel(op) all abort
+	// the in-flight call.
+	actx, cancel, err := p.auth.AttemptContext(ctx, g.OperationID, time.Time{})
+	if err != nil {
+		return nil, nop, fmt.Errorf("provider: %w", err)
+	}
+	req = req.WithContext(actx)
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("provider: transport: %w", err)
+		cancel()
+		if isPreWire(err) {
+			return nil, nop, &Failure{Code: s7.CodeTransportPreWire, Retryable: true, Cause: fmt.Errorf("transport: %w", err)}
+		}
+		return nil, nop, &Failure{Code: s7.CodeTransportPostWrite, Cause: fmt.Errorf("transport: %w", err)}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		resp.Body.Close()
+		cancel()
 		// Status only — upstream bodies can carry anything.
-		return nil, fmt.Errorf("provider: upstream HTTP %d", resp.StatusCode)
+		cause := fmt.Errorf("upstream HTTP %d", resp.StatusCode)
+		switch {
+		case resp.StatusCode == 429:
+			return nil, nop, &Failure{Code: s7.CodeHTTP429, Retryable: true, Cause: cause}
+		case resp.StatusCode >= 500:
+			return nil, nop, &Failure{Code: s7.CodeHTTP5xx, Retryable: true, Cause: cause}
+		}
+		return nil, nop, &Failure{Code: s7.CodeHTTP4xx, Cause: cause}
 	}
-	return resp, nil
+	return resp, cancel, nil
 }
 
 // Chat performs one OpenAI-compatible completion call under grant g.
-func (p *APIKey) Chat(ctx context.Context, msgs []ChatMessage, g s7min.Grant) (ChatOutput, error) {
+func (p *APIKey) Chat(ctx context.Context, msgs []ChatMessage, g s7.Grant) (ChatOutput, error) {
 	if len(msgs) == 0 {
 		return ChatOutput{}, fmt.Errorf("provider: empty message list (fail closed)")
 	}
@@ -198,13 +297,18 @@ func (p *APIKey) Chat(ctx context.Context, msgs []ChatMessage, g s7min.Grant) (C
 	if err != nil {
 		return ChatOutput{}, fmt.Errorf("provider: %w", err)
 	}
-	resp, err := p.transport(ctx, g, body)
+	resp, cancel, err := p.transport(ctx, g, body)
 	if err != nil {
 		return ChatOutput{}, err
 	}
+	defer cancel()
 	defer resp.Body.Close()
+	raw, err := readBounded(resp.Body, maxBodyBytes)
+	if err != nil {
+		return ChatOutput{}, err
+	}
 	var out chatResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := decodeSingle(raw, &out); err != nil {
 		return ChatOutput{}, fmt.Errorf("provider: malformed upstream reply: %w", err)
 	}
 	if len(out.Choices) == 0 {
@@ -237,11 +341,11 @@ func (p *APIKey) Probe(ctx context.Context, resolved config.Resolved) closure.Pr
 		return pr
 	}
 	if _, err := p.Chat(ctx, []ChatMessage{{Role: "user", Content: "ping"}}, g); err != nil {
-		p.auth.Report(op, s7min.OutcomeFailedTerminal)
+		p.auth.Report(op, s7.OutcomeFailedTerminal, "", nil)
 		pr.Detail = err.Error()
 		return pr
 	}
-	p.auth.Report(op, s7min.OutcomeSucceeded)
+	p.auth.Report(op, s7.OutcomeSucceeded, "", nil)
 	pr.Passed = true
 	return pr
 }
@@ -250,7 +354,7 @@ func (p *APIKey) Probe(ctx context.Context, resolved config.Resolved) closure.Pr
 // content deltas in order. A non-nil return after partial deltas means
 // the stream BROKE — the caller must treat received content as
 // incomplete, never as a full reply.
-func (p *APIKey) Stream(ctx context.Context, msgs []ChatMessage, g s7min.Grant, deliver func(delta string) error) error {
+func (p *APIKey) Stream(ctx context.Context, msgs []ChatMessage, g s7.Grant, deliver func(delta string) error) error {
 	if deliver == nil {
 		return fmt.Errorf("provider: a delivery sink is required (fail closed)")
 	}
@@ -264,12 +368,16 @@ func (p *APIKey) Stream(ctx context.Context, msgs []ChatMessage, g s7min.Grant, 
 	if err != nil {
 		return fmt.Errorf("provider: %w", err)
 	}
-	resp, err := p.transport(ctx, g, body)
+	resp, cancel, err := p.transport(ctx, g, body)
 	if err != nil {
 		return err
 	}
+	defer cancel()
 	defer resp.Body.Close()
-	sc := bufio.NewScanner(resp.Body)
+	// Transport-layer total ceiling (F8): a never-ending stream is cut here;
+	// the planner's accumulator has its own, lower, ceiling.
+	lim := &io.LimitedReader{R: resp.Body, N: maxStreamBytes}
+	sc := bufio.NewScanner(lim)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	sawDone := false
 	for sc.Scan() {
@@ -290,6 +398,11 @@ func (p *APIKey) Stream(ctx context.Context, msgs []ChatMessage, g s7min.Grant, 
 			} `json:"choices"`
 		}
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			if lim.N <= 0 {
+				// The ceiling cut the stream mid-chunk: report the ceiling,
+				// not the truncated JSON.
+				return fmt.Errorf("provider: stream exceeded the %d-byte ceiling without [DONE] — cut, content is INCOMPLETE (fail closed)", maxStreamBytes)
+			}
 			return fmt.Errorf("provider: malformed stream chunk: %w", err)
 		}
 		for _, c := range chunk.Choices {
@@ -304,7 +417,23 @@ func (p *APIKey) Stream(ctx context.Context, msgs []ChatMessage, g s7min.Grant, 
 		return fmt.Errorf("provider: stream broke: %w", err)
 	}
 	if !sawDone {
+		if lim.N <= 0 {
+			return fmt.Errorf("provider: stream exceeded the %d-byte ceiling without [DONE] — cut, content is INCOMPLETE (fail closed)", maxStreamBytes)
+		}
 		return fmt.Errorf("provider: stream ended without [DONE] — content is INCOMPLETE")
 	}
 	return nil
+}
+
+// newAPIKeyWithEgress is the TEST seam for the shared egress owner: it builds
+// the provider exactly like NewAPIKey but with an injected resolver/dialer so a
+// detector can present a poisoned resolution (metadata/RFC1918/rebind) and
+// prove ZERO sockets are dialed. Production never sets opts.
+func newAPIKeyWithEgress(cfg config.Config, auth *s7.Authority, sink egress.ReceiptSink, opts egress.Options) (*APIKey, error) {
+	p := &APIKey{egressOpts: opts}
+	built, err := p.build(cfg, auth, sink)
+	if err != nil {
+		return nil, err
+	}
+	return built, nil
 }

@@ -7,6 +7,7 @@ package doctor
 
 import (
 	"fmt"
+	"github.com/MatNik89/nexus/internal/channel/health"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -40,16 +41,32 @@ type Env struct {
 	DataDir    string // resolved nexus data directory
 	Detect     func() (probe.Availability, error)
 	FloorProbe func(probe.Availability) error
+	// Secrets names the env vars that hold the secrets, RESOLVED from the
+	// typed configuration (Slice E, AUDIT-FULL F7) — doctor never hardcodes
+	// NEXUS_API_KEY / NEXUS_TELEGRAM_TOKEN: a custom provider_key_env must
+	// not report a false OFF, and a populated DEFAULT name must not report
+	// a false ON when the configuration points elsewhere.
+	Secrets Secrets
 }
 
-// DefaultEnv resolves the real host environment.
-func DefaultEnv() (Env, error) {
+// Secrets is the pair of configured secret-reference names
+// (config.Config.ProviderKeyEnv / TelegramTokenEnv). An empty name is a
+// misconfiguration and reports the capability OFF (fail closed).
+type Secrets struct {
+	ProviderKeyEnv   string
+	TelegramTokenEnv string
+}
+
+// DefaultEnv resolves the real host environment for the given configured
+// secret names.
+func DefaultEnv(secrets Secrets) (Env, error) {
 	base, err := os.UserConfigDir()
 	if err != nil {
 		return Env{}, fmt.Errorf("cannot resolve user config dir: %w", err)
 	}
 	return Env{
 		LookupEnv: os.LookupEnv,
+		Secrets:   secrets,
 		DataDir:   filepath.Join(base, "nexus"),
 		Detect:    probe.Detect,
 		// The floor probe runs the REAL production launch path against this
@@ -106,16 +123,9 @@ func Run(e Env) []Check {
 	// 3. Data directory: exists (or creatable), private, writable.
 	checks = append(checks, checkDataDir(e.DataDir))
 
-	// 4. Provider key → conversation capability.
-	if v, ok := e.LookupEnv("NEXUS_API_KEY"); !ok || v == "" {
-		checks = append(checks, Check{
-			Name: "provider-key", Capability: "conversation", Status: StatusOff,
-			Detail: "NEXUS_API_KEY is not set",
-			Fix:    "export NEXUS_API_KEY=<your provider API key>",
-		})
-	} else {
-		checks = append(checks, Check{Name: "provider-key", Capability: "conversation", Status: StatusOK, Detail: "set"})
-	}
+	// 4. Provider key → conversation capability (the CONFIGURED name).
+	checks = append(checks, checkSecret(e, "provider-key", "conversation",
+		e.Secrets.ProviderKeyEnv, "provider_key_env", "<your provider API key>"))
 
 	// 6 (C8 observability): scheduler last_occurrence_fired counter — an
 	// informational mirror the daemon writes after every fire; absent
@@ -175,18 +185,50 @@ func Run(e Env) []Check {
 			Fix: "fix permissions on " + healthPath})
 	}
 
-	// 5. Telegram token → telegram capability.
-	if v, ok := e.LookupEnv("NEXUS_TELEGRAM_TOKEN"); !ok || v == "" {
-		checks = append(checks, Check{
-			Name: "telegram-token", Capability: "telegram", Status: StatusOff,
-			Detail: "NEXUS_TELEGRAM_TOKEN is not set",
-			Fix:    "export NEXUS_TELEGRAM_TOKEN=<bot token from @BotFather>",
-		})
+	// 6c (Slice D): channel runtime health — the adapter's journal-independent
+	// projection. A recorded non-healthy component reports its typed class;
+	// a malformed/unreadable projection is broken observability (OFF).
+	chPath := filepath.Join(e.DataDir, "system", "channel_health.json")
+	if entries, herr := health.Read(chPath); herr != nil {
+		checks = append(checks, Check{Name: "channel-health", Capability: "telegram", Status: StatusOff,
+			Detail: "channel health projection unreadable: " + herr.Error(), Fix: "fix or remove " + chPath})
 	} else {
-		checks = append(checks, Check{Name: "telegram-token", Capability: "telegram", Status: StatusOK, Detail: "set"})
+		bad := 0
+		for _, en := range entries {
+			if !en.Healthy {
+				bad++
+				checks = append(checks, Check{Name: "channel-health", Capability: "telegram", Status: StatusOff,
+					Detail: fmt.Sprintf("%s %s/%s at %s (stopped=%v): %s", en.Component, en.Class, en.Code, en.At.Format(time.RFC3339), en.Stopped, en.Detail),
+					Fix:    "inspect the daemon log; repair (token/config/journal) then restart the daemon"})
+			}
+		}
+		if bad == 0 {
+			checks = append(checks, Check{Name: "channel-health", Capability: "telegram", Status: StatusOK, Detail: "no unhealthy channel component recorded"})
+		}
 	}
 
+	// 5. Telegram token → telegram capability (the CONFIGURED name).
+	checks = append(checks, checkSecret(e, "telegram-token", "telegram",
+		e.Secrets.TelegramTokenEnv, "telegram_token_env", "<bot token from @BotFather>"))
+
 	return checks
+}
+
+// checkSecret reports one secret-backed capability from the CONFIGURED env
+// var name: no name -> OFF (misconfiguration), name unset/empty -> OFF with
+// the exact export to run, otherwise OK. The value itself is never echoed.
+func checkSecret(e Env, name, capability, envName, configKey, placeholder string) Check {
+	if envName == "" {
+		return Check{Name: name, Capability: capability, Status: StatusOff,
+			Detail: "no env var name configured (" + configKey + " is empty)",
+			Fix:    "set " + configKey + " in config.json (or NEXUS_CFG_" + strings.ToUpper(configKey) + ")"}
+	}
+	if v, ok := e.LookupEnv(envName); !ok || v == "" {
+		return Check{Name: name, Capability: capability, Status: StatusOff,
+			Detail: envName + " is not set",
+			Fix:    "export " + envName + "=" + placeholder}
+	}
+	return Check{Name: name, Capability: capability, Status: StatusOK, Detail: envName + " set"}
 }
 
 func checkDataDir(dir string) Check {

@@ -253,7 +253,7 @@ func TestRejectedValueNotEchoed(t *testing.T) {
 // telegram_api_base is production-or-loopback ONLY (T27 codex #4: the
 // bot token rides in the URL path — an arbitrary host is exfiltration).
 func TestTelegramAPIBaseLoopbackOnly(t *testing.T) {
-	base := Config{DefaultProfile: "private"}
+	base := Config{DefaultProfile: "private", ContextHardLimitTokens: 64000}
 	ok := func(u string) error {
 		c := base
 		c.TelegramAPIBase = u
@@ -268,5 +268,60 @@ func TestTelegramAPIBaseLoopbackOnly(t *testing.T) {
 		if err := ok(bad); err == nil {
 			t.Fatalf("token-exfiltration base %q accepted", bad)
 		}
+	}
+}
+
+// Slice C (AUDIT-FULL F5): the ONE configured context hard limit is a
+// bounded positive integer. Zero and negative are REJECTED at Resolve — they
+// must never reach the planner as "unlimited"; absent means the default.
+func TestContextHardLimitBoundsAndDefault(t *testing.T) {
+	write := func(t *testing.T, body string) string {
+		t.Helper()
+		dir := t.TempDir()
+		p := filepath.Join(dir, "config.json")
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	cases := []struct {
+		body    string
+		wantErr bool
+		want    int
+	}{
+		{`{}`, false, 64000},
+		{`{"context_hard_limit_tokens": 12000}`, false, 12000},
+		{`{"context_hard_limit_tokens": 0}`, true, 0},
+		{`{"context_hard_limit_tokens": -1}`, true, 0},
+		{`{"context_hard_limit_tokens": 2000001}`, true, 0},
+		{`{"context_hard_limit_tokens": "abc"}`, true, 0},
+		{`{"context_hard_limit_tokens": 64000.5}`, true, 0},
+		{`{"context_hard_limit_tokens": 6.4e4}`, true, 0},
+	}
+	for _, tc := range cases {
+		res, err := Resolve(write(t, tc.body), "/nonexistent", nil, nil)
+		if tc.wantErr {
+			if err == nil {
+				t.Fatalf("%s: accepted (want rejection)", tc.body)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("%s: %v", tc.body, err)
+		}
+		if res.Config.ContextHardLimitTokens != tc.want {
+			t.Fatalf("%s: limit = %d, want %d", tc.body, res.Config.ContextHardLimitTokens, tc.want)
+		}
+	}
+	// Env layer: strict decimal only.
+	if _, err := Resolve("/nonexistent", "/nonexistent", []string{"NEXUS_CFG_CONTEXT_HARD_LIMIT_TOKENS=0"}, nil); err == nil {
+		t.Fatal("env zero limit accepted")
+	}
+	if _, err := Resolve("/nonexistent", "/nonexistent", []string{"NEXUS_CFG_CONTEXT_HARD_LIMIT_TOKENS= 1000"}, nil); err == nil {
+		t.Fatal("env padded integer accepted")
+	}
+	res, err := Resolve("/nonexistent", "/nonexistent", []string{"NEXUS_CFG_CONTEXT_HARD_LIMIT_TOKENS=1000"}, nil)
+	if err != nil || res.Config.ContextHardLimitTokens != 1000 {
+		t.Fatalf("env limit: %v %d", err, res.Config.ContextHardLimitTokens)
 	}
 }

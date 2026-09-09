@@ -38,7 +38,7 @@ import (
 	"github.com/MatNik89/nexus/internal/kernel/effectpath"
 	"github.com/MatNik89/nexus/internal/kernel/journal"
 	"github.com/MatNik89/nexus/internal/kernel/machine"
-	"github.com/MatNik89/nexus/internal/kernel/s7min"
+	"github.com/MatNik89/nexus/internal/kernel/s7"
 	"github.com/MatNik89/nexus/internal/schedule"
 )
 
@@ -636,7 +636,7 @@ func ValidateFileNoteParams(params string) error {
 // decision, S7 grant, receipt discipline). Task handlers NEVER run
 // outside it (Phase-4 codex #3).
 type EffectRunner interface {
-	RunTool(ctx context.Context, call contracts.ToolCall, grant s7min.Grant) (contracts.ToolResult, error)
+	RunTool(ctx context.Context, call contracts.ToolCall, grant s7.Grant) (contracts.ToolResult, error)
 }
 
 // Manager is the obligation facade over the profile's ONE journal.
@@ -646,7 +646,7 @@ type Manager struct {
 	reg      *Registry
 	clock    clockid.Clock
 	runner   EffectRunner
-	auth     *s7min.Authority
+	auth     *s7.Authority
 	notesDir string // IMMUTABLE profile-bound reconcile root (B3 — no globals)
 	gate     *DoneGate
 	// testPostArmFail injects a deterministic append failure AFTER the
@@ -658,7 +658,7 @@ type Manager struct {
 }
 
 func NewManager(j *journal.Journal, s *schedule.Scheduler, r *Registry, c clockid.Clock,
-	runner EffectRunner, auth *s7min.Authority, notesDir string, gate *DoneGate) (*Manager, error) {
+	runner EffectRunner, auth *s7.Authority, notesDir string, gate *DoneGate) (*Manager, error) {
 	if j == nil || s == nil || r == nil || c == nil || runner == nil || auth == nil || notesDir == "" || gate == nil {
 		return nil, fmt.Errorf("obligation: journal, scheduler, registry, clock, effect runner, S7 authority, notes dir and done gate are required (fail closed)")
 	}
@@ -1181,7 +1181,7 @@ type LazyRunner struct {
 	R EffectRunner
 }
 
-func (l *LazyRunner) RunTool(ctx context.Context, call contracts.ToolCall, grant s7min.Grant) (contracts.ToolResult, error) {
+func (l *LazyRunner) RunTool(ctx context.Context, call contracts.ToolCall, grant s7.Grant) (contracts.ToolResult, error) {
 	if l.R == nil {
 		return contracts.ToolResult{}, fmt.Errorf("obligation: effect runner not wired yet (fail closed)")
 	}

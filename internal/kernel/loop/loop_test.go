@@ -20,7 +20,7 @@ import (
 	"github.com/MatNik89/nexus/internal/kernel/effectpath"
 	"github.com/MatNik89/nexus/internal/kernel/journal"
 	"github.com/MatNik89/nexus/internal/kernel/machine"
-	"github.com/MatNik89/nexus/internal/kernel/s7min"
+	"github.com/MatNik89/nexus/internal/kernel/s7"
 	"github.com/MatNik89/nexus/internal/security/redact"
 )
 
@@ -92,7 +92,7 @@ type harness struct {
 	loop    *Loop
 	planner *scriptedPlanner
 	journal *journal.Journal
-	grants  *s7min.Authority
+	grants  *s7.Authority
 	toolOut *[]contracts.ContextBlock // next inproc tool output blocks
 	toolErr *error
 }
@@ -144,7 +144,7 @@ func buildFull(t *testing.T, policy Policy, ruleSpec map[string]string, actions 
 	if err != nil {
 		t.Fatal(err)
 	}
-	grants := s7min.NewAuthority(nil, time.Minute)
+	grants := s7.NewAuthority(nil, time.Minute)
 	path, err := effectpath.NewEffectPath(pep, nopMW{}, inproc,
 		effectpath.NewSandboxedProcessExecutor(nopSandbox{}), grants)
 	if err != nil {

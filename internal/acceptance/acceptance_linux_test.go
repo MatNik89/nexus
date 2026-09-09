@@ -177,6 +177,10 @@ func (w *world) daemon() func() {
 			cmd.Process.Kill()
 			<-done
 		}
+		// Read ONLY after Wait (F4): the builder is quiescent here.
+		if w.t.Failed() {
+			w.t.Logf("daemon output:\n%s", out.String())
+		}
 	}
 	w.t.Cleanup(stop)
 	return stop
@@ -217,7 +221,7 @@ func newFakeBot(t *testing.T) *fakeBot {
 	b.srv = httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/getMe"):
-			rw.Write([]byte(`{"ok":true,"result":{"is_bot":true}}`))
+			rw.Write([]byte(`{"ok":true,"result":{"id":1,"is_bot":true,"username":"acceptance_bot"}}`))
 		case strings.HasSuffix(r.URL.Path, "/getUpdates"):
 			// OFFSET-FAITHFUL like the real Bot API (prep3 reviews): an
 			// update stays pending until the client's offset passes it —

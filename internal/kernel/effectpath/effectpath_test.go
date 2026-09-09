@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
-	"github.com/MatNik89/nexus/internal/kernel/s7min"
+	"github.com/MatNik89/nexus/internal/kernel/s7"
 )
 
 // --- contract fakes ---
@@ -90,7 +90,7 @@ type harness struct {
 	sandbox *fakeSandbox
 	audit   *fakeAudit
 	mw      *recordingMW
-	grants  *s7min.Authority
+	grants  *s7.Authority
 	inprocN *int
 }
 
@@ -115,7 +115,7 @@ func build(t *testing.T, mode PolicyMode, rules map[contracts.ToolID]Decision) *
 	sb := &fakeSandbox{}
 	mw := &recordingMW{}
 	// Real clock: grant expiry participates in the S7 attempt context.
-	grants := s7min.NewAuthority(nil, time.Minute)
+	grants := s7.NewAuthority(nil, time.Minute)
 	path, err := NewEffectPath(pep, mw, inproc, NewSandboxedProcessExecutor(sb), grants)
 	if err != nil {
 		t.Fatal(err)
@@ -123,7 +123,7 @@ func build(t *testing.T, mode PolicyMode, rules map[contracts.ToolID]Decision) *
 	return &harness{pep: pep, path: path, sandbox: sb, audit: audit, mw: mw, grants: grants, inprocN: &n}
 }
 
-func grantFor(t *testing.T, h *harness, op string, c contracts.ToolCall) s7min.Grant {
+func grantFor(t *testing.T, h *harness, op string, c contracts.ToolCall) s7.Grant {
 	t.Helper()
 	g, err := h.grants.Issue(contracts.OperationID(op), ToolTarget(c))
 	if err != nil {
@@ -225,15 +225,15 @@ func TestReadOnlyProcessStillSandboxed(t *testing.T) {
 func TestNoAttemptWithoutGrant(t *testing.T) {
 	h := build(t, ModeDefault, map[contracts.ToolID]Decision{"read": DecisionAllow})
 	c := call(t, "read", contracts.EffectReadOnly, contracts.ExecInProcess)
-	forged := s7min.Grant{OperationID: "op-x", AttemptNo: 1, TargetID: ToolTarget(c), Nonce: "deadbeef"}
-	if _, err := h.path.RunTool(context.Background(), c, forged); !errors.Is(err, s7min.ErrAttemptNotAuthorized) {
+	forged := s7.Grant{OperationID: "op-x", AttemptNo: 1, TargetID: ToolTarget(c), Nonce: "deadbeef"}
+	if _, err := h.path.RunTool(context.Background(), c, forged); !errors.Is(err, s7.ErrAttemptNotAuthorized) {
 		t.Fatalf("forged grant executed: %v", err)
 	}
 	g := grantFor(t, h, "op-1", c)
 	if _, err := h.path.RunTool(context.Background(), c, g); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.path.RunTool(context.Background(), c, g); !errors.Is(err, s7min.ErrAttemptNotAuthorized) {
+	if _, err := h.path.RunTool(context.Background(), c, g); !errors.Is(err, s7.ErrAttemptNotAuthorized) {
 		t.Fatalf("reused grant executed: %v", err)
 	}
 	if *h.inprocN != 1 {
@@ -387,7 +387,7 @@ func TestForeignGrantCannotAuthorizeThisCall(t *testing.T) {
 	b := call(t, "read", contracts.EffectReadOnly, contracts.ExecInProcess)
 	b.ToolCallID = "tc-other"
 	gForB := grantFor(t, h, "op-b", b)
-	if _, err := h.path.RunTool(context.Background(), a, gForB); !errors.Is(err, s7min.ErrAttemptNotAuthorized) {
+	if _, err := h.path.RunTool(context.Background(), a, gForB); !errors.Is(err, s7.ErrAttemptNotAuthorized) {
 		t.Fatalf("grant for another call authorized this one: %v", err)
 	}
 	if *h.inprocN != 0 {
@@ -416,7 +416,7 @@ func TestOnErrorCannotEraseRefusal(t *testing.T) {
 			return contracts.ToolResult{}, fmt.Errorf("tool exploded")
 		},
 	})
-	grants := s7min.NewAuthority(nil, time.Minute)
+	grants := s7.NewAuthority(nil, time.Minute)
 	mw := &nilSwallowMW{}
 	path, err := NewEffectPath(pep, mw, inproc, NewSandboxedProcessExecutor(&fakeSandbox{}), grants)
 	if err != nil {
@@ -448,11 +448,11 @@ func TestYoloRefusedWhenAuditNotDurable(t *testing.T) {
 // EFFECTFUL call parks UNKNOWN (Phase-2 codex #5), and an effectful
 // "success" WITHOUT a receipt is a claim, not proof.
 func TestResultValidationAndEffectfulReceiptRule(t *testing.T) {
-	mk := func(fn InProcFunc) (*EffectPath, *s7min.Authority) {
+	mk := func(fn InProcFunc) (*EffectPath, *s7.Authority) {
 		audit := &fakeAudit{}
 		pep, _ := NewPEP(map[contracts.ToolID]Decision{"w": DecisionAllow},
 			NewApprovals(func() time.Time { return time.Unix(1000, 0) }, time.Minute), audit, ModeDefault)
-		grants := s7min.NewAuthority(nil, time.Minute)
+		grants := s7.NewAuthority(nil, time.Minute)
 		path, _ := NewEffectPath(pep, &recordingMW{}, NewInProcessExecutor(map[contracts.ToolID]InProcFunc{"w": fn}),
 			NewSandboxedProcessExecutor(&fakeSandbox{}), grants)
 		return path, grants
@@ -529,7 +529,7 @@ func TestModifiedCallCannotRideOldGrant(t *testing.T) {
 	g := grantFor(t, h, "op-1", c)
 	mutated := c
 	mutated.Arguments = json.RawMessage(`{"path":"/etc/shadow"}`) // same ids, new payload
-	if _, err := h.path.RunTool(context.Background(), mutated, g); !errors.Is(err, s7min.ErrAttemptNotAuthorized) {
+	if _, err := h.path.RunTool(context.Background(), mutated, g); !errors.Is(err, s7.ErrAttemptNotAuthorized) {
 		t.Fatalf("modified call rode the old grant: %v", err)
 	}
 	if *h.inprocN != 0 {
@@ -548,7 +548,7 @@ func TestCallDeadlinePropagatedIntoExecution(t *testing.T) {
 	audit := &fakeAudit{}
 	pep, _ := NewPEP(map[contracts.ToolID]Decision{"slow": DecisionAllow},
 		NewApprovals(func() time.Time { return time.Unix(1000, 0) }, time.Minute), audit, ModeDefault)
-	grants := s7min.NewAuthority(nil, time.Minute)
+	grants := s7.NewAuthority(nil, time.Minute)
 	var sawDeadline time.Time
 	inproc := NewInProcessExecutor(map[contracts.ToolID]InProcFunc{
 		"slow": func(ctx context.Context, c contracts.ToolCall) (contracts.ToolResult, error) {
@@ -599,7 +599,7 @@ func TestStartObserverFailureCancelsNeverLoses(t *testing.T) {
 // The execution context is S7-OWNED: the authority supplies the earlier
 // of call deadline and grant expiry, and refuses a non-RUNNING operation.
 func TestAttemptContextIsS7Owned(t *testing.T) {
-	auth := s7min.NewAuthority(func() time.Time { return time.Unix(1000, 0) }, time.Minute)
+	auth := s7.NewAuthority(func() time.Time { return time.Unix(1000, 0) }, time.Minute)
 	if _, _, err := auth.AttemptContext(context.Background(), "op-never", time.Now().Add(time.Hour)); err == nil {
 		t.Fatal("attempt context granted for an unknown operation")
 	}
@@ -610,16 +610,19 @@ func TestAttemptContextIsS7Owned(t *testing.T) {
 	if err := auth.Consume(g); err != nil {
 		t.Fatal(err)
 	}
-	// Grant expiry (issue+1m from the pinned clock) caps a longer call
-	// deadline.
-	dctx, cancel, err := auth.AttemptContext(context.Background(), "op-1", time.Unix(999999, 0))
+	// Grant expiry (issue+1m on the authority's pinned clock) caps a longer
+	// call deadline: the context deadline is the REMAINING lease projected
+	// onto the wall clock (~1m from now), not the hour the caller asked for.
+	longCall := time.Now().Add(time.Hour)
+	dctx, cancel, err := auth.AttemptContext(context.Background(), "op-1", longCall)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer cancel()
 	dl, ok := dctx.Deadline()
-	if !ok || !dl.Equal(g.ExpiresAt) {
-		t.Fatalf("S7 did not cap the deadline at grant expiry: %v (want %v)", dl, g.ExpiresAt)
+	remaining := time.Until(dl)
+	if !ok || !dl.Before(longCall) || remaining > 61*time.Second || remaining < 55*time.Second {
+		t.Fatalf("S7 did not cap the deadline at the grant lease: deadline in %v (want ~1m, grant expires %v)", remaining, g.ExpiresAt)
 	}
 }
 

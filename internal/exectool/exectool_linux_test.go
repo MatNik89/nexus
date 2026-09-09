@@ -21,7 +21,7 @@ import (
 
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
 	"github.com/MatNik89/nexus/internal/kernel/effectpath"
-	"github.com/MatNik89/nexus/internal/kernel/s7min"
+	"github.com/MatNik89/nexus/internal/kernel/s7"
 	"github.com/MatNik89/nexus/internal/sandbox"
 	"github.com/MatNik89/nexus/internal/security/redact"
 )
@@ -101,7 +101,7 @@ func path(t *testing.T, a *Adapter, mode effectpath.PolicyMode, approvals *effec
 	}
 	p, err := effectpath.NewEffectPath(pep, nopMW{},
 		effectpath.NewInProcessExecutor(map[contracts.ToolID]effectpath.InProcFunc{}),
-		effectpath.NewSandboxedProcessExecutor(a), s7min.NewAuthority(nil, time.Minute))
+		effectpath.NewSandboxedProcessExecutor(a), s7.NewAuthority(nil, time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +127,7 @@ func (nopMW) OnError(ctx context.Context, e error) error { return e }
 func TestExecRunsSandboxedE2EWithAsk(t *testing.T) {
 	a := adapter(t)
 	approvals := effectpath.NewApprovals(nil, 5*time.Minute)
-	auth := s7min.NewAuthority(nil, time.Minute)
+	auth := s7.NewAuthority(nil, time.Minute)
 	pep, err := effectpath.NewPEP(Rules(), approvals, nopAudit{}, effectpath.ModeDefault)
 	if err != nil {
 		t.Fatal(err)

@@ -30,10 +30,10 @@ func (a *Adapter) openPicker(ctx context.Context, chat int64) error {
 	var res struct {
 		MessageID int64 `json:"message_id"`
 	}
-	if err := a.call(ctx, "sendMessage", map[string]any{
+	if err := a.uiCall(ctx, "sendMessage", map[string]any{
 		"chat_id": chat, "text": "Odaberi datum:",
 		"reply_markup": map[string]any{"inline_keyboard": monthKeyboard(sess)},
-	}, &res); err == nil {
+	}, &res, chat); err == nil {
 		sess.messageID = res.MessageID
 	}
 	// Ephemeral: a send failure just means the owner re-runs /cronjob.
@@ -46,7 +46,11 @@ func (a *Adapter) openPicker(ctx context.Context, chat int64) error {
 func (a *Adapter) handlePickerCallback(ctx context.Context, cq *tgCallbackQuery) error {
 	answer := func(text string) error {
 		if cq != nil && cq.ID != "" {
-			a.call(ctx, "answerCallbackQuery", map[string]any{"callback_query_id": cq.ID, "text": text}, nil)
+			var chat int64
+			if cq.Message != nil {
+				chat = cq.Message.Chat.ID
+			}
+			_ = a.uiCall(ctx, "answerCallbackQuery", map[string]any{"callback_query_id": cq.ID, "text": text}, nil, chat)
 		}
 		return nil
 	}
@@ -155,10 +159,10 @@ func parseISODayInMonth(iso string, y, m int) (int, bool) {
 
 // editCalendar swaps only the inline keyboard (month nav). Best-effort.
 func (a *Adapter) editCalendar(ctx context.Context, chat, msgID int64, rows [][]button) {
-	a.call(ctx, "editMessageReplyMarkup", map[string]any{
+	_ = a.uiCall(ctx, "editMessageReplyMarkup", map[string]any{
 		"chat_id": chat, "message_id": msgID,
 		"reply_markup": map[string]any{"inline_keyboard": rows},
-	}, nil)
+	}, nil, chat)
 }
 
 // editText rewrites the message text (and keyboard if rows != nil). Best-effort;
@@ -168,5 +172,5 @@ func (a *Adapter) editText(ctx context.Context, chat, msgID int64, text string, 
 	if rows != nil {
 		req["reply_markup"] = map[string]any{"inline_keyboard": rows}
 	}
-	a.call(ctx, "editMessageText", req, nil)
+	_ = a.uiCall(ctx, "editMessageText", req, nil, chat)
 }
