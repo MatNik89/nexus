@@ -399,7 +399,12 @@ BEFORE returning its S7 outcome — an accepted salvage returns `OutcomeSucceede
 the accepted value; no accepted value returns `OutcomeFailedTerminal` and NO value.
 A value is never returned after `Execute` has committed a failed terminal state: the
 caller's result and the S7 state are one decision (returned value <=> `SUCCEEDED`).
-The extractor never calls `Issue`/`Next`. The
+The extractor never calls `Issue`/`Next`. SCOPE NOTE (code-review r2 codex #5): in P1 no production
+path calls `ExtractVia` — the planner's tool-call parsing is DRIFT-typed by design (a
+typed error, no second provider call; tgout plan) and must not gain a re-ask;
+`ExtractVia` is the S2.3 library owner that future structured consumers (P2 planner
+schemas) submit through. The planner's plain-chat path submits its own
+`PolicyProvider` operation. The
 planner's structured path submits this one operation (its plain-chat path submits
 its own `PolicyProvider` operation; the two are distinct operations, never nested). `Stream` failures after the first delivered byte are TERMINAL (partial output
 already reached the user). Tool attempts keep `PolicyTool` (MaxAttempts 1).
