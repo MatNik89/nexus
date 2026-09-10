@@ -252,3 +252,112 @@ func TestFileContainsLineCriterion(t *testing.T) {
 		t.Fatal("empty file-line criterion accepted")
 	}
 }
+
+// CodingProofIs (PLAN-CODING-TRIO.md Slice 1, invariant 8): a BEHAVIORAL
+// fix requires at least one FAIL_TO_PASS transition; any regression
+// (PassToFail) or a vanished previously-passing test (Missing) ALWAYS
+// fails, regardless of mode.
+func TestCodingProofBehavioralRequiresFailToPass(t *testing.T) {
+	contract := AcceptanceContract{ID: "c", Worker: "w", Criteria: []Criterion{
+		{CodingProofIs: &CodingProofCriterion{Mode: CodingProofBehavioral}},
+	}}
+	pass, err := Grade(contract, []Evidence{
+		{Contract: "c", Producer: "evidence-capture", Coding: &CodingProofEvidence{
+			FailToPass: []string{"pkg.TestFixed"}, PassToPass: []string{"pkg.TestStable"},
+		}},
+	})
+	if err != nil || !pass.Pass {
+		t.Fatalf("expected PASS with a non-empty FailToPass: %+v %v", pass, err)
+	}
+
+	fail, err := Grade(contract, []Evidence{
+		{Contract: "c", Producer: "evidence-capture", Coding: &CodingProofEvidence{
+			PassToPass: []string{"pkg.TestStable"}, // no FailToPass
+		}},
+	})
+	if err != nil || fail.Pass {
+		t.Fatalf("expected FAIL with an empty FailToPass in BEHAVIORAL mode: %+v %v", fail, err)
+	}
+}
+
+func TestCodingProofAnyRegressionAlwaysFails(t *testing.T) {
+	contract := AcceptanceContract{ID: "c", Worker: "w", Criteria: []Criterion{
+		{CodingProofIs: &CodingProofCriterion{Mode: CodingProofBehavioral}},
+	}}
+	v, err := Grade(contract, []Evidence{
+		{Contract: "c", Producer: "evidence-capture", Coding: &CodingProofEvidence{
+			FailToPass: []string{"pkg.TestFixed"}, PassToFail: []string{"pkg.TestBroken"},
+		}},
+	})
+	if err != nil || v.Pass {
+		t.Fatalf("expected FAIL when a previously-passing test regresses, even with a FailToPass present: %+v %v", v, err)
+	}
+}
+
+func TestCodingProofMissingTestAlwaysFails(t *testing.T) {
+	contract := AcceptanceContract{ID: "c", Worker: "w", Criteria: []Criterion{
+		{CodingProofIs: &CodingProofCriterion{Mode: CodingProofBehavioral}},
+	}}
+	v, err := Grade(contract, []Evidence{
+		{Contract: "c", Producer: "evidence-capture", Coding: &CodingProofEvidence{
+			FailToPass: []string{"pkg.TestFixed"}, Missing: []string{"pkg.TestVanished"},
+		}},
+	})
+	if err != nil || v.Pass {
+		t.Fatalf("expected FAIL when a previously-passing test vanishes: %+v %v", v, err)
+	}
+}
+
+// REFACTOR mode: an empty FailToPass is legitimate ONLY when every
+// RequiredStructural postcondition is present in StructuralPassed — a
+// bare mode switch with nothing backing it must be REJECTED at the
+// criterion level (validate), and an UNMET structural postcondition must
+// FAIL at grading time even though FailToPass being empty is otherwise
+// allowed.
+func TestCodingProofRefactorRequiresStructuralPostcondition(t *testing.T) {
+	if _, err := Grade(AcceptanceContract{ID: "c", Worker: "w", Criteria: []Criterion{
+		{CodingProofIs: &CodingProofCriterion{Mode: CodingProofRefactor}}, // no RequiredStructural
+	}}, nil); err == nil {
+		t.Fatal("REFACTOR mode with zero RequiredStructural postconditions was accepted")
+	}
+
+	contract := AcceptanceContract{ID: "c", Worker: "w", Criteria: []Criterion{
+		{CodingProofIs: &CodingProofCriterion{Mode: CodingProofRefactor,
+			RequiredStructural: []string{"old-name-gone"}}},
+	}}
+	pass, err := Grade(contract, []Evidence{
+		{Contract: "c", Producer: "evidence-capture", Coding: &CodingProofEvidence{
+			PassToPass:       []string{"pkg.TestStable"},
+			StructuralPassed: []string{"old-name-gone"},
+		}},
+	})
+	if err != nil || !pass.Pass {
+		t.Fatalf("expected PASS: empty FailToPass backed by the required structural postcondition: %+v %v", pass, err)
+	}
+
+	fail, err := Grade(contract, []Evidence{
+		{Contract: "c", Producer: "evidence-capture", Coding: &CodingProofEvidence{
+			PassToPass: []string{"pkg.TestStable"}, // StructuralPassed empty — postcondition never held
+		}},
+	})
+	if err != nil || fail.Pass {
+		t.Fatalf("expected FAIL: empty FailToPass with the required structural postcondition unmet: %+v %v", fail, err)
+	}
+}
+
+func TestCodingProofRequiredSpecificTests(t *testing.T) {
+	contract := AcceptanceContract{ID: "c", Worker: "w", Criteria: []Criterion{
+		{CodingProofIs: &CodingProofCriterion{Mode: CodingProofBehavioral,
+			RequiredFailToPass: []string{"pkg.TestFixed"},
+			RequiredPassToPass: []string{"pkg.TestStable"}}},
+	}}
+	missing, err := Grade(contract, []Evidence{
+		{Contract: "c", Producer: "evidence-capture", Coding: &CodingProofEvidence{
+			FailToPass: []string{"pkg.TestOtherFix"}, // not the required one
+			PassToPass: []string{"pkg.TestStable"},
+		}},
+	})
+	if err != nil || missing.Pass {
+		t.Fatalf("expected FAIL when the REQUIRED FailToPass test is absent: %+v %v", missing, err)
+	}
+}

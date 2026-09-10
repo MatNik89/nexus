@@ -26,6 +26,45 @@ type Criterion struct {
 	// stable postcondition for one appended record (Phase-4 codex #6: a
 	// whole-file hash breaks when a later task appends legitimately).
 	FileContainsLine *FileLineCriterion
+	// CodingProofIs: a coding-run's base-vs-candidate test transitions
+	// (PLAN-CODING-TRIO.md Slice 1, invariant 8) satisfy the named
+	// requirement.
+	CodingProofIs *CodingProofCriterion
+}
+
+// CodingProofMode distinguishes a BEHAVIORAL fix (must show at least one
+// FAIL_TO_PASS transition — invariant 8's default) from a
+// semantics-preserving REFACTOR (an empty FAIL_TO_PASS set is legitimate
+// ONLY alongside at least one predeclared, PASSED structural
+// postcondition — invariant 8's own exemption, never a bare
+// "allow empty" escape hatch with nothing backing it).
+type CodingProofMode int
+
+const (
+	CodingProofBehavioral CodingProofMode = iota
+	CodingProofRefactor
+)
+
+// CodingProofCriterion names what one coding-run must prove. Evidence
+// for this criterion is produced ONLY by internal/coding/evidence.Capture
+// — never hand-constructed — so Grade trusts the causal ordering of the
+// underlying journal chain (bound -> base-run -> candidate-run) was
+// already enforced by that single, trusted producer at write time; Grade
+// grades the DOMAIN claim (which tests transitioned how), the same
+// separation of concerns FileHashIs/DeliveredAndAcked already have from
+// the journal machinery that produced their evidence.
+type CodingProofCriterion struct {
+	Mode CodingProofMode
+	// RequiredFailToPass/RequiredPassToPass, when non-empty, name SPECIFIC
+	// "package.Test" keys that must appear in the evidence's own
+	// FailToPass/PassToPass sets — a stronger requirement than "the set
+	// is merely non-empty" when the contract cares about a named test.
+	RequiredFailToPass []string
+	RequiredPassToPass []string
+	// RequiredStructural names structural postconditions (Mode ==
+	// CodingProofRefactor only) that MUST all appear, and pass, in the
+	// evidence's StructuralPassed set when FailToPass is empty.
+	RequiredStructural []string
 }
 
 // FileLineCriterion pins one immutable marker line.
@@ -62,6 +101,14 @@ func (c Criterion) validate() error {
 	if c.FileContainsLine != nil && (c.FileContainsLine.Path == "" || c.FileContainsLine.Line == "") {
 		return fmt.Errorf("file-line criterion requires a path and a non-empty line")
 	}
+	if c.CodingProofIs != nil {
+		if c.CodingProofIs.Mode != CodingProofBehavioral && c.CodingProofIs.Mode != CodingProofRefactor {
+			return fmt.Errorf("coding-proof criterion has an unknown mode (fail closed)")
+		}
+		if c.CodingProofIs.Mode == CodingProofRefactor && len(c.CodingProofIs.RequiredStructural) == 0 {
+			return fmt.Errorf("coding-proof criterion in REFACTOR mode requires at least one RequiredStructural postcondition — a bare mode switch with nothing backing it is not a proof")
+		}
+	}
 	set := 0
 	if c.ExitCodeIs != nil {
 		set++
@@ -73,6 +120,9 @@ func (c Criterion) validate() error {
 		set++
 	}
 	if c.FileContainsLine != nil {
+		set++
+	}
+	if c.CodingProofIs != nil {
 		set++
 	}
 	if set != 1 {
@@ -109,6 +159,19 @@ type Evidence struct {
 	Delivery *DeliveryEvidence
 	Ack      *AckEvidence
 	FileLine *FileLineEvidence
+	Coding   *CodingProofEvidence
+}
+
+// CodingProofEvidence is one coding-run's classified base-vs-candidate
+// test transitions (PLAN-CODING-TRIO.md Slice 1). Every "package.Test"
+// string uses the SAME formatting internal/coding/evidence.Classify
+// produces ("package.Test") — Grade does not re-derive or re-parse it.
+type CodingProofEvidence struct {
+	FailToPass       []string
+	PassToPass       []string
+	PassToFail       []string // regressions — non-empty ALWAYS fails grading
+	Missing          []string // present in base, absent from candidate — non-empty ALWAYS fails grading
+	StructuralPassed []string // structural postcondition names that held (REFACTOR mode)
 }
 
 // FileLineEvidence reports whether the verifier FOUND the exact line.
@@ -170,6 +233,9 @@ func (e Evidence) validate() error {
 		set++
 	}
 	if e.FileLine != nil {
+		set++
+	}
+	if e.Coding != nil {
 		set++
 	}
 	if set != 1 {
@@ -319,6 +385,70 @@ func gradeOne(idx int, c Criterion, bundle []Evidence) CriterionResult {
 			return fail("no user acknowledgment for occurrence " + occ)
 		}
 		return CriterionResult{Index: idx, Pass: true}
+	case c.CodingProofIs != nil:
+		return gradeCodingProof(idx, *c.CodingProofIs, bundle, fail)
 	}
 	return fail("unknown criterion kind (fail closed)")
+}
+
+// gradeCodingProof grades one CodingProofCriterion. ALL matching evidence
+// in the bundle must agree (same order-independence discipline as every
+// other criterion kind above) — contradictory coding-proof evidence for
+// the same contract FAILS, it does not average or take the first.
+func gradeCodingProof(idx int, c CodingProofCriterion, bundle []Evidence, fail func(string) CriterionResult) CriterionResult {
+	found := false
+	for _, e := range bundle {
+		if e.Coding == nil {
+			continue
+		}
+		found = true
+		ce := e.Coding
+		// A regression or a vanished test ALWAYS fails grading — invariant
+		// 8 never trades away a broken previously-passing test for a
+		// newly-fixed one, and a test that disappeared is not proof it
+		// still passes (Classify's own Missing/PassToFail semantics).
+		if len(ce.PassToFail) > 0 {
+			return fail(fmt.Sprintf("coding-proof regression: previously passing test(s) now fail: %v", ce.PassToFail))
+		}
+		if len(ce.Missing) > 0 {
+			return fail(fmt.Sprintf("coding-proof: previously passing test(s) are absent from the candidate run: %v", ce.Missing))
+		}
+		switch c.Mode {
+		case CodingProofBehavioral:
+			if len(ce.FailToPass) == 0 {
+				return fail("coding-proof (BEHAVIORAL mode) requires at least one FAIL_TO_PASS transition")
+			}
+		case CodingProofRefactor:
+			if len(ce.FailToPass) == 0 {
+				for _, want := range c.RequiredStructural {
+					if !containsString(ce.StructuralPassed, want) {
+						return fail("coding-proof (REFACTOR mode, empty FAIL_TO_PASS) missing required structural postcondition: " + want)
+					}
+				}
+			}
+		}
+		for _, want := range c.RequiredFailToPass {
+			if !containsString(ce.FailToPass, want) {
+				return fail("coding-proof missing required FAIL_TO_PASS test: " + want)
+			}
+		}
+		for _, want := range c.RequiredPassToPass {
+			if !containsString(ce.PassToPass, want) {
+				return fail("coding-proof missing required PASS_TO_PASS test: " + want)
+			}
+		}
+	}
+	if !found {
+		return fail("no coding-proof evidence in the bundle")
+	}
+	return CriterionResult{Index: idx, Pass: true}
+}
+
+func containsString(haystack []string, needle string) bool {
+	for _, s := range haystack {
+		if s == needle {
+			return true
+		}
+	}
+	return false
 }
