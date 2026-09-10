@@ -53,6 +53,16 @@ type Snapshot struct {
 	Digest string
 }
 
+// FileDigest is one regular file's snapshot-relative path and SHA-256
+// content digest (hex-encoded), as computed by copyTreeInto's single
+// tree walk — exposed so a caller (Slice 2's file-to-package mapping)
+// can diff two snapshots file-by-file without a second, independently
+// maintained tree walker that could drift from the aggregate Digest.
+type FileDigest struct {
+	Path   string
+	SHA256 string
+}
+
 // CreateSnapshot copies sourceDir into a fresh, private (0700), disposable
 // temp directory and returns its content digest. The caller MUST call the
 // returned cleanup func once the snapshot is no longer needed — a crash
@@ -78,7 +88,7 @@ func CreateSnapshot(sourceDir string) (snap Snapshot, cleanup func(), err error)
 	}
 	cleanup = func() { os.RemoveAll(dstDir) }
 
-	digest, err := copyTreeInto(sourceDir, dstDir)
+	_, digest, err := copyTreeIntoFiles(sourceDir, dstDir)
 	if err != nil {
 		cleanup()
 		return Snapshot{}, nil, err
@@ -97,12 +107,22 @@ func CreateSnapshot(sourceDir string) (snap Snapshot, cleanup func(), err error)
 // the two digests are GUARANTEED comparable — not just similarly
 // computed by two independently-maintained algorithms that could drift.
 func DigestTree(dir string) (string, error) {
+	_, digest, err := DigestTreeFiles(dir)
+	return digest, err
+}
+
+// DigestTreeFiles is DigestTree plus the per-file breakdown (FileDigest),
+// via the SAME single tree walk (copyTreeIntoFiles) — for diffing two
+// snapshots file-by-file (Slice 2's authoritative change source) without
+// a second tree walker that could compute digests differently than the
+// aggregate one.
+func DigestTreeFiles(dir string) ([]FileDigest, string, error) {
 	tmp, err := os.MkdirTemp("", "nexus-coding-digest-*")
 	if err != nil {
-		return "", fmt.Errorf("runner: create digest scratch dir: %w", err)
+		return nil, "", fmt.Errorf("runner: create digest scratch dir: %w", err)
 	}
 	defer os.RemoveAll(tmp)
-	return copyTreeInto(dir, tmp)
+	return copyTreeIntoFiles(dir, tmp)
 }
 
 // copyTreeInto copies sourceDir's contents into dstDir (which the caller
@@ -114,6 +134,14 @@ func DigestTree(dir string) (string, error) {
 // parent directory itself instead of accepting CreateSnapshot's own
 // randomly-named top-level temp dir.
 func copyTreeInto(sourceDir, dstDir string) (digest string, err error) {
+	_, digest, err = copyTreeIntoFiles(sourceDir, dstDir)
+	return digest, err
+}
+
+// copyTreeIntoFiles is copyTreeInto's actual implementation, additionally
+// returning the per-file digest breakdown (sorted by Path) alongside the
+// same aggregate digest.
+func copyTreeIntoFiles(sourceDir, dstDir string) (files []FileDigest, digest string, err error) {
 	var entries []string // "relpath\x00hexdigest", sorted before hashing
 	var fileCount int
 	var totalBytes int64
@@ -196,16 +224,19 @@ func copyTreeInto(sourceDir, dstDir string) (digest string, err error) {
 		return nil
 	})
 	if walkErr != nil {
-		return "", walkErr
+		return nil, "", walkErr
 	}
 
 	sort.Strings(entries)
 	h := sha256.New()
+	files = make([]FileDigest, 0, len(entries))
 	for _, e := range entries {
 		io.WriteString(h, e)
 		io.WriteString(h, "\n")
+		rel, hexdigest, _ := strings.Cut(e, "\x00")
+		files = append(files, FileDigest{Path: rel, SHA256: hexdigest})
 	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	return files, hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // openRegularNoFollow opens path for reading, refusing outright (never

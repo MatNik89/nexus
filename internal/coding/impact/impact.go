@@ -36,6 +36,10 @@ type Package struct {
 	GoFiles      []string `json:"GoFiles,omitempty"`
 	TestGoFiles  []string `json:"TestGoFiles,omitempty"`
 	XTestGoFiles []string `json:"XTestGoFiles,omitempty"`
+
+	EmbedFiles      []string `json:"EmbedFiles,omitempty"`
+	TestEmbedFiles  []string `json:"TestEmbedFiles,omitempty"`
+	XTestEmbedFiles []string `json:"XTestEmbedFiles,omitempty"`
 }
 
 // isTarget reports whether this package entry is a REAL workspace package

@@ -3,6 +3,8 @@
 package runner
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -190,5 +192,70 @@ func TestOpenRegularNoFollowRefusesSymlink(t *testing.T) {
 	}
 	if _, err := openRegularNoFollow(link); err == nil {
 		t.Fatal("openRegularNoFollow followed a symlink to a regular file")
+	}
+}
+
+// Detector (Slice 2 file-to-package mapping): DigestTreeFiles must return
+// the SAME aggregate digest as DigestTree/CreateSnapshot, plus a per-file
+// breakdown that actually reflects the tree's real content — not a
+// vacuous or file-count-mismatched list.
+func TestDigestTreeFilesMatchesAggregateAndPerFileContent(t *testing.T) {
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "a.go"), []byte("package a"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(src, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "sub", "b.go"), []byte("package sub"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	files, digest, err := DigestTreeFiles(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDigest, err := DigestTree(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if digest != wantDigest {
+		t.Fatalf("DigestTreeFiles digest = %s, want %s (must match DigestTree)", digest, wantDigest)
+	}
+	if len(files) != 2 {
+		t.Fatalf("DigestTreeFiles returned %d files, want 2: %+v", len(files), files)
+	}
+	byPath := map[string]string{}
+	for _, f := range files {
+		byPath[f.Path] = f.SHA256
+	}
+	aSum := sha256.Sum256([]byte("package a"))
+	subSum := sha256.Sum256([]byte("package sub"))
+	if got := byPath["a.go"]; got != hex.EncodeToString(aSum[:]) {
+		t.Fatalf("a.go digest = %s, want %s", got, hex.EncodeToString(aSum[:]))
+	}
+	if got := byPath[filepath.Join("sub", "b.go")]; got != hex.EncodeToString(subSum[:]) {
+		t.Fatalf("sub/b.go digest = %s, want %s", got, hex.EncodeToString(subSum[:]))
+	}
+
+	// Mutating one file must change ONLY that file's own digest, not the
+	// other's — proves this is a real per-file breakdown, not a
+	// duplicated aggregate value.
+	if err := os.WriteFile(filepath.Join(src, "a.go"), []byte("package a2"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	files2, _, err := DigestTreeFiles(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byPath2 := map[string]string{}
+	for _, f := range files2 {
+		byPath2[f.Path] = f.SHA256
+	}
+	if byPath2["a.go"] == byPath["a.go"] {
+		t.Fatal("a.go digest did not change after mutating its content")
+	}
+	if byPath2[filepath.Join("sub", "b.go")] != byPath[filepath.Join("sub", "b.go")] {
+		t.Fatal("sub/b.go digest changed even though its content did not")
 	}
 }
