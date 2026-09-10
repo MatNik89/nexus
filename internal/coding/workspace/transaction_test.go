@@ -3,7 +3,9 @@
 package workspace
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -43,7 +45,7 @@ func TestApplyCreatesMultipleNewFiles(t *testing.T) {
 	defer unix.Close(rootFd)
 	store := newTestStore(t)
 
-	res, err := Apply(rootFd, store, []FileMutation{
+	res, err := apply(context.Background(), rootFd, store, []FileMutation{
 		{BaseName: "a.go", After: []byte("package a\n"), Mode: 0o644},
 		{BaseName: "b.go", After: []byte("package b\n"), Mode: 0o644},
 	}, noopBindDurable)
@@ -87,7 +89,7 @@ func TestApplyReplacesMultipleExistingFiles(t *testing.T) {
 	defer unix.Close(rootFd)
 	store := newTestStore(t)
 
-	res, err := Apply(rootFd, store, []FileMutation{
+	res, err := apply(context.Background(), rootFd, store, []FileMutation{
 		{BaseName: "a.go", After: []byte("package new_a\n"), Mode: 0o644},
 		{RelDir: "sub", BaseName: "b.go", After: []byte("package new_b\n"), Mode: 0o644},
 	}, noopBindDurable)
@@ -128,7 +130,7 @@ func TestApplyValidatesAllMutationsBeforeAnyWrite(t *testing.T) {
 	defer unix.Close(rootFd)
 	store := newTestStore(t)
 
-	_, err = Apply(rootFd, store, []FileMutation{
+	_, err = apply(context.Background(), rootFd, store, []FileMutation{
 		{BaseName: "a.go", After: []byte("package new_a\n"), Mode: 0o644},
 		{BaseName: "sub/b.go", After: []byte("package new_b\n"), Mode: 0o644}, // invalid base name
 	}, noopBindDurable)
@@ -188,7 +190,7 @@ func TestApplyRollsBackAlreadyWrittenFileOnMidTransactionFailure(t *testing.T) {
 		}
 	}
 
-	_, err = Apply(rootFd, store, []FileMutation{
+	_, err = apply(context.Background(), rootFd, store, []FileMutation{
 		{BaseName: "a.go", After: []byte("package new_a\n"), Mode: 0o644},
 		{BaseName: "b.go", After: []byte("package new_b\n"), Mode: 0o644},
 	}, noopBindDurable)
@@ -249,7 +251,7 @@ func TestApplyRollsBackNewlyCreatedFileByRemovingIt(t *testing.T) {
 		}
 	}
 
-	_, err = Apply(rootFd, store, []FileMutation{
+	_, err = apply(context.Background(), rootFd, store, []FileMutation{
 		{BaseName: "a.go", After: []byte("package new_a\n"), Mode: 0o644},
 		{BaseName: "b.go", After: []byte("package new_b\n"), Mode: 0o644}, // was new, but got planted as a symlink first
 	}, noopBindDurable)
@@ -272,7 +274,7 @@ func TestApplyRollsBackNewlyCreatedFileByRemovingIt(t *testing.T) {
 }
 
 // Detector: replacing an existing file with an EXPLICITLY DIFFERENT mode
-// actually changes its permission bits — WriteFileBeneath's replace path
+// actually changes its permission bits — writeFileBeneath's replace path
 // never preserves the pre-existing file's own mode, it always applies
 // the mutation's own Mode (the temp file is created at that mode and
 // exchanged into place). A caller that wants to preserve permissions
@@ -289,7 +291,7 @@ func TestApplyReplaceAppliesMutationModeNotOriginalMode(t *testing.T) {
 	defer unix.Close(rootFd)
 	store := newTestStore(t)
 
-	_, err = Apply(rootFd, store, []FileMutation{
+	_, err = apply(context.Background(), rootFd, store, []FileMutation{
 		{BaseName: "a.go", After: []byte("new"), Mode: 0o600},
 	}, noopBindDurable)
 	if err != nil {
@@ -315,7 +317,7 @@ func TestApplyRefusesEmptyMutationSet(t *testing.T) {
 	defer unix.Close(rootFd)
 	store := newTestStore(t)
 
-	if _, err := Apply(rootFd, store, nil, noopBindDurable); err == nil {
+	if _, err := apply(context.Background(), rootFd, store, nil, noopBindDurable); err == nil {
 		t.Fatal("expected an error for an empty mutation set")
 	}
 }
@@ -335,7 +337,7 @@ func TestApplyPersistsReconstructableBeforeAndAfterBytes(t *testing.T) {
 	defer unix.Close(rootFd)
 	store := newTestStore(t)
 
-	res, err := Apply(rootFd, store, []FileMutation{
+	res, err := apply(context.Background(), rootFd, store, []FileMutation{
 		{BaseName: "a.go", After: []byte("package new_a\n"), Mode: 0o644},
 	}, noopBindDurable)
 	if err != nil {
@@ -361,7 +363,7 @@ func TestApplyPersistsReconstructableBeforeAndAfterBytes(t *testing.T) {
 }
 
 // Detector (code-review finding, codex, round 1): a file whose
-// WriteFileBeneath call reports committed==true but ALSO returns an
+// writeFileBeneath call reports committed==true but ALSO returns an
 // error (here: the trailing directory fsync fails right after the
 // second mutation's exchange already landed) must still be included in
 // Apply's own rollback set — not silently omitted because the call
@@ -393,7 +395,7 @@ func TestApplyRollsBackFileThatCommittedButThenReturnedAnError(t *testing.T) {
 		return unix.Fsync(fd)
 	}
 
-	_, err = Apply(rootFd, store, []FileMutation{
+	_, err = apply(context.Background(), rootFd, store, []FileMutation{
 		{BaseName: "a.go", After: []byte("package new_a\n"), Mode: 0o644},
 		{BaseName: "b.go", After: []byte("package new_b\n"), Mode: 0o644},
 	}, noopBindDurable)
@@ -456,7 +458,7 @@ func TestApplyRollbackRestoresOriginalModeNotAfterMode(t *testing.T) {
 		}
 	}
 
-	_, err = Apply(rootFd, store, []FileMutation{
+	_, err = apply(context.Background(), rootFd, store, []FileMutation{
 		{BaseName: "a.go", After: []byte("package new_a\n"), Mode: 0o600},
 		{BaseName: "b.go", After: []byte("package new_b\n"), Mode: 0o644},
 	}, noopBindDurable)
@@ -498,7 +500,7 @@ func TestApplyAbortsBeforeAnyWriteWhenBindDurableFails(t *testing.T) {
 	defer unix.Close(rootFd)
 	store := newTestStore(t)
 
-	_, err = Apply(rootFd, store, []FileMutation{
+	_, err = apply(context.Background(), rootFd, store, []FileMutation{
 		{BaseName: "a.go", After: []byte("package new_a\n"), Mode: 0o644},
 		{BaseName: "b.go", After: []byte("package b\n"), Mode: 0o644},
 	}, func(digest string) error { return fmt.Errorf("simulated durable-binding failure") })
@@ -520,7 +522,7 @@ func TestApplyAbortsBeforeAnyWriteWhenBindDurableFails(t *testing.T) {
 
 // Detector: a mutation set naming the SAME target (RelDir+BaseName)
 // twice is refused upfront, before any write — cheap, cleaner than
-// relying on WriteFileBeneath's own identity check to incidentally catch
+// relying on writeFileBeneath's own identity check to incidentally catch
 // it after the first write already landed.
 func TestApplyRejectsDuplicateTarget(t *testing.T) {
 	root := t.TempDir()
@@ -531,7 +533,7 @@ func TestApplyRejectsDuplicateTarget(t *testing.T) {
 	defer unix.Close(rootFd)
 	store := newTestStore(t)
 
-	_, err = Apply(rootFd, store, []FileMutation{
+	_, err = apply(context.Background(), rootFd, store, []FileMutation{
 		{BaseName: "a.go", After: []byte("first"), Mode: 0o644},
 		{BaseName: "a.go", After: []byte("second"), Mode: 0o644},
 	}, noopBindDurable)
@@ -549,7 +551,7 @@ func TestApplyRejectsDuplicateTarget(t *testing.T) {
 // after Apply successfully wrote it but before a LATER mutation fails
 // and triggers rollback, that foreign content must survive — never be
 // silently deleted just because the inode still matches. Exercises
-// RemoveFileWithExpectedIdentity's ContentDigest binding through the
+// removeFileWithExpectedIdentity's ContentDigest binding through the
 // full Apply rollback path, not just directly.
 func TestApplyRollbackRefusesToDeleteForeignInPlaceContentMutation(t *testing.T) {
 	root := t.TempDir()
@@ -586,7 +588,7 @@ func TestApplyRollbackRefusesToDeleteForeignInPlaceContentMutation(t *testing.T)
 		}
 	}
 
-	_, err = Apply(rootFd, store, []FileMutation{
+	_, err = apply(context.Background(), rootFd, store, []FileMutation{
 		{BaseName: "a.go", After: []byte("package new_a\n"), Mode: 0o644},
 		{BaseName: "b.go", After: []byte("package new_b\n"), Mode: 0o644},
 	}, noopBindDurable)
@@ -623,7 +625,7 @@ func TestApplyRefusesWhenExpectedBeforeDigestMismatches(t *testing.T) {
 	defer unix.Close(rootFd)
 	store := newTestStore(t)
 
-	_, err = Apply(rootFd, store, []FileMutation{
+	_, err = apply(context.Background(), rootFd, store, []FileMutation{
 		{BaseName: "a.go", After: []byte("new content"), Mode: 0o644, ExpectedBeforeDigest: sha256Hex([]byte("stale expected content"))},
 	}, noopBindDurable)
 	if err == nil {
@@ -652,7 +654,7 @@ func TestApplyAcceptsWhenExpectedBeforeDigestMatches(t *testing.T) {
 	defer unix.Close(rootFd)
 	store := newTestStore(t)
 
-	res, err := Apply(rootFd, store, []FileMutation{
+	res, err := apply(context.Background(), rootFd, store, []FileMutation{
 		{BaseName: "a.go", After: []byte("new content"), Mode: 0o644, ExpectedBeforeDigest: sha256Hex([]byte("actual content"))},
 	}, noopBindDurable)
 	if err != nil {
@@ -683,7 +685,7 @@ func TestApplyRefusesWhenExpectedBeforeDigestSetButFileMissing(t *testing.T) {
 	defer unix.Close(rootFd)
 	store := newTestStore(t)
 
-	_, err = Apply(rootFd, store, []FileMutation{
+	_, err = apply(context.Background(), rootFd, store, []FileMutation{
 		{BaseName: "a.go", After: []byte("new content"), Mode: 0o644, ExpectedBeforeDigest: sha256Hex([]byte("expected content"))},
 	}, noopBindDurable)
 	if err == nil {
@@ -720,7 +722,7 @@ func TestApplyRefusesWhenExpectedIdentityMismatches(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = Apply(rootFd, store, []FileMutation{
+	_, err = apply(context.Background(), rootFd, store, []FileMutation{
 		{
 			BaseName: "a.go", After: []byte("new content"), Mode: 0o644,
 			ExpectedBeforeDigest:  sha256Hex([]byte("same content")),
@@ -761,7 +763,7 @@ func TestApplyRefusesWhenExpectedModeMismatches(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = Apply(rootFd, store, []FileMutation{
+	_, err = apply(context.Background(), rootFd, store, []FileMutation{
 		{
 			BaseName: "a.go", After: []byte("new content"), Mode: 0o600,
 			ExpectedBeforeDigest:  sha256Hex([]byte("content")),
@@ -780,5 +782,146 @@ func TestApplyRefusesWhenExpectedModeMismatches(t *testing.T) {
 	}
 	if string(got) != "content" {
 		t.Fatalf("a.go content = %q, want untouched %q", got, "content")
+	}
+}
+
+// Detector (code-review finding, codex round 2 HIGH #2): a caller's ctx
+// being already cancelled before Apply is even called must refuse the
+// whole transaction — zero writes, not a best-effort attempt.
+func TestApplyRefusesWhenContextIsAlreadyCancelled(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("package old_a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rootFd, err := OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(rootFd)
+	store := newTestStore(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err = apply(ctx, rootFd, store, []FileMutation{
+		{BaseName: "a.go", After: []byte("package new_a\n"), Mode: 0o644},
+	}, noopBindDurable)
+	if err == nil {
+		t.Fatal("expected an error: ctx was already cancelled")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected errors.Is(err, context.Canceled), got: %v", err)
+	}
+	got, readErr := os.ReadFile(filepath.Join(root, "a.go"))
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(got) != "package old_a\n" {
+		t.Fatalf("a.go content = %q, want untouched %q (zero writes)", got, "package old_a\n")
+	}
+}
+
+// Detector (code-review finding, codex round 2 HIGH #2, the concrete
+// scenario the previously-discarded AttemptContext was meant to guard):
+// a ctx cancelled BETWEEN two files' writes (the first already committed)
+// must stop Apply from writing the SECOND file and roll the first back —
+// S7 saying CANCELLED must never coexist with writes still landing.
+func TestApplyStopsWritingRemainingFilesWhenContextIsCancelledMidTransaction(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("package old_a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "b.go"), []byte("package old_b\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rootFd, err := OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(rootFd)
+	store := newTestStore(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	orig := beforeApplyWritesFile
+	defer func() { beforeApplyWritesFile = orig }()
+	beforeApplyWritesFile = func(baseName string) {
+		if baseName == "a.go" {
+			cancel() // takes effect before b.go's OWN ctx check, AFTER a.go's
+		}
+	}
+
+	_, err = apply(ctx, rootFd, store, []FileMutation{
+		{BaseName: "a.go", After: []byte("package new_a\n"), Mode: 0o644},
+		{BaseName: "b.go", After: []byte("package new_b\n"), Mode: 0o644},
+	}, noopBindDurable)
+	if err == nil {
+		t.Fatal("expected an error: ctx was cancelled mid-transaction")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected errors.Is(err, context.Canceled), got: %v", err)
+	}
+	gotA, readErr := os.ReadFile(filepath.Join(root, "a.go"))
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(gotA) != "package old_a\n" {
+		t.Fatalf("a.go content = %q, want rolled back to %q", gotA, "package old_a\n")
+	}
+	gotB, readErr := os.ReadFile(filepath.Join(root, "b.go"))
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(gotB) != "package old_b\n" {
+		t.Fatalf("b.go content = %q, want NEVER written (cancelled before its own turn)", gotB)
+	}
+}
+
+// Detector (code-review finding, codex round 4 HIGH #2): the TWO-file
+// cancellation test above does not, on its own, prove the FINAL
+// post-loop ctx check (added to guard against cancellation during the
+// LAST write) is load-bearing — with two files, the SECOND file's own
+// per-iteration check at the top of its loop turn already catches the
+// same cancellation, so ablating only the final check would still leave
+// that test green. This test uses exactly ONE mutation: cancellation is
+// scheduled from beforeApplyWritesFile, which fires AFTER apply's own
+// per-iteration ctx check for this (the only) file already passed —
+// there is no second iteration to catch it. Only the final check,
+// immediately before Committed:true, can still refuse this.
+func TestApplyRefusesSingleFileCommitWhenContextCancelledDuringItsOwnWrite(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("package old_a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rootFd, err := OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(rootFd)
+	store := newTestStore(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	orig := beforeApplyWritesFile
+	defer func() { beforeApplyWritesFile = orig }()
+	beforeApplyWritesFile = func(baseName string) {
+		if baseName == "a.go" {
+			cancel() // fires AFTER this file's own per-iteration check already passed
+		}
+	}
+
+	_, err = apply(ctx, rootFd, store, []FileMutation{
+		{BaseName: "a.go", After: []byte("package new_a\n"), Mode: 0o644},
+	}, noopBindDurable)
+	if err == nil {
+		t.Fatal("expected an error: ctx was cancelled during the only file's own write")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected errors.Is(err, context.Canceled), got: %v", err)
+	}
+	got, readErr := os.ReadFile(filepath.Join(root, "a.go"))
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(got) != "package old_a\n" {
+		t.Fatalf("a.go content = %q, want rolled back to %q (the write itself succeeded, but cancellation must still refuse the commit)", got, "package old_a\n")
 	}
 }

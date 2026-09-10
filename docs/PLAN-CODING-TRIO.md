@@ -1879,3 +1879,400 @@ operation type, not yet designed); the restart-time crash-recovery classificatio
 and `PolicyWorkspaceRollback` (invariant 4 steps 6/7); the Prepare-phase "format+type-check
 the staged result" step; expanding beyond `RenameSymbol` to further gopls actions (Slice 4,
 explicitly not before Slice 3 is deployed and dogfooded per the plan's own build order).
+
+## Status 2026-09-10 — S7/journal wiring for `workspace.Apply` (invariant 2's own contract, round 1 FAIL + real redesign)
+
+First pass (`internal/coding/workspace/governed.go` v1) scoped the `bindDurable` seam
+narrowly off invariant 4 §2's transaction-local table alone — a genuine mistake caught
+immediately by codex round 1 (**FAIL, 7 HIGH findings**): the plan's own "Cross-slice
+invariants" §2 (written well before this piece, at the SAME time as invariant 4's own
+first draft) already fully specifies this wiring's shape, and v1 missed most of it:
+caller-chosen `op`/`target` instead of exact-intent-derived ids; `MaxAttempts: 1` making
+the plan's own required same-operation retry impossible; every post-Consume failure landed
+`FailedTerminal` with no distinction from an unverified/incomplete rollback (the plan
+requires `Unknown` for that case, never retried blind); `s7.AttemptContext` never called
+(no cancel-owner registration); no `sealed_payload_ref` wiring; failure-path
+Report/Cancel errors silently discarded; and the plan's own explicitly required
+`SetAppendFault` paired-batch RED detector was missing.
+
+**Redesign, addressing 6 of 7 findings directly:**
+- `ApplyOperationID(profile, rootDev, rootIno, planDigest)` /
+  `ApplyTargetID(profile, rootDev, rootIno)`: exact-intent identity derived from the
+  transaction root's own descriptor identity + the prepared plan's digest — never a
+  caller-chosen string (mirrors `channel.ControlOperation`'s existing precedent exactly).
+- `PolicyWorkspaceApply` now carries a REAL budget (`MaxAttempts: 3`,
+  `Deadline: 2m`, small `Backoff`) and a new closed `s7` code,
+  `s7.CodeMutationRolledBack`, meaning exactly "a fully verified, complete rollback —
+  safe to retry the SAME operation."
+- `transaction.go` gained one new exported sentinel, `ErrRollbackIncomplete` (wrapped via
+  `errors.Join` into `rollbackAndReport`'s existing failure path when any file's rollback
+  itself failed or its post-write identity was never captured) — the ONLY change to the
+  already-3-round-converged file; `Apply`'s own signature and every existing behavior is
+  untouched. `ApplyGoverned` branches on its presence: absent → propose
+  `FailedRetryable`/`CodeMutationRolledBack` (S7 itself decides retry-vs-terminal from the
+  budget); present → `Report(Unknown)`, never retried.
+- `ApplyGoverned` is now a bounded retry LOOP (Begin once; Next/Consume/Apply/Report per
+  attempt; a `time.After`-based wait, `ctx`-cancellable, when `Next` returns `ErrNotDue`) —
+  small backoff was a deliberate choice (a synchronous, foreground-scale operation, not a
+  background delivery loop).
+- `s7.AttemptContext(ctx, op, ...)` is now called immediately after `Consume` succeeds
+  (registers the cancel owner; bounds the attempt's wall-clock budget via the new
+  `AttemptTimeout: 30s`) — documented honestly as NOT interrupting an in-flight `Apply`
+  call (synchronous local descriptor I/O has no blocking wait points to select on); this
+  is a structural/bookkeeping guarantee, not mid-syscall cancellation.
+- New `SetAppendFault` detector (`TestApplyGovernedFaultInEitherHalfOfConsumeBatchWritesZeroFiles`,
+  both event-type positions) proving the plan's own required atomicity guarantee.
+
+**2 findings NOT fixed, deliberately, with reasoning for codex round 2 to weigh in on:**
+- **Finding 1's S6.0/S6.9 half** (exact-intent identity, the OTHER half of finding 1, IS
+  fixed above): `RunDurableTool` does not exist anywhere in this codebase (grep confirms
+  it — the plan names it only as agy's suggested "starting shape... for Slice 3's own
+  review to refine," never a built API). `S6.0`'s `PEP.Decide` lives in
+  `internal/kernel/effectpath` and is called ONLY from `EffectPath.RunTool` — the
+  model-tool-call dispatch pipeline. Neither of this codebase's two other already-converged
+  durable effects with the SAME shape — `runner.Run` (this package's own sibling,
+  `PolicyCodingRun`) and `channel/telegram`'s `registerCommands`/`ControlEffect` — calls it
+  either, for the identical reason: neither is dispatched BY that loop. `ApplyGoverned` is
+  the same shape — symedit's own physical-mutation primitive, never itself the point a
+  model tool call is authorized (no `rename_symbol` ToolID is wired into the loop
+  anywhere yet; that future wiring is what would call `EffectPath.RunTool` first, THEN
+  this primitive). Governed.go's own package doc now states this explicitly, per the
+  plan's own permitted alternate route ("an equally explicit alternate route that still
+  enforces S6.0/S6.9... that slice's own review must specify its S6.0/S6.9
+  re-enforcement mechanism explicitly — a slice-level decision, not a plan gap").
+- **Finding 4 (`sealed_payload_ref`)**: verified real — `contracts.EnvelopeParams` has no
+  such field, and `journal.go`'s INSERT hardcodes SQL `NULL` for it unconditionally. But
+  PLAN-CODING-TRIO.md's OWN Slice-1 section (line ~1186) already recorded this exact gap
+  and explicitly deferred it: "recorded here so a future Slice that DOES need it doesn't
+  assume the wiring already exists." That future slice's actual consumer — the canonical
+  GC/mark-and-sweep traversal — IS invariant 4 step 6/7's not-yet-built recovery piece.
+  Wiring the reference now, before its only consumer exists, is machinery ahead of need
+  (topknot). The bundle digest IS recorded durably today, in `EvApplyStarted`/
+  `EvMutationCommitted`'s JSON payload — just not yet through the canonical column.
+
+Full verification: `internal/coding/workspace` green ×20, `internal/coding/symedit` green
+(11 real-gopls tests total across the package), `internal/kernel/s7` green, `go vet`
+clean, `go build ./...` clean. Every new branch RED-proven by targeted ablation (the
+Unknown-vs-Retryable branch, exact-intent id derivation, and the retry loop's own
+continuation — each confirmed to fail exactly as predicted when disabled, then restored).
+Dispatched for codex round 2.
+
+## Status 2026-09-10 — S7/journal wiring round 2 FAIL + real redesign (retry actually works now)
+
+Round 2 (**FAIL, 5 new HIGH findings**) accepted both deliberate deferrals from round 1
+(S6.0/S6.9 non-applicability, `sealed_payload_ref`) but found the retry design itself
+broken, and 4 other real gaps:
+
+1. **The advertised retry could never actually succeed.** A genuine rollback restores a
+   file via `WriteFileBeneath`'s atomic exchange, which always mints a NEW inode — but the
+   retry reused the SAME, now-stale, original `ExpectedBeforeDev/Ino`, so its own
+   precondition check refused it unconditionally. The round-1 test only proved loop
+   continuation using a synthetic seam that skipped an actual write/rollback cycle
+   entirely — not a real retry. **Genuine, embarrassing gap — caught only because codex
+   insisted the test prove this against a REAL rollback.**
+2. `AttemptContext`'s derived context was discarded — the 30s `AttemptTimeout` was
+   unobservable, and a concurrent `Cancel` could land S7 `CANCELLED` while writes
+   continued.
+3. The wrapper reimplemented a retry-driving loop using wall-clock `time.Until` against an
+   `Authority` whose clock is caller-injectable — a frozen/fake clock could spin forever.
+   `s7.Execute`, this codebase's ONE canonical retry driver, explicitly refuses `Durable`
+   policies; no durable counterpart exists.
+4. Operation identity accepted an arbitrary caller-supplied `profile`, independent of the
+   journal's own bound profile.
+5. Every retry's journaled event hardcoded `AttemptNo: 1`; validators used permissive
+   `json.Unmarshal` and accepted any non-empty string as a "bundle digest."
+
+**Redesign:**
+- `ApplyGoverned` now makes exactly ONE attempt per call — it does NOT own a retry loop
+  (matches this codebase's only other durable-effect precedent, `channel/telegram`'s
+  `registerCommands`: each call does its own Begin/Next/Consume/Report and returns
+  immediately, including on `ErrNotDue`; an external caller decides whether/when to call
+  again). This is a simplification (removes the buggy sleep loop entirely), not added
+  complexity, and fully closes finding 3.
+- `transaction.go` gained `Result.RolledBack []RolledBackFile` (each restored file's
+  post-rollback identity, captured via a re-`StatBeneath` right after
+  `rollbackAndReport`'s own restore succeeds) and a new exported
+  `UpdateMutationsAfterRollback(mutations, rolledBack)` helper. A caller retrying after a
+  verified-clean-rollback failure MUST rebuild its mutations through this helper first —
+  proven by a NEW test using a REAL rollback (content-only drift on a second file,
+  preserving its own inode so the test isolates exactly one moving part): the retry fails
+  with the OLD bug's exact symptom when RED-proven (stale mutations reused), and succeeds
+  once `UpdateMutationsAfterRollback` is used.
+- `Apply` itself gained a `ctx context.Context` parameter, checked once per mutation
+  immediately before that file's write — a per-file boundary check (not mid-syscall
+  interruption; local descriptor I/O has no cancellable wait point once a single
+  `WriteFileBeneath` call starts). `ApplyGoverned` derives `AttemptContext` right after
+  `Consume` succeeds and threads it through. Two new `transaction_test.go` detectors
+  (already-cancelled context; cancelled between two files' writes, proving the SECOND file
+  is never attempted and the first rolls back) — both RED-proven.
+- `ApplyGoverned` derives its profile from `j.Profile()` (the journal's OWN bound profile)
+  — the `profile` parameter is gone entirely, closing finding 4 by removing the possibility
+  of disagreement rather than adding a cross-check.
+- Every companion envelope now carries the grant's real `AttemptNo`. `Events()`'s
+  validators now strictly decode (no unknown fields/trailing data, mirroring `s7.Events`'s
+  own discipline), require a well-formed sha256-hex `bundle_digest` (new `validSHA256Hex`),
+  and validate `Landing`/`Code` against S7's own closed sets (new exported `s7.KnownCode`,
+  so this vocabulary check shares ONE source of truth with S7's own `Report`/`Events`
+  rather than duplicating and risking drifting from it).
+- New `ErrRetryNotDue` sentinel: an immediate re-call before backoff elapses returns it
+  rather than blocking.
+
+Full verification: `internal/coding/workspace` green at -count=20 (16 tests total, incl. 7
+new/rewritten this round), `internal/coding/symedit` green, `internal/kernel/s7` green,
+`go vet` clean, `go build ./...` clean, full `go test ./...` green. Every new/changed
+branch RED-proven by targeted ablation, including — critically — the real
+retry-after-rollback test itself: reverting to stale (pre-`UpdateMutationsAfterRollback`)
+mutations on the second attempt reproduces the EXACT original bug's symptom (`"a.go"'s
+current identity ... does not match the caller's expected before-identity`), proving the
+test genuinely exercises what it claims rather than merely compiling.
+
+Two deferrals from round 1 stand, both accepted by codex round 2: S6.0/S6.9 non-
+applicability (no `rename_symbol` ToolID is wired into the model-tool-call loop anywhere in
+this codebase yet — codex's own caveat: exact-intent IDs plus S7 do not themselves
+"re-enforce S6"; a future model-facing caller must still pass through the real PEP first)
+and `sealed_payload_ref` (no production GC/recovery consumer exists yet — that consumer IS
+invariant 4 steps 6/7, still unbuilt). Also newly, explicitly deferred: a durable,
+S7-owned retry-DRIVING primitive analogous to `s7.Execute` but for `Durable` policies — this
+piece's single-attempt shape sidesteps needing one (matching the telegram precedent), but a
+real background retry scheduler for RenameSymbol specifically remains unbuilt; a caller
+today drives retries by hand.
+
+Dispatched for codex round 3.
+
+## Status 2026-09-10 — S7/journal wiring round 3 FAIL + real deadlock caught + real fixes
+
+Round 3 (**FAIL, 4 new HIGH + 1 MEDIUM**) confirmed findings 3/4 from round 2 fully closed,
+but found the retry design STILL had a real correctness gap, plus a genuine reachability
+concern, a cancellation gap, and validator softness:
+
+1. **HIGH — the ungoverned mutation path remained publicly reachable.** `symedit.Apply`
+   was exported and called raw `workspace.Apply` with no S7 grant at all — a careless
+   production caller could bypass governance entirely. **Fixed**: unexported to
+   `symedit.apply` (package-private) — only reachable from this package's OWN tests
+   (same-package `_test.go`, no import needed); production callers have only
+   `ApplyGoverned`.
+2. **HIGH — FailedRetryable was proposed without verifying the COMPLETE mutation set is
+   all-BEFORE, not just the subset Apply happened to write.** The round-2 "real rollback"
+   test's own scenario proved this: it left b.go drifted, reported attempt 1 retryable
+   anyway, and only repaired b.go AFTER the fact — a.go's own clean rollback was NOT
+   sufficient grounds to call the WHOLE transaction verified. **Fixed**: `transaction.go`'s
+   write loop now tracks its index and passes the NEVER-REACHED tail of `prep` (including
+   the file whose own write just failed) to `rollbackAndReport`, which re-verifies EACH
+   one's current on-disk state against its ORIGINALLY captured before-state (new
+   `verifyStillBefore`, new package-level `prepared` type — moved out of `Apply`'s own
+   body so both functions can share it). A content-drift failure now correctly produces
+   `ErrRollbackIncomplete` (Unknown) even when the file that ACTUALLY failed had a clean
+   rollback of its own — new test `TestApplyGovernedReportsUnknownWhenAnUnreachedFileHasDrifted`
+   proves this directly. The round-2 retry test's OWN scenario had to be redesigned to use
+   a genuine infra-style failure (a chmod'd subdirectory — EACCES creating a temp file,
+   never touching the target's own content/identity) instead of content drift, since drift
+   now correctly disqualifies retry.
+3. **HIGH — retry was unusable/non-durable at the actual symedit boundary** (durable,
+   non-forgeable precondition reconstruction across a restart does not exist). Took
+   codex's own explicitly offered alternative: `PolicyWorkspaceApply`'s `MaxAttempts`
+   default is now **1** — this piece no longer claims retry support. A caller that wants
+   it may override the package var with a real budget + `RetryableCodes`; `ApplyGoverned`'s
+   single-attempt shape and `UpdateMutationsAfterRollback` still compose correctly for
+   that caller (proven by the redesigned test #2 above, using a policy override).
+4. **HIGH — cancellation could still land SUCCEEDED, and a consumed ctx-cancelled attempt
+   was misclassified as a code-carrying failure.** `Apply` gained a FINAL `ctx.Err()` check
+   immediately before declaring `Committed: true` (every write can have succeeded, but ctx
+   may have been cancelled DURING the last one). `ApplyGoverned` now detects
+   `errors.Is(applyErr, context.Canceled/DeadlineExceeded)` specifically and routes to
+   `Cancel`, not `Report(FailedRetryable/Terminal)` — mirroring `runner.Run`'s own
+   `selfDeadlineCancelled` classification for the identical distinction. New test
+   `TestApplyGovernedCancelsOperationWhenCtxCancelledMidTransaction`.
+5. **MEDIUM — the failure validator admitted impossible narratives and phantom attempt
+   numbers.** `validLanding` now excludes `LandingSucceeded` (this is exclusively the
+   FAILURE companion). `AttemptNo` is no longer precomputed as `Attempts(op)+1` before
+   `Next` even runs (which could claim a phantom attempt for an operation Next terminalizes
+   via exhaustion without ever issuing a grant) — it now starts at the REAL pre-call
+   consumed count and only updates to the grant's own `AttemptNo` once `Consume` actually
+   succeeds.
+
+**A genuine deadlock, caught by the test suite itself, not review**: the first attempt at
+fixing #5 above made `failedBuild` call `grants.Attempts(op)` LIVE, at invocation time —
+but every builder S7 passes to `Next`/`Consume`/`Report`/`Cancel` is invoked WHILE S7
+already holds its own internal mutex, so a same-goroutine call back into a method that
+also locks it (`Attempts`) is a same-goroutine relock: an immediate, total deadlock, hung
+the entire `go test` run past its 60s timeout instead of failing fast. Diagnosed by
+noticing tests were HANGING, not failing, and bisecting the exact call. Fixed by capturing
+the attempt number ONCE, outside any lock, before `Next` runs, and updating that captured
+variable via a plain assignment (not a method call) once `Consume` succeeds — the actual
+converged design in `governed.go` now.
+
+A second, smaller bug surfaced by the fix above: `contracts.EnvelopeParams.AttemptNo` (the
+generic envelope-level field, always >=1 by the journal's own admission rule — distinct
+from this package's own `attempt_no` JSON payload field, which legitimately CAN be 0,
+meaning "no attempt was ever consumed") needed its own clamp; `envelope()` now clamps only
+the generic field, leaving the domain-truthful value in the payload untouched.
+
+Full verification: `internal/coding/workspace` green at -count=20 (20 tests, several
+new/redesigned this round), `internal/coding/symedit` green, `internal/kernel/s7` green,
+`go vet` clean, `go build ./...` clean, full `go test ./...` green. Every changed branch
+RED-proven by targeted ablation (the unreached-verification pass, the ctx-cancel-to-Cancel
+routing); the deadlock's own RED proof is the empirical 60s hang itself, observed directly
+rather than re-derived via a clean ablation (Go's unused-variable check made a faithful
+ablation of the fixed code impossible without also breaking compilation — the hang was
+reproduced and root-caused via a standalone debug test instead).
+
+Dispatched for codex round 4.
+
+## Status 2026-09-11 — S7/journal wiring round 4 FAIL + convergence on the remaining gaps
+
+Round 4 (**FAIL, 2 new HIGH + 2 new MEDIUM**) confirmed the deadlock fix, the whole-set
+all-BEFORE verification, the chmod'd-subdirectory test technique, and `MaxAttempts: 1`'s
+default are ALL correct. Convergence is close — every remaining finding was small and
+contained:
+
+1. **HIGH — `symedit.apply` was unexported, but it still called the raw exported
+   `workspace.Apply`, which itself required no S7 grant.** The actual owner boundary
+   (invariant 2: every dispatched `workspace.Apply` effect must be S7-governed) was still
+   crossable from any package. **Fixed properly**: `workspace.Apply` is now unexported to
+   `workspace.apply` too — `ApplyGoverned` is the ONLY exported entry point into a real
+   mutation, from any package. This forced a genuine, positive cleanup of `symedit`'s own
+   test suite: the pure "digest tamper detection" tests (`TestApplyRefusesEmptyPlan`,
+   `TestApplyRefusesTamperedPlan`, `TestApplyRefusesPlanWithTamperedPreimageContent/Mode`)
+   never actually needed a real filesystem write in the first place — they now call
+   `planMutations` directly (simpler, faster, and more precisely isolates what they
+   claim); the one test that DOES need a real on-disk precondition check
+   (`TestApplyRefusesWhenFileDriftedSincePrepare`) now goes through `ApplyGoverned`; and
+   the now-redundant `TestPrepareApplyEndToEndRename` (superseded by
+   `TestApplyGovernedEndToEndRenameWiresRealS7Grant`, which gained its extra
+   plan-shape assertions) was deleted outright — deletion over addition, one fewer real
+   `gopls` invocation per test run.
+2. **HIGH — the final post-write ctx-cancellation check had no RED-capable detector of
+   its own.** Both existing cancellation tests used two mutations, so the SECOND file's
+   own ordinary per-iteration check already caught the cancellation — ablating only the
+   NEW final check left both tests green (verified directly: it does). New
+   `TestApplyRefusesSingleFileCommitWhenContextCancelledDuringItsOwnWrite` uses exactly
+   ONE mutation, scheduling cancellation to fire AFTER that file's own (only) per-iteration
+   check already passed — there is no second iteration to mask the ablation. Confirmed:
+   the two-file test stays green when the final check alone is ablated (proving it WAS
+   redundant coverage, exactly as codex diagnosed); the new one-file test turns RED.
+3. **MEDIUM — the failure-event validator admitted impossible (attempt_no, landing, code)
+   combinations** (e.g. attempt_no=0 with Unknown, or Retry paired with an unrelated known
+   S7 code). Replaced the bare closed-landing-enum check with an exact
+   `validApplyFailedNarrative` compatibility table scoped to what THIS owner actually
+   emits: Cancelled/Terminal allow any attempt_no, code must be `""` for Cancelled;
+   Retry/Unknown both require a CONSUMED attempt (attempt_no>=1); Retry requires
+   `CodeMutationRolledBack` specifically, Unknown requires empty code; any other non-empty
+   code is rejected outright (this owner never legitimately produces one). The
+   now-unused, this-round-added `s7.KnownCode` export was removed again rather than left
+   as dead kernel surface.
+4. **MEDIUM — a `Consume`-succeeded-but-`AttemptContext`-failed gap between Consume and
+   the write loop was misclassified as `CodeMutationRolledBack`** ("verified rollback,
+   safe to retry") even though Apply's write loop was never entered — nothing was ever
+   mutated, so nothing was ever rolled back. New `deriveAttemptContext` test seam
+   (mirrors `applyFn`'s own pattern — a real clock race here would need a
+   microsecond-precision window with no test-visible hook) lets a test force this
+   deterministically. Fixed: this specific case now routes to the SAME `Cancel` branch as
+   a ctx cancellation/deadline (the attempt never got to run because its own timing bound
+   was already gone — the same shape, not a code-carrying failure). New
+   `TestApplyGovernedCancelsWhenAttemptContextFailsAfterConsume`.
+
+Full verification: `internal/coding/workspace` green at -count=20, `internal/coding/symedit`
+green (now 1 fewer real-`gopls` test, same coverage), `internal/kernel/s7` green, `go vet`
+clean, `go build ./...` clean, full `go test ./...` green. Every changed branch RED-proven
+by targeted ablation, including the negative-control proof that the round-3 two-file
+cancellation test does NOT independently exercise the final check (ablating it leaves that
+test green, confirmed directly) — exactly the gap codex identified.
+
+Dispatched for codex round 5.
+
+## Status 2026-09-11 — S7/journal wiring round 5 FAIL + 2 more real fixes
+
+Round 5 (**FAIL, 2 HIGH**) confirmed the round-4 fixes for the final-cancellation detector
+and the `neverWrote`/`AttemptContext` classification are both correct, but found 2 more:
+
+1. **HIGH — the round-4 exact-narrative table was ITSELF too strict, and codex proved it
+   with a live reproduction, not just a hypothetical**: S7's own `Cancel` preserves the
+   PRIOR report's code as `rec.lastCode` when building its companion — so cancelling an
+   operation that already landed `FAILED_RETRYABLE`/`CodeMutationRolledBack` once (a
+   legitimate step in the caller-driven retry path this package explicitly documents and
+   supports) produces exactly `(attempt_no>=1, Cancelled, CodeMutationRolledBack)` — which
+   the round-4 table rejected outright, making the durable `Cancel` append itself fail
+   validation and **stranding the real operation in AUTHORIZED forever**. Fixed: `Cancelled`
+   and `Terminal` now both accept `code == "" || (code == CodeMutationRolledBack &&
+   attemptNo >= 1)` (Terminal has the identical possibility for the identical reason — Next's
+   own exhaustion path echoes the same `rec.lastCode`). New
+   `TestApplyGovernedCancelsRetryEligibleOperationCarryingPriorRetryCode` reproduces codex's
+   EXACT sequence (attempt 1 fails with a genuinely verified rollback via the chmod
+   technique, lands `FAILED_RETRYABLE`; attempt 2 deliberately reuses the STALE
+   pre-rollback mutations — the same real bug the sibling retry test proves
+   `UpdateMutationsAfterRollback` fixes — so it refuses pre-Consume, landing `Cancelled`
+   via the exact narrative that used to fail validation) — RED-proven against the round-4
+   table verbatim (reproduces the identical AUTHORIZED-stuck symptom, then fixed).
+2. **HIGH — `ApplyGoverned` was not actually the only exported mutation entrypoint**:
+   `workspace.WriteFileBeneath` and `workspace.RemoveFileWithExpectedIdentity`
+   (descriptor.go's own atomic-replace/quarantine-remove primitives) remained exported,
+   requiring no S7 grant, with zero current cross-package callers to break. Unexported
+   both (`writeFileBeneath`/`removeFileWithExpectedIdentity`) — the read-only descriptor
+   helpers (`OpenRoot`, `WalkDirBeneath`, `StatBeneath`, `CaptureFileBeneath`) stay
+   exported as before. `ApplyGoverned`'s claim to be the sole exported path into a real
+   mutation is now actually true.
+
+Full verification: `internal/coding/workspace` green at -count=20 (23 tests now),
+`internal/coding/symedit` green, `internal/kernel/s7` green, `go vet` clean, `go build
+./...` clean, full `go test ./...` green. The new retry-cancellation test RED-proven
+against the exact round-4 table (reproduces codex's own live reproduction verbatim before
+the fix, passes after).
+
+Dispatched for codex round 6.
+
+## Status 2026-09-11 — S7/journal wiring CLOSED: round 6 PASS
+
+Round 6: **PASS**, plainly. Both round-5 findings independently re-verified closed (codex
+restored the OLD Cancelled-requires-empty-code branch in a disposable copy and confirmed
+`TestApplyGovernedCancelsRetryEligibleOperationCarryingPriorRetryCode` turns RED with the
+identical `state = AUTHORIZED` symptom, then confirmed the current code passes ×20; ran an
+exhaustive scan of `internal/coding/workspace` for any other exported function performing
+a physical mutation — found none, only read/walk/stat/capture helpers plus
+`ApplyGoverned`). One editorial-only note (a stale sentence in `validApplyFailedNarrative`'s
+own doc comment still said Cancelled always requires an empty code, though the
+implementation and the rest of the comment already had it right) — fixed.
+
+**This closes S7/journal wiring for `workspace.Apply`/RenameSymbol as its own converged
+piece — 6 review rounds, each of the first 5 finding something real** (round 1: missed
+invariant 2's own pre-existing contract entirely — exact-intent IDs, a real retry budget,
+`AttemptContext`; round 2: the retry design was fundamentally broken — rollback always
+mints a new inode, silently making the advertised retry impossible; round 3: still didn't
+verify the WHOLE mutation set was all-BEFORE, only the written subset, PLUS a genuine
+deadlock I introduced fixing round 2's own attempt-numbering bug, caught by the test suite
+hanging; round 4: the raw `workspace.Apply` bypass was still exported, the final
+cancellation check had no independent detector, two narrower validator gaps; round 5: the
+round-4 validator fix was itself too strict — codex reproduced a live sequence where
+cancelling a legitimate retry-eligible operation got permanently stuck `AUTHORIZED` — plus
+two more raw mutation primitives were still exported). The empirical lesson already
+recorded twice this program (workspace.Apply's own 7 rounds, symedit's Prepare/Apply's 4
+rounds) held a third time, at even greater length: one clean test run and one reviewer PASS
+is never sufficient for concurrent/filesystem/security-sensitive code — only sustained,
+adversarial, round-after-round pressure converges it.
+
+**What is now real and governed**: `ApplyGoverned` is the sole exported entry point into
+any workspace mutation, from any package; exact-intent S7 operation identity derived from
+the journal's own bound profile + root identity + plan digest; a durable
+`workspace.apply_started`/`workspace.mutation_committed`/`workspace.apply_failed` event
+trio with an exact, owner-scoped narrative-validation table; per-file ctx-cancellation
+checks (including the specific post-last-write gap) correctly routed to S7 `Cancel`, never
+a code-carrying failure; a genuinely verified all-BEFORE classification (re-checking every
+mutation, not just the ones actually written) gating the ONE retryable code this owner
+proposes; `RolledBack`/`UpdateMutationsAfterRollback` giving a caller-driven retry (for a
+caller that opts in via a policy override — the default `MaxAttempts: 1` makes no retry
+claim) a real, working path, proven end-to-end against an ACTUAL rollback, not a synthetic
+stand-in.
+
+**Still explicitly, deliberately NOT built** (unchanged from earlier rounds, restated for
+anyone resuming this plan): the restart-time crash-recovery classification table and the
+governed `PolicyWorkspaceRollback` operation (invariant 4 steps 6/7); `sealed_payload_ref`
+wiring (no production GC/recovery consumer exists yet — that consumer IS the item above);
+S6.0/S6.9 re-enforcement at a model-facing `rename_symbol` tool boundary (doesn't exist yet
+in this codebase — `ApplyGoverned` is a primitive a future tool-dispatch layer would call
+AFTER its own PEP check, mirroring `runner.Run`'s identical, already-accepted shape); a
+durable, S7-owned retry-DRIVING primitive analogous to `s7.Execute` but for `Durable`
+policies (this piece's single-attempt shape sidesteps needing one; a real background
+retry scheduler for RenameSymbol specifically remains unbuilt).
+
+Final verification before this status: `go build ./...` clean, `go vet ./...` clean,
+`internal/coding/workspace` green at -count=20, `internal/coding/symedit` green,
+`internal/kernel/s7` green, full `go test ./...` green.

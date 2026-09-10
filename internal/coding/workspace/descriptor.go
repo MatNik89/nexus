@@ -49,9 +49,9 @@ const resolveFlags = unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS | unix.RESO
 // restoring exchange, without a real (flaky) goroutine race.
 var beforeRestoreExchange = func() {}
 
-// fsyncDirHook is WriteFileBeneath's trailing directory fsync, indirected
+// fsyncDirHook is writeFileBeneath's trailing directory fsync, indirected
 // through a var so descriptor_test.go/transaction_test.go can force it to
-// fail deterministically — proving WriteFileBeneath's committed return
+// fail deterministically — proving writeFileBeneath's committed return
 // value is correct even when this specific trailing step errors after
 // the rename/exchange has already landed (code-review finding, codex,
 // transaction.go round 1).
@@ -59,7 +59,7 @@ var fsyncDirHook = unix.Fsync
 
 // beforeQuarantineVerify is a test seam: a no-op in production, it lets
 // descriptor_test.go deterministically inject a concurrent CREATE at
-// baseName immediately after RemoveFileWithExpectedIdentity has
+// baseName immediately after removeFileWithExpectedIdentity has
 // quarantined (renamed away) whatever was previously there, proving that
 // creation survives untouched — without a real (flaky) goroutine race.
 var beforeQuarantineVerify = func() {}
@@ -75,7 +75,7 @@ var beforeQuarantineVerify = func() {}
 // call only applies to the FINAL path component, per POSIX/Linux
 // semantics — an INTERMEDIATE symlink (e.g. rootPath = "/tmp/x/link/ws"
 // where "link" is a symlink) is silently traversed. Since every
-// downstream WalkDirBeneath/WriteFileBeneath call trusts rootFd as the
+// downstream WalkDirBeneath/writeFileBeneath call trusts rootFd as the
 // correct containment boundary, a wrong root fd silently defeats the
 // ENTIRE rest of this package's symlink defense. openat2's
 // RESOLVE_NO_SYMLINKS applies to EVERY resolved component, not just the
@@ -150,7 +150,7 @@ func WalkDirBeneath(rootFd int, relDir string) (fd int, err error) {
 	return cur, nil
 }
 
-// TargetExpectation states what WriteFileBeneath must find (or not
+// TargetExpectation states what writeFileBeneath must find (or not
 // find) at baseName immediately before replacing it (code-review
 // finding, codex, round 1: an earlier version performed an
 // unconditional rename-over, silently overwriting whatever was there —
@@ -165,12 +165,12 @@ type TargetExpectation struct {
 	// check-then-act race window at all.
 	MustNotExist bool
 	// Dev/Ino, when MustNotExist is false, are the device+inode
-	// WriteFileBeneath must find at baseName at the moment it is
+	// writeFileBeneath must find at baseName at the moment it is
 	// displaced — captured by the caller at an earlier point (e.g.
 	// Prepare time, via StatBeneath). A mismatch, INCLUDING baseName
 	// having become a symlink, a directory, or any other non-regular
 	// type since then, is refused and the original entry is restored
-	// (see WriteFileBeneath's exchange-verify-restore sequence, which
+	// (see writeFileBeneath's exchange-verify-restore sequence, which
 	// closes the check-then-act window a separate fstatat-then-renameat
 	// would leave open — code-review finding, codex, round 2).
 	Dev, Ino uint64
@@ -194,7 +194,7 @@ type TargetExpectation struct {
 	CheckMode bool
 }
 
-// WriteFileBeneath atomically replaces (or creates) baseName within the
+// writeFileBeneath atomically replaces (or creates) baseName within the
 // directory identified by dirFd, per expect: create a private, randomly-
 // named temp file (O_CREAT|O_EXCL, so a name collision fails rather than
 // silently reusing an existing file), write+fsync its content, then
@@ -220,13 +220,13 @@ type TargetExpectation struct {
 // committed reports whether baseName's directory entry now points at
 // the NEW content — true as soon as the rename/exchange itself has
 // landed, even if a LATER step (removing the displaced original,
-// directory fsync) then fails and WriteFileBeneath returns a non-nil
+// directory fsync) then fails and writeFileBeneath returns a non-nil
 // error (code-review finding, codex, transaction.go round 1: a caller
 // that only tracks success/failure, not "did the entry change", can
 // silently omit an actually-mutated file from its own rollback
 // bookkeeping). A caller MUST treat committed==true as "this file needs
 // rollback on transaction failure" regardless of err.
-func WriteFileBeneath(dirFd int, baseName string, content []byte, mode fs.FileMode, expect TargetExpectation) (committed bool, err error) {
+func writeFileBeneath(dirFd int, baseName string, content []byte, mode fs.FileMode, expect TargetExpectation) (committed bool, err error) {
 	if err := validateBaseName(baseName); err != nil {
 		return false, err
 	}
@@ -368,8 +368,8 @@ func WriteFileBeneath(dirFd int, baseName string, content []byte, mode fs.FileMo
 // existing-replacement target, refused here rather than silently handed
 // back as a capturable identity (code-review finding, codex, round 2: a
 // caller could otherwise capture a planted symlink's own Dev/Ino and
-// have WriteFileBeneath's identity check "match" it, authorizing an
-// overwrite of that symlink instead of refusing it; WriteFileBeneath
+// have writeFileBeneath's identity check "match" it, authorizing an
+// overwrite of that symlink instead of refusing it; writeFileBeneath
 // itself also re-checks S_IFREG on the displaced entry as defense in
 // depth against drift between capture and replace).
 func StatBeneath(dirFd int, baseName string) (dev, ino uint64, err error) {
@@ -444,12 +444,12 @@ func CaptureFileBeneath(dirFd int, baseName string) (content []byte, dev, ino ui
 	return data, uint64(st.Dev), st.Ino, fs.FileMode(st.Mode & 0o777), nil
 }
 
-// RemoveFileWithExpectedIdentity descriptor-relatively removes baseName
+// removeFileWithExpectedIdentity descriptor-relatively removes baseName
 // within dirFd, but ONLY if it is still the exact regular file matching
 // expect — used by transaction.go's rollback path to undo a file this
 // same process just created. expect's MustNotExist is ignored (removal
 // has no "must be new" case); Dev/Ino/ContentDigest/CheckMode+ExpectMode
-// are all checked against the displaced entry exactly as WriteFileBeneath's
+// are all checked against the displaced entry exactly as writeFileBeneath's
 // replace path checks them.
 //
 // Design (code-review finding, codex, round 3 — a THIRD iteration on
@@ -471,7 +471,7 @@ func CaptureFileBeneath(dirFd int, baseName string) (content []byte, dev, ino ui
 // content under the quarantine name for manual recovery) if baseName is
 // now occupied by something a concurrent creator placed there while
 // this function was vacating and checking.
-func RemoveFileWithExpectedIdentity(dirFd int, baseName string, expect TargetExpectation) error {
+func removeFileWithExpectedIdentity(dirFd int, baseName string, expect TargetExpectation) error {
 	if err := validateBaseName(baseName); err != nil {
 		return err
 	}

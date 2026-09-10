@@ -13,7 +13,7 @@ import (
 )
 
 // Detector: a real, minimal write — create a NEW file (MustNotExist) in
-// a nested directory via OpenRoot + WalkDirBeneath + WriteFileBeneath —
+// a nested directory via OpenRoot + WalkDirBeneath + writeFileBeneath —
 // produces the exact expected content on disk.
 func TestWriteFileBeneathCreatesFile(t *testing.T) {
 	root := t.TempDir()
@@ -32,7 +32,7 @@ func TestWriteFileBeneathCreatesFile(t *testing.T) {
 	}
 	defer unix.Close(dirFd)
 
-	if _, err := WriteFileBeneath(dirFd, "f.go", []byte("package b\n"), 0o644, TargetExpectation{MustNotExist: true}); err != nil {
+	if _, err := writeFileBeneath(dirFd, "f.go", []byte("package b\n"), 0o644, TargetExpectation{MustNotExist: true}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := os.ReadFile(filepath.Join(root, "a", "b", "f.go"))
@@ -58,7 +58,7 @@ func TestWriteFileBeneathMustNotExistRefusesWhenFileAlreadyExists(t *testing.T) 
 	}
 	defer unix.Close(rootFd)
 
-	_, err = WriteFileBeneath(rootFd, "f.go", []byte("new content"), 0o644, TargetExpectation{MustNotExist: true})
+	_, err = writeFileBeneath(rootFd, "f.go", []byte("new content"), 0o644, TargetExpectation{MustNotExist: true})
 	if err == nil {
 		t.Fatal("expected an error: f.go already exists, MustNotExist should refuse")
 	}
@@ -71,7 +71,7 @@ func TestWriteFileBeneathMustNotExistRefusesWhenFileAlreadyExists(t *testing.T) 
 	}
 }
 
-// Detector: WriteFileBeneath on a file that ALREADY EXISTS, with its
+// Detector: writeFileBeneath on a file that ALREADY EXISTS, with its
 // CORRECT expected identity (captured via StatBeneath), replaces its
 // content atomically (rename-over), rather than erroring or appending.
 func TestWriteFileBeneathReplacesExistingFileWithMatchingIdentity(t *testing.T) {
@@ -89,7 +89,7 @@ func TestWriteFileBeneathReplacesExistingFileWithMatchingIdentity(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := WriteFileBeneath(rootFd, "f.go", []byte("new content"), 0o644, TargetExpectation{Dev: dev, Ino: ino}); err != nil {
+	if _, err := writeFileBeneath(rootFd, "f.go", []byte("new content"), 0o644, TargetExpectation{Dev: dev, Ino: ino}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := os.ReadFile(filepath.Join(root, "f.go"))
@@ -117,7 +117,7 @@ func TestWalkDirBeneathEmptyRelDirReturnsRoot(t *testing.T) {
 	}
 	defer unix.Close(dirFd)
 
-	if _, err := WriteFileBeneath(dirFd, "top.go", []byte("x"), 0o644, TargetExpectation{MustNotExist: true}); err != nil {
+	if _, err := writeFileBeneath(dirFd, "top.go", []byte("x"), 0o644, TargetExpectation{MustNotExist: true}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(root, "top.go")); err != nil {
@@ -168,7 +168,7 @@ func TestWalkDirBeneathRefusesSymlinkedDirectoryComponent(t *testing.T) {
 // refused"). A directory that is VALID when WalkDirBeneath resolves it,
 // but whose target FILENAME is swapped for a symlink AFTER the caller
 // captured its expected identity (simulating a Prepare-time capture,
-// then a TOCTOU race before Apply), must make WriteFileBeneath REFUSE —
+// then a TOCTOU race before Apply), must make writeFileBeneath REFUSE —
 // via the descriptor-relative fstatat identity check immediately before
 // the rename — not silently replace it.
 func TestWriteFileBeneathRefusesTargetIdentityDrift(t *testing.T) {
@@ -202,9 +202,9 @@ func TestWriteFileBeneathRefusesTargetIdentityDrift(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = WriteFileBeneath(rootFd, "f.go", []byte("attacker should not see this replace"), 0o644, TargetExpectation{Dev: dev, Ino: ino})
+	_, err = writeFileBeneath(rootFd, "f.go", []byte("attacker should not see this replace"), 0o644, TargetExpectation{Dev: dev, Ino: ino})
 	if err == nil {
-		t.Fatal("expected WriteFileBeneath to refuse — the target's identity drifted to a planted symlink")
+		t.Fatal("expected writeFileBeneath to refuse — the target's identity drifted to a planted symlink")
 	}
 
 	// The planted symlink must be left EXACTLY as it was — untouched,
@@ -214,7 +214,7 @@ func TestWriteFileBeneathRefusesTargetIdentityDrift(t *testing.T) {
 		t.Fatal(err)
 	}
 	if fi.Mode()&os.ModeSymlink == 0 {
-		t.Fatal("f.go should still be the planted symlink — WriteFileBeneath must not have touched it")
+		t.Fatal("f.go should still be the planted symlink — writeFileBeneath must not have touched it")
 	}
 	outsideContent, err := os.ReadFile(filepath.Join(outside, "secret.txt"))
 	if err != nil {
@@ -295,12 +295,12 @@ func TestWriteFileBeneathRejectsBaseNameWithSeparator(t *testing.T) {
 	}
 	defer unix.Close(rootFd)
 
-	if _, err := WriteFileBeneath(rootFd, "a/f.go", []byte("x"), 0o644, TargetExpectation{MustNotExist: true}); err == nil {
+	if _, err := writeFileBeneath(rootFd, "a/f.go", []byte("x"), 0o644, TargetExpectation{MustNotExist: true}); err == nil {
 		t.Fatal("expected an error for a base name containing a separator")
 	}
 }
 
-// Detector: content written through WriteFileBeneath is FULLY DURABLE —
+// Detector: content written through writeFileBeneath is FULLY DURABLE —
 // no partial temp files are left behind after a successful write.
 func TestWriteFileBeneathLeavesNoTempFilesBehind(t *testing.T) {
 	root := t.TempDir()
@@ -310,7 +310,7 @@ func TestWriteFileBeneathLeavesNoTempFilesBehind(t *testing.T) {
 	}
 	defer unix.Close(rootFd)
 
-	if _, err := WriteFileBeneath(rootFd, "f.go", []byte("x"), 0o644, TargetExpectation{MustNotExist: true}); err != nil {
+	if _, err := writeFileBeneath(rootFd, "f.go", []byte("x"), 0o644, TargetExpectation{MustNotExist: true}); err != nil {
 		t.Fatal(err)
 	}
 	entries, err := os.ReadDir(root)
@@ -325,7 +325,7 @@ func TestWriteFileBeneathLeavesNoTempFilesBehind(t *testing.T) {
 // Detector (code-review finding, codex, round 2): StatBeneath must
 // REFUSE a symlink outright, not report its own identity as a
 // capturable TargetExpectation — otherwise a caller could capture a
-// planted symlink's Dev/Ino and later have WriteFileBeneath's identity
+// planted symlink's Dev/Ino and later have writeFileBeneath's identity
 // check "match" it, authorizing an overwrite of the symlink instead of
 // refusing it. This also proves StatBeneath does not silently FOLLOW
 // the symlink either: if it did, it would succeed (reporting real.go's
@@ -354,9 +354,9 @@ func TestStatBeneathRefusesSymlink(t *testing.T) {
 
 // Detector (code-review finding, codex, round 3): if a DIFFERENT writer
 // replaces baseName concurrently, exactly in the window between
-// WriteFileBeneath detecting an identity mismatch and performing its
+// writeFileBeneath detecting an identity mismatch and performing its
 // restoring exchange, that writer's content must SURVIVE — never be
-// silently deleted by WriteFileBeneath's own cleanup. Uses the
+// silently deleted by writeFileBeneath's own cleanup. Uses the
 // beforeRestoreExchange test seam to inject the concurrent write
 // deterministically, without a real (flaky) goroutine race.
 func TestWriteFileBeneathPreservesConcurrentWriteDuringMismatchRestore(t *testing.T) {
@@ -394,9 +394,9 @@ func TestWriteFileBeneathPreservesConcurrentWriteDuringMismatchRestore(t *testin
 	}
 	t.Cleanup(func() { beforeRestoreExchange = func() {} })
 
-	_, err = WriteFileBeneath(rootFd, "f.go", []byte("our content, should not land"), 0o644, TargetExpectation{Dev: wrongDev, Ino: wrongIno})
+	_, err = writeFileBeneath(rootFd, "f.go", []byte("our content, should not land"), 0o644, TargetExpectation{Dev: wrongDev, Ino: wrongIno})
 	if err == nil {
-		t.Fatal("expected WriteFileBeneath to refuse (wrong expectation)")
+		t.Fatal("expected writeFileBeneath to refuse (wrong expectation)")
 	}
 
 	// baseName must hold the ORIGINAL content restored — not our new
@@ -423,14 +423,14 @@ func TestWriteFileBeneathPreservesConcurrentWriteDuringMismatchRestore(t *testin
 		}
 	}
 	if !found {
-		t.Fatal("the concurrent writer's content was lost — WriteFileBeneath deleted it during mismatch restore")
+		t.Fatal("the concurrent writer's content was lost — writeFileBeneath deleted it during mismatch restore")
 	}
 }
 
 // Detector (code-review finding, codex, round 2, defense-in-depth): even
 // if a caller bypassed StatBeneath's own symlink refusal and captured a
 // symlink's raw Dev/Ino directly (e.g. a future caller stats via some
-// other path), WriteFileBeneath's OWN S_IFREG check on the displaced
+// other path), writeFileBeneath's OWN S_IFREG check on the displaced
 // entry — not just StatBeneath's gate — must still refuse the swap.
 // Identity (Dev/Ino) alone is not sufficient; type must match too.
 func TestWriteFileBeneathRefusesSymlinkEvenWithMatchingRawIdentity(t *testing.T) {
@@ -453,22 +453,22 @@ func TestWriteFileBeneathRefusesSymlinkEvenWithMatchingRawIdentity(t *testing.T)
 		t.Fatal(err)
 	}
 
-	_, err = WriteFileBeneath(rootFd, "link.go", []byte("attacker content"), 0o644, TargetExpectation{Dev: uint64(st.Dev), Ino: st.Ino})
+	_, err = writeFileBeneath(rootFd, "link.go", []byte("attacker content"), 0o644, TargetExpectation{Dev: uint64(st.Dev), Ino: st.Ino})
 	if err == nil {
-		t.Fatal("expected WriteFileBeneath to refuse replacing a symlink even with its own exact Dev/Ino as the expectation")
+		t.Fatal("expected writeFileBeneath to refuse replacing a symlink even with its own exact Dev/Ino as the expectation")
 	}
 	fi, err := os.Lstat(filepath.Join(root, "link.go"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if fi.Mode()&os.ModeSymlink == 0 {
-		t.Fatal("link.go should still be a symlink — WriteFileBeneath must not have touched it")
+		t.Fatal("link.go should still be a symlink — writeFileBeneath must not have touched it")
 	}
 }
 
 // Detector (code-review finding, codex, round 2): even if a caller
 // somehow obtained a foreign REGULAR file's Dev/Ino (not a symlink —
-// StatBeneath already refuses those), WriteFileBeneath's exchange-
+// StatBeneath already refuses those), writeFileBeneath's exchange-
 // verify-restore sequence must still refuse a target whose actual
 // identity does not match, and must leave that foreign file completely
 // untouched, restored under its original name.
@@ -495,9 +495,9 @@ func TestWriteFileBeneathRestoresForeignRegularFileOnIdentityMismatch(t *testing
 		t.Fatal(err)
 	}
 
-	_, err = WriteFileBeneath(rootFd, "f.go", []byte("should not land"), 0o644, TargetExpectation{Dev: wrongDev, Ino: wrongIno})
+	_, err = writeFileBeneath(rootFd, "f.go", []byte("should not land"), 0o644, TargetExpectation{Dev: wrongDev, Ino: wrongIno})
 	if err == nil {
-		t.Fatal("expected WriteFileBeneath to refuse — f.go's identity does not match the captured expectation")
+		t.Fatal("expected writeFileBeneath to refuse — f.go's identity does not match the captured expectation")
 	}
 
 	got, err := os.ReadFile(filepath.Join(root, "f.go"))
@@ -541,7 +541,7 @@ func TestWriteFileBeneathReportsCommittedEvenWhenTrailingFsyncFails(t *testing.T
 	defer func() { fsyncDirHook = orig }()
 	fsyncDirHook = func(fd int) error { return fmt.Errorf("injected fsync failure") }
 
-	committed, err := WriteFileBeneath(rootFd, "f.go", []byte("new content"), 0o644, TargetExpectation{Dev: dev, Ino: ino})
+	committed, err := writeFileBeneath(rootFd, "f.go", []byte("new content"), 0o644, TargetExpectation{Dev: dev, Ino: ino})
 	if err == nil {
 		t.Fatal("expected the injected fsync error to propagate")
 	}
@@ -585,11 +585,11 @@ func TestWriteFileBeneathRefusesContentDigestMismatchDespiteMatchingIdentity(t *
 	// content ("original content") — simulates a caller whose captured
 	// before-content is stale relative to an in-place mutation that kept
 	// the same inode.
-	committed, err := WriteFileBeneath(rootFd, "f.go", []byte("new content"), 0o644, TargetExpectation{
+	committed, err := writeFileBeneath(rootFd, "f.go", []byte("new content"), 0o644, TargetExpectation{
 		Dev: dev, Ino: ino, ContentDigest: wrongDigest,
 	})
 	if err == nil {
-		t.Fatal("expected WriteFileBeneath to refuse — content digest does not match despite matching Dev/Ino")
+		t.Fatal("expected writeFileBeneath to refuse — content digest does not match despite matching Dev/Ino")
 	}
 	if committed {
 		t.Fatal("expected committed = false — the mismatch was caught and restored")
@@ -603,7 +603,7 @@ func TestWriteFileBeneathRefusesContentDigestMismatchDespiteMatchingIdentity(t *
 	}
 }
 
-// Detector: RemoveFileWithExpectedIdentity actually removes a file whose
+// Detector: removeFileWithExpectedIdentity actually removes a file whose
 // identity matches, and leaves no tombstone or temp artifacts behind.
 func TestRemoveFileWithExpectedIdentityRemovesMatchingFile(t *testing.T) {
 	root := t.TempDir()
@@ -620,7 +620,7 @@ func TestRemoveFileWithExpectedIdentityRemovesMatchingFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := RemoveFileWithExpectedIdentity(rootFd, "f.go", TargetExpectation{Dev: dev, Ino: ino}); err != nil {
+	if err := removeFileWithExpectedIdentity(rootFd, "f.go", TargetExpectation{Dev: dev, Ino: ino}); err != nil {
 		t.Fatal(err)
 	}
 	if _, statErr := os.Stat(filepath.Join(root, "f.go")); !os.IsNotExist(statErr) {
@@ -636,9 +636,9 @@ func TestRemoveFileWithExpectedIdentityRemovesMatchingFile(t *testing.T) {
 }
 
 // Detector (code-review finding, codex, transaction.go round 1: the
-// original RemoveFileWithExpectedIdentity was a plain fstatat-then-
+// original removeFileWithExpectedIdentity was a plain fstatat-then-
 // unlinkat, a real check-then-act race — rewritten with the same
-// exchange-verify-restore discipline as WriteFileBeneath's replace
+// exchange-verify-restore discipline as writeFileBeneath's replace
 // path). A target whose identity has drifted (here: swapped for a
 // symlink) must be refused, left completely untouched.
 func TestRemoveFileWithExpectedIdentityRefusesDriftedTarget(t *testing.T) {
@@ -669,16 +669,16 @@ func TestRemoveFileWithExpectedIdentityRefusesDriftedTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = RemoveFileWithExpectedIdentity(rootFd, "f.go", TargetExpectation{Dev: dev, Ino: ino})
+	err = removeFileWithExpectedIdentity(rootFd, "f.go", TargetExpectation{Dev: dev, Ino: ino})
 	if err == nil {
-		t.Fatal("expected RemoveFileWithExpectedIdentity to refuse — the target's identity drifted to a planted symlink")
+		t.Fatal("expected removeFileWithExpectedIdentity to refuse — the target's identity drifted to a planted symlink")
 	}
 	fi, err := os.Lstat(filepath.Join(root, "f.go"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if fi.Mode()&os.ModeSymlink == 0 {
-		t.Fatal("f.go should still be the planted symlink — RemoveFileWithExpectedIdentity must not have touched it")
+		t.Fatal("f.go should still be the planted symlink — removeFileWithExpectedIdentity must not have touched it")
 	}
 	outsideContent, err := os.ReadFile(filepath.Join(outside, "secret.txt"))
 	if err != nil {
@@ -738,7 +738,7 @@ func TestRemoveFileWithExpectedIdentityPreservesConcurrentCreateDuringQuarantine
 		}
 	}
 
-	if err := RemoveFileWithExpectedIdentity(rootFd, "f.go", TargetExpectation{Dev: dev, Ino: ino}); err != nil {
+	if err := removeFileWithExpectedIdentity(rootFd, "f.go", TargetExpectation{Dev: dev, Ino: ino}); err != nil {
 		t.Fatalf("expected the original (correctly quarantined) target to be removed successfully, got: %v", err)
 	}
 	if !fired {
@@ -762,11 +762,11 @@ func TestRemoveFileWithExpectedIdentityPreservesConcurrentCreateDuringQuarantine
 }
 
 // Detector (code-review finding, codex, round 2): the earlier version of
-// RemoveFileWithExpectedIdentity checked only Dev/Ino, so a file mutated
+// removeFileWithExpectedIdentity checked only Dev/Ino, so a file mutated
 // IN PLACE (same inode) after its identity was captured would still
 // "match" and be deleted, losing whatever content was written there in
 // the meantime. ContentDigest+CheckMode close this the same way they
-// close it for WriteFileBeneath's replace path.
+// close it for writeFileBeneath's replace path.
 func TestRemoveFileWithExpectedIdentityRefusesContentDigestMismatchDespiteMatchingIdentity(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "f.go"), []byte("original content"), 0o644); err != nil {
@@ -784,9 +784,9 @@ func TestRemoveFileWithExpectedIdentityRefusesContentDigestMismatchDespiteMatchi
 	}
 	wrongDigest := strings.Repeat("0", 64)
 
-	err = RemoveFileWithExpectedIdentity(rootFd, "f.go", TargetExpectation{Dev: dev, Ino: ino, ContentDigest: wrongDigest})
+	err = removeFileWithExpectedIdentity(rootFd, "f.go", TargetExpectation{Dev: dev, Ino: ino, ContentDigest: wrongDigest})
 	if err == nil {
-		t.Fatal("expected RemoveFileWithExpectedIdentity to refuse — content digest does not match despite matching Dev/Ino")
+		t.Fatal("expected removeFileWithExpectedIdentity to refuse — content digest does not match despite matching Dev/Ino")
 	}
 	got, readErr := os.ReadFile(filepath.Join(root, "f.go"))
 	if readErr != nil {
@@ -801,7 +801,7 @@ func TestRemoveFileWithExpectedIdentityRefusesContentDigestMismatchDespiteMatchi
 // is masked by the process umask like any O_CREAT, so requesting 0666
 // under a typical restrictive umask would silently produce a narrower
 // mode — contradicting FileMutation.Mode's "the result ALWAYS ends up
-// with" contract. WriteFileBeneath must Fchmod to the EXACT requested
+// with" contract. writeFileBeneath must Fchmod to the EXACT requested
 // bits regardless of umask.
 func TestWriteFileBeneathAppliesExactModeRegardlessOfUmask(t *testing.T) {
 	root := t.TempDir()
@@ -814,7 +814,7 @@ func TestWriteFileBeneathAppliesExactModeRegardlessOfUmask(t *testing.T) {
 	oldUmask := unix.Umask(0o077) // would mask 0666 down to 0600 without the fix
 	defer unix.Umask(oldUmask)
 
-	if _, err := WriteFileBeneath(rootFd, "f.go", []byte("x"), 0o666, TargetExpectation{MustNotExist: true}); err != nil {
+	if _, err := writeFileBeneath(rootFd, "f.go", []byte("x"), 0o666, TargetExpectation{MustNotExist: true}); err != nil {
 		t.Fatal(err)
 	}
 	fi, statErr := os.Stat(filepath.Join(root, "f.go"))
@@ -826,7 +826,7 @@ func TestWriteFileBeneathAppliesExactModeRegardlessOfUmask(t *testing.T) {
 	}
 }
 
-// Detector (code-review finding, codex, round 4): RemoveFileWithExpectedIdentity's
+// Detector (code-review finding, codex, round 4): removeFileWithExpectedIdentity's
 // initial quarantine step used a plain Renameat, which silently clobbers
 // an existing entry at the destination name. Forces tempName (a var,
 // specifically so this is possible) to return a name that ALREADY has
@@ -857,7 +857,7 @@ func TestRemoveFileWithExpectedIdentityRefusesToClobberCollidingQuarantineName(t
 	defer func() { tempName = orig }()
 	tempName = func() (string, error) { return collidingName, nil }
 
-	err = RemoveFileWithExpectedIdentity(rootFd, "f.go", TargetExpectation{Dev: dev, Ino: ino})
+	err = removeFileWithExpectedIdentity(rootFd, "f.go", TargetExpectation{Dev: dev, Ino: ino})
 	if err == nil {
 		t.Fatal("expected an error: the quarantine name collides with an existing unrelated file")
 	}

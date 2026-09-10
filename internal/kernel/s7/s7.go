@@ -126,7 +126,7 @@ var knownCodes = map[string]bool{
 	CodeTransportPreWire: true, CodeHTTP429: true, CodeHTTP4xx: true, CodeHTTP5xx: true,
 	CodeTransportPostWrite: true, CodeMalformedReply: true, CodeLocalRefused: true,
 	CodeInvalidGeneral: true, CodeCrashRecovered: true, CodeHTTP400Format: true,
-	CodeReceiptNotDurable: true,
+	CodeReceiptNotDurable: true, CodeMutationRolledBack: true,
 }
 
 // Validate rejects a policy that cannot be honoured or serialised.
@@ -188,6 +188,15 @@ const (
 	// member so Report's closed-code check recognizes it directly, not
 	// only via a caller-side Failure fallback).
 	CodeReceiptNotDurable = "receipt_not_durable"
+	// CodeMutationRolledBack: an irreversible multi-file mutation attempt
+	// failed AFTER a real physical write began, but every already-written
+	// file was verified restored to its captured before-state — the
+	// workspace is definitely clean, so the SAME operation may safely
+	// retry within its budget (PLAN-CODING-TRIO.md invariant 2's
+	// state-transition binding: "a FULLY VERIFIED rollback to all-BEFORE
+	// may report FailedRetryable"). Never used for an UNVERIFIED or
+	// partial rollback — that lands UNKNOWN instead, never retried blind.
+	CodeMutationRolledBack = "mutation_rolled_back"
 )
 
 // Policy constants — the ONE place retry policy lives (no config knob;

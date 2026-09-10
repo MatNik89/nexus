@@ -37,6 +37,7 @@ import (
 	"github.com/MatNik89/nexus/internal/coding/runner"
 	"github.com/MatNik89/nexus/internal/coding/workspace"
 	"github.com/MatNik89/nexus/internal/foundation/sealedstore"
+	"github.com/MatNik89/nexus/internal/kernel/contracts"
 	"github.com/MatNik89/nexus/internal/kernel/journal"
 	"github.com/MatNik89/nexus/internal/kernel/s7"
 	"github.com/MatNik89/nexus/internal/sandbox"
@@ -262,14 +263,14 @@ func Prepare(ctx context.Context, rootFd int, backend *sandbox.Bwrap, report san
 	}, nil
 }
 
-// Apply first recomputes plan's own PlanDigest and refuses if it does
-// not match plan.PlanDigest — anything about the plan changed since
-// Prepare, by tampering or corruption, is caught here before anything
-// else runs. It then builds one workspace.FileMutation per edited file,
-// computing After via ApplyEdits against the EXACT preimage bytes
-// Prepare captured (never a fresh independent read — PlanDigest just
-// proved that bytes-identity held), and carries the preimage's digest,
-// identity, AND mode into the mutation's Expected* fields so
+// planMutations (below) recomputes plan's own PlanDigest and refuses if
+// it does not match plan.PlanDigest — anything about the plan changed
+// since Prepare, by tampering or corruption, is caught here before
+// anything else runs. It then builds one workspace.FileMutation per
+// edited file, computing After via ApplyEdits against the EXACT preimage
+// bytes Prepare captured (never a fresh independent read — PlanDigest
+// just proved that bytes-identity held), and carries the preimage's
+// digest, identity, AND mode into the mutation's Expected* fields so
 // workspace.Apply's OWN capture — happening later, at whatever moment it
 // actually reads the file — is checked against ALL THREE, at that exact
 // point (invariant 3: "Apply re-hashes every preimage immediately before
@@ -279,29 +280,81 @@ func Prepare(ctx context.Context, rootFd int, backend *sandbox.Bwrap, report san
 // Apply time" — code-review finding, codex, round 2: content alone does
 // not catch an atomic replace-with-identical-bytes that changes only
 // identity, or a content-preserving chmod).
-func Apply(rootFd int, store *sealedstore.Store, plan Plan, bindDurable func(digest string) error) (workspace.Result, error) {
+//
+// There is deliberately no package-private "pure, ungoverned apply"
+// wrapper around workspace.Apply here any more (code-review finding,
+// codex round 3 HIGH #1, round 4 HIGH #1: invariant 2 requires every
+// dispatched workspace.Apply effect to be S7-governed, and a raw
+// cross-package call from this package — even a private one only this
+// package could reach — was itself the reachable bypass; workspace.Apply
+// is now unexported too, so ApplyGoverned is the ONLY path from any
+// package into a real mutation). This package's own tests that used to
+// exercise the pure precondition-verification logic now call
+// planMutations directly (no filesystem write involved in a refusal
+// anyway) or ApplyGoverned (for the one detector that genuinely needs a
+// real governed write attempt).
+
+// ApplyGoverned is Apply's real S7/journal-governed counterpart (PLAN-
+// CODING-TRIO.md invariants 2 and 4 step 2): the SAME plan-digest
+// verification and mutation set Apply itself uses, applied through
+// workspace.ApplyGoverned's durable S7 grant lifecycle instead of a
+// caller-supplied bindDurable stub — a genuine, exact-intent AttemptGrant
+// (its operation identity derives from the journal's own bound profile +
+// workspace root identity + plan.PlanDigest, see
+// workspace.ApplyOperationID), Consumed with a durable
+// workspace.apply_started companion naming the sealed bundle before any
+// file is written, now backs every RenameSymbol Apply. Makes exactly ONE
+// attempt — see workspace.ApplyGoverned's own doc comment for why it
+// does not drive its own retry loop, and workspace.UpdateMutationsAfterRollback
+// for how a caller retries after a verified-clean-rollback failure.
+func ApplyGoverned(ctx context.Context, rootFd int, store *sealedstore.Store, plan Plan, grants *s7.Authority, j *journal.Journal, runID contracts.RunID) (workspace.Result, error) {
+	mutations, err := planMutations(plan)
+	if err != nil {
+		return workspace.Result{}, err
+	}
+	return workspace.ApplyGoverned(ctx, rootFd, store, mutations, grants, j, plan.PlanDigest, runID)
+}
+
+// planMutations recomputes plan's PlanDigest — refusing on mismatch,
+// since anything about the plan changed since Prepare, by tampering or
+// corruption, must be caught before anything else runs — and builds the
+// workspace.FileMutation set both Apply and ApplyGoverned apply. It
+// computes each file's After via ApplyEdits against the EXACT preimage
+// bytes Prepare captured (never a fresh independent read — PlanDigest
+// just proved that bytes-identity held), and carries the preimage's
+// digest, identity, AND mode into the mutation's Expected* fields so
+// workspace.Apply's OWN capture — happening later, at whatever moment it
+// actually reads the file — is checked against ALL THREE, at that exact
+// point (invariant 3: "Apply re-hashes every preimage immediately before
+// writing... any drift invalidates the prepared plan"; invariant 4:
+// "content, mode, and metadata expectations are checked explicitly...
+// independent of inode", "the PRE-EDIT inode is a PRECONDITION check at
+// Apply time" — code-review finding, codex, round 2: content alone does
+// not catch an atomic replace-with-identical-bytes that changes only
+// identity, or a content-preserving chmod).
+func planMutations(plan Plan) ([]workspace.FileMutation, error) {
 	if len(plan.Edits) == 0 {
-		return workspace.Result{}, fmt.Errorf("symedit: apply: plan has no edits")
+		return nil, fmt.Errorf("symedit: apply: plan has no edits")
 	}
 
 	gotDigest, err := computePlanDigest(plan.NewName, plan.OpenedFileRelPath, plan.Edits, plan.Preimages)
 	if err != nil {
-		return workspace.Result{}, fmt.Errorf("symedit: apply: recomputing plan digest: %w", err)
+		return nil, fmt.Errorf("symedit: apply: recomputing plan digest: %w", err)
 	}
 	if gotDigest != plan.PlanDigest {
-		return workspace.Result{}, fmt.Errorf("symedit: apply: plan digest mismatch (got %s, want %s) — the plan was altered since Prepare (fail closed)", gotDigest, plan.PlanDigest)
+		return nil, fmt.Errorf("symedit: apply: plan digest mismatch (got %s, want %s) — the plan was altered since Prepare (fail closed)", gotDigest, plan.PlanDigest)
 	}
 
 	mutations := make([]workspace.FileMutation, 0, len(plan.Edits))
 	for _, fe := range plan.Edits {
 		pre, ok := plan.Preimages[fe.RelPath]
 		if !ok {
-			return workspace.Result{}, fmt.Errorf("symedit: apply: %s has no preimage recorded in the plan (fail closed)", fe.RelPath)
+			return nil, fmt.Errorf("symedit: apply: %s has no preimage recorded in the plan (fail closed)", fe.RelPath)
 		}
 
 		after, err := ApplyEdits(pre.Content, fe.Edits)
 		if err != nil {
-			return workspace.Result{}, fmt.Errorf("symedit: apply: %s: %w", fe.RelPath, err)
+			return nil, fmt.Errorf("symedit: apply: %s: %w", fe.RelPath, err)
 		}
 
 		relDir, baseName := splitRelPath(fe.RelPath)
@@ -315,8 +368,7 @@ func Apply(rootFd int, store *sealedstore.Store, plan Plan, bindDurable func(dig
 			CheckExpectedMode:     true,
 		})
 	}
-
-	return workspace.Apply(rootFd, store, mutations, bindDurable)
+	return mutations, nil
 }
 
 // verifyRootIdentity confirms rootFd and sourceDir name the SAME

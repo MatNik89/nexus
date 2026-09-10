@@ -9,7 +9,7 @@
 // caller-supplied durable-binding hook invoked while the bundle's pin is
 // still held and before any write (the seam step 2's S7/journal pairing
 // will use once it exists), each file replaced atomically in order
-// through WriteFileBeneath (step 3), and ordinary (non-crash) mid-
+// through writeFileBeneath (step 3), and ordinary (non-crash) mid-
 // transaction failure rolled back to the sealed before-images (step 5).
 // NOT YET built here, as a LATER increment: the actual S7 `Consume`
 // companion-batch pairing behind the bindDurable hook, the restart-time
@@ -23,6 +23,7 @@
 package workspace
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -46,7 +47,7 @@ type FileMutation struct {
 	// After is the complete new content for this file.
 	After []byte
 	// Mode is the file's permission bits the result ALWAYS ends up with
-	// — both for a new file and for a replace. WriteFileBeneath's atomic
+	// — both for a new file and for a replace. writeFileBeneath's atomic
 	// replace works by creating a new temp file at this mode and
 	// exchanging it into place; the pre-existing file's own mode is
 	// never consulted or preserved. A caller replacing an existing file
@@ -121,18 +122,69 @@ type Result struct {
 	// `workspace.mutation_committed` marker (not yet a journal event in
 	// this increment).
 	Committed bool
+	// RolledBack lists, for a FAILED Apply whose rollback was fully
+	// verified (ErrRollbackIncomplete absent from the returned error),
+	// each already-written file's identity IMMEDIATELY AFTER rollback
+	// restored it — see RolledBackFile's own doc comment for why a
+	// caller retrying the SAME logical mutation MUST use these, not the
+	// original pre-Apply identity. Empty on success (Committed==true)
+	// and meaningless (do not use) when ErrRollbackIncomplete is present.
+	RolledBack []RolledBackFile
+}
+
+// RolledBackFile is one file's identity immediately after Apply's own
+// rollback restored it. Restoring a file via writeFileBeneath's atomic
+// exchange always produces a NEW inode, even when the restored bytes and
+// mode are byte-identical to the original (this package's own atomic-
+// replace discipline never preserves a target's pre-existing identity —
+// see writeFileBeneath's own doc comment). A caller that wants to retry
+// the SAME logical mutation after a verified rollback MUST update its
+// ExpectedBeforeDev/ExpectedBeforeIno to these values first (see
+// UpdateMutationsAfterRollback) — the original Prepare-time identity is
+// gone the instant rollback restores the file (code-review finding,
+// codex round 2 HIGH #1: reusing the stale original precondition makes a
+// "verified rollback, safe to retry" proposal impossible to ever honor).
+type RolledBackFile struct {
+	RelDir, BaseName string
+	Dev, Ino         uint64
+}
+
+// UpdateMutationsAfterRollback returns a COPY of mutations with each
+// entry named in rolledBack having its ExpectedBeforeDev/ExpectedBeforeIno
+// updated to that file's actual post-rollback identity (content and mode
+// preconditions are unchanged — rollback restores the EXACT original
+// bytes and mode, only the inode changes). A mutation not named in
+// rolledBack is returned unchanged: nothing about its precondition needs
+// to change (this only happens for a mutation whose target did not exist
+// before Apply and was removed again by rollback — its original
+// "must not exist" precondition, carrying no identity, is still valid).
+func UpdateMutationsAfterRollback(mutations []FileMutation, rolledBack []RolledBackFile) []FileMutation {
+	byKey := make(map[string]RolledBackFile, len(rolledBack))
+	for _, rb := range rolledBack {
+		byKey[rb.RelDir+"\x00"+rb.BaseName] = rb
+	}
+	out := make([]FileMutation, len(mutations))
+	for i, m := range mutations {
+		out[i] = m
+		if rb, ok := byKey[m.RelDir+"\x00"+m.BaseName]; ok {
+			out[i].ExpectedBeforeDev = rb.Dev
+			out[i].ExpectedBeforeIno = rb.Ino
+		}
+	}
+	return out
 }
 
 // writtenFile tracks one already-applied mutation for possible rollback.
-// It is added to the rollback set as soon as WriteFileBeneath reports
+// It is added to the rollback set as soon as writeFileBeneath reports
 // committed==true — REGARDLESS of whether that same call also returned
-// an error (code-review finding, codex, round 1: WriteFileBeneath can
+// an error (code-review finding, codex, round 1: writeFileBeneath can
 // complete its replacement and only THEN fail, e.g. removing the
 // displaced original or a trailing directory fsync — a caller that only
 // tracks success/failure, not "did the entry change", can silently omit
 // an actually-mutated file from its own rollback bookkeeping).
 type writtenFile struct {
 	dirFd         int
+	relDir        string
 	baseName      string
 	existedBefore bool
 	beforeContent []byte
@@ -147,6 +199,21 @@ type writtenFile struct {
 	// wrong-identity) rollback attempt.
 	identityKnown      bool
 	afterDev, afterIno uint64
+}
+
+// prepared is one mutation's captured before-state, from Apply's own
+// prepare pass — kept at package level (not local to Apply) so
+// rollbackAndReport/verifyStillBefore can re-verify a mutation that was
+// never reached at all, not just ones Apply actually wrote.
+type prepared struct {
+	dirFd        int
+	mutation     FileMutation
+	existed      bool
+	beforeDev    uint64
+	beforeIno    uint64
+	before       []byte
+	beforeMode   fs.FileMode
+	beforeDigest string
 }
 
 // beforeApplyWritesFile is a test seam: a no-op in production, it lets
@@ -175,7 +242,27 @@ var beforeApplyWritesFile = func(baseName string) {}
 // but then failed a later step — every already-committed file is rolled
 // back to its sealed before-image (step 5) before Apply returns the
 // original error.
-func Apply(rootFd int, store *sealedstore.Store, mutations []FileMutation, bindDurable func(digest string) error) (Result, error) {
+//
+// ctx is checked once per mutation, immediately before that file's write
+// (code-review finding, codex round 2 HIGH #2): a consumed S7 attempt's
+// AttemptContext bounds this call, and a concurrent Cancel or an expired
+// deadline must stop Apply from writing FURTHER files rather than
+// silently continuing while S7 has already moved to a terminal state.
+// This is a per-file boundary check, not mid-syscall interruption — a
+// single writeFileBeneath call, once started, always runs to completion
+// (local descriptor I/O has no cancellable wait point); ctx.Err() being
+// non-nil at the top of an iteration is treated exactly like any other
+// write failure at that same point: every already-committed file is
+// rolled back before Apply returns.
+//
+// apply is package-private (code-review finding, codex round 3 HIGH #1,
+// round 4 HIGH #1): invariant 2 requires every dispatched effect here to
+// be S7-governed — ApplyGoverned, in this same package, is the ONLY
+// exported entry point into a real mutation. A previous version left
+// this exported and reachable cross-package (via symedit's own
+// now-deleted ungoverned wrapper); nothing outside this package needs it
+// directly, and same-package tests reach it exactly as before.
+func apply(ctx context.Context, rootFd int, store *sealedstore.Store, mutations []FileMutation, bindDurable func(digest string) error) (Result, error) {
 	if len(mutations) == 0 {
 		return Result{}, fmt.Errorf("workspace: apply: no mutations given")
 	}
@@ -191,16 +278,6 @@ func Apply(rootFd int, store *sealedstore.Store, mutations []FileMutation, bindD
 		seen[key] = true
 	}
 
-	type prepared struct {
-		dirFd        int
-		mutation     FileMutation
-		existed      bool
-		beforeDev    uint64
-		beforeIno    uint64
-		before       []byte
-		beforeMode   fs.FileMode
-		beforeDigest string
-	}
 	prep := make([]prepared, 0, len(mutations))
 	defer func() {
 		for _, p := range prep {
@@ -282,7 +359,11 @@ func Apply(rootFd int, store *sealedstore.Store, mutations []FileMutation, bindD
 	defer pin.Release()
 
 	written := make([]writtenFile, 0, len(prep))
-	for _, p := range prep {
+	for i, p := range prep {
+		if err := ctx.Err(); err != nil {
+			rolledBack, rerr := rollbackAndReport(written, prep[i:], fmt.Errorf("workspace: apply: cancelled before writing %q: %w", p.mutation.BaseName, err))
+			return Result{BundleDigest: digest, RolledBack: rolledBack}, rerr
+		}
 		beforeApplyWritesFile(p.mutation.BaseName) // test seam: inject drift between prepare and write
 
 		expect := TargetExpectation{MustNotExist: !p.existed, Dev: p.beforeDev, Ino: p.beforeIno}
@@ -292,16 +373,17 @@ func Apply(rootFd int, store *sealedstore.Store, mutations []FileMutation, bindD
 			expect.CheckMode = true
 		}
 
-		committed, werr := WriteFileBeneath(p.dirFd, p.mutation.BaseName, p.mutation.After, p.mutation.Mode, expect)
+		committed, werr := writeFileBeneath(p.dirFd, p.mutation.BaseName, p.mutation.After, p.mutation.Mode, expect)
 		if !committed {
 			if werr == nil {
-				werr = fmt.Errorf("internal inconsistency: WriteFileBeneath reported neither committed nor an error")
+				werr = fmt.Errorf("internal inconsistency: writeFileBeneath reported neither committed nor an error")
 			}
-			return Result{BundleDigest: digest}, rollbackAndReport(written, fmt.Errorf("workspace: apply: writing %q failed: %w", p.mutation.BaseName, werr))
+			rolledBack, rerr := rollbackAndReport(written, prep[i:], fmt.Errorf("workspace: apply: writing %q failed: %w", p.mutation.BaseName, werr))
+			return Result{BundleDigest: digest, RolledBack: rolledBack}, rerr
 		}
 
 		wf := writtenFile{
-			dirFd: p.dirFd, baseName: p.mutation.BaseName,
+			dirFd: p.dirFd, relDir: p.mutation.RelDir, baseName: p.mutation.BaseName,
 			existedBefore: p.existed, beforeContent: p.before, beforeMode: p.beforeMode, beforeDigest: p.beforeDigest,
 			afterMode: p.mutation.Mode, afterDigest: sha256Hex(p.mutation.After),
 		}
@@ -312,23 +394,56 @@ func Apply(rootFd int, store *sealedstore.Store, mutations []FileMutation, bindD
 		written = append(written, wf)
 
 		if werr != nil {
-			return Result{BundleDigest: digest}, rollbackAndReport(written, fmt.Errorf("workspace: apply: writing %q reported an error after taking effect: %w", p.mutation.BaseName, werr))
+			rolledBack, rerr := rollbackAndReport(written, prep[i+1:], fmt.Errorf("workspace: apply: writing %q reported an error after taking effect: %w", p.mutation.BaseName, werr))
+			return Result{BundleDigest: digest, RolledBack: rolledBack}, rerr
 		}
 		if statErr != nil {
-			return Result{BundleDigest: digest}, rollbackAndReport(written, fmt.Errorf("workspace: apply: wrote %q but could not capture its new identity: %w", p.mutation.BaseName, statErr))
+			rolledBack, rerr := rollbackAndReport(written, prep[i+1:], fmt.Errorf("workspace: apply: wrote %q but could not capture its new identity: %w", p.mutation.BaseName, statErr))
+			return Result{BundleDigest: digest, RolledBack: rolledBack}, rerr
 		}
+	}
+
+	// Final check (code-review finding, codex round 3 HIGH #4): every
+	// write succeeded, but ctx may have been cancelled DURING the last
+	// one — declaring Committed success at that point would let S7 land
+	// SUCCEEDED (via the caller's own Report) after it may already be
+	// CANCELLED. Every file just written is rolled back exactly like any
+	// other post-write failure; nothing remains unreached (the whole set
+	// was just written), so this checks only the already-written set.
+	if err := ctx.Err(); err != nil {
+		rolledBack, rerr := rollbackAndReport(written, nil, fmt.Errorf("workspace: apply: cancelled after the last write, before commit: %w", err))
+		return Result{BundleDigest: digest, RolledBack: rolledBack}, rerr
 	}
 
 	return Result{BundleDigest: digest, Committed: true}, nil
 }
+
+// ErrRollbackIncomplete marks an Apply failure where NOT every
+// already-written file could be restored to its sealed before-image and
+// verified — the workspace may hold a MIXED before/after state; manual
+// reconciliation is required (PLAN-CODING-TRIO.md invariant 2's
+// state-transition binding: "a FAILED or INCOMPLETE rollback reports
+// Unknown — never retryable, never silently retried"). Its ABSENCE from
+// a failed Apply's error chain (errors.Is returns false) means every
+// already-written file WAS restored and verified — including the
+// trivial case where nothing had been written yet — even though Apply
+// still returns a non-nil error for the original failure; a durable
+// caller (e.g. workspace.ApplyGoverned) uses this distinction to decide
+// between a retryable landing and an UNKNOWN one.
+var ErrRollbackIncomplete = errors.New("workspace: rollback of already-written files was incomplete")
 
 // rollbackAndReport restores every already-committed file to its
 // captured before-state, in reverse order, and folds any rollback
 // failure into the returned error alongside the original failure. A
 // file whose post-write identity could not be captured is never
 // guessed at — it is reported as needing manual reconciliation instead.
-func rollbackAndReport(written []writtenFile, original error) error {
+// On a fully verified rollback it also returns each restored file's NEW
+// post-rollback identity (see RolledBackFile) — nil whenever
+// ErrRollbackIncomplete is returned instead (nothing here can be trusted
+// in that case).
+func rollbackAndReport(written []writtenFile, unreached []prepared, original error) ([]RolledBackFile, error) {
 	var rollbackErrs []error
+	rolledBack := make([]RolledBackFile, 0, len(written))
 	for i := len(written) - 1; i >= 0; i-- {
 		w := written[i]
 		if !w.identityKnown {
@@ -338,23 +453,75 @@ func rollbackAndReport(written []writtenFile, original error) error {
 		var err error
 		if w.existedBefore {
 			restore := TargetExpectation{Dev: w.afterDev, Ino: w.afterIno, ContentDigest: w.afterDigest, ExpectMode: w.afterMode, CheckMode: true}
-			_, err = WriteFileBeneath(w.dirFd, w.baseName, w.beforeContent, w.beforeMode, restore)
+			_, err = writeFileBeneath(w.dirFd, w.baseName, w.beforeContent, w.beforeMode, restore)
+			if err == nil {
+				if newDev, newIno, statErr := StatBeneath(w.dirFd, w.baseName); statErr == nil {
+					rolledBack = append(rolledBack, RolledBackFile{RelDir: w.relDir, BaseName: w.baseName, Dev: newDev, Ino: newIno})
+				} else {
+					err = fmt.Errorf("restored but could not re-capture its new identity: %w", statErr)
+				}
+			}
 		} else {
 			remove := TargetExpectation{Dev: w.afterDev, Ino: w.afterIno, ContentDigest: w.afterDigest, ExpectMode: w.afterMode, CheckMode: true}
-			err = RemoveFileWithExpectedIdentity(w.dirFd, w.baseName, remove)
+			err = removeFileWithExpectedIdentity(w.dirFd, w.baseName, remove)
+			// Removed back to non-existent: no identity to report — the
+			// mutation's original "must not exist" precondition, which
+			// carries no identity, is still valid for a retry.
 		}
 		if err != nil {
 			rollbackErrs = append(rollbackErrs, fmt.Errorf("restoring %q: %w", w.baseName, err))
 		}
 	}
+	// A "verified all-BEFORE" claim (code-review finding, codex round 3
+	// HIGH #2) covers the WHOLE transaction, not just the files this
+	// process happened to reach and write: every mutation that was NEVER
+	// written — including the one whose own write attempt just failed,
+	// most commonly because IT no longer matches what was captured — must
+	// be re-verified against its ORIGINAL captured before-state too. A
+	// caller (e.g. workspace.ApplyGoverned) that skips this and reports
+	// "verified, safe to retry" whenever the WRITTEN subset rolled back
+	// cleanly would be wrong the moment anything else in the set had
+	// independently drifted.
+	for _, p := range unreached {
+		if err := verifyStillBefore(p); err != nil {
+			rollbackErrs = append(rollbackErrs, err)
+		}
+	}
 	if len(rollbackErrs) > 0 {
-		return fmt.Errorf("%w (rollback of %d already-written file(s) ALSO failed, manual reconciliation required: %w)",
-			original, len(written), errors.Join(rollbackErrs...))
+		return nil, errors.Join(
+			fmt.Errorf("%w (rollback/verification of %d file(s) failed, manual reconciliation required: %w)",
+				original, len(written)+len(unreached), errors.Join(rollbackErrs...)),
+			ErrRollbackIncomplete,
+		)
 	}
 	if len(written) > 0 {
-		return fmt.Errorf("%w (rolled back %d already-written file(s))", original, len(written))
+		return rolledBack, fmt.Errorf("%w (rolled back %d already-written file(s))", original, len(written))
 	}
-	return original
+	return nil, original
+}
+
+// verifyStillBefore re-reads one prepared mutation's CURRENT on-disk
+// state and confirms it still matches exactly what Apply originally
+// captured — used for a mutation whose own write was never reached, to
+// prove the whole transaction is genuinely all-BEFORE, not just the
+// subset that happened to get written.
+func verifyStillBefore(p prepared) error {
+	if !p.existed {
+		if _, _, err := StatBeneath(p.dirFd, p.mutation.BaseName); err == nil {
+			return fmt.Errorf("%q now exists but was expected to still not exist", p.mutation.BaseName)
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("%q: could not verify it still does not exist: %w", p.mutation.BaseName, err)
+		}
+		return nil
+	}
+	content, dev, ino, mode, err := CaptureFileBeneath(p.dirFd, p.mutation.BaseName)
+	if err != nil {
+		return fmt.Errorf("%q: could not re-verify its before-state: %w", p.mutation.BaseName, err)
+	}
+	if sha256Hex(content) != p.beforeDigest || dev != p.beforeDev || ino != p.beforeIno || mode.Perm() != p.beforeMode.Perm() {
+		return fmt.Errorf("%q no longer matches its originally captured before-state", p.mutation.BaseName)
+	}
+	return nil
 }
 
 func sha256Hex(data []byte) string {

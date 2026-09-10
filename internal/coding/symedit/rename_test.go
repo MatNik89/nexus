@@ -14,6 +14,7 @@ import (
 	"github.com/MatNik89/nexus/internal/coding/runner"
 	"github.com/MatNik89/nexus/internal/coding/workspace"
 	"github.com/MatNik89/nexus/internal/foundation/sealedstore"
+	"github.com/MatNik89/nexus/internal/kernel/contracts"
 	"github.com/MatNik89/nexus/internal/kernel/journal"
 	"github.com/MatNik89/nexus/internal/kernel/s7"
 	"github.com/MatNik89/nexus/internal/sandbox"
@@ -76,20 +77,46 @@ func testStore(t *testing.T) *sealedstore.Store {
 	return store
 }
 
-func noopBindDurable(string) error { return nil }
+func testDurableJournal(t *testing.T) *journal.Journal {
+	t.Helper()
+	events := s7.Events()
+	for n, v := range workspace.Events() {
+		events[n] = v
+	}
+	events["coding.run"] = nil
+	j, err := journal.Open(filepath.Join(t.TempDir(), "journal.db"), "work", redact.None{},
+		events, s7.NewProjection())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { j.Close() })
+	return j
+}
 
-// Detector: Prepare + Apply perform a REAL, end-to-end, governed
-// RenameSymbol — real gopls session, real sandbox, real on-disk files —
-// touching both the declaration and the call site, and the workspace
-// root on disk actually ends up with the renamed identifier in both
-// files. This is the whole point of Slice 3: no mocks anywhere in this
-// path.
-func TestPrepareApplyEndToEndRename(t *testing.T) {
+func testDurableGrants(t *testing.T, j *journal.Journal) *s7.Authority {
+	t.Helper()
+	a, err := s7.New(j, time.Now, 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return a
+}
+
+// Detector: Prepare + ApplyGoverned perform a REAL, end-to-end, governed
+// RenameSymbol — real gopls session, real sandbox, real on-disk files,
+// real S7 durable grant lifecycle — touching both the declaration and
+// the call site, and the workspace root on disk actually ends up with
+// the renamed identifier in both files. This is the whole point of
+// Slice 3: no mocks anywhere in this path (folds what used to be a
+// separate TestPrepareApplyEndToEndRename against the non-governed
+// `apply` — removed once `apply`/workspace.Apply stopped being
+// reachable outside this package's own tests, codex round 4 HIGH #1).
+func TestApplyGovernedEndToEndRenameWiresRealS7Grant(t *testing.T) {
 	goBin := realGoBinary(t)
 	goplsBin := realGoplsBinary(t)
 	backend, report := testBackend(t)
-	grants := s7.NewAuthority(time.Now, 5*time.Minute)
-	j := testJournal(t)
+	j := testDurableJournal(t)
+	grants := testDurableGrants(t, j)
 	store := testStore(t)
 
 	src := t.TempDir()
@@ -111,8 +138,8 @@ func TestPrepareApplyEndToEndRename(t *testing.T) {
 		SourceDir: src, FileRelPath: "main.go",
 		Line: 2, Character: 5, NewName: "Bar",
 		GoBinary: goBin, GoplsBinary: goplsBin, Timeout: 60 * time.Second,
-		OperationID: "op-symedit-rename-1", TargetID: "target-symedit-rename",
-		RunID: "run-symedit-rename-1", ProfileID: "work",
+		OperationID: "op-governed-rename-1", TargetID: "target-governed-rename",
+		RunID: "run-governed-rename-1", ProfileID: "work",
 	}
 
 	plan, err := Prepare(ctxT(), rootFd, backend, report, grants, j, req)
@@ -135,12 +162,22 @@ func TestPrepareApplyEndToEndRename(t *testing.T) {
 		t.Fatal("expected a non-empty PlanDigest")
 	}
 
-	res, err := Apply(rootFd, store, plan, noopBindDurable)
+	res, err := ApplyGoverned(ctxT(), rootFd, store, plan, grants, j, "run-governed-rename-1")
 	if err != nil {
-		t.Fatalf("Apply failed: %v", err)
+		t.Fatalf("ApplyGoverned failed: %v", err)
 	}
 	if !res.Committed {
 		t.Fatal("expected Committed = true")
+	}
+
+	var rootSt unix.Stat_t
+	if err := unix.Fstat(rootFd, &rootSt); err != nil {
+		t.Fatal(err)
+	}
+	op := workspace.ApplyOperationID("work", uint64(rootSt.Dev), rootSt.Ino, plan.PlanDigest)
+	state, ok := grants.State(op)
+	if !ok || state != contracts.AttemptSucceeded {
+		t.Fatalf("apply operation state = %v (ok=%v), want SUCCEEDED", state, ok)
 	}
 
 	got, err := os.ReadFile(filepath.Join(src, "main.go"))
@@ -171,6 +208,8 @@ func TestApplyRefusesWhenFileDriftedSincePrepare(t *testing.T) {
 	}
 	defer unix.Close(rootFd)
 	store := testStore(t)
+	j := testDurableJournal(t)
+	grants := testDurableGrants(t, j)
 
 	originalContent := []byte("package main\n\nfunc Foo() int { return 1 }\n")
 	dev, ino, err := workspace.StatBeneath(rootFd, "main.go")
@@ -202,9 +241,9 @@ func TestApplyRefusesWhenFileDriftedSincePrepare(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = Apply(rootFd, store, plan, noopBindDurable)
+	_, err = ApplyGoverned(ctxT(), rootFd, store, plan, grants, j, "run-drift-1")
 	if err == nil {
-		t.Fatal("expected Apply to refuse — main.go drifted since the plan was captured")
+		t.Fatal("expected ApplyGoverned to refuse — main.go drifted since the plan was captured")
 	}
 
 	got, err := os.ReadFile(filepath.Join(src, "main.go"))
@@ -219,15 +258,7 @@ func TestApplyRefusesWhenFileDriftedSincePrepare(t *testing.T) {
 // Detector: Apply refuses a plan with no edits at all rather than
 // silently reporting success for nothing.
 func TestApplyRefusesEmptyPlan(t *testing.T) {
-	src := t.TempDir()
-	rootFd, err := workspace.OpenRoot(src)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer unix.Close(rootFd)
-	store := testStore(t)
-
-	if _, err := Apply(rootFd, store, Plan{}, noopBindDurable); err == nil {
+	if _, err := planMutations(Plan{}); err == nil {
 		t.Fatal("expected an error for an empty plan")
 	}
 }
@@ -288,7 +319,6 @@ func TestApplyRefusesTamperedPlan(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer unix.Close(rootFd)
-	store := testStore(t)
 
 	dev, ino, err := workspace.StatBeneath(rootFd, "main.go")
 	if err != nil {
@@ -316,16 +346,8 @@ func TestApplyRefusesTamperedPlan(t *testing.T) {
 	// plan (or plan corruption across a serialize/deserialize boundary).
 	plan.Edits[0].Edits[0].NewText = "Evil"
 
-	_, err = Apply(rootFd, store, plan, noopBindDurable)
-	if err == nil {
-		t.Fatal("expected Apply to refuse — the plan was tampered with after Prepare")
-	}
-	got, readErr := os.ReadFile(filepath.Join(src, "main.go"))
-	if readErr != nil {
-		t.Fatal(readErr)
-	}
-	if string(got) != string(originalContent) {
-		t.Fatalf("main.go was modified despite the refusal: %q", got)
+	if _, err := planMutations(plan); err == nil {
+		t.Fatal("expected planMutations to refuse — the plan was tampered with after Prepare")
 	}
 }
 
@@ -346,7 +368,6 @@ func TestApplyRefusesPlanWithTamperedPreimageContent(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer unix.Close(rootFd)
-	store := testStore(t)
 
 	dev, ino, err := workspace.StatBeneath(rootFd, "main.go")
 	if err != nil {
@@ -377,16 +398,8 @@ func TestApplyRefusesPlanWithTamperedPreimageContent(t *testing.T) {
 	tampered.Content = []byte("package main\n\nfunc Zzz() int { return 1 }\n")
 	plan.Preimages = map[string]Preimage{"main.go": tampered}
 
-	_, err = Apply(rootFd, store, plan, noopBindDurable)
-	if err == nil {
-		t.Fatal("expected Apply to refuse — the preimage's Content was tampered with after Prepare")
-	}
-	got, readErr := os.ReadFile(filepath.Join(src, "main.go"))
-	if readErr != nil {
-		t.Fatal(readErr)
-	}
-	if string(got) != string(originalContent) {
-		t.Fatalf("main.go was modified despite the refusal: %q", got)
+	if _, err := planMutations(plan); err == nil {
+		t.Fatal("expected planMutations to refuse — the preimage's Content was tampered with after Prepare")
 	}
 }
 
@@ -404,7 +417,6 @@ func TestApplyRefusesPlanWithTamperedPreimageMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer unix.Close(rootFd)
-	store := testStore(t)
 
 	dev, ino, err := workspace.StatBeneath(rootFd, "main.go")
 	if err != nil {
@@ -433,16 +445,8 @@ func TestApplyRefusesPlanWithTamperedPreimageMode(t *testing.T) {
 	tampered.Mode = 0o644
 	plan.Preimages = map[string]Preimage{"main.go": tampered}
 
-	_, err = Apply(rootFd, store, plan, noopBindDurable)
-	if err == nil {
-		t.Fatal("expected Apply to refuse — the preimage's Mode was tampered with after Prepare")
-	}
-	fi, statErr := os.Stat(filepath.Join(src, "main.go"))
-	if statErr != nil {
-		t.Fatal(statErr)
-	}
-	if fi.Mode().Perm() != 0o600 {
-		t.Fatalf("main.go mode = %o, want untouched %o", fi.Mode().Perm(), 0o600)
+	if _, err := planMutations(plan); err == nil {
+		t.Fatal("expected planMutations to refuse — the preimage's Mode was tampered with after Prepare")
 	}
 }
 
