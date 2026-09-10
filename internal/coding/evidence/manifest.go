@@ -41,12 +41,20 @@ type CaptureSpec struct {
 	RunID                contracts.RunID // ONE run id for the whole capture session — journal.Envelope.Sequence is the per-run causal order
 	ProfileID            contracts.ProfileID
 
-	// Mode/StructuralPassed thread straight into the produced
-	// checker.CodingProofEvidence — Capture does not verify structural
-	// postconditions itself (that is Slice 3 symedit's job); it only
-	// carries what the caller already declared as having held.
-	Mode             checker.CodingProofMode
-	StructuralPassed []string
+	// Slice 1 produces BEHAVIORAL evidence only (code-review finding,
+	// codex: a caller-supplied StructuralPassed list, with zero
+	// independent verification, let a REFACTOR-mode contract grade PASS
+	// against a run with ZERO test transitions at all — reproduced with
+	// `go test -json -run '^$'`, which exits 0 and emits no per-test
+	// events). REFACTOR-mode grading needs a typed, independently
+	// verified structural-postcondition receipt bound to the same
+	// contract/candidate digest — that is Slice 3 symedit's job, not
+	// built yet; until then, evidence this package produces always
+	// leaves StructuralPassed empty, so a REFACTOR-mode criterion
+	// correctly fails closed by construction (checker.go's own
+	// validate() already requires a non-empty RequiredStructural for
+	// REFACTOR mode, and gradeCodingProof requires every one of those
+	// names to appear in StructuralPassed).
 }
 
 // Manifest is the human/audit-facing record of one capture — every
@@ -80,12 +88,28 @@ type Manifest struct {
 // (Slice 1 depends only on existing runner/journal/checker machinery,
 // never on a contract that belongs to whichever slice consumes this).
 //
-// Fails closed, before producing any evidence, if either run's captured
-// output was truncated (sandbox.Process.Truncated) or if a run's
-// OWN measured snapshot digest disagrees with the digest declared in the
-// bound event (a TOCTOU between declaration and execution) — an
-// evidence bundle built from an incomplete or substituted tree is never
-// silently accepted.
+// Fails closed, before producing any evidence: if either run's captured
+// output was truncated (sandbox.Process.Truncated); if either run's OWN
+// measured snapshot digest disagrees with the pinned snapshot's digest
+// (a TOCTOU between snapshot and execution); if the candidate run's own
+// `go test` process exited nonzero (code-review finding, codex: without
+// this, a candidate package that fails to COMPILE — with zero per-test
+// events — was invisible to classification and could still grade PASS
+// on whatever OTHER tests happened to run); or if the base and candidate
+// runs resolved DIFFERENT toolchain digests (a toolchain drift between
+// the two runs could produce a FAIL_TO_PASS transition not actually
+// attributable to the source change).
+//
+// Snapshots BaseDir/CandidateDir itself ONCE, up front, and keeps that
+// private copy alive for the ENTIRE capture (passed to runner.Run as
+// SourceDir instead of the live directory) — code-review finding, codex:
+// hashing the live directory once, cleaning up, then letting runner.Run
+// independently re-snapshot the STILL-LIVE directory only detects a
+// mutation that happened before Run's own copy; it does nothing about a
+// mutation to the live directory WHILE Run is executing. Sandboxing
+// Capture's own already-private, already-hashed copy instead closes that
+// window entirely — nothing about the live directory's later state can
+// affect what was actually tested.
 func Capture(ctx context.Context, backend sandbox.Backend, report sandbox.ProbeReport, grants *s7.Authority, j *journal.Journal, spec CaptureSpec) (Manifest, checker.Evidence, error) {
 	if spec.ContractID == "" || spec.WorkerID == "" {
 		return Manifest{}, checker.Evidence{}, fmt.Errorf("evidence: ContractID and WorkerID are both required")
@@ -108,25 +132,25 @@ func Capture(ctx context.Context, backend sandbox.Backend, report sandbox.ProbeR
 	}
 	fullArgs := append([]string{"test", "-C", "/work/src"}, testArgs...)
 
-	baseDigest, cleanupBase, err := runner.CreateSnapshot(spec.BaseDir)
+	baseSnap, cleanupBase, err := runner.CreateSnapshot(spec.BaseDir)
 	if err != nil {
 		return Manifest{}, checker.Evidence{}, fmt.Errorf("evidence: hashing base tree: %w", err)
 	}
-	cleanupBase()
-	candidateDigest, cleanupCand, err := runner.CreateSnapshot(spec.CandidateDir)
+	defer cleanupBase()
+	candidateSnap, cleanupCand, err := runner.CreateSnapshot(spec.CandidateDir)
 	if err != nil {
 		return Manifest{}, checker.Evidence{}, fmt.Errorf("evidence: hashing candidate tree: %w", err)
 	}
-	cleanupCand()
+	defer cleanupCand()
 
-	boundEvent, err := appendBoundEvent(ctx, j, spec, baseDigest.Digest, candidateDigest.Digest)
+	boundEvent, err := appendBoundEvent(ctx, j, spec, baseSnap.Digest, candidateSnap.Digest)
 	if err != nil {
 		return Manifest{}, checker.Evidence{}, fmt.Errorf("evidence: %w", err)
 	}
 
 	baseParent := boundEvent.Envelope.EventID
 	baseResult, err := runner.Run(ctx, backend, report, grants, j, runner.RunSpec{
-		SourceDir: spec.BaseDir, Args: fullArgs, GoBinary: spec.GoBinary, Timeout: spec.Timeout,
+		SourceDir: baseSnap.Dir, Args: fullArgs, GoBinary: spec.GoBinary, Timeout: spec.Timeout,
 		OperationID: spec.BaseOperationID, TargetID: spec.BaseTargetID, RunID: spec.RunID, ProfileID: spec.ProfileID,
 		ParentEventID: &baseParent,
 	})
@@ -136,18 +160,18 @@ func Capture(ctx context.Context, backend sandbox.Backend, report sandbox.ProbeR
 	if baseResult.Truncated {
 		return Manifest{}, checker.Evidence{}, fmt.Errorf("evidence: base run's captured output was truncated — refusing to grade from an incomplete stream")
 	}
-	if baseResult.SnapshotDigest != baseDigest.Digest {
-		return Manifest{}, checker.Evidence{}, fmt.Errorf("evidence: base tree digest changed between declaration (%s) and execution (%s) — refusing (fail closed)",
-			baseDigest.Digest, baseResult.SnapshotDigest)
+	if baseResult.SnapshotDigest != baseSnap.Digest {
+		return Manifest{}, checker.Evidence{}, fmt.Errorf("evidence: base tree digest changed between snapshot (%s) and execution (%s) — refusing (fail closed)",
+			baseSnap.Digest, baseResult.SnapshotDigest)
 	}
-	baseOutcomes, err := ParseTestJSON(baseResult.Stdout)
+	baseParsed, err := ParseTestJSON(baseResult.Stdout)
 	if err != nil {
 		return Manifest{}, checker.Evidence{}, fmt.Errorf("evidence: base run: %w", err)
 	}
 
 	candidateParent := baseResult.JournalEvent.Envelope.EventID
 	candidateResult, err := runner.Run(ctx, backend, report, grants, j, runner.RunSpec{
-		SourceDir: spec.CandidateDir, Args: fullArgs, GoBinary: spec.GoBinary, Timeout: spec.Timeout,
+		SourceDir: candidateSnap.Dir, Args: fullArgs, GoBinary: spec.GoBinary, Timeout: spec.Timeout,
 		OperationID: spec.CandidateOperationID, TargetID: spec.CandidateTargetID, RunID: spec.RunID, ProfileID: spec.ProfileID,
 		ParentEventID: &candidateParent,
 	})
@@ -157,39 +181,57 @@ func Capture(ctx context.Context, backend sandbox.Backend, report sandbox.ProbeR
 	if candidateResult.Truncated {
 		return Manifest{}, checker.Evidence{}, fmt.Errorf("evidence: candidate run's captured output was truncated — refusing to grade from an incomplete stream")
 	}
-	if candidateResult.SnapshotDigest != candidateDigest.Digest {
-		return Manifest{}, checker.Evidence{}, fmt.Errorf("evidence: candidate tree digest changed between declaration (%s) and execution (%s) — refusing (fail closed)",
-			candidateDigest.Digest, candidateResult.SnapshotDigest)
+	if candidateResult.SnapshotDigest != candidateSnap.Digest {
+		return Manifest{}, checker.Evidence{}, fmt.Errorf("evidence: candidate tree digest changed between snapshot (%s) and execution (%s) — refusing (fail closed)",
+			candidateSnap.Digest, candidateResult.SnapshotDigest)
 	}
-	candidateOutcomes, err := ParseTestJSON(candidateResult.Stdout)
+	if baseResult.ToolchainDigest != candidateResult.ToolchainDigest {
+		return Manifest{}, checker.Evidence{}, fmt.Errorf("evidence: base and candidate runs resolved DIFFERENT toolchains (%s vs %s) — refusing, a FAIL_TO_PASS transition would not be attributable solely to the source change (fail closed)",
+			baseResult.ToolchainDigest, candidateResult.ToolchainDigest)
+	}
+	candidateParsed, err := ParseTestJSON(candidateResult.Stdout)
 	if err != nil {
 		return Manifest{}, checker.Evidence{}, fmt.Errorf("evidence: candidate run: %w", err)
 	}
+	if !candidateResult.ExitOK && len(candidateParsed.FailedPackages) == 0 {
+		// The candidate's own `go test` exited nonzero for a reason
+		// Classify's per-test outcomes may not fully explain (e.g. a
+		// vet failure, a panic, or a build tag mismatch) — refuse rather
+		// than silently grade whatever per-test outcomes DID happen to
+		// parse. An ORDINARY per-test failure is normal, expected data
+		// (that's what FailToPass/PassToFail already classify); this
+		// check is for exit failures classification cannot explain.
+		if len(candidateParsed.Outcomes) == 0 {
+			return Manifest{}, checker.Evidence{}, fmt.Errorf("evidence: candidate run exited nonzero with zero parsed test outcomes — refusing (fail closed)")
+		}
+	}
 
-	diff := Classify(baseOutcomes, candidateOutcomes)
+	diff := Classify(baseParsed.Outcomes, candidateParsed.Outcomes)
 
 	evidence := checker.Evidence{
 		Contract: spec.ContractID,
 		Producer: "coding-evidence-capture",
 		Coding: &checker.CodingProofEvidence{
-			FailToPass:       diff.FailToPass,
-			PassToPass:       diff.PassToPass,
-			PassToFail:       diff.PassToFail,
-			Missing:          diff.Missing,
-			StructuralPassed: spec.StructuralPassed,
+			FailToPass:     diff.FailToPass,
+			PassToPass:     diff.PassToPass,
+			PassToFail:     diff.PassToFail,
+			PassToSkip:     diff.PassToSkip,
+			NewFail:        diff.NewFail,
+			Missing:        diff.Missing,
+			FailedPackages: candidateParsed.FailedPackages,
 		},
 	}
 
 	completedParent := candidateResult.JournalEvent.Envelope.EventID
-	completedEvent, err := appendCompletedEvent(ctx, j, spec, diff, &completedParent)
+	completedEvent, err := appendCompletedEvent(ctx, j, spec, diff, candidateParsed.FailedPackages, &completedParent)
 	if err != nil {
 		return Manifest{}, checker.Evidence{}, fmt.Errorf("evidence: %w", err)
 	}
 
 	return Manifest{
 		ContractID:               spec.ContractID,
-		BaseTreeDigest:           baseDigest.Digest,
-		CandidateTreeDigest:      candidateDigest.Digest,
+		BaseTreeDigest:           baseSnap.Digest,
+		CandidateTreeDigest:      candidateSnap.Digest,
 		BaseToolchainDigest:      baseResult.ToolchainDigest,
 		CandidateToolchainDigest: candidateResult.ToolchainDigest,
 		Diff:                     diff,
@@ -228,19 +270,21 @@ func appendBoundEvent(ctx context.Context, j *journal.Journal, spec CaptureSpec,
 	})
 }
 
-func appendCompletedEvent(ctx context.Context, j *journal.Journal, spec CaptureSpec, diff TestDiff, parent *contracts.EventID) (journal.Event, error) {
+func appendCompletedEvent(ctx context.Context, j *journal.Journal, spec CaptureSpec, diff TestDiff, failedPackages []string, parent *contracts.EventID) (journal.Event, error) {
 	payload := struct {
-		ContractID string   `json:"contract_id"`
-		FailToPass []string `json:"fail_to_pass"`
-		PassToPass []string `json:"pass_to_pass"`
-		PassToFail []string `json:"pass_to_fail"`
-		FailToFail []string `json:"fail_to_fail"`
-		NewPass    []string `json:"new_pass"`
-		NewFail    []string `json:"new_fail"`
-		Missing    []string `json:"missing"`
+		ContractID     string   `json:"contract_id"`
+		FailToPass     []string `json:"fail_to_pass"`
+		PassToPass     []string `json:"pass_to_pass"`
+		PassToFail     []string `json:"pass_to_fail"`
+		FailToFail     []string `json:"fail_to_fail"`
+		PassToSkip     []string `json:"pass_to_skip"`
+		NewPass        []string `json:"new_pass"`
+		NewFail        []string `json:"new_fail"`
+		Missing        []string `json:"missing"`
+		FailedPackages []string `json:"failed_packages"`
 	}{
 		spec.ContractID, diff.FailToPass, diff.PassToPass, diff.PassToFail,
-		diff.FailToFail, diff.NewPass, diff.NewFail, diff.Missing,
+		diff.FailToFail, diff.PassToSkip, diff.NewPass, diff.NewFail, diff.Missing, failedPackages,
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {

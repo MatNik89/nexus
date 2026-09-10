@@ -43,8 +43,23 @@ type TestKey struct {
 // isn't valid JSON — a caller must never treat a corrupted stream as "no
 // tests ran" (silently swallowing a parse error would look identical to
 // an empty, all-passing suite).
-func ParseTestJSON(stdout string) (map[TestKey]TestOutcome, error) {
+// ParsedRun is one `go test -json` stream's parsed result: every test's
+// terminal outcome, PLUS which packages themselves reported a
+// package-level "fail" action (Test == "") — a package that fails to
+// COMPILE emits no per-test events at all for its own tests, so relying
+// on per-test outcomes alone would make a candidate compile failure
+// completely invisible to Classify (code-review finding, codex:
+// confirmed by direct reproduction — `go test -json -run '^$'` and a
+// build failure both look like "zero relevant test events" unless the
+// package-level action is captured separately).
+type ParsedRun struct {
+	Outcomes       map[TestKey]TestOutcome
+	FailedPackages []string // packages with THEIR OWN "fail" action, sorted
+}
+
+func ParseTestJSON(stdout string) (ParsedRun, error) {
 	outcomes := make(map[TestKey]TestOutcome)
+	failedPackages := map[string]bool{}
 	scanner := bufio.NewScanner(strings.NewReader(stdout))
 	scanner.Buffer(make([]byte, 0, 64*1024), 16<<20) // a single JSON line rarely exceeds this; fail closed if it does
 	lineNo := 0
@@ -60,9 +75,12 @@ func ParseTestJSON(stdout string) (map[TestKey]TestOutcome, error) {
 			Test    string `json:"Test"`
 		}
 		if err := json.Unmarshal([]byte(line), &ev); err != nil {
-			return nil, fmt.Errorf("evidence: malformed go test -json line %d: %w", lineNo, err)
+			return ParsedRun{}, fmt.Errorf("evidence: malformed go test -json line %d: %w", lineNo, err)
 		}
 		if ev.Test == "" {
+			if ev.Action == "fail" && ev.Package != "" {
+				failedPackages[ev.Package] = true
+			}
 			continue // package-level aggregate, not a per-test outcome
 		}
 		key := TestKey{Package: ev.Package, Test: ev.Test}
@@ -76,9 +94,14 @@ func ParseTestJSON(stdout string) (map[TestKey]TestOutcome, error) {
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("evidence: reading go test -json stream: %w", err)
+		return ParsedRun{}, fmt.Errorf("evidence: reading go test -json stream: %w", err)
 	}
-	return outcomes, nil
+	names := make([]string, 0, len(failedPackages))
+	for name := range failedPackages {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return ParsedRun{Outcomes: outcomes, FailedPackages: names}, nil
 }
 
 // TestDiff is the classified transition of every test key present in
@@ -88,9 +111,13 @@ type TestDiff struct {
 	PassToPass []string // PASS in both — preserved behavior
 	PassToFail []string // base PASS, candidate FAIL — a REGRESSION
 	FailToFail []string // FAIL in both — an unresolved preexisting failure
-	NewPass    []string // present only in candidate, PASS
-	NewFail    []string // present only in candidate, FAIL
-	Missing    []string // present in base, ABSENT from candidate — never silently dropped
+	PassToSkip []string // base PASS, candidate SKIP — a REGRESSION (code-review finding,
+	// codex: silently disabling a passing test — e.g. adding t.Skip() —
+	// must never be indistinguishable from "nothing changed"; treated
+	// the same as PassToFail wherever it's graded)
+	NewPass []string // present only in candidate, PASS
+	NewFail []string // present only in candidate, FAIL — never silently omitted from grading
+	Missing []string // present in base, ABSENT from candidate — never silently dropped
 }
 
 // formatKey renders a TestKey as "package.Test" — the string vocabulary
@@ -119,6 +146,8 @@ func Classify(base, candidate map[TestKey]TestOutcome) TestDiff {
 			d.PassToFail = append(d.PassToFail, formatKey(key))
 		case baseOutcome == OutcomeFail && candOutcome == OutcomeFail:
 			d.FailToFail = append(d.FailToFail, formatKey(key))
+		case baseOutcome == OutcomePass && candOutcome == OutcomeSkip:
+			d.PassToSkip = append(d.PassToSkip, formatKey(key))
 		}
 	}
 	for key, candOutcome := range candidate {
@@ -136,6 +165,7 @@ func Classify(base, candidate map[TestKey]TestOutcome) TestDiff {
 	sort.Strings(d.PassToPass)
 	sort.Strings(d.PassToFail)
 	sort.Strings(d.FailToFail)
+	sort.Strings(d.PassToSkip)
 	sort.Strings(d.NewPass)
 	sort.Strings(d.NewFail)
 	sort.Strings(d.Missing)

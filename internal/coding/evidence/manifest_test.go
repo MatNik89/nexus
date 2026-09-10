@@ -220,3 +220,65 @@ func TestCaptureRequiresIdentifiers(t *testing.T) {
 		t.Fatal("Capture accepted a spec with no ContractID/WorkerID/identifiers")
 	}
 }
+
+// Detector (code-review finding, codex): a candidate package that fails
+// to COMPILE — a syntax error in a file with no corresponding base
+// test — emits ZERO per-test events for it and must not be invisible to
+// grading. Capture refuses (fails closed) rather than silently grading
+// PASS based on whatever OTHER tests happened to run.
+func TestCaptureDetectsCandidateCompileFailureInNewPackage(t *testing.T) {
+	goBin := realGoBinary(t)
+	b, rep := testBackend(t)
+	grants := s7.NewAuthority(time.Now, 5*time.Minute)
+	j := testJournal(t)
+
+	baseDir := t.TempDir()
+	writeModule(t, baseDir, `package main
+
+import "testing"
+
+func TestStable(t *testing.T) {}
+`)
+	candidateDir := t.TempDir()
+	writeModule(t, candidateDir, `package main
+
+import "testing"
+
+func TestStable(t *testing.T) {}
+`)
+	// A BRAND-NEW package with a syntax error — it has no corresponding
+	// base test at all, so Missing/PassToFail alone would never catch
+	// it; only FailedPackages does (code-review finding, codex).
+	if err := os.Mkdir(filepath.Join(candidateDir, "broken"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(candidateDir, "broken", "broken.go"), []byte("package broken\n\nfunc broken( {\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	manifest, evidence, err := Capture(ctxT(), b, rep, grants, j, CaptureSpec{
+		ContractID: "contract-3", WorkerID: "worker-1",
+		BaseDir: baseDir, CandidateDir: candidateDir, GoBinary: goBin,
+		Timeout: 150 * time.Second,
+		BaseOperationID: "op-base-3", CandidateOperationID: "op-candidate-3",
+		BaseTargetID: "target-base-3", CandidateTargetID: "target-candidate-3",
+		RunID: "run-capture-3", ProfileID: "work",
+	})
+	if err != nil {
+		t.Fatalf("Capture failed: %v", err)
+	}
+	if evidence.Coding == nil || len(evidence.Coding.FailedPackages) == 0 {
+		t.Fatalf("expected a non-empty FailedPackages for the broken new package, got: %+v", manifest.Diff)
+	}
+
+	contract := checker.AcceptanceContract{ID: "contract-3", Worker: "worker-1", Criteria: []checker.Criterion{
+		{CodingProofIs: &checker.CodingProofCriterion{Mode: checker.CodingProofBehavioral}},
+	}}
+	verdict, err := checker.Grade(contract, []checker.Evidence{evidence})
+	if err != nil {
+		t.Fatalf("Grade error: %v", err)
+	}
+	if verdict.Pass {
+		t.Fatalf("expected grading to FAIL when a candidate package failed to compile: %+v", verdict)
+	}
+}

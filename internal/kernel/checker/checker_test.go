@@ -361,3 +361,50 @@ func TestCodingProofRequiredSpecificTests(t *testing.T) {
 		t.Fatalf("expected FAIL when the REQUIRED FailToPass test is absent: %+v %v", missing, err)
 	}
 }
+
+// Detector (code-review finding, codex): PassToSkip, NewFail, and
+// FailedPackages are ALL treated as always-fail conditions, same as
+// PassToFail/Missing — silently disabling a test, a new broken test, or
+// a package that failed to compile must never be indistinguishable from
+// "nothing changed".
+func TestCodingProofPassToSkipAlwaysFails(t *testing.T) {
+	contract := AcceptanceContract{ID: "c", Worker: "w", Criteria: []Criterion{
+		{CodingProofIs: &CodingProofCriterion{Mode: CodingProofBehavioral}},
+	}}
+	v, err := Grade(contract, []Evidence{
+		{Contract: "c", Producer: "evidence-capture", Coding: &CodingProofEvidence{
+			FailToPass: []string{"pkg.TestFixed"}, PassToSkip: []string{"pkg.TestNowSkipped"},
+		}},
+	})
+	if err != nil || v.Pass {
+		t.Fatalf("expected FAIL when a previously-passing test is now skipped: %+v %v", v, err)
+	}
+}
+
+func TestCodingProofNewFailAlwaysFails(t *testing.T) {
+	contract := AcceptanceContract{ID: "c", Worker: "w", Criteria: []Criterion{
+		{CodingProofIs: &CodingProofCriterion{Mode: CodingProofBehavioral}},
+	}}
+	v, err := Grade(contract, []Evidence{
+		{Contract: "c", Producer: "evidence-capture", Coding: &CodingProofEvidence{
+			FailToPass: []string{"pkg.TestFixed"}, NewFail: []string{"pkg.TestNewlyBroken"},
+		}},
+	})
+	if err != nil || v.Pass {
+		t.Fatalf("expected FAIL when a new candidate-only test fails: %+v %v", v, err)
+	}
+}
+
+func TestCodingProofFailedPackagesAlwaysFails(t *testing.T) {
+	contract := AcceptanceContract{ID: "c", Worker: "w", Criteria: []Criterion{
+		{CodingProofIs: &CodingProofCriterion{Mode: CodingProofBehavioral}},
+	}}
+	v, err := Grade(contract, []Evidence{
+		{Contract: "c", Producer: "evidence-capture", Coding: &CodingProofEvidence{
+			FailToPass: []string{"pkg.TestFixed"}, FailedPackages: []string{"broken/pkg"},
+		}},
+	})
+	if err != nil || v.Pass {
+		t.Fatalf("expected FAIL when a candidate package failed to build: %+v %v", v, err)
+	}
+}

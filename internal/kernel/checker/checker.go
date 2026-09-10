@@ -167,10 +167,18 @@ type Evidence struct {
 // string uses the SAME formatting internal/coding/evidence.Classify
 // produces ("package.Test") — Grade does not re-derive or re-parse it.
 type CodingProofEvidence struct {
-	FailToPass       []string
-	PassToPass       []string
-	PassToFail       []string // regressions — non-empty ALWAYS fails grading
-	Missing          []string // present in base, absent from candidate — non-empty ALWAYS fails grading
+	FailToPass []string
+	PassToPass []string
+	PassToFail []string // regressions — non-empty ALWAYS fails grading
+	PassToSkip []string // a previously-passing test now SKIPPED — non-empty ALWAYS fails grading (code-review finding, codex: silently disabling a test must never look like "nothing changed")
+	NewFail    []string // a test that exists ONLY in the candidate and FAILS — non-empty ALWAYS fails grading (code-review finding, codex: was computed by Classify but never reached Grade before this fix — a new, broken test was invisible)
+	Missing    []string // present in base, absent from candidate — non-empty ALWAYS fails grading
+	// FailedPackages names candidate packages that failed to COMPILE
+	// (no per-test events at all) — non-empty ALWAYS fails grading
+	// (code-review finding, codex: a compile failure in a package with
+	// no tests in base, or a brand-new package, produces zero
+	// classifiable test transitions and would otherwise be invisible).
+	FailedPackages   []string
 	StructuralPassed []string // structural postcondition names that held (REFACTOR mode)
 }
 
@@ -412,6 +420,15 @@ func gradeCodingProof(idx int, c CodingProofCriterion, bundle []Evidence, fail f
 		}
 		if len(ce.Missing) > 0 {
 			return fail(fmt.Sprintf("coding-proof: previously passing test(s) are absent from the candidate run: %v", ce.Missing))
+		}
+		if len(ce.PassToSkip) > 0 {
+			return fail(fmt.Sprintf("coding-proof regression: previously passing test(s) are now skipped: %v", ce.PassToSkip))
+		}
+		if len(ce.NewFail) > 0 {
+			return fail(fmt.Sprintf("coding-proof: new test(s) introduced by the candidate fail: %v", ce.NewFail))
+		}
+		if len(ce.FailedPackages) > 0 {
+			return fail(fmt.Sprintf("coding-proof: candidate package(s) failed to build/run: %v", ce.FailedPackages))
 		}
 		switch c.Mode {
 		case CodingProofBehavioral:

@@ -18,18 +18,42 @@ func TestParseTestJSONExtractsTerminalOutcomes(t *testing.T) {
 {"Action":"output","Package":"pkg","Output":"FAIL\n"}
 {"Action":"fail","Package":"pkg"}
 `
-	outcomes, err := ParseTestJSON(stream)
+	parsed, err := ParseTestJSON(stream)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(outcomes) != 2 {
-		t.Fatalf("expected 2 test outcomes (package aggregate excluded), got %d: %+v", len(outcomes), outcomes)
+	if len(parsed.Outcomes) != 2 {
+		t.Fatalf("expected 2 test outcomes (package aggregate excluded), got %d: %+v", len(parsed.Outcomes), parsed.Outcomes)
 	}
-	if outcomes[TestKey{"pkg", "TestA"}] != OutcomePass {
-		t.Fatalf("TestA: want pass, got %v", outcomes[TestKey{"pkg", "TestA"}])
+	if parsed.Outcomes[TestKey{"pkg", "TestA"}] != OutcomePass {
+		t.Fatalf("TestA: want pass, got %v", parsed.Outcomes[TestKey{"pkg", "TestA"}])
 	}
-	if outcomes[TestKey{"pkg", "TestB"}] != OutcomeFail {
-		t.Fatalf("TestB: want fail, got %v", outcomes[TestKey{"pkg", "TestB"}])
+	if parsed.Outcomes[TestKey{"pkg", "TestB"}] != OutcomeFail {
+		t.Fatalf("TestB: want fail, got %v", parsed.Outcomes[TestKey{"pkg", "TestB"}])
+	}
+	if len(parsed.FailedPackages) != 1 || parsed.FailedPackages[0] != "pkg" {
+		t.Fatalf("expected FailedPackages=[pkg] (the trailing package-level fail line), got %v", parsed.FailedPackages)
+	}
+}
+
+// Detector (code-review finding, codex): a package that fails to COMPILE
+// emits ONLY a package-level "fail" action, with zero per-test events —
+// this must be captured as a FailedPackage, not silently treated as
+// "zero relevant tests ran".
+func TestParseTestJSONCapturesPackageLevelCompileFailure(t *testing.T) {
+	stream := `{"Action":"start","Package":"broken/pkg"}
+{"Action":"output","Package":"broken/pkg","Output":"# broken/pkg\n./x.go:1:1: syntax error\n"}
+{"Action":"fail","Package":"broken/pkg","Elapsed":0}
+`
+	parsed, err := ParseTestJSON(stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.Outcomes) != 0 {
+		t.Fatalf("expected zero per-test outcomes for a compile failure, got %+v", parsed.Outcomes)
+	}
+	if len(parsed.FailedPackages) != 1 || parsed.FailedPackages[0] != "broken/pkg" {
+		t.Fatalf("expected FailedPackages=[broken/pkg], got %v", parsed.FailedPackages)
 	}
 }
 
@@ -50,12 +74,12 @@ func TestParseTestJSONTakesLastActionAsTerminal(t *testing.T) {
 {"Action":"run","Package":"pkg","Test":"TestFlaky"}
 {"Action":"pass","Package":"pkg","Test":"TestFlaky"}
 `
-	outcomes, err := ParseTestJSON(stream)
+	parsed, err := ParseTestJSON(stream)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if outcomes[TestKey{"pkg", "TestFlaky"}] != OutcomePass {
-		t.Fatalf("expected the LAST terminal action (pass) to win, got %v", outcomes[TestKey{"pkg", "TestFlaky"}])
+	if parsed.Outcomes[TestKey{"pkg", "TestFlaky"}] != OutcomePass {
+		t.Fatalf("expected the LAST terminal action (pass) to win, got %v", parsed.Outcomes[TestKey{"pkg", "TestFlaky"}])
 	}
 }
 
@@ -66,6 +90,7 @@ func TestClassifyInvariant8Vocabulary(t *testing.T) {
 		{"pkg", "TestBroken"}:     OutcomePass, // will regress
 		{"pkg", "TestStillFails"}: OutcomeFail,
 		{"pkg", "TestVanished"}:   OutcomePass,
+		{"pkg", "TestSkipped"}:    OutcomePass, // will be skipped in candidate
 	}
 	candidate := map[TestKey]TestOutcome{
 		{"pkg", "TestFixed"}:      OutcomePass,
@@ -74,6 +99,7 @@ func TestClassifyInvariant8Vocabulary(t *testing.T) {
 		{"pkg", "TestStillFails"}: OutcomeFail,
 		{"pkg", "TestNew"}:        OutcomePass,
 		{"pkg", "TestNewFail"}:    OutcomeFail,
+		{"pkg", "TestSkipped"}:    OutcomeSkip,
 	}
 	d := Classify(base, candidate)
 
@@ -81,6 +107,7 @@ func TestClassifyInvariant8Vocabulary(t *testing.T) {
 	assertEqual(t, "PassToPass", d.PassToPass, []string{"pkg.TestStable"})
 	assertEqual(t, "PassToFail", d.PassToFail, []string{"pkg.TestBroken"})
 	assertEqual(t, "FailToFail", d.FailToFail, []string{"pkg.TestStillFails"})
+	assertEqual(t, "PassToSkip", d.PassToSkip, []string{"pkg.TestSkipped"})
 	assertEqual(t, "NewPass", d.NewPass, []string{"pkg.TestNew"})
 	assertEqual(t, "NewFail", d.NewFail, []string{"pkg.TestNewFail"})
 	assertEqual(t, "Missing", d.Missing, []string{"pkg.TestVanished"})
