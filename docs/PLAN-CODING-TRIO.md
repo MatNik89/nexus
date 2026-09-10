@@ -1675,3 +1675,107 @@ Committed. Next: the S7-governed durable transaction wrapper on top of this prim
 `internal/foundation/sealedstore`, the crash-recovery classification table, restart-time
 `PolicyWorkspaceRollback` with its own S7 grant) — this package's own scope was
 deliberately just the descriptor-relative I/O layer everything above it will call.
+
+## Status 2026-09-10 — workspace transaction.go: same-process sealed-bundle multi-file transaction
+
+`internal/coding/workspace/transaction.go`: the second piece of Slice 3's multi-file
+transaction coordinator, built on descriptor.go's now-converged primitives. Implements
+`Apply(rootFd, store *sealedstore.Store, mutations []FileMutation, bindDurable func(digest
+string) error) (Result, error)` — invariant 4 steps 1/3/4/5 of 7:
+
+- Step 1: for every mutation, capture before-state (content+identity+mode from ONE
+  descriptor-relative open — `captureFileBeneath`), marshal every file's before AND after
+  bytes into ONE sealed bundle, `store.Put` it BEFORE any write.
+- The `bindDurable` hook fires right after `Put` succeeds, still holding the pin, still
+  before any write — the seam a future S7/journal integration will use to durably record
+  the bundle reference; aborts with zero writes if it fails, preserving the plan's
+  required "bundle, durable reference, THEN first write" ordering even though no real
+  durable reference exists in this increment.
+- Steps 3/4: each file replaced atomically in order via `WriteFileBeneath`, binding the
+  write's precondition to the captured before-identity, before-content digest, and
+  before-mode (not just Dev/Ino).
+- Step 5: on any per-file failure — including a write that DID commit but then failed a
+  later step — every already-committed file is rolled back to its sealed before-image.
+
+Explicitly NOT built here (a later increment): the actual S7 `Consume` companion-batch
+pairing behind the `bindDurable` hook, the restart-time crash-recovery classification
+table (step 6), the governed `PolicyWorkspaceRollback` operation (step 6's restart path).
+
+**5 review rounds on transaction.go itself, plus a further 2 rounds purely on
+`RemoveFileWithExpectedIdentity`'s own evolution (7 rounds total on this piece, on top of
+the 4 already spent on descriptor.go) — codex found a real bug in every single round
+except the last:**
+
+1. (Round 1) Five HIGH findings at once: the sealed-bundle pin was released before any
+   durable reference could exist, and `Apply`'s own shape couldn't support the required
+   bundle→reference→write ordering without a redesign; before-image captured via two
+   SEPARATE opens (`StatBeneath` then `ReadFileBeneath`) left a window for in-place
+   content mutation (same inode) to go undetected; a file `WriteFileBeneath` committed
+   but then errored on a LATER step (trailing fsync, cleanup unlink) was silently omitted
+   from rollback since the caller only tracked `err == nil`; rollback restored the
+   WRONG — after, not before — file mode (a field-conflation bug); `RemoveFileWithExpectedIdentity`
+   had the exact check-then-act race `WriteFileBeneath` itself had already been hardened
+   against. Fixed: `bindDurable` hook; `captureFileBeneath` (one atomic open);
+   `WriteFileBeneath` changed to return `(committed bool, err error)` with `Apply`
+   tracking rollback membership by `committed`, not by `werr == nil`; before/after mode
+   tracked as separate fields; `RemoveFileWithExpectedIdentity` rewritten with a
+   tombstone-exchange (mirroring `WriteFileBeneath`'s own exchange-verify-restore).
+2. (Round 2) The tombstone-exchange rewrite still checked only Dev/Ino, not content/mode,
+   on the file it was about to delete — an in-place content mutation on a rollback target
+   would still be silently destroyed; its OWN success-path final unlink (removing what it
+   assumed was its own tombstone) was itself still check-then-act; Openat2's `O_CREAT`
+   mode is masked by the process umask, silently contradicting `FileMutation.Mode`'s
+   documented "the result ALWAYS ends up with this mode" contract. Fixed:
+   `TargetExpectation` gained `ContentDigest`/`CheckMode`/`ExpectMode`, checked on
+   `RemoveFileWithExpectedIdentity`'s target too; its final unlink gained an own-identity
+   re-verification; `WriteFileBeneath` now `Fchmod`s the temp file to the exact requested
+   bits (Fchmod bypasses umask); the mode-check sentinel changed from `ExpectMode != 0`
+   (fail-open for the legitimate value 0000) to an explicit `CheckMode bool`.
+3. (Round 3) The round-2 "fix" to the tombstone success path only NARROWED its
+   check-then-act window (re-stat immediately before unlink) rather than closing it — a
+   concurrent writer could still replace the public name `baseName` in that shrunk gap
+   and have their file deleted. Fixed with a full redesign (per codex's own suggested
+   approach): `RemoveFileWithExpectedIdentity` now does ONE unconditional rename of
+   `baseName` to a private, unpredictable quarantine name FIRST — `baseName` is
+   definitively vacated before any verification happens, so there is no public name left
+   to race a cleanup deletion against at all (no tombstone, no exchange partner needed —
+   the goal was always just "atomically vacate baseName", which a plain rename achieves
+   in one syscall). The quarantined entry is verified and deleted on match, or renamed
+   back via `RENAME_NOREPLACE` on mismatch (refusing if a concurrent creator now occupies
+   `baseName`).
+4. (Round 4, on the redesign) The initial quarantine step used plain `Renameat`, which
+   silently clobbers an existing entry at the destination — astronomically unlikely given
+   `tempName`'s 128-bit randomness, but the wrong primitive at a destructive, fail-closed
+   boundary when the kernel provides exact no-clobber semantics for free. Fixed with
+   `RENAME_NOREPLACE` on the quarantine step too; `tempName` became a package-level var
+   so a test could force a deterministic collision and prove the fix.
+5. (Round 5) codex **PASS** — traced the complete current function end to end against
+   invariant 4 one more time and found nothing further; the one accepted ceiling (cleanup
+   of the cryptographically unpredictable private quarantine name is not itself an
+   atomic verify-and-unlink operation) is explicitly non-blocking, matching the same
+   accepted ceiling already on `WriteFileBeneath`'s own private-temp cleanup paths.
+
+Every finding across all 5 rounds independently verified before being accepted (real
+syscalls, `go test -count=20` stress runs, and for every fix a genuine RED-proof: the
+specific guard temporarily disabled, the new test confirmed to fail exactly as predicted,
+then restored). Full suite: `internal/coding/workspace` 39/39 (×20 stress), `go vet`
+clean, full repo `CGO_ENABLED=0 go test ./...` green throughout every round.
+
+**Review-agent availability note (continuing the pattern from the descriptor.go status
+section above):** agy (w8:p4) remained quota-blocked (`Individual quota reached`) for
+this entire piece's review history — it never returned a verdict for any transaction.go
+round. This piece therefore converged entirely on **codex-only** review, the same forced
+deviation from the mandatory 2-active-agent process (kilo has been permanently dead all
+session) documented for descriptor.go's later rounds — not a shortcut taken by choice.
+Once agy's quota appeared to reset, a full catch-up review request was dispatched
+covering everything it had missed; its own pane still showed the same live quota-reached
+error at dispatch time, so that catch-up review could not run either. The piece is being
+committed on codex's convergence alone, with this gap recorded transparently rather than
+silently treated as full 2-agent coverage.
+
+Committed. Next: symedit's Prepare/Apply orchestration layer tying `symedit.ParseWorkspaceEdit`/
+`ApplyEdits` together with `runner.RunGoplsRename` and this `workspace` package to perform
+a governed, end-to-end `RenameSymbol` — Slice 3's ultimate deliverable — OR continue
+building out invariant 4's remaining scope (step 2's real S7/journal wiring, step 6/7's
+crash-recovery classification + `PolicyWorkspaceRollback`) first. Both remain open; the
+next increment should pick whichever is smaller/more reviewable first.

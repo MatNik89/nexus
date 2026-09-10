@@ -3,8 +3,10 @@
 package workspace
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -30,7 +32,7 @@ func TestWriteFileBeneathCreatesFile(t *testing.T) {
 	}
 	defer unix.Close(dirFd)
 
-	if err := WriteFileBeneath(dirFd, "f.go", []byte("package b\n"), 0o644, TargetExpectation{MustNotExist: true}); err != nil {
+	if _, err := WriteFileBeneath(dirFd, "f.go", []byte("package b\n"), 0o644, TargetExpectation{MustNotExist: true}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := os.ReadFile(filepath.Join(root, "a", "b", "f.go"))
@@ -56,7 +58,7 @@ func TestWriteFileBeneathMustNotExistRefusesWhenFileAlreadyExists(t *testing.T) 
 	}
 	defer unix.Close(rootFd)
 
-	err = WriteFileBeneath(rootFd, "f.go", []byte("new content"), 0o644, TargetExpectation{MustNotExist: true})
+	_, err = WriteFileBeneath(rootFd, "f.go", []byte("new content"), 0o644, TargetExpectation{MustNotExist: true})
 	if err == nil {
 		t.Fatal("expected an error: f.go already exists, MustNotExist should refuse")
 	}
@@ -87,7 +89,7 @@ func TestWriteFileBeneathReplacesExistingFileWithMatchingIdentity(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := WriteFileBeneath(rootFd, "f.go", []byte("new content"), 0o644, TargetExpectation{Dev: dev, Ino: ino}); err != nil {
+	if _, err := WriteFileBeneath(rootFd, "f.go", []byte("new content"), 0o644, TargetExpectation{Dev: dev, Ino: ino}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := os.ReadFile(filepath.Join(root, "f.go"))
@@ -115,7 +117,7 @@ func TestWalkDirBeneathEmptyRelDirReturnsRoot(t *testing.T) {
 	}
 	defer unix.Close(dirFd)
 
-	if err := WriteFileBeneath(dirFd, "top.go", []byte("x"), 0o644, TargetExpectation{MustNotExist: true}); err != nil {
+	if _, err := WriteFileBeneath(dirFd, "top.go", []byte("x"), 0o644, TargetExpectation{MustNotExist: true}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(root, "top.go")); err != nil {
@@ -200,7 +202,7 @@ func TestWriteFileBeneathRefusesTargetIdentityDrift(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = WriteFileBeneath(rootFd, "f.go", []byte("attacker should not see this replace"), 0o644, TargetExpectation{Dev: dev, Ino: ino})
+	_, err = WriteFileBeneath(rootFd, "f.go", []byte("attacker should not see this replace"), 0o644, TargetExpectation{Dev: dev, Ino: ino})
 	if err == nil {
 		t.Fatal("expected WriteFileBeneath to refuse — the target's identity drifted to a planted symlink")
 	}
@@ -293,7 +295,7 @@ func TestWriteFileBeneathRejectsBaseNameWithSeparator(t *testing.T) {
 	}
 	defer unix.Close(rootFd)
 
-	if err := WriteFileBeneath(rootFd, "a/f.go", []byte("x"), 0o644, TargetExpectation{MustNotExist: true}); err == nil {
+	if _, err := WriteFileBeneath(rootFd, "a/f.go", []byte("x"), 0o644, TargetExpectation{MustNotExist: true}); err == nil {
 		t.Fatal("expected an error for a base name containing a separator")
 	}
 }
@@ -308,7 +310,7 @@ func TestWriteFileBeneathLeavesNoTempFilesBehind(t *testing.T) {
 	}
 	defer unix.Close(rootFd)
 
-	if err := WriteFileBeneath(rootFd, "f.go", []byte("x"), 0o644, TargetExpectation{MustNotExist: true}); err != nil {
+	if _, err := WriteFileBeneath(rootFd, "f.go", []byte("x"), 0o644, TargetExpectation{MustNotExist: true}); err != nil {
 		t.Fatal(err)
 	}
 	entries, err := os.ReadDir(root)
@@ -392,7 +394,7 @@ func TestWriteFileBeneathPreservesConcurrentWriteDuringMismatchRestore(t *testin
 	}
 	t.Cleanup(func() { beforeRestoreExchange = func() {} })
 
-	err = WriteFileBeneath(rootFd, "f.go", []byte("our content, should not land"), 0o644, TargetExpectation{Dev: wrongDev, Ino: wrongIno})
+	_, err = WriteFileBeneath(rootFd, "f.go", []byte("our content, should not land"), 0o644, TargetExpectation{Dev: wrongDev, Ino: wrongIno})
 	if err == nil {
 		t.Fatal("expected WriteFileBeneath to refuse (wrong expectation)")
 	}
@@ -451,7 +453,7 @@ func TestWriteFileBeneathRefusesSymlinkEvenWithMatchingRawIdentity(t *testing.T)
 		t.Fatal(err)
 	}
 
-	err = WriteFileBeneath(rootFd, "link.go", []byte("attacker content"), 0o644, TargetExpectation{Dev: uint64(st.Dev), Ino: st.Ino})
+	_, err = WriteFileBeneath(rootFd, "link.go", []byte("attacker content"), 0o644, TargetExpectation{Dev: uint64(st.Dev), Ino: st.Ino})
 	if err == nil {
 		t.Fatal("expected WriteFileBeneath to refuse replacing a symlink even with its own exact Dev/Ino as the expectation")
 	}
@@ -493,7 +495,7 @@ func TestWriteFileBeneathRestoresForeignRegularFileOnIdentityMismatch(t *testing
 		t.Fatal(err)
 	}
 
-	err = WriteFileBeneath(rootFd, "f.go", []byte("should not land"), 0o644, TargetExpectation{Dev: wrongDev, Ino: wrongIno})
+	_, err = WriteFileBeneath(rootFd, "f.go", []byte("should not land"), 0o644, TargetExpectation{Dev: wrongDev, Ino: wrongIno})
 	if err == nil {
 		t.Fatal("expected WriteFileBeneath to refuse — f.go's identity does not match the captured expectation")
 	}
@@ -511,5 +513,367 @@ func TestWriteFileBeneathRestoresForeignRegularFileOnIdentityMismatch(t *testing
 	}
 	if len(entries) != 2 {
 		t.Fatalf("directory entries = %v, want exactly [f.go, other.go] — no leftover temp files", entries)
+	}
+}
+
+// Detector (code-review finding, codex, transaction.go round 1): a
+// trailing failure AFTER the exchange has already landed (here: the
+// directory fsync) must still report committed==true — the new content
+// is genuinely on disk, and a caller that only checks err!=nil would
+// wrongly conclude nothing happened.
+func TestWriteFileBeneathReportsCommittedEvenWhenTrailingFsyncFails(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "f.go"), []byte("old content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rootFd, err := OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(rootFd)
+
+	dev, ino, err := StatBeneath(rootFd, "f.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	orig := fsyncDirHook
+	defer func() { fsyncDirHook = orig }()
+	fsyncDirHook = func(fd int) error { return fmt.Errorf("injected fsync failure") }
+
+	committed, err := WriteFileBeneath(rootFd, "f.go", []byte("new content"), 0o644, TargetExpectation{Dev: dev, Ino: ino})
+	if err == nil {
+		t.Fatal("expected the injected fsync error to propagate")
+	}
+	if !committed {
+		t.Fatal("expected committed = true — the exchange already landed before the fsync failure")
+	}
+	got, readErr := os.ReadFile(filepath.Join(root, "f.go"))
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(got) != "new content" {
+		t.Fatalf("f.go content = %q, want %q — committed=true must mean the write genuinely took effect", got, "new content")
+	}
+}
+
+// Detector (code-review finding, codex, transaction.go round 1): identity
+// (Dev/Ino) alone does not catch a writer that mutates a file's content
+// IN PLACE (same inode, via truncate+rewrite) between the caller
+// capturing Dev/Ino and this call — invariant 4 explicitly requires
+// content to be checked "independent of inode". ContentDigest closes
+// this: even with a perfectly matching Dev/Ino, a content mismatch must
+// still be refused.
+func TestWriteFileBeneathRefusesContentDigestMismatchDespiteMatchingIdentity(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "f.go"), []byte("original content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rootFd, err := OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(rootFd)
+
+	dev, ino, err := StatBeneath(rootFd, "f.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongDigest := strings.Repeat("0", 64)
+
+	// Same Dev/Ino, but a digest that does not match the ACTUAL current
+	// content ("original content") — simulates a caller whose captured
+	// before-content is stale relative to an in-place mutation that kept
+	// the same inode.
+	committed, err := WriteFileBeneath(rootFd, "f.go", []byte("new content"), 0o644, TargetExpectation{
+		Dev: dev, Ino: ino, ContentDigest: wrongDigest,
+	})
+	if err == nil {
+		t.Fatal("expected WriteFileBeneath to refuse — content digest does not match despite matching Dev/Ino")
+	}
+	if committed {
+		t.Fatal("expected committed = false — the mismatch was caught and restored")
+	}
+	got, readErr := os.ReadFile(filepath.Join(root, "f.go"))
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(got) != "original content" {
+		t.Fatalf("f.go content = %q, want untouched %q", got, "original content")
+	}
+}
+
+// Detector: RemoveFileWithExpectedIdentity actually removes a file whose
+// identity matches, and leaves no tombstone or temp artifacts behind.
+func TestRemoveFileWithExpectedIdentityRemovesMatchingFile(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "f.go"), []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rootFd, err := OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(rootFd)
+
+	dev, ino, err := StatBeneath(rootFd, "f.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveFileWithExpectedIdentity(rootFd, "f.go", TargetExpectation{Dev: dev, Ino: ino}); err != nil {
+		t.Fatal(err)
+	}
+	if _, statErr := os.Stat(filepath.Join(root, "f.go")); !os.IsNotExist(statErr) {
+		t.Fatal("f.go should have been removed")
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("directory entries = %v, want empty — no leftover tombstone/temp files", entries)
+	}
+}
+
+// Detector (code-review finding, codex, transaction.go round 1: the
+// original RemoveFileWithExpectedIdentity was a plain fstatat-then-
+// unlinkat, a real check-then-act race — rewritten with the same
+// exchange-verify-restore discipline as WriteFileBeneath's replace
+// path). A target whose identity has drifted (here: swapped for a
+// symlink) must be refused, left completely untouched.
+func TestRemoveFileWithExpectedIdentityRefusesDriftedTarget(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("s3cr3t"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "f.go"), []byte("original content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rootFd, err := OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(rootFd)
+
+	dev, ino, err := StatBeneath(rootFd, "f.go") // simulates an earlier capture
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Drift: f.go is replaced by a symlink AFTER identity was captured.
+	if err := os.Remove(filepath.Join(root, "f.go")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(outside, "secret.txt"), filepath.Join(root, "f.go")); err != nil {
+		t.Fatal(err)
+	}
+
+	err = RemoveFileWithExpectedIdentity(rootFd, "f.go", TargetExpectation{Dev: dev, Ino: ino})
+	if err == nil {
+		t.Fatal("expected RemoveFileWithExpectedIdentity to refuse — the target's identity drifted to a planted symlink")
+	}
+	fi, err := os.Lstat(filepath.Join(root, "f.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("f.go should still be the planted symlink — RemoveFileWithExpectedIdentity must not have touched it")
+	}
+	outsideContent, err := os.ReadFile(filepath.Join(outside, "secret.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(outsideContent) != "s3cr3t" {
+		t.Fatal("outside file was unexpectedly modified through the planted symlink")
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "f.go" {
+		t.Fatalf("directory entries = %v, want exactly [f.go] — no leftover tombstone/temp files", entries)
+	}
+}
+
+// Detector (code-review finding, codex, round 2, then round 3 — the
+// round-2 "fix" moved a re-verification immediately before the final
+// unlink of the PUBLIC name baseName, but that was still a separate
+// fstatat-then-unlinkat: narrower, not closed. The round-3 redesign
+// quarantines (renames away) baseName FIRST, unconditionally, so
+// baseName is definitively vacated before any verification happens —
+// there is no public name left to race a cleanup deletion against at
+// all). A concurrent CREATE at baseName, injected via the
+// beforeQuarantineVerify seam immediately after quarantine, must
+// survive completely untouched, AND the original (correctly
+// quarantined) target must still be removed successfully — the two
+// no longer interfere with each other at all.
+func TestRemoveFileWithExpectedIdentityPreservesConcurrentCreateDuringQuarantine(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "f.go"), []byte("original content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rootFd, err := OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(rootFd)
+
+	dev, ino, err := StatBeneath(rootFd, "f.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const concurrentContent = "concurrent writer's legitimate new file"
+	orig := beforeQuarantineVerify
+	defer func() { beforeQuarantineVerify = orig }()
+	fired := false
+	beforeQuarantineVerify = func() {
+		if fired {
+			return
+		}
+		fired = true
+		if err := os.WriteFile(filepath.Join(root, "f.go"), []byte(concurrentContent), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := RemoveFileWithExpectedIdentity(rootFd, "f.go", TargetExpectation{Dev: dev, Ino: ino}); err != nil {
+		t.Fatalf("expected the original (correctly quarantined) target to be removed successfully, got: %v", err)
+	}
+	if !fired {
+		t.Fatal("test setup bug: the injection hook never fired")
+	}
+
+	got, readErr := os.ReadFile(filepath.Join(root, "f.go"))
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(got) != concurrentContent {
+		t.Fatalf("f.go content = %q, want the concurrent writer's untouched content %q", got, concurrentContent)
+	}
+	entries, readErr := os.ReadDir(root)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(entries) != 1 || entries[0].Name() != "f.go" {
+		t.Fatalf("directory entries = %v, want exactly [f.go] — no leftover quarantine files", entries)
+	}
+}
+
+// Detector (code-review finding, codex, round 2): the earlier version of
+// RemoveFileWithExpectedIdentity checked only Dev/Ino, so a file mutated
+// IN PLACE (same inode) after its identity was captured would still
+// "match" and be deleted, losing whatever content was written there in
+// the meantime. ContentDigest+CheckMode close this the same way they
+// close it for WriteFileBeneath's replace path.
+func TestRemoveFileWithExpectedIdentityRefusesContentDigestMismatchDespiteMatchingIdentity(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "f.go"), []byte("original content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rootFd, err := OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(rootFd)
+
+	dev, ino, err := StatBeneath(rootFd, "f.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongDigest := strings.Repeat("0", 64)
+
+	err = RemoveFileWithExpectedIdentity(rootFd, "f.go", TargetExpectation{Dev: dev, Ino: ino, ContentDigest: wrongDigest})
+	if err == nil {
+		t.Fatal("expected RemoveFileWithExpectedIdentity to refuse — content digest does not match despite matching Dev/Ino")
+	}
+	got, readErr := os.ReadFile(filepath.Join(root, "f.go"))
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(got) != "original content" {
+		t.Fatalf("f.go content = %q, want untouched %q", got, "original content")
+	}
+}
+
+// Detector (code-review finding, codex, round 2): Openat2's create Mode
+// is masked by the process umask like any O_CREAT, so requesting 0666
+// under a typical restrictive umask would silently produce a narrower
+// mode — contradicting FileMutation.Mode's "the result ALWAYS ends up
+// with" contract. WriteFileBeneath must Fchmod to the EXACT requested
+// bits regardless of umask.
+func TestWriteFileBeneathAppliesExactModeRegardlessOfUmask(t *testing.T) {
+	root := t.TempDir()
+	rootFd, err := OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(rootFd)
+
+	oldUmask := unix.Umask(0o077) // would mask 0666 down to 0600 without the fix
+	defer unix.Umask(oldUmask)
+
+	if _, err := WriteFileBeneath(rootFd, "f.go", []byte("x"), 0o666, TargetExpectation{MustNotExist: true}); err != nil {
+		t.Fatal(err)
+	}
+	fi, statErr := os.Stat(filepath.Join(root, "f.go"))
+	if statErr != nil {
+		t.Fatal(statErr)
+	}
+	if fi.Mode().Perm() != 0o666 {
+		t.Fatalf("f.go mode = %o, want exactly %o regardless of umask", fi.Mode().Perm(), 0o666)
+	}
+}
+
+// Detector (code-review finding, codex, round 4): RemoveFileWithExpectedIdentity's
+// initial quarantine step used a plain Renameat, which silently clobbers
+// an existing entry at the destination name. Forces tempName (a var,
+// specifically so this is possible) to return a name that ALREADY has
+// unrelated sentinel content — RENAME_NOREPLACE must make the quarantine
+// step itself fail, leaving both the sentinel content and baseName
+// completely untouched.
+func TestRemoveFileWithExpectedIdentityRefusesToClobberCollidingQuarantineName(t *testing.T) {
+	root := t.TempDir()
+	const collidingName = ".nexus-workspace-tmp-collision-test"
+	if err := os.WriteFile(filepath.Join(root, collidingName), []byte("unrelated sentinel content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "f.go"), []byte("original content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rootFd, err := OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(rootFd)
+
+	dev, ino, err := StatBeneath(rootFd, "f.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	orig := tempName
+	defer func() { tempName = orig }()
+	tempName = func() (string, error) { return collidingName, nil }
+
+	err = RemoveFileWithExpectedIdentity(rootFd, "f.go", TargetExpectation{Dev: dev, Ino: ino})
+	if err == nil {
+		t.Fatal("expected an error: the quarantine name collides with an existing unrelated file")
+	}
+
+	got, readErr := os.ReadFile(filepath.Join(root, collidingName))
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(got) != "unrelated sentinel content" {
+		t.Fatalf("colliding sentinel file content = %q, want untouched %q", got, "unrelated sentinel content")
+	}
+	got, readErr = os.ReadFile(filepath.Join(root, "f.go"))
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(got) != "original content" {
+		t.Fatalf("f.go content = %q, want untouched %q", got, "original content")
 	}
 }
