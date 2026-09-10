@@ -1241,3 +1241,49 @@ the journal append itself fails.
 Next: implement the sandbox output-capture change (separate bounded stdout/stderr +
 truncation flag on `Process`) first — the smallest, most mechanical piece, and the
 long pole every other Slice 1 piece depends on for correctness.
+
+## Status 2026-09-10 — Slice 1 (evidence manifest) BUILT, pending adversarial review (0a43597)
+
+All four increments shipped and pushed, each with its own RED/GREEN proof, full-repo-suite
+green after every commit:
+1. `cdef247` — `sandbox.Process` splits stdout/stderr into separate bounded (32MiB)
+   buffers with a `Truncated()` flag, verified mutex-free (one os/exec copy goroutine per
+   stream) and zero-regression to every existing caller (`Output()` kept as
+   stdout+stderr concatenated, diagnostic-only, verified no caller parses its exact
+   format).
+2. `c3bdf8f` — `internal/kernel/checker` extended with `Criterion.CodingProofIs`/
+   `Evidence.Coding`, mirroring the existing XOR pattern exactly. BEHAVIORAL mode requires
+   a non-empty FAIL_TO_PASS; REFACTOR mode allows empty FAIL_TO_PASS only alongside a
+   predeclared, passed structural postcondition (`validate()` rejects REFACTOR mode with
+   zero `RequiredStructural` entries — no bare "allow empty" escape hatch). A regression
+   or a vanished previously-passing test ALWAYS fails grading, in either mode. Causal
+   ordering deliberately NOT re-verified inside `Grade` — that would bloat `Evidence` with
+   journal-specific fields no other evidence kind carries; the journal-native ordering
+   (codex's round-1 research finding, adopted over agy's timestamp-based proposal) is
+   enforced by `evidence.Capture` itself, the sole trusted writer of the event chain.
+3. `3b99b03` — `runner.RunSpec` gains `ParentEventID`, `RunResult` gains `JournalEvent`
+   (the actual journal receipt, previously silently discarded) — the mechanism
+   `evidence.Capture` uses to chain events without duplicating `runner.Run`'s own
+   `coding.run` event under a second name.
+4. `0a43597` — `internal/coding/evidence` (`ParseTestJSON`/`Classify`/`Capture`): the
+   full orchestration, journaling `coding.evidence_bound -> base-run -> candidate-run ->
+   coding.evidence_completed`, fail-closed on truncated output or a tree-digest mismatch
+   between declaration and execution. Two real end-to-end tests (a real fix, a real
+   regression) prove classification, the causal chain, AND that `checker.Grade` actually
+   grades the produced evidence correctly — all through the real bwrap sandbox, not mocks.
+
+**Scoping note, recorded for reviewers**: `Capture` does NOT call `checker.Grade` itself
+— it produces `checker.Evidence`, a later caller (Slice 3's not-yet-built symedit
+orchestration, which owns the actual `AcceptanceContract`) grades it. This is a deliberate
+reinterpretation of the plan's "the completion event is appended only after checker.Grade"
+line — read as design intent for that eventual Slice 3 orchestration, not a literal
+requirement inside Slice 1's own `Capture` function, which has no contract to grade
+against. Flag for review if this reading is wrong.
+
+**Not built, deliberately deferred**: `Capture` does not verify `StructuralPassed` itself
+(REFACTOR mode postconditions) — it only carries whatever the caller already declared,
+matching "Slice 1 depends only on existing runner/journal/checker machinery, never on a
+symedit package that doesn't exist yet."
+
+Dispatching codex+agy adversarial code review against `0a43597` next (kilo still
+unavailable — 2-of-3, per this session's established precedent).
