@@ -602,3 +602,183 @@ func TestApplyRollbackRefusesToDeleteForeignInPlaceContentMutation(t *testing.T)
 		t.Fatalf("a.go content = %q, want the foreign in-place mutation %q preserved (rollback must refuse to delete content it never wrote)", got, foreignContent)
 	}
 }
+
+// Detector (code-review finding, codex, symedit round 1): a caller that
+// validates a preimage ITSELF (e.g. symedit's own Prepare/Apply split)
+// and supplies ExpectedBeforeDigest must have Apply refuse — before any
+// write — if the file's ACTUAL content at Apply's own capture point does
+// not match, even though the caller's own earlier check might have
+// passed against now-stale bytes. Closes the window between an outer
+// caller's validation and Apply's own capture, rather than leaving a
+// gap for a caller to (incorrectly) trust its own stale check.
+func TestApplyRefusesWhenExpectedBeforeDigestMismatches(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("actual content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rootFd, err := OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(rootFd)
+	store := newTestStore(t)
+
+	_, err = Apply(rootFd, store, []FileMutation{
+		{BaseName: "a.go", After: []byte("new content"), Mode: 0o644, ExpectedBeforeDigest: sha256Hex([]byte("stale expected content"))},
+	}, noopBindDurable)
+	if err == nil {
+		t.Fatal("expected an error: ExpectedBeforeDigest does not match a.go's actual content")
+	}
+	got, readErr := os.ReadFile(filepath.Join(root, "a.go"))
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(got) != "actual content" {
+		t.Fatalf("a.go content = %q, want untouched %q", got, "actual content")
+	}
+}
+
+// Detector: ExpectedBeforeDigest, when it DOES match, does not block the
+// write — it's a precondition, not an unconditional refusal.
+func TestApplyAcceptsWhenExpectedBeforeDigestMatches(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("actual content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rootFd, err := OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(rootFd)
+	store := newTestStore(t)
+
+	res, err := Apply(rootFd, store, []FileMutation{
+		{BaseName: "a.go", After: []byte("new content"), Mode: 0o644, ExpectedBeforeDigest: sha256Hex([]byte("actual content"))},
+	}, noopBindDurable)
+	if err != nil {
+		t.Fatalf("expected success, got: %v", err)
+	}
+	if !res.Committed {
+		t.Fatal("expected Committed = true")
+	}
+	got, readErr := os.ReadFile(filepath.Join(root, "a.go"))
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(got) != "new content" {
+		t.Fatalf("a.go content = %q, want %q", got, "new content")
+	}
+}
+
+// Detector: ExpectedBeforeDigest set on a mutation whose target file does
+// NOT exist at all (existed==false) is also a mismatch — a caller that
+// expected specific pre-existing content must not have Apply silently
+// treat "the file is gone" as acceptable.
+func TestApplyRefusesWhenExpectedBeforeDigestSetButFileMissing(t *testing.T) {
+	root := t.TempDir()
+	rootFd, err := OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(rootFd)
+	store := newTestStore(t)
+
+	_, err = Apply(rootFd, store, []FileMutation{
+		{BaseName: "a.go", After: []byte("new content"), Mode: 0o644, ExpectedBeforeDigest: sha256Hex([]byte("expected content"))},
+	}, noopBindDurable)
+	if err == nil {
+		t.Fatal("expected an error: a.go does not exist but ExpectedBeforeDigest was set")
+	}
+	if _, statErr := os.Stat(filepath.Join(root, "a.go")); !os.IsNotExist(statErr) {
+		t.Fatal("a.go should not have been created")
+	}
+}
+
+// Detector (code-review finding, codex, symedit round 2): content alone
+// does not catch an atomic replace-with-identical-bytes that changes
+// only the file's identity — CheckExpectedIdentity must independently
+// refuse when Dev/Ino don't match the caller's expectation, even though
+// content is byte-identical.
+func TestApplyRefusesWhenExpectedIdentityMismatches(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("same content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rootFd, err := OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(rootFd)
+	store := newTestStore(t)
+
+	// Atomic replace-with-identical-bytes: new inode, same content.
+	tmp := filepath.Join(root, ".replacement")
+	if err := os.WriteFile(tmp, []byte("same content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, filepath.Join(root, "a.go")); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = Apply(rootFd, store, []FileMutation{
+		{
+			BaseName: "a.go", After: []byte("new content"), Mode: 0o644,
+			ExpectedBeforeDigest:  sha256Hex([]byte("same content")),
+			ExpectedBeforeDev:     999999, ExpectedBeforeIno: 999999,
+			CheckExpectedIdentity: true,
+		},
+	}, noopBindDurable)
+	if err == nil {
+		t.Fatal("expected an error: identity does not match despite matching content")
+	}
+	got, readErr := os.ReadFile(filepath.Join(root, "a.go"))
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(got) != "same content" {
+		t.Fatalf("a.go content = %q, want untouched %q", got, "same content")
+	}
+}
+
+// Detector (code-review finding, codex, symedit round 2): a
+// content-preserving chmod between an outer caller's own capture and
+// Apply's capture must be caught by CheckExpectedMode — Apply must not
+// silently overwrite the file at the caller's stale expected mode.
+func TestApplyRefusesWhenExpectedModeMismatches(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rootFd, err := OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(rootFd)
+	store := newTestStore(t)
+
+	dev, ino, err := StatBeneath(rootFd, "a.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = Apply(rootFd, store, []FileMutation{
+		{
+			BaseName: "a.go", After: []byte("new content"), Mode: 0o600,
+			ExpectedBeforeDigest:  sha256Hex([]byte("content")),
+			ExpectedBeforeDev:     dev, ExpectedBeforeIno: ino,
+			CheckExpectedIdentity: true,
+			ExpectedBeforeMode:    0o644, // stale: actual mode is 0600
+			CheckExpectedMode:     true,
+		},
+	}, noopBindDurable)
+	if err == nil {
+		t.Fatal("expected an error: mode does not match the caller's expectation despite matching content and identity")
+	}
+	got, readErr := os.ReadFile(filepath.Join(root, "a.go"))
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(got) != "content" {
+		t.Fatalf("a.go content = %q, want untouched %q", got, "content")
+	}
+}

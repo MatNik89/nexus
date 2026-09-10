@@ -106,13 +106,24 @@ func validateFileRelPath(p string) error {
 	return nil
 }
 
+// GoplsSandboxRoot is the fixed absolute path every RunGoplsRename
+// session's gopls process resolves its workspace at, inside the
+// snapshot sandbox — NOT the caller's real, on-disk RenameRequest.SourceDir
+// (that tree is only ever copied in, read-only, and never touched by
+// gopls). Exported so a caller resolving the returned WorkspaceEdit's
+// `file:` URIs (e.g. symedit.ParseWorkspaceEdit's workspaceRoot
+// parameter) uses the SAME root this package itself builds URIs
+// against, rather than a second, independently-hardcoded literal that
+// could silently drift out of sync with this one.
+const GoplsSandboxRoot = "/work/src"
+
 // fileURIFor builds the in-sandbox file: URI for relPath (already
 // validated by validateFileRelPath) via net/url, not string
 // concatenation — a valid Go filename can contain '#', '?', a space, or
 // a literal '%', all of which change or break URI syntax if pasted in
 // raw (code-review finding, codex).
 func fileURIFor(relPath string) string {
-	return (&url.URL{Scheme: "file", Path: "/work/src/" + relPath}).String()
+	return (&url.URL{Scheme: "file", Path: GoplsSandboxRoot + "/" + relPath}).String()
 }
 
 func RunGoplsRename(ctx context.Context, backend *sandbox.Bwrap, report sandbox.ProbeReport, grants *s7.Authority, j *journal.Journal, req RenameRequest) (RenameResult, error) {
@@ -349,7 +360,7 @@ func journalGoplsRenameEvent(ctx context.Context, j *journal.Journal, req Rename
 // rename request's raw response message (id 2).
 func runGoplsSession(proc *sandbox.InteractiveProcess, req RenameRequest, fileContent []byte) (map[string]json.RawMessage, error) {
 	reader := bufio.NewReader(proc.Stdout())
-	rootURI := "file:///work/src"
+	rootURI := "file://" + GoplsSandboxRoot
 	// net/url, not string concatenation (code-review finding, codex): a
 	// valid Go filename can contain '#', '?', a space, or non-ASCII
 	// bytes, all of which change URI semantics if pasted in raw —

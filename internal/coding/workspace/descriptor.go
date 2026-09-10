@@ -429,12 +429,14 @@ func ReadFileBeneath(dirFd int, baseName string) ([]byte, error) {
 	return data, err
 }
 
-// captureFileBeneath is ReadFileBeneath plus the identity and mode from
-// the SAME open — used by transaction.go's prepare pass so a file's
+// CaptureFileBeneath is ReadFileBeneath plus the identity and mode from
+// the SAME open — used by transaction.go's prepare pass (and by callers
+// outside this package needing a file's original mode, e.g. symedit's
+// orchestration preserving it across a content-only edit) so a file's
 // before-content, before-identity, and before-mode all come from one
 // atomic view of one inode, never two independent opens that could
 // straddle an in-place mutation.
-func captureFileBeneath(dirFd int, baseName string) (content []byte, dev, ino uint64, mode fs.FileMode, err error) {
+func CaptureFileBeneath(dirFd int, baseName string) (content []byte, dev, ino uint64, mode fs.FileMode, err error) {
 	data, st, err := readFileBeneathWithStat(dirFd, baseName)
 	if err != nil {
 		return nil, 0, 0, 0, err

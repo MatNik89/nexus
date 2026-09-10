@@ -1779,3 +1779,103 @@ a governed, end-to-end `RenameSymbol` — Slice 3's ultimate deliverable — OR 
 building out invariant 4's remaining scope (step 2's real S7/journal wiring, step 6/7's
 crash-recovery classification + `PolicyWorkspaceRollback`) first. Both remain open; the
 next increment should pick whichever is smaller/more reviewable first.
+
+## Status 2026-09-10 — symedit.Prepare/Apply: real end-to-end RenameSymbol
+
+`internal/coding/symedit/{rename.go,discover.go}` — Slice 3's own ultimate deliverable:
+`Prepare`/`Apply` ties together the three already-converged pieces (Slice 0's
+`runner.RunGoplsRename`, this package's own pure `ParseWorkspaceEdit`/`ApplyEdits`, and
+`workspace.Apply`) into a real, governed, end-to-end `RenameSymbol` — proven by a genuine
+integration test driving a real `gopls` session against a real on-disk Go module and
+verifying the resulting files on disk.
+
+- `ExtractTouchedRelPaths` (discover.go): a loose, non-authoritative pre-pass over the raw
+  `WorkspaceEdit` to learn which files are touched, solving the chicken-and-egg
+  `ParseWorkspaceEdit` itself creates by requiring every touched file's preimage up front.
+  `ParseWorkspaceEdit` independently re-validates everything afterward and fails closed on
+  any mismatch, so a wrong/incomplete result here can never be silently trusted.
+- `Prepare`: runs the gopls session, captures every touched file's preimage
+  (content+identity+mode, one atomic descriptor-relative open each), and returns a `Plan` —
+  the "canonical preview" invariant 3 requires — bound together by a `PlanDigest`.
+- `Apply`: recomputes `PlanDigest` and refuses on any mismatch before touching anything,
+  then hands `workspace.Apply` a fully-specified precondition (content digest + identity +
+  mode) per file, carried through to the exact point `workspace.Apply` captures its own
+  authoritative "before" state.
+
+Small supporting exports on already-converged code, both additive: `runner.GoplsSandboxRoot`
+(promoted from a literal duplicated in two places in gopls.go to one shared constant) and
+`workspace.CaptureFileBeneath` (promoted from an already-existing unexported helper).
+
+**4 review rounds, codex found a real HIGH issue in every round but the last:**
+
+1. (Round 1) Three findings at once: gopls computes its `WorkspaceEdit` against a
+   disposable snapshot of `SourceDir` taken at an unobservable internal moment — reading
+   preimages via `rootFd` afterward without any check could silently resolve gopls's
+   (line, character) positions against DRIFTED content, corrupting the file instead of
+   failing; symedit's own separate re-hash-then-compare pass (run before `workspace.Apply`
+   was even called) still left a window before `workspace.Apply`'s own later capture; the
+   exported, field-mutable `Plan` had no tamper-evidence at all. Fixed: `Prepare` brackets
+   the whole gopls call with two whole-tree content digests
+   (`runner.DigestTreeFiles`, the same fail-closed walk `RunGoplsRename`'s own snapshot
+   uses) plus a `verifyRootIdentity` sanity check; the drift precondition moved INTO
+   `workspace.Apply` itself via a new `ExpectedBeforeDigest` field on `FileMutation`,
+   checked at its own single authoritative capture point; `Plan` gained a `PlanDigest`
+   recomputed and verified by `Apply`.
+2. (Round 2) Three more: the digest sandwich still resolved everything by
+   `req.SourceDir`'s own PATHNAME, not `rootFd`'s identity — a pathname swap mid-call
+   would go undetected; `PlanDigest` only bound the separately-stored, independently-
+   tamperable `Preimage.Digest` STRING, not the actual `Content`/`Mode` fields
+   `Apply` consumes; the Prepare→Apply precondition covered content only, not identity or
+   mode (an atomic replace-with-identical-bytes, or a content-preserving chmod, would go
+   undetected). An attempted fix routing everything through `/proc/self/fd/<rootFd>`
+   broke `RunGoplsRename`'s own internal snapshot copy (its walk Lstats its root and
+   refuses to descend into what it sees as a symlink — confirmed live) — reverted in
+   favor of a narrower fix: `verifyRootIdentity` called a SECOND time immediately after
+   `RunGoplsRename` returns; `Preimage.Digest` removed as a stored field entirely (every
+   consumer computes `sha256Hex(Content)` fresh, never a cached value);
+   `workspace.FileMutation` gained `ExpectedBeforeDev`/`ExpectedBeforeIno`/
+   `CheckExpectedIdentity` and `ExpectedBeforeMode`/`CheckExpectedMode`, checked at the
+   same single capture point as the content digest.
+3. (Round 3) The two-point digest sandwich still could not see an ABA entirely WITHIN
+   `RunGoplsRename`'s own call (content changed then reverted before the sandwich's own
+   endpoints observe it) — closed using data that was already being returned and simply
+   never compared: `RunGoplsRename`'s own `res.SnapshotDigest` (the digest of the EXACT
+   tree its internal copy captured) is now compared against the pre-call digest, and the
+   initial digest call's PER-FILE digest list is retained and each preimage checked
+   against its own entry. Also strengthened the round-2 pathname-swap test to swap in a
+   BYTE-IDENTICAL replacement directory (same content, different inode) — cleanly
+   isolating that the identity re-check, not a coincidental digest mismatch, is what
+   catches it.
+4. (Round 4) codex **PASS** — confirmed all three boundaries closed, both new detectors
+   genuinely isolated (traced explicitly), all earlier fixes still holding. Notes only,
+   non-blocking: `SnapshotDigest`/`ToolchainDigest`/`PolicyHash` aren't bound into
+   `PlanDigest` since nothing currently makes an Apply decision based on them — bind them
+   once a real consumer (durable approval/evidence) starts trusting them, matching this
+   program's established "defer until a real consumer needs it" pattern; full preimage
+   bytes in memory are fine for this increment but must go through the sealed-artifact
+   owner, never raw into the journal, once durable persistence lands.
+
+Every finding independently verified before being accepted; every fix RED-proven (the
+specific guard disabled, the new test confirmed to fail exactly as predicted, restored) —
+including two rounds where an initial RED-proof attempt was itself found to be
+insufficiently isolated (a coincidental downstream check masked whether the NEW guard was
+actually load-bearing) and had to be redone with a more precisely constructed scenario
+before being trusted. Full suite: `internal/coding/symedit` 25/25 (6 of them real,
+non-mocked `gopls` sessions, ~12s), `internal/coding/workspace` 44/44 (×20 stress),
+`go vet` clean, full repo `CGO_ENABLED=0 go test ./...` green throughout every round.
+
+**Review-agent availability note (same pattern as every prior piece since the descriptor.go
+status section above):** agy (w8:p4) remained quota-blocked for this entire piece's review
+history too — every dispatch attempt (including several where the quota's own remaining-time
+countdown had visibly ticked down between attempts, confirming it was genuinely still
+blocked, not merely stale) returned the same `Individual quota reached` error. This piece
+converged entirely on codex-only review, once again a forced deviation from the mandatory
+2-active-agent process (kilo dead the whole session), not a shortcut.
+
+Committed. **Slice 3's own core deliverable (governed, end-to-end RenameSymbol) is now
+real and working.** Remaining open scope, still explicitly deferred and documented at each
+piece's own boundary: real S7/journal wiring for the `bindDurable` hook (a genuine new
+operation type, not yet designed); the restart-time crash-recovery classification table
+and `PolicyWorkspaceRollback` (invariant 4 steps 6/7); the Prepare-phase "format+type-check
+the staged result" step; expanding beyond `RenameSymbol` to further gopls actions (Slice 4,
+explicitly not before Slice 3 is deployed and dogfooded per the plan's own build order).

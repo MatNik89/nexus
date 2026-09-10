@@ -54,6 +54,42 @@ type FileMutation struct {
 	// capturing them (e.g. at Prepare time) and passing them through
 	// here explicitly.
 	Mode fs.FileMode
+	// ExpectedBeforeDigest, when non-empty, is the sha256 hex digest the
+	// EXISTING file's content must match at the exact moment Apply
+	// captures its own before-state — checked as part of THAT capture,
+	// not as a separate pass (code-review finding, codex: a caller that
+	// validates a preimage itself and only THEN calls Apply leaves a
+	// window between its own check and Apply's own later capture; a
+	// concurrent writer landing in that window would have Apply silently
+	// treat their content as the legitimate "before" and overwrite it —
+	// carrying the caller's own expectation through to be checked AT
+	// Apply's own capture point, not separately beforehand, closes that
+	// window rather than merely narrowing it). Empty skips the check —
+	// existing callers, and MustNotExist-style new-file mutations
+	// (nothing exists yet to digest), are unaffected.
+	ExpectedBeforeDigest string
+	// ExpectedBeforeDev/ExpectedBeforeIno, checked only when
+	// CheckExpectedIdentity is true, are the device+inode the EXISTING
+	// file's identity must match at Apply's own capture point — the
+	// same closes-the-window rationale as ExpectedBeforeDigest, applied
+	// to identity (PLAN-CODING-TRIO.md invariant 4: "the PRE-EDIT inode
+	// is a PRECONDITION check at Apply time" — code-review finding,
+	// codex: content alone does not catch an atomic replace-with-
+	// identical-bytes that changes only identity).
+	ExpectedBeforeDev, ExpectedBeforeIno uint64
+	CheckExpectedIdentity                bool
+	// ExpectedBeforeMode, checked only when CheckExpectedMode is true,
+	// is the permission bits the EXISTING file's mode must match at
+	// Apply's own capture point — independent of content (invariant 4:
+	// "content, mode, and metadata expectations are checked explicitly
+	// ...independent of inode" — code-review finding, codex: a
+	// content-preserving chmod between an outer caller's own capture and
+	// Apply's capture would otherwise be silently overwritten with the
+	// caller's stale mode). A bool gate, not a zero-value sentinel —
+	// mode 0000 is a legitimate value (same reasoning as
+	// TargetExpectation.CheckMode elsewhere in this package).
+	ExpectedBeforeMode fs.FileMode
+	CheckExpectedMode  bool
 }
 
 // fileRecord is one mutation's captured before/after state, serialized
@@ -186,7 +222,7 @@ func Apply(rootFd int, store *sealedstore.Store, mutations []FileMutation, bindD
 		var existed bool
 		var beforeMode fs.FileMode
 		var dev, ino uint64
-		content, capDev, capIno, capMode, capErr := captureFileBeneath(dirFd, m.BaseName)
+		content, capDev, capIno, capMode, capErr := CaptureFileBeneath(dirFd, m.BaseName)
 		switch {
 		case capErr == nil:
 			existed, before, dev, ino, beforeMode = true, content, capDev, capIno, capMode
@@ -200,6 +236,18 @@ func Apply(rootFd int, store *sealedstore.Store, mutations []FileMutation, bindD
 		var beforeDigest string
 		if existed {
 			beforeDigest = sha256Hex(before)
+		}
+		if m.ExpectedBeforeDigest != "" && beforeDigest != m.ExpectedBeforeDigest {
+			unix.Close(dirFd)
+			return Result{}, fmt.Errorf("workspace: apply: %q's current content (digest=%s) does not match the caller's expected before-digest (%s) — fail closed, no write performed", m.BaseName, beforeDigest, m.ExpectedBeforeDigest)
+		}
+		if m.CheckExpectedIdentity && (dev != m.ExpectedBeforeDev || ino != m.ExpectedBeforeIno) {
+			unix.Close(dirFd)
+			return Result{}, fmt.Errorf("workspace: apply: %q's current identity (dev=%d,ino=%d) does not match the caller's expected before-identity (dev=%d,ino=%d) — fail closed, no write performed", m.BaseName, dev, ino, m.ExpectedBeforeDev, m.ExpectedBeforeIno)
+		}
+		if m.CheckExpectedMode && beforeMode.Perm() != m.ExpectedBeforeMode.Perm() {
+			unix.Close(dirFd)
+			return Result{}, fmt.Errorf("workspace: apply: %q's current mode (%o) does not match the caller's expected before-mode (%o) — fail closed, no write performed", m.BaseName, beforeMode.Perm(), m.ExpectedBeforeMode.Perm())
 		}
 		prep = append(prep, prepared{
 			dirFd: dirFd, mutation: m, existed: existed,
