@@ -1450,3 +1450,42 @@ codex's proposal is more detailed, e.g. `RecallEvaluated bool`, and specifically
 actually EXECUTING the selected-subset run rather than a name-only comparison against
 full-suite failures, since a dependent package can still catch a dependency's compile
 failure).
+
+## Status 2026-09-10 — Slice 2 file-to-package mapping (763781e)
+
+Built the next Slice 2 plumbing piece on top of the impact.go fix (5b7c1ba/11a5528):
+`runner.DigestTreeFiles` (per-file digest breakdown, reusing `copyTreeInto`'s existing
+single walk — pure refactor, zero behavior change) and `impact.FileIndex`/
+`BuildFileIndex`/`ResolveChanges` (maps changed files, from `DiffFileMaps` on two
+`DigestTreeFiles` results, to their owning package import paths — fails closed per
+invariant 5 on any deletion, build-control file change, or unmapped file).
+
+**2 review rounds, codex+agy, 2 real bugs:**
+- Both independently found the SAME root cause (2-of-2 convergence): `BuildFileIndex`
+  indexed stdlib/GOMODCACHE packages under escaping `"../"`-prefixed keys —
+  `filepath.Rel` does NOT error on Unix for a target outside root. Verified live against
+  a real `go list -deps -test -json` run (pulled in `fmt` with `Dir` far outside the
+  workspace). Fixed with an explicit escape guard.
+- codex separately found: `ResolveChanges` treated an unrecognized/zero-value
+  `ChangeKind` as an ordinary resolvable change instead of failing closed — violates
+  this repo's own CLAUDE.md rule on unknown enum discriminators. Fixed with a total
+  switch.
+- agy also flagged (MEDIUM) that the originally-planned union-of-base-and-candidate
+  indexing design was unnecessary and introduced a real stale-mapping hazard (a file no
+  longer declared by candidate would keep resolving to its stale base-side owner). I
+  independently re-derived this before accepting — confirmed deletions never touch the
+  index (fail closed before lookup) and additions are already in candidate's own
+  listing, so union added nothing. Simplified to single (candidate) listing.
+
+Round 2: both PASS. Full repo suite green throughout. Pushed (763781e).
+
+Deferred (both reviewers agreed, not blocking this layer): `CompiledGoFiles` exclusion
+(already naturally excluded — never in the indexed field set), and
+`Incomplete`/`Error`/`DepsErrors` go-list-failure handling (belongs to the future `tia`
+orchestrator, which must refuse a failed/truncated `go list` run before ever calling
+`BuildGraph`/`BuildFileIndex`) — NOT this pure mapping layer's responsibility.
+
+Next: the `internal/coding/tia` orchestration package itself (`ShadowSpec`/
+`ShadowResult`/`RunShadow`) — governed `go list -deps -test -json` via `runner.Run`,
+reuse `evidence.ParseTestJSON` for selected/full test runs, and the `coding.tia_shadow`
+journal event. This is the last major Slice 2 piece.
