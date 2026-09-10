@@ -1329,3 +1329,41 @@ introduces. Threading journal offsets/parent chains into `Evidence` would be the
 evidence kind to break that documented, accepted separation.
 
 Dispatching round 2 re-verification (codex+agy) against `4aedfb8`.
+
+## Status 2026-09-10 — Slice 1 review round 2: agy PASS, codex FAIL→2 real gaps folded, 1 withdrawn (f27842e)
+
+**Genuine adjudication on the round-1 disputed finding**: codex re-examined its own
+"checker.Grade should re-verify the causal journal chain" finding from first principles
+and explicitly **withdrew** it — "the parity argument is sound... CodingProofEvidence is
+not uniquely weaker [than FileHashEvidence's identical trust model]." **agy independently
+reached the same conclusion.** Not stubbornness on either side — a real disagreement
+resolved by direct re-verification, exactly the discipline this whole session has used.
+
+**Two real, distinct findings remained, both fixed (`f27842e`)**:
+1. **`coding.evidence_completed` fired before any grading, with no verdict** — contradicted
+   its own name and the plan's "completion is appended only after checker.Grade." Renamed
+   to `coding.evidence_captured` (`Manifest.CapturedEvent`) — it records classified,
+   UNJUDGED evidence; grading + a future `coding.evidence_graded` event belongs to
+   whichever later caller (Slice 3) owns an `AcceptanceContract`.
+2. **The TOCTOU freeze only covered the LIVE host directory, never the disposable
+   `/work/src` copy the test itself runs against** — a test mutating its own source tree
+   during execution (rewriting a fixture) went undetected. This is the plan's own explicit
+   "hash again after... reject on undeclared mutation" requirement, not previously built.
+   Fixed: `runner.DigestTree` (reuses `copyTreeInto`'s own algorithm via a throwaway
+   destination so pre/post digests are guaranteed comparable) + `RunResult.
+   PostSnapshotDigest` + `Capture` refuses on mismatch. RED-proven with a real test that
+   legitimately passes but self-mutates its own package directory as a side effect.
+
+**Deliberately deferred, not blocking**: codex's 3rd round-2 finding (the closed event
+vocabulary lacks REGISTERED journal `PayloadValidator`s — both new event types use `nil`
+validators in tests, matching `coding.run`'s own existing precedent from Slice 0 — and the
+payloads omit the plan's full eventual field list: canonical workspace path, argv/env,
+timing, proof ceiling, fallback reason). This is real, plan-mandated completeness work,
+but building the FULL eventual field list now — before Slice 3 gives most of those fields
+(workspace identity, argv, patch digests) an actual referent — is scope creep beyond
+correctness. Tracked as its own follow-up increment, not a blocker for Slice 1's current
+proof-of-concept scope (a single trivial module, matching every other Slice 0/1 test's own
+scope).
+
+Dispatching round 3 (confirmation only — verify the 2 fixes, confirm explicit agreement on
+deferring the validator-completeness item).
