@@ -313,7 +313,7 @@ func appendCapturedEvent(ctx context.Context, j *journal.Journal, spec CaptureSp
 	}
 	return j.Append(ctx, contracts.EnvelopeParams{
 		SchemaID: "nexus.event", SchemaVersion: 1,
-		EventID:       contracts.EventID("ev-" + string(spec.RunID) + "-completed-" + randHex(8)),
+		EventID:       contracts.EventID("ev-" + string(spec.RunID) + "-captured-" + randHex(8)),
 		EventType:     "coding.evidence_captured",
 		RunID:         spec.RunID,
 		ParentEventID: parent,

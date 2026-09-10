@@ -4,7 +4,7 @@
 // it captures a base run and a candidate run of `go test -json` through
 // Slice 0's governed internal/coding/runner.Run, classifies each test's
 // transition (FAIL_TO_PASS / PASS_TO_PASS / a regression), and journals a
-// two-event chain (coding.evidence_bound -> coding.evidence_completed)
+// two-event chain (coding.evidence_bound -> coding.evidence_captured)
 // that a checker.CodingProofCriterion can grade. Depends only on
 // existing machinery (internal/kernel/journal, internal/kernel/checker)
 // plus internal/coding/runner — never internal/coding/impact (TIA) or a
