@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -179,10 +180,10 @@ func Run(ctx context.Context, backend sandbox.Backend, report sandbox.ProbeRepor
 
 	proc, launchErr := backend.Launch(execCtx, policy)
 	if launchErr != nil {
-		launchExecCause := context.Cause(execCtx)
+		selfDeadline := selfDeadlineCancelled(execCtx, launchErr)
 		cancelExec()
 		partial := RunResult{PolicyHash: policy.PolicyHash(), SnapshotDigest: snapDigest, ToolchainDigest: pin.HashDigest}
-		if launchExecCause != nil {
+		if selfDeadline {
 			// The deadline can expire DURING launch itself, before any
 			// process ever starts — same self-deadline CANCELLED
 			// classification as a Wait-time kill below (code-review
@@ -198,7 +199,7 @@ func Run(ctx context.Context, backend sandbox.Backend, report sandbox.ProbeRepor
 		return RunResult{}, journalRunEvent(ctx, j, spec, partial, fmt.Errorf("launch: %w", launchErr))
 	}
 	waitErr := proc.Wait()
-	execCause := context.Cause(execCtx)
+	selfDeadlineAfterWait := waitErr != nil && selfDeadlineCancelled(execCtx, waitErr)
 	cancelExec()
 	output := proc.Output()
 	proc.Close()
@@ -211,7 +212,7 @@ func Run(ctx context.Context, backend sandbox.Backend, report sandbox.ProbeRepor
 		PolicyHash:      policy.PolicyHash(),
 	}
 
-	if waitErr != nil && execCause != nil {
+	if selfDeadlineAfterWait {
 		// Killed by ITS OWN deadline/cancel — the attempt itself never
 		// completed; nothing durable happened downstream of it, so this
 		// is CANCELLED, not a failed attempt (mirrors effectpath's own
@@ -256,6 +257,25 @@ func attestOrOutcome(ctx context.Context, backend sandbox.Backend, proc *sandbox
 // caller inspects it later.
 func reportOutcome(grants *s7.Authority, op contracts.OperationID, outcome s7.Outcome, code string) {
 	_ = grants.Report(op, outcome, code, nil)
+}
+
+// selfDeadlineCancelled reports whether err — from a call governed by
+// execCtx — was actually caused by execCtx's own deadline/cancel, so the
+// caller should classify it as CANCELLED rather than a failed attempt.
+// Checks BOTH context.Cause(execCtx) (set once ctx.Done() has actually
+// fired — the case after a real launched process is killed by the
+// cancel-watch) AND errors.Is(err, context.DeadlineExceeded/Canceled)
+// (code-review finding, codex, round 3): sandbox.prepareLaunch's own
+// synchronous wall-clock deadline check can return before the context's
+// internal timer goroutine has published cancellation, so
+// context.Cause(execCtx) alone can still read nil at that exact moment
+// even though the deadline has objectively passed — the wrapped error is
+// the race-free signal for that specific window.
+func selfDeadlineCancelled(execCtx context.Context, err error) bool {
+	if context.Cause(execCtx) != nil {
+		return true
+	}
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
 }
 
 // journalRunEvent emits one coding.run event recording the run's

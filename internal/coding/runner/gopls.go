@@ -206,15 +206,18 @@ func RunGoplsRename(ctx context.Context, backend *sandbox.Bwrap, report sandbox.
 
 	proc, err := backend.LaunchInteractive(execCtx, policy)
 	if err != nil {
-		if execCause := context.Cause(execCtx); execCause != nil {
+		if selfDeadlineCancelled(execCtx, err) {
 			// The deadline can expire DURING launch preparation itself,
 			// before any process ever starts — the same self-deadline
 			// CANCELLED classification applies here as after Wait
-			// (code-review finding, codex: reproduced non-deterministically,
-			// a 1ms deadline landed here in ~2 of 10 runs; classifying it
-			// as FailedTerminal unconditionally, as this branch used to,
-			// makes the SAME deadline produce two different S7 outcomes
-			// depending on unrelated scheduling timing).
+			// (code-review finding, codex, rounds 2-3: reproduced
+			// non-deterministically, and the naive context.Cause(execCtx)
+			// check alone missed a narrower race where sandbox's own
+			// synchronous deadline check fires before ctx.Done() is
+			// actually published — see selfDeadlineCancelled's doc
+			// comment). An unconditional FailedTerminal here made the
+			// SAME deadline produce different S7 outcomes depending on
+			// unrelated scheduling timing.
 			grants.Cancel(req.OperationID, nil)
 			journalGoplsRenameEvent(ctx, j, req, RenameResult{}, err)
 			return RenameResult{}, fmt.Errorf("runner: launch cancelled by its own deadline: %w", err)
@@ -227,11 +230,10 @@ func RunGoplsRename(ctx context.Context, backend *sandbox.Bwrap, report sandbox.
 	renameResp, sessionErr := runGoplsSession(proc, req, fileContent)
 
 	waitErr := proc.Wait()
-	execCause := context.Cause(execCtx)
 	if sessionErr == nil {
 		sessionErr = waitErr
 	}
-	if sessionErr != nil && execCause != nil {
+	if sessionErr != nil && selfDeadlineCancelled(execCtx, sessionErr) {
 		// Killed by ITS OWN deadline/cancel (mirrors Run's identical
 		// classification, run.go): the attempt itself never completed,
 		// nothing durable happened downstream of it, so this is

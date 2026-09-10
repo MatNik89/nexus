@@ -749,9 +749,21 @@ func (h *Handle) Start() error {
 }
 
 // Kill terminates the sandbox leader; PID isolation + --die-with-parent
-// take everything inside down with it.
+// take everything inside down with it — killing the leader (PID 1 of its
+// OWN new PID namespace, from --unshare-pid) triggers the kernel's own
+// namespace-death cascade onto every process inside, which is what
+// TestBackendTimeoutKillsTree has proven for years, not process-group
+// signaling. cmd.SysProcAttr.Setpgid additionally puts the leader in its
+// own process group; signaling that group too (best-effort, defense in
+// depth — code-review round 3, agy's hypothesis that a surviving
+// grandchild could hold a pipe fd open) is a no-op if the namespace
+// cascade already reaped everything, and cannot be a regression: a
+// missing/already-dead group is ESRCH, silently ignored.
 func (h *Handle) Kill() {
 	if h.cmd.Process != nil {
+		if pid := h.cmd.Process.Pid; pid > 0 {
+			_ = syscall.Kill(-pid, syscall.SIGKILL)
+		}
 		h.cmd.Process.Kill()
 	}
 	h.cancel()

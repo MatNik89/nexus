@@ -427,7 +427,16 @@ func (b *Bwrap) prepareLaunch(ctx context.Context, policy CompiledPolicy) (*prob
 		}
 	}
 	if timeout <= 0 {
-		return nil, fmt.Errorf("sandbox: attempt deadline already passed (fail closed)")
+		// Wraps context.DeadlineExceeded (code-review finding, codex,
+		// round 3): this is a SYNCHRONOUS wall-clock check against
+		// ctx.Deadline(), independent of ctx.Done()/context.Cause(ctx) —
+		// a caller that only checks context.Cause(execCtx) after this
+		// error can observe it still nil, because the context's own
+		// internal timer goroutine has not yet published cancellation
+		// even though the deadline has objectively passed by this
+		// check's own math. errors.Is(err, context.DeadlineExceeded)
+		// gives callers a synchronous, race-free signal instead.
+		return nil, fmt.Errorf("sandbox: attempt deadline already passed (fail closed): %w", context.DeadlineExceeded)
 	}
 	h, err := probe.Prepare(b.av, probe.Spec{
 		Target: policy.spec.Target, Args: policy.spec.Args,
