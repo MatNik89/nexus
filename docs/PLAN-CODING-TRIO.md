@@ -1118,3 +1118,38 @@ Dispatching round 4 (codex+agy) against `90816de` — the specific, narrow quest
 time is whether the `errors.Is`-based fix genuinely closes the race (both reviewers should
 stress-run the same detector again) and whether the process-group-kill addition introduces
 any regression to the existing kill/attestation invariants.
+
+## Status 2026-09-10 — round 4: BOTH codex and agy PASS — gopls session CLOSED (34b93cd)
+
+**codex PASS**: 200/200 deadline-classification iterations clean (-count=10, 20 per run),
+`TestBackendTimeoutKillsTree` + both `InteractiveProcess` kill tests 30/30 clean in
+isolation, full suite green. Explicitly confirmed "the synchronous wrapped error removes
+the race by construction," and found no evidence supporting the process-group hypothesis
+as the actual root cause (concurs the PID-namespace cascade remains authoritative; the
+added `syscall.Kill(-pid, ...)` is valid, harmless defense-in-depth since `Setpgid: true`
+is already set).
+
+**agy PASS**: 400/400 iterations clean (-count=20), sandbox+full suite clean.
+
+**Genuine convergence, not rubber-stamped** — this closes a real 3-round bug chain (round
+1: 3 HIGH + 1 MEDIUM in the new gopls code; round 2: the launch-error branch entirely
+missing the self-deadline check; round 3: the check itself racing an async timer
+goroutine), each one independently found and fixed with a verified, working detector.
+
+**Slice 0's gopls stdio JSON-RPC session is DONE for its current proof-of-concept scope**
+(single trivial Go module, real `gopls serve` driven through the real bwrap sandbox,
+correct `WorkspaceEdit` returned, governed by the same non-durable S7 shape as `Run`).
+
+**Still tracked, deliberately out of scope for this closure, for their own future
+increments**:
+1. PATH-exposed `go` binary is identity-pinned via `ExtraROBinds`, not content-hash-pinned
+   + re-verified at Launch like the primary Target — needs extending
+   `internal/preflight/probe`'s promoted-executable pinning to a second executable.
+2. Server-initiated JSON-RPC requests (e.g. `workspace/configuration`) are silently
+   discarded by `lspAwaitResponse` rather than answered with `MethodNotFound` — a real
+   hardening gap for Slice 3's real-repository scope (both reviewers agree non-blocking
+   for the current trivial-module scope).
+
+Slice 0 is now feature-complete: toolchain-visibility primitive, coding-runner (real `go
+build`/`go test`), gopls rename session, all 7 required causal detectors satisfied. Next:
+Slice 1 (evidence manifest).
