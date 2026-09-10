@@ -56,6 +56,14 @@ type RunSpec struct {
 	TargetID    contracts.TargetID
 	RunID       contracts.RunID
 	ProfileID   contracts.ProfileID
+	// ParentEventID, when set, chains this run's own coding.run event to
+	// an earlier one in the SAME causal sequence (PLAN-CODING-TRIO.md
+	// Slice 1: a base run's event parents the bound-evidence event, and
+	// a candidate run's event parents the base run's — evidence.Capture
+	// reads RunResult.JournalEvent's own EventID/Sequence/JournalOffset
+	// to build that chain, never re-deriving them). Nil for an ordinary,
+	// unchained coding-run.
+	ParentEventID *contracts.EventID
 }
 
 // RunResult is the outcome of one coding-run.
@@ -68,6 +76,12 @@ type RunResult struct {
 	SnapshotDigest  string
 	ToolchainDigest string
 	PolicyHash      string
+	// JournalEvent is the actual receipt from the coding.run event this
+	// run appended — zero-valued if no journal was supplied, or if
+	// appending failed before this field could be set (check the
+	// returned error). Slice 1's evidence.Capture reads its EventID/
+	// Sequence/JournalOffset to chain a follow-up event's ParentEventID.
+	JournalEvent journal.Event
 }
 
 // Run executes one governed coding-run: snapshot the source tree,
@@ -196,10 +210,13 @@ func Run(ctx context.Context, backend sandbox.Backend, report sandbox.ProbeRepor
 			// on unrelated scheduling timing — whether it lands before
 			// or after Launch returns).
 			grants.Cancel(spec.OperationID, nil)
-			return partial, journalRunEvent(ctx, j, spec, partial, fmt.Errorf("launch cancelled by its own deadline: %w", launchErr))
+			ev, jerr := journalRunEvent(ctx, j, spec, partial, fmt.Errorf("launch cancelled by its own deadline: %w", launchErr))
+			partial.JournalEvent = ev
+			return partial, jerr
 		}
 		reportOutcome(grants, spec.OperationID, s7.OutcomeFailedTerminal, s7.CodeLocalRefused)
-		return RunResult{}, journalRunEvent(ctx, j, spec, partial, fmt.Errorf("launch: %w", launchErr))
+		_, jerr := journalRunEvent(ctx, j, spec, partial, fmt.Errorf("launch: %w", launchErr))
+		return RunResult{}, jerr
 	}
 	waitErr := proc.Wait()
 	selfDeadlineAfterWait := waitErr != nil && selfDeadlineCancelled(execCtx, waitErr)
@@ -226,7 +243,9 @@ func Run(ctx context.Context, backend sandbox.Backend, report sandbox.ProbeRepor
 		// classification for a read-only call killed by its own
 		// deadline).
 		grants.Cancel(spec.OperationID, nil)
-		return result, journalRunEvent(ctx, j, spec, result, fmt.Errorf("coding-run cancelled by its own deadline: %w", waitErr))
+		ev, jerr := journalRunEvent(ctx, j, spec, result, fmt.Errorf("coding-run cancelled by its own deadline: %w", waitErr))
+		result.JournalEvent = ev
+		return result, jerr
 	}
 
 	// The SANDBOXED PROCESS's own exit code (result.ExitOK) is DATA, not
@@ -235,12 +254,16 @@ func Run(ctx context.Context, backend sandbox.Backend, report sandbox.ProbeRepor
 	// tracks whether the governed ATTEMPT itself (launch, run to
 	// completion inside the sandbox boundary) succeeded.
 	if _, err := attestOrOutcome(ctx, backend, proc, policy, grants, spec.OperationID); err != nil {
-		return result, journalRunEvent(ctx, j, spec, result, fmt.Errorf("attest: %w", err))
+		ev, jerr := journalRunEvent(ctx, j, spec, result, fmt.Errorf("attest: %w", err))
+		result.JournalEvent = ev
+		return result, jerr
 	}
 	if err := grants.Report(spec.OperationID, s7.OutcomeSucceeded, "", nil); err != nil {
 		return result, fmt.Errorf("runner: %w", err)
 	}
-	return result, journalRunEvent(ctx, j, spec, result, nil)
+	ev, jerr := journalRunEvent(ctx, j, spec, result, nil)
+	result.JournalEvent = ev
+	return result, jerr
 }
 
 // attestOrOutcome verifies the attestation and, on failure, reports the
@@ -289,9 +312,9 @@ func selfDeadlineCancelled(execCtx context.Context, err error) bool {
 // outcome — this package's OWN closed event vocabulary (plan-review
 // round 1, kilo: "not a borrowed tool-call event, the correct audit
 // record"), never routed through EffectPath's tool-call event shape.
-func journalRunEvent(ctx context.Context, j *journal.Journal, spec RunSpec, result RunResult, runErr error) error {
+func journalRunEvent(ctx context.Context, j *journal.Journal, spec RunSpec, result RunResult, runErr error) (journal.Event, error) {
 	if j == nil {
-		return runErr
+		return journal.Event{}, runErr
 	}
 	payload := struct {
 		Args            []string `json:"args"`
@@ -311,32 +334,33 @@ func journalRunEvent(ctx context.Context, j *journal.Journal, spec RunSpec, resu
 	raw, marshalErr := json.Marshal(payload)
 	if marshalErr != nil {
 		if runErr != nil {
-			return runErr
+			return journal.Event{}, runErr
 		}
-		return fmt.Errorf("runner: marshal coding.run payload: %w", marshalErr)
+		return journal.Event{}, fmt.Errorf("runner: marshal coding.run payload: %w", marshalErr)
 	}
-	_, appendErr := j.Append(ctx, contracts.EnvelopeParams{
+	ev, appendErr := j.Append(ctx, contracts.EnvelopeParams{
 		SchemaID: "nexus.event", SchemaVersion: 1,
-		EventID:     contracts.EventID("ev-" + string(spec.OperationID) + "-" + randHex(8)),
-		EventType:   "coding.run",
-		RunID:       spec.RunID,
-		EmittedAt:   time.Now().UTC(),
-		ActorType:   contracts.ActorSystem,
-		ActorID:     "coding-runner",
-		PrincipalID: "nexus",
-		WorkspaceID: "local",
-		ProfileID:   spec.ProfileID,
-		AttemptNo:   1,
-		Payload:     raw,
-		PayloadHash: "recomputed",
+		EventID:       contracts.EventID("ev-" + string(spec.OperationID) + "-" + randHex(8)),
+		EventType:     "coding.run",
+		RunID:         spec.RunID,
+		ParentEventID: spec.ParentEventID,
+		EmittedAt:     time.Now().UTC(),
+		ActorType:     contracts.ActorSystem,
+		ActorID:       "coding-runner",
+		PrincipalID:   "nexus",
+		WorkspaceID:   "local",
+		ProfileID:     spec.ProfileID,
+		AttemptNo:     1,
+		Payload:       raw,
+		PayloadHash:   "recomputed",
 	})
 	if appendErr != nil {
 		if runErr != nil {
-			return runErr
+			return journal.Event{}, runErr
 		}
-		return fmt.Errorf("runner: journal coding.run: %w", appendErr)
+		return journal.Event{}, fmt.Errorf("runner: journal coding.run: %w", appendErr)
 	}
-	return runErr
+	return ev, runErr
 }
 
 func randHex(n int) string {

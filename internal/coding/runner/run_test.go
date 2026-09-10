@@ -247,3 +247,53 @@ func TestRunSeparatesStdoutFromStderrForJSONParsing(t *testing.T) {
 		}
 	}
 }
+
+// Detector (PLAN-CODING-TRIO.md Slice 1 prerequisite): RunResult.JournalEvent
+// carries the ACTUAL receipt from the coding.run event Run appended, and
+// a second Run chained via RunSpec.ParentEventID produces an event whose
+// own ParentEventID matches the first — the mechanism evidence.Capture
+// depends on to build its base->candidate causal chain, without
+// re-deriving or duplicating what Run already journals.
+func TestRunJournalEventChaining(t *testing.T) {
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skipf("no go binary on PATH: %v", err)
+	}
+	b, rep := testBackend(t)
+	grants := s7.NewAuthority(time.Now, 5*time.Minute)
+	j := testJournal(t)
+
+	src := t.TempDir()
+	tinyModule(t, src)
+
+	first, err := Run(ctxT(), b, rep, grants, j, RunSpec{
+		SourceDir: src, Args: []string{"build", "-C", "/work/src", "-o", "/work/out"},
+		GoBinary: goBin, Timeout: 150 * time.Second,
+		OperationID: "op-chain-1", TargetID: "target-chain-1", RunID: "run-chain-1", ProfileID: "work",
+	})
+	if err != nil {
+		t.Fatalf("first Run failed: %v\noutput: %s", err, first.Output)
+	}
+	if first.JournalEvent.Envelope.EventID == "" {
+		t.Fatal("expected RunResult.JournalEvent to carry a real EventID")
+	}
+
+	parent := first.JournalEvent.Envelope.EventID
+	second, err := Run(ctxT(), b, rep, grants, j, RunSpec{
+		SourceDir: src, Args: []string{"build", "-C", "/work/src", "-o", "/work/out"},
+		GoBinary: goBin, Timeout: 150 * time.Second,
+		OperationID: "op-chain-2", TargetID: "target-chain-2", RunID: "run-chain-1", ProfileID: "work",
+		ParentEventID: &parent,
+	})
+	if err != nil {
+		t.Fatalf("second Run failed: %v\noutput: %s", err, second.Output)
+	}
+	if second.JournalEvent.Envelope.ParentEventID == nil || *second.JournalEvent.Envelope.ParentEventID != parent {
+		t.Fatalf("expected the second run's ParentEventID to equal the first run's EventID %q, got %+v",
+			parent, second.JournalEvent.Envelope.ParentEventID)
+	}
+	if second.JournalEvent.JournalOffset <= first.JournalEvent.JournalOffset {
+		t.Fatalf("expected the second run's JournalOffset (%d) to exceed the first's (%d)",
+			second.JournalEvent.JournalOffset, first.JournalEvent.JournalOffset)
+	}
+}
