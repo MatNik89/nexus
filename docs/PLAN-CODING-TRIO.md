@@ -1489,3 +1489,55 @@ Next: the `internal/coding/tia` orchestration package itself (`ShadowSpec`/
 `ShadowResult`/`RunShadow`) — governed `go list -deps -test -json` via `runner.Run`,
 reuse `evidence.ParseTestJSON` for selected/full test runs, and the `coding.tia_shadow`
 journal event. This is the last major Slice 2 piece.
+
+## Status 2026-09-10 — Slice 2 CORE DONE: tia shadow-mode orchestrator (f3226f9)
+
+`internal/coding/tia.RunShadow` built: the orchestration piece tying together `impact`
+(graph + file mapping, both already merged this Slice) and `runner`/`evidence` (governed
+subprocess launch + test-JSON parsing) into the actual shadow-mode comparison the plan
+calls for — always runs the real full suite, records what TIA would have selected, and
+(when not falling back) runs the selected subset for real too, measuring recall against
+its OWN observed failures rather than a name-only comparison against selection
+membership (the plan's own explicit methodology).
+
+**6 review rounds, codex+agy (kilo still dead), 7 real bugs — each deeper than the last
+on the SAME underlying theme (trusting a test run without verifying it was actually
+complete and uncorrupted):**
+1. Analysis failure (bad list output, parse/graph error) aborted RunShadow entirely,
+   skipping the plan's explicit "always run the full suite" requirement — verified
+   against the actual plan text before fixing. Restructured so analysis failures become
+   `FallbackReason` and the full run always still executes.
+2. Full/selected test runs missing the TOCTOU/mutation checks the list run already had
+   (agy+codex, same finding, 2-of-2 convergence).
+3. No toolchain-digest consistency check across list/full/selected runs.
+4. No test proved an actual recall MISS computes correctly — added a real end-to-end
+   fixture with a pre-existing failure in an untouched package.
+5. A test run exiting nonzero with zero parsed outcomes could be silently treated as
+   "zero failures" — added `checkExplainedExit`.
+6. The TOCTOU/toolchain checks had no durable end-to-end regression detector (only a
+   temporary in-session disable/rerun proved they worked) — extracted a pure
+   `checkRunIntegrity` + table tests, plus one real bwrap self-mutating-test detector.
+7. (Deepest, 2 sub-rounds) `checkExplainedExit` accepted PASS/SKIP-only outcomes as
+   explaining an unrelated nonzero exit; then, after adding a `SeenPackages`-based
+   completeness check, codex found THAT was also insufficient — a package that only
+   emitted `"start"` still counted as "covered." Closed by extending
+   `evidence.ParsedRun` with `TerminalPackages` (package-level pass/fail/skip actions
+   ONLY) and `checkTerminalCoverage`, requiring every expected package to actually
+   finish, not merely appear.
+
+**Lesson reinforced yet again**: agy's own round-5 "weakest points" list literally named
+the exact bug codex found in that same round (the `start`-event-counts-as-coverage
+issue) but reasoned it away incorrectly ("correctly handled because checkExplainedExit
+catches it" — false). Spotting the smell isn't the same as following it to the actual
+bug. Independent verification of every claim — including my own fixes' side effects —
+beats trusting either agent's confidence.
+
+Every finding RED-proven via real disable/rerun/restore, several through the actual
+bwrap sandbox. Full repo suite green throughout all 6 rounds. Pushed (f3226f9).
+
+**Slice 2 core is DONE.** Remaining, smaller, optional Slice 2 polish (not blocking):
+none currently identified — the plan's core Slice 2 ask (shadow-mode: run the full
+suite, record the selection, measure recall) is fully implemented and reviewed.
+
+Next: Slice 3 (symedit RenameSymbol) — the last piece of the coding trio, per the plan's
+build order.
