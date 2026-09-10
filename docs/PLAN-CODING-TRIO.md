@@ -1153,3 +1153,91 @@ increments**:
 Slice 0 is now feature-complete: toolchain-visibility primitive, coding-runner (real `go
 build`/`go test`), gopls rename session, all 7 required causal detectors satisfied. Next:
 Slice 1 (evidence manifest).
+
+### Slice 1 — concrete design, round 1 (research: my own + codex + agy, independently converged on the core shape, 2 blocking findings resolved)
+
+Both codex and agy independently confirmed `go test -json` output format directly (`Action`:
+start/run/output/pass/fail/skip, keyed by Package+Test) and that FAIL_TO_PASS/PASS_TO_PASS
+(invariant 8) requires classifying each `(Package,Test)` key across a BASE run and a
+CANDIDATE run: FAIL_TO_PASS = failed base + passed candidate; PASS_TO_PASS = passed both;
+PASS_TO_FAIL (a regression) = passed base + failed candidate, forces overall grading
+failure; empty FAIL_TO_PASS is legitimate only for a semantics-preserving refactor with a
+predeclared structural postcondition (invariant 8's own text) and zero regressions.
+
+**Two real, verified blocking findings from codex — both independently confirmed by direct
+reading before accepting, not trusted on codex's word alone:**
+
+1. **`sandbox.boundedBuffer` (1MiB, combined stdout+stderr, no truncation marker) is
+   insufficient for authoritative `go test -json` evidence** — a truncation landing at a
+   complete JSON-object boundary parses successfully while silently omitting later
+   failures; interleaved stderr can make an otherwise-valid stdout event stream
+   unparsable. I independently found the same gap before reading codex's report (flagged
+   as a known risk from an earlier segment, never yet load-bearing until now). **Resolved
+   without a foundational journal change**: codex itself offered the escape hatch
+   ("store complete permitted output in the sealed artifact OR state the cap as a proof
+   ceiling — never silently accept the prefix") — invariant 7's own wording already
+   sanctions "bounded... output" as one of two acceptable shapes, not only a sealed
+   artifact. v1 goes with: separate, larger bounded stdout/stderr capture on the one-shot
+   `Process` type (not `InteractiveProcess`) with an explicit `OutputTruncated` flag;
+   evidence capture FAILS CLOSED (refuses to grade) if either run's output was truncated,
+   rather than silently misclassifying. Deferred, not built now: full sealedstore-backed
+   unbounded raw-log persistence — a topknot ceiling with a measurable upgrade trigger
+   (build it if the bounded cap is ever actually hit by a real test suite).
+2. **`EnvelopeParams` has NO `SealedPayloadRef` field at all** — verified directly:
+   `journal.Event` has `SealedPayloadRef *string` (journal.go:51, read path), but
+   `contracts.EnvelopeParams` has no corresponding field, and `insertInTx`'s own INSERT
+   hardcodes `sealed_payload_ref` to SQL `NULL` unconditionally (journal.go:505-508) —
+   there is currently NO caller-reachable way to append an event carrying a sealed
+   payload reference. This is now moot given resolution #1 above (v1 doesn't need sealed
+   storage) — recorded here so a future Slice that DOES need it doesn't assume the wiring
+   already exists.
+3. **Git commit/tree provenance has no current owner** (codex): nothing in
+   `runner.RunSpec`/`RunResult` supplies an authenticated Git identity, and requiring one
+   would need a NEW governed Git-resolution operation, contradicting "Slice 1 depends only
+   on existing runner machinery." **Resolved** per codex's own proposed answer: content-tree
+   digests (already computed by `CreateSnapshot`) are the authoritative identity for v1;
+   Git commit/tree values are optional, caller-declared provenance annotations, never a
+   required, verified field.
+
+**Causal ordering — codex's journal-native design adopted over agy's timestamp-based one,
+verified directly**: `contracts.EnvelopeParams`/`Event` already carry `ParentEventID
+*EventID` and `Sequence uint64` (contracts.go:37-38,137-138, confirmed by direct read) —
+timestamps cannot prove causal order (clock skew, concurrent runs), but a journal offset +
+parent-event chain can: require `bound.offset < base-run.offset < candidate-run.offset`,
+`base.parent == bound.event_id`, `candidate.parent == base.event_id`, and the completion
+event's parent is the candidate run event, appended ONLY after `checker.Grade` runs
+(matching invariant 5 — a failed append means no completion verdict, never a
+best-effort one).
+
+**Two-event chain, not one flat manifest** (codex): a single manifest event cannot prove
+its OWN internal ordering claims are true (nothing stops a dishonestly-constructed
+document from claiming a false order) — `coding.evidence_bound` (contract/workspace/base
++candidate tree identities durable BEFORE testing begins) then `coding.evidence_completed`
+(parsed transitions + deterministic checker verdict, parented to the candidate run) is the
+minimum chain that actually proves the claimed ordering via journal structure itself, not
+just asserted payload fields.
+
+**Checker extension** (both agy and codex converged on the same shape, mirroring the
+existing XOR pattern in `checker.go` exactly per invariant 6): new `Criterion.CodingProofIs
+*CodingProofCriterion` / `Evidence.Coding *CodingProofEvidence`, with `Mode` distinguishing
+BEHAVIORAL (non-empty FAIL_TO_PASS required) from REFACTOR (empty allowed only alongside a
+predeclared, passing structural postcondition) — codex's explicit refinement over agy's
+plain `AllowEmptyFailToPass bool`, since a bare bool lets ANY refactor claim the exemption
+with no actual structural proof backing it.
+
+**Package boundary**: new `internal/coding/evidence` (both reviewers converged
+independently) — `runner` stays a mechanical execution substrate, `evidence` owns
+`go test -json` parsing/classification/manifest orchestration, avoiding a checker→runner
+import a package-inside-runner shape would risk.
+
+**Recommended RED-capable detectors** (codex's list, concrete and specific): missing
+required field; candidate-before-baseline; baseline-before-bound-postimage; broken parent
+chain; snapshot-digest mismatch; a previously-passing test now failing (regression);
+a previously-passing test silently missing from the candidate run; a truncated stdout
+JSON stream (even one ending at a valid object boundary); test mutation of the disposable
+source (already covered by Slice 0, re-verify it composes); completion never appended when
+the journal append itself fails.
+
+Next: implement the sandbox output-capture change (separate bounded stdout/stderr +
+truncation flag on `Process`) first — the smallest, most mechanical piece, and the
+long pole every other Slice 1 piece depends on for correctness.
