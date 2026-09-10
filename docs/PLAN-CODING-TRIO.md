@@ -1599,3 +1599,79 @@ openat2 descriptor-relative symlink defense, the full crash-recovery classificat
 table, restart-time `PolicyWorkspaceRollback` with its own grant). This is Slice 3's
 largest remaining piece — `internal/foundation/sealedstore` (its storage dependency)
 already exists from earlier P1 work.
+
+## Status 2026-09-10 — workspace descriptor-relative I/O primitive (first piece of Slice 3's multi-file transaction coordinator)
+
+`internal/coding/workspace/descriptor.go` + `descriptor_test.go`: the foundational
+descriptor-relative filesystem primitive every future write in the transaction
+coordinator goes through — `OpenRoot` (openat2, `RESOLVE_NO_SYMLINKS|RESOLVE_NO_MAGICLINKS`,
+no `RESOLVE_BENEATH` since an absolute root path has no beneath-ancestor), `WalkDirBeneath`
+(one `openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_MAGICLINKS)` per path
+component, never falling back to path-string resolution), `WriteFileBeneath` (atomic
+create-temp+fsync+rename+fsync-directory), `StatBeneath` (identity capture for
+`TargetExpectation`).
+
+**4 review rounds, codex+agy, 5 real bugs found — every round on the SAME symlink/TOCTOU
+defense theme, each deeper than the last (matching the exact pattern from impact.go,
+tia, and symedit earlier in this program):**
+
+1. (Round 1, codex HIGH) `WriteFileBeneath` performed an unconditional rename-over —
+   a planted symlink at the target name was silently overwritten instead of refused,
+   contradicting the plan's own identity-drift requirement. My own test originally
+   encoded the WRONG behavior (asserted successful overwrite). Fixed with a mandatory
+   `TargetExpectation{MustNotExist, Dev, Ino}` parameter.
+2. (Round 1, codex HIGH, empirically confirmed live on this kernel) `OpenRoot` used
+   plain `open()+O_NOFOLLOW`, which POSIX/Linux only apply to the FINAL path component —
+   an INTERMEDIATE symlink in rootPath was silently traversed, defeating every
+   downstream `RESOLVE_BENEATH` containment. Fixed with `openat2(RESOLVE_NO_SYMLINKS|RESOLVE_NO_MAGICLINKS)`
+   against the whole path.
+3. (Round 2, codex HIGH) `StatBeneath` returned Dev/Ino for ANY node including a
+   symlink — `AT_SYMLINK_NOFOLLOW` meant it reported the symlink's OWN identity rather
+   than following it, but never checked TYPE — so a caller could capture a pre-existing
+   symlink's identity and have `WriteFileBeneath`'s dev/ino check "match" it, a
+   deterministic bypass requiring no race at all. Fixed: `StatBeneath` now requires
+   `S_IFREG`, refuses any non-regular node; `WriteFileBeneath` independently re-checks
+   `S_IFREG` on the displaced entry as defense-in-depth.
+4. (Round 2, codex HIGH) Existing-file replacement was a plain `fstatat`-then-`renameat`
+   — a genuine check-then-act race window, contradicting the plan's "provably the same
+   kernel object" requirement. Fixed with an exchange-verify-restore protocol:
+   `renameat2(RENAME_EXCHANGE)` swaps unconditionally FIRST (so whatever is actually at
+   baseName at the swap instant — not an earlier check — ends up under the temp name),
+   then the displaced entry is verified (S_IFREG + Dev/Ino match); on mismatch a second
+   `RENAME_EXCHANGE` restores the original untouched.
+5. (Round 3, codex HIGH) The restore path's own cleanup (`unix.Unlinkat(tmpName)` after
+   the restoring exchange) was unconditional — if a DIFFERENT concurrent writer replaced
+   baseName in the exact window between mismatch-detection and the restoring exchange,
+   THEIR content would land under tmpName by the restore swap and then be silently
+   deleted. Real data-loss bug, ordinary concurrent-write timing sufficient, no active
+   attacker required. Fixed: `WriteFileBeneath` captures its OWN temp file's identity
+   before the first exchange; after a mismatch-restore, only unlinks tmpName if it still
+   identifies that exact file — otherwise leaves it in place and returns a distinct
+   manual-recovery error. Verified via a deterministic test seam (`beforeRestoreExchange`,
+   a no-op func var in production) injecting the exact-window concurrent write without a
+   flaky real race.
+
+Round 4: codex PASS (independently re-verified all 3 prior fixes, ran the suite ×20
+stress, confirmed the remaining hardening note — temp identity captured name-relative
+after close rather than fd-relative before close — requires an actor with pre-existing
+arbitrary live-workspace write authority, not a newly crossed boundary, non-blocking).
+
+**Review-agent availability note:** kilo (w8:p3) has been dead this entire session
+(permanent). agy (w8:p4) hit its account quota mid-round-3 (`Individual quota reached...
+Resets in ~11h`) and never returned a round-3 or round-4 verdict — effectively dead for
+the remainder of this session too. This piece therefore converged on CODEX-ONLY review
+from round 3 onward, a deviation from the mandatory 3-agent process (`nexus-mandatory-agent-review`)
+forced by external tool availability, not a shortcut taken by choice. Every one of
+codex's 5 findings across 4 rounds was independently verified (real syscalls, live
+kernel behavior, `go test -count=20` stress runs) before being accepted, and every fix
+was RED-proven (each guard temporarily disabled, confirmed the specific new test failed
+exactly as predicted, restored) before being called closed — the same rigor applied
+throughout this whole program, just with one fewer independent reviewer than the process
+calls for. Full suite: `internal/coding/workspace` 16/16 (×20 stress), `go vet` clean,
+full repo `CGO_ENABLED=0 go test ./...` green throughout every round.
+
+Committed. Next: the S7-governed durable transaction wrapper on top of this primitive
+(Prepare/Apply coordination, sealed-bundle before/after-image storage via the existing
+`internal/foundation/sealedstore`, the crash-recovery classification table, restart-time
+`PolicyWorkspaceRollback` with its own S7 grant) — this package's own scope was
+deliberately just the descriptor-relative I/O layer everything above it will call.
