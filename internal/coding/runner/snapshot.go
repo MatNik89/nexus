@@ -86,6 +86,25 @@ func CreateSnapshot(sourceDir string) (snap Snapshot, cleanup func(), err error)
 	return Snapshot{Dir: dstDir, Digest: digest}, cleanup, nil
 }
 
+// DigestTree computes the SAME content digest CreateSnapshot/copyTreeInto
+// use, without persisting a copy — for measuring a tree AFTER a governed
+// run to detect undeclared mutation (PLAN-CODING-TRIO.md Slice 1, codex's
+// finding: a test can mutate its own /work/src during execution — e.g.
+// rewriting a fixture a LATER test reads — with nothing to catch it
+// unless the tree is re-hashed after the run and compared against the
+// pre-run digest). Routes through copyTreeInto itself (a throwaway
+// destination, discarded) rather than a separate digest-only walker, so
+// the two digests are GUARANTEED comparable — not just similarly
+// computed by two independently-maintained algorithms that could drift.
+func DigestTree(dir string) (string, error) {
+	tmp, err := os.MkdirTemp("", "nexus-coding-digest-*")
+	if err != nil {
+		return "", fmt.Errorf("runner: create digest scratch dir: %w", err)
+	}
+	defer os.RemoveAll(tmp)
+	return copyTreeInto(dir, tmp)
+}
+
 // copyTreeInto copies sourceDir's contents into dstDir (which the caller
 // must already have created, private and empty) and returns the tree's
 // content digest. Split out from CreateSnapshot so a caller that needs

@@ -70,7 +70,7 @@ type Manifest struct {
 	BoundEvent               journal.Event
 	BaseRunEvent             journal.Event
 	CandidateRunEvent        journal.Event
-	CompletedEvent           journal.Event
+	CapturedEvent            journal.Event
 }
 
 // Capture runs the base and candidate trees through `go test -json`
@@ -79,7 +79,7 @@ type Manifest struct {
 // coding.evidence_bound (tree identities declared BEFORE any test runs)
 // -> the base run's own coding.run event (parented to bound) -> the
 // candidate run's own coding.run event (parented to the base run) ->
-// coding.evidence_completed (parented to the candidate run). Reuses
+// coding.evidence_captured (parented to the candidate run). Reuses
 // runner.Run's own journal event for each run rather than duplicating a
 // second event type for the same fact.
 //
@@ -164,6 +164,14 @@ func Capture(ctx context.Context, backend sandbox.Backend, report sandbox.ProbeR
 		return Manifest{}, checker.Evidence{}, fmt.Errorf("evidence: base tree digest changed between snapshot (%s) and execution (%s) — refusing (fail closed)",
 			baseSnap.Digest, baseResult.SnapshotDigest)
 	}
+	if baseResult.PostSnapshotDigest != baseResult.SnapshotDigest {
+		// code-review finding, codex: the test itself could mutate its
+		// own /work/src during execution (e.g. rewriting a fixture) —
+		// the plan's own "hash again after" requirement, not yet closed
+		// by the pre-run freeze alone.
+		return Manifest{}, checker.Evidence{}, fmt.Errorf("evidence: base tree was mutated DURING the run (pre-run %s, post-run %q) — refusing (fail closed)",
+			baseResult.SnapshotDigest, baseResult.PostSnapshotDigest)
+	}
 	baseParsed, err := ParseTestJSON(baseResult.Stdout)
 	if err != nil {
 		return Manifest{}, checker.Evidence{}, fmt.Errorf("evidence: base run: %w", err)
@@ -184,6 +192,10 @@ func Capture(ctx context.Context, backend sandbox.Backend, report sandbox.ProbeR
 	if candidateResult.SnapshotDigest != candidateSnap.Digest {
 		return Manifest{}, checker.Evidence{}, fmt.Errorf("evidence: candidate tree digest changed between snapshot (%s) and execution (%s) — refusing (fail closed)",
 			candidateSnap.Digest, candidateResult.SnapshotDigest)
+	}
+	if candidateResult.PostSnapshotDigest != candidateResult.SnapshotDigest {
+		return Manifest{}, checker.Evidence{}, fmt.Errorf("evidence: candidate tree was mutated DURING the run (pre-run %s, post-run %q) — refusing (fail closed)",
+			candidateResult.SnapshotDigest, candidateResult.PostSnapshotDigest)
 	}
 	if baseResult.ToolchainDigest != candidateResult.ToolchainDigest {
 		return Manifest{}, checker.Evidence{}, fmt.Errorf("evidence: base and candidate runs resolved DIFFERENT toolchains (%s vs %s) — refusing, a FAIL_TO_PASS transition would not be attributable solely to the source change (fail closed)",
@@ -222,8 +234,8 @@ func Capture(ctx context.Context, backend sandbox.Backend, report sandbox.ProbeR
 		},
 	}
 
-	completedParent := candidateResult.JournalEvent.Envelope.EventID
-	completedEvent, err := appendCompletedEvent(ctx, j, spec, diff, candidateParsed.FailedPackages, &completedParent)
+	capturedParent := candidateResult.JournalEvent.Envelope.EventID
+	capturedEvent, err := appendCapturedEvent(ctx, j, spec, diff, candidateParsed.FailedPackages, &capturedParent)
 	if err != nil {
 		return Manifest{}, checker.Evidence{}, fmt.Errorf("evidence: %w", err)
 	}
@@ -238,7 +250,7 @@ func Capture(ctx context.Context, backend sandbox.Backend, report sandbox.ProbeR
 		BoundEvent:               boundEvent,
 		BaseRunEvent:             baseResult.JournalEvent,
 		CandidateRunEvent:        candidateResult.JournalEvent,
-		CompletedEvent:           completedEvent,
+		CapturedEvent:            capturedEvent,
 	}, evidence, nil
 }
 
@@ -270,7 +282,16 @@ func appendBoundEvent(ctx context.Context, j *journal.Journal, spec CaptureSpec,
 	})
 }
 
-func appendCompletedEvent(ctx context.Context, j *journal.Journal, spec CaptureSpec, diff TestDiff, failedPackages []string, parent *contracts.EventID) (journal.Event, error) {
+// appendCapturedEvent journals the classified diff as "coding.evidence_captured"
+// — deliberately NOT named "completed" (code-review finding, codex, round
+// 2: the plan's own wording, "the completion event is appended only
+// after checker.Grade," means a "completed" event should carry a
+// deterministic verdict; Capture has no AcceptanceContract to grade
+// against, so what it actually produces is captured, unjudged evidence).
+// Grading, and a future "coding.evidence_graded" event carrying the
+// verdict, belongs to whichever later caller (Slice 3's not-yet-built
+// symedit orchestration) owns the contract.
+func appendCapturedEvent(ctx context.Context, j *journal.Journal, spec CaptureSpec, diff TestDiff, failedPackages []string, parent *contracts.EventID) (journal.Event, error) {
 	payload := struct {
 		ContractID     string   `json:"contract_id"`
 		FailToPass     []string `json:"fail_to_pass"`
@@ -288,12 +309,12 @@ func appendCompletedEvent(ctx context.Context, j *journal.Journal, spec CaptureS
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
-		return journal.Event{}, fmt.Errorf("marshal coding.evidence_completed payload: %w", err)
+		return journal.Event{}, fmt.Errorf("marshal coding.evidence_captured payload: %w", err)
 	}
 	return j.Append(ctx, contracts.EnvelopeParams{
 		SchemaID: "nexus.event", SchemaVersion: 1,
 		EventID:       contracts.EventID("ev-" + string(spec.RunID) + "-completed-" + randHex(8)),
-		EventType:     "coding.evidence_completed",
+		EventType:     "coding.evidence_captured",
 		RunID:         spec.RunID,
 		ParentEventID: parent,
 		EmittedAt:     time.Now().UTC(),

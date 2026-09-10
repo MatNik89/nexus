@@ -32,9 +32,9 @@ func testBackend(t *testing.T) (*sandbox.Bwrap, sandbox.ProbeReport) {
 func testJournal(t *testing.T) *journal.Journal {
 	t.Helper()
 	j, err := journal.Open(filepath.Join(t.TempDir(), "journal.db"), "work", redact.None{}, map[string]journal.PayloadValidator{
-		"coding.run":                nil,
-		"coding.evidence_bound":     nil,
-		"coding.evidence_completed": nil,
+		"coding.run":               nil,
+		"coding.evidence_bound":    nil,
+		"coding.evidence_captured": nil,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -98,7 +98,7 @@ func TestBroken(t *testing.T) {} // fixed
 	manifest, evidence, err := Capture(ctxT(), b, rep, grants, j, CaptureSpec{
 		ContractID: "contract-1", WorkerID: "worker-1",
 		BaseDir: baseDir, CandidateDir: candidateDir, GoBinary: goBin,
-		Timeout: 150 * time.Second,
+		Timeout:         150 * time.Second,
 		BaseOperationID: "op-base-1", CandidateOperationID: "op-candidate-1",
 		BaseTargetID: "target-base", CandidateTargetID: "target-candidate",
 		RunID: "run-capture-1", ProfileID: "work",
@@ -127,11 +127,11 @@ func TestBroken(t *testing.T) {} // fixed
 	if manifest.CandidateRunEvent.Envelope.ParentEventID == nil || *manifest.CandidateRunEvent.Envelope.ParentEventID != manifest.BaseRunEvent.Envelope.EventID {
 		t.Fatalf("candidate run's parent should be the base run event")
 	}
-	if manifest.CompletedEvent.Envelope.ParentEventID == nil || *manifest.CompletedEvent.Envelope.ParentEventID != manifest.CandidateRunEvent.Envelope.EventID {
+	if manifest.CapturedEvent.Envelope.ParentEventID == nil || *manifest.CapturedEvent.Envelope.ParentEventID != manifest.CandidateRunEvent.Envelope.EventID {
 		t.Fatalf("completed event's parent should be the candidate run event")
 	}
 	offsets := []uint64{manifest.BoundEvent.JournalOffset, manifest.BaseRunEvent.JournalOffset,
-		manifest.CandidateRunEvent.JournalOffset, manifest.CompletedEvent.JournalOffset}
+		manifest.CandidateRunEvent.JournalOffset, manifest.CapturedEvent.JournalOffset}
 	for i := 1; i < len(offsets); i++ {
 		if offsets[i] <= offsets[i-1] {
 			t.Fatalf("expected strictly increasing journal offsets, got %v", offsets)
@@ -180,7 +180,7 @@ func TestWasFine(t *testing.T) { t.Fatal("regressed") }
 	manifest, evidence, err := Capture(ctxT(), b, rep, grants, j, CaptureSpec{
 		ContractID: "contract-2", WorkerID: "worker-1",
 		BaseDir: baseDir, CandidateDir: candidateDir, GoBinary: goBin,
-		Timeout: 150 * time.Second,
+		Timeout:         150 * time.Second,
 		BaseOperationID: "op-base-2", CandidateOperationID: "op-candidate-2",
 		BaseTargetID: "target-base-2", CandidateTargetID: "target-candidate-2",
 		RunID: "run-capture-2", ProfileID: "work",
@@ -259,7 +259,7 @@ func TestStable(t *testing.T) {}
 	manifest, evidence, err := Capture(ctxT(), b, rep, grants, j, CaptureSpec{
 		ContractID: "contract-3", WorkerID: "worker-1",
 		BaseDir: baseDir, CandidateDir: candidateDir, GoBinary: goBin,
-		Timeout: 150 * time.Second,
+		Timeout:         150 * time.Second,
 		BaseOperationID: "op-base-3", CandidateOperationID: "op-candidate-3",
 		BaseTargetID: "target-base-3", CandidateTargetID: "target-candidate-3",
 		RunID: "run-capture-3", ProfileID: "work",
@@ -280,5 +280,55 @@ func TestStable(t *testing.T) {}
 	}
 	if verdict.Pass {
 		t.Fatalf("expected grading to FAIL when a candidate package failed to compile: %+v", verdict)
+	}
+}
+
+// Detector (code-review finding, codex, round 2): a test that mutates
+// its own source tree DURING execution — e.g. rewriting a fixture a
+// later test reads — is caught by the post-run digest check, not just
+// the pre-run freeze (which only protects against a mutation to the
+// LIVE host directory, not the disposable /work/src copy the test
+// itself runs against).
+func TestCaptureRefusesWhenTestMutatesItsOwnSourceTree(t *testing.T) {
+	goBin := realGoBinary(t)
+	b, rep := testBackend(t)
+	grants := s7.NewAuthority(time.Now, 5*time.Minute)
+	j := testJournal(t)
+
+	baseDir := t.TempDir()
+	writeModule(t, baseDir, `package main
+
+import "testing"
+
+func TestStable(t *testing.T) {}
+`)
+	candidateDir := t.TempDir()
+	// This test PASSES, but self-mutates its own source file as a side
+	// effect — exactly the class of tree drift the post-run digest
+	// check exists to catch.
+	writeModule(t, candidateDir, `package main
+
+import (
+	"os"
+	"testing"
+)
+
+func TestStable(t *testing.T) {
+	if err := os.WriteFile("mutated.txt", []byte("mutated"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+`)
+
+	_, _, err := Capture(ctxT(), b, rep, grants, j, CaptureSpec{
+		ContractID: "contract-4", WorkerID: "worker-1",
+		BaseDir: baseDir, CandidateDir: candidateDir, GoBinary: goBin,
+		Timeout: 150 * time.Second,
+		BaseOperationID: "op-base-4", CandidateOperationID: "op-candidate-4",
+		BaseTargetID: "target-base-4", CandidateTargetID: "target-candidate-4",
+		RunID: "run-capture-4", ProfileID: "work",
+	})
+	if err == nil {
+		t.Fatal("expected Capture to refuse when the candidate's own test mutates its source tree during execution")
 	}
 }

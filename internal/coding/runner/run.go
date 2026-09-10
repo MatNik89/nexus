@@ -74,8 +74,20 @@ type RunResult struct {
 	Stderr          string
 	Truncated       bool // EITHER stream hit sandbox.maxProcessOutputBytes
 	SnapshotDigest  string
-	ToolchainDigest string
-	PolicyHash      string
+	// PostSnapshotDigest re-measures the disposable /work/src copy AFTER
+	// the sandboxed process exits, before cleanup (PLAN-CODING-TRIO.md
+	// Slice 1, codex's finding: a test can mutate its own source tree
+	// during execution — e.g. rewriting a fixture — with nothing to
+	// catch it otherwise). Left empty if the re-measurement itself
+	// fails (e.g. the tree gained a symlink mid-run, which
+	// copyTreeInto's own refusal rejects) — Run itself does not fail
+	// on that (existing callers that don't check this field are
+	// unaffected), but an empty value can never equal a non-empty
+	// SnapshotDigest, so a caller comparing the two (evidence.Capture)
+	// fails closed either way.
+	PostSnapshotDigest string
+	ToolchainDigest    string
+	PolicyHash         string
 	// JournalEvent is the actual receipt from the coding.run event this
 	// run appended — zero-valued if no journal was supplied, or if
 	// appending failed before this field could be set (check the
@@ -224,16 +236,22 @@ func Run(ctx context.Context, backend sandbox.Backend, report sandbox.ProbeRepor
 	output := proc.Output()
 	stdout, stderr, truncated := proc.Stdout(), proc.Stderr(), proc.Truncated()
 	proc.Close()
+	// Measured BEFORE scratchRoot's cleanup (deferred at the top of Run)
+	// removes srcDir — a failure here (e.g. the tree gained a symlink
+	// mid-run) leaves PostSnapshotDigest empty rather than failing Run
+	// itself; see the field's own doc comment.
+	postDigest, _ := DigestTree(srcDir)
 
 	result := RunResult{
-		ExitOK:          waitErr == nil,
-		Output:          output,
-		Stdout:          stdout,
-		Stderr:          stderr,
-		Truncated:       truncated,
-		SnapshotDigest:  snapDigest,
-		ToolchainDigest: pin.HashDigest,
-		PolicyHash:      policy.PolicyHash(),
+		ExitOK:             waitErr == nil,
+		Output:             output,
+		Stdout:             stdout,
+		Stderr:             stderr,
+		Truncated:          truncated,
+		SnapshotDigest:     snapDigest,
+		PostSnapshotDigest: postDigest,
+		ToolchainDigest:    pin.HashDigest,
+		PolicyHash:         policy.PolicyHash(),
 	}
 
 	if selfDeadlineAfterWait {
