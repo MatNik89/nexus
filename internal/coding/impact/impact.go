@@ -1,7 +1,8 @@
 // Package impact is Test Impact Analysis (TIA) for Go, package-granular:
-// given a set of changed source files, compute the packages whose tests
-// need to re-run — the transitive closure of dependents, intersected with
-// packages that actually have tests (PLAN-CODING-TRIO.md Slice 2).
+// given a set of changed source files, compute the packages that must be
+// PASSED TO `go test` — the transitive closure of dependents, intersected
+// with packages `go test ./...` would actually build and run
+// (PLAN-CODING-TRIO.md Slice 2).
 //
 // This package holds ONLY the pure, in-memory graph computation (parsing
 // `go list`'s output, inverting the import graph, walking the closure) —
@@ -17,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 )
 
 // Package is one Go package's identity and direct forward imports, as
@@ -25,7 +27,9 @@ import (
 type Package struct {
 	ImportPath   string   `json:"ImportPath"`
 	Dir          string   `json:"Dir"`
+	Name         string   `json:"Name,omitempty"`
 	ForTest      string   `json:"ForTest,omitempty"`
+	Match        []string `json:"Match,omitempty"`
 	Imports      []string `json:"Imports,omitempty"`
 	TestImports  []string `json:"TestImports,omitempty"`
 	XTestImports []string `json:"XTestImports,omitempty"`
@@ -34,11 +38,47 @@ type Package struct {
 	XTestGoFiles []string `json:"XTestGoFiles,omitempty"`
 }
 
-// hasTests reports whether this package entry itself declares tests (the
-// base package record — not the synthetic ".test" main or a ForTest
-// variant, which redundantly restate the same files).
-func (p Package) hasTests() bool {
-	return p.ForTest == "" && (len(p.TestGoFiles) > 0 || len(p.XTestGoFiles) > 0)
+// isTarget reports whether this package entry is a REAL workspace package
+// `go test ./...` directly matches and therefore builds — the base
+// record (ForTest == "") with a non-empty Match, as opposed to a
+// synthetic ".test" main (empty Match) or a ForTest variant (restates the
+// base package's own files under a different key). Live `go list -test
+// -json` verified: the base package entry for a directly-matched package
+// carries Match: ["<pattern>"]; its ".test" harness entry has an empty
+// Match; its ForTest variant is excluded by the ForTest check already
+// above (code-review finding, codex, Slice 2 research: `go test` ALWAYS
+// compiles every directly-matched package, whether or not it has test
+// files — Affected excluding no-test packages from selection let a
+// compile error in an untested leaf go completely unselected while the
+// full suite would have caught it).
+func (p Package) isTarget() bool {
+	return p.ForTest == "" && len(p.Match) > 0
+}
+
+// isSyntheticTestMain reports whether p is the generated go-test-binary
+// main package (ImportPath "<pkg>.test") rather than a real workspace
+// package. Three fields together are required (code-review finding,
+// codex, Slice 2 round 2+3 review, verified against real `go list -test
+// -json` output on multiple packages):
+//   - ImportPath ends in ".test" — a naming CONVENTION for the harness,
+//     not a reserved suffix, so this alone is not sufficient: a real
+//     workspace package can legitimately have an import path ending in
+//     ".test" too (round-2 finding).
+//   - Match is empty — but this alone is not sufficient either: a real,
+//     non-target DEPENDENCY package (reached only via -deps, never
+//     directly matched by the `go test` pattern) also has an empty Match,
+//     and could also happen to have a ".test"-suffixed import path
+//     (round-3 finding) — skipping it would silently break a real
+//     production edge running through it.
+//   - Name == "main" — the synthetic harness is always package main; a
+//     real, non-synthetic dependency package is never compiled as
+//     package main under a ".test"-suffixed import path (a genuine `main`
+//     package's own import path is never itself ".test"-suffixed). This
+//     is what rules out the round-3 counterexample: an unmatched
+//     dependency named e.g. "mid.test" still reports its OWN package
+//     name (e.g. "mid"), never "main".
+func isSyntheticTestMain(p Package) bool {
+	return strings.HasSuffix(p.ImportPath, ".test") && len(p.Match) == 0 && p.Name == "main"
 }
 
 // ParseGoList decodes the CONCATENATED-JSON-OBJECTS stream `go list -json`
@@ -81,28 +121,37 @@ func ParseGoList(r io.Reader) ([]Package, error) {
 type Graph struct {
 	prodRdeps  map[string]map[string]bool
 	testOwners map[string]map[string]bool
-	tests      map[string]bool
-	known      map[string]bool
+	// targets holds every REAL, directly-matched workspace package
+	// (isTarget()) — NOT just ones with test files. `go test ./...`
+	// compiles (and can therefore FAIL on) every matched package
+	// regardless of whether it has tests, so selection must offer every
+	// such package as a candidate, not only ones with actual test
+	// functions (code-review finding, codex, Slice 2 research).
+	targets map[string]bool
+	known   map[string]bool
 }
 
 // BuildGraph inverts every package's forward Imports into reverse edges.
 // ForTest-variant and synthetic ".test" main entries are skipped for edge
 // purposes (they restate the base package's own imports); only the base
-// package's hasTests() flag is recorded.
+// package's isTarget() flag is recorded.
 func BuildGraph(pkgs []Package) *Graph {
 	g := &Graph{
 		prodRdeps:  map[string]map[string]bool{},
 		testOwners: map[string]map[string]bool{},
-		tests:      map[string]bool{},
+		targets:    map[string]bool{},
 		known:      map[string]bool{},
 	}
 	for _, p := range pkgs {
 		if p.ForTest != "" {
 			continue // restates the base package; not a distinct node
 		}
+		if isSyntheticTestMain(p) {
+			continue
+		}
 		g.known[p.ImportPath] = true
-		if p.hasTests() {
-			g.tests[p.ImportPath] = true
+		if p.isTarget() {
+			g.targets[p.ImportPath] = true
 		}
 		for _, imp := range p.Imports {
 			if imp == p.ImportPath {
@@ -129,14 +178,17 @@ func BuildGraph(pkgs []Package) *Graph {
 	return g
 }
 
-// Affected returns the packages (within this Graph's known set) whose
-// tests must re-run for a change to any of the changed import paths:
+// Affected returns the packages (within this Graph's known set) that must
+// be PASSED TO `go test` for a change to any of the changed import paths:
 // every package reached by walking PRODUCTION import edges transitively
-// from the changed set (intersected with packages that have tests, so a
-// change to the changed packages themselves is included when they have
-// tests), PLUS — at every node visited along that production walk,
-// including the changed packages themselves — any package that reaches
-// that node only through a test-only import (TestImports/XTestImports).
+// from the changed set (intersected with real, directly-matched target
+// packages — isTarget(), not just ones with test files: `go test`
+// compiles, and can fail on, every matched package regardless of whether
+// it has tests, so a change to the changed packages themselves is
+// included even when they have none), PLUS — at every node visited along
+// that production walk, including the changed packages themselves — any
+// package that reaches that node only through a test-only import
+// (TestImports/XTestImports).
 // A test-only owner is added directly but never enqueued: it is a
 // TERMINAL edge (see the Graph doc comment) — its own production
 // importers, if any, never see the changed code through it, so the walk
@@ -165,11 +217,19 @@ func (g *Graph) Affected(changed []string) (affected []string, resolved bool) {
 	for len(queue) > 0 {
 		cur := queue[0]
 		queue = queue[1:]
-		if g.tests[cur] {
+		if g.targets[cur] {
 			result[cur] = true
 		}
 		for owner := range g.testOwners[cur] {
-			result[owner] = true // terminal: never enqueued
+			// codex+agy finding: an owner reached only via a test-only
+			// import must still be a real go-test target (isTarget()) to
+			// be selected — an unmatched dependency package (e.g. a
+			// stdlib or non-workspace package pulled in by `go list
+			// -deps -test`) can carry TestImports too, and must not leak
+			// into the result just because it owns a test-only edge.
+			if g.targets[owner] {
+				result[owner] = true // terminal: never enqueued
+			}
 		}
 		for dep := range g.prodRdeps[cur] {
 			if !visited[dep] {
