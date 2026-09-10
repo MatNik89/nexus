@@ -1287,3 +1287,45 @@ symedit package that doesn't exist yet."
 
 Dispatching codex+agy adversarial code review against `0a43597` next (kilo still
 unavailable — 2-of-3, per this session's established precedent).
+
+## Status 2026-09-10 — Slice 1 code review: agy PASS, codex FAIL (5 real gaps folded, 4aedfb8)
+
+**agy PASS** — thorough, direct source verification, ran the tests itself. **codex FAIL**
+with 6 HIGH findings — the 5th time this session codex's slower pass caught something
+agy's PASS missed on the exact same diff. Each finding verified directly against the code
+before fixing:
+
+1. **Package-level compile failures were invisible to classification** — `ParseTestJSON`
+   discarded every `Test==""` event; a candidate package that fails to COMPILE emits zero
+   per-test events, so a brand-new broken package (no base-side test to go `Missing`) was
+   completely unclassified. Fixed: `ParseTestJSON` returns `ParsedRun{Outcomes,
+   FailedPackages}`; `checker.CodingProofEvidence` grows `FailedPackages` (always-fail).
+   RED-proven with a real bwrap compile-failure test.
+2. **`Pass->Skip` and candidate-only failures silently dropped** — `Classify` had no
+   branch for a previously-passing test now skipped, and `NewFail` was computed but never
+   forwarded to `CodingProofEvidence` at all. Fixed: `TestDiff.PassToSkip` added,
+   `CodingProofEvidence.NewFail` added, both always-fail.
+3. **REFACTOR mode's structural check was pure caller assertion** — codex reproduced
+   `go test -json -run '^$'` exiting 0 with zero per-test events, meaning a caller could
+   declare an untested REFACTOR "structurally verified." Fixed: removed `Mode`/
+   `StructuralPassed` from `CaptureSpec` entirely — Slice 1 produces BEHAVIORAL evidence
+   only until Slice 3 provides a real, independently-verified structural receipt; empty
+   `StructuralPassed` already fails REFACTOR-mode grading closed by construction.
+4. **Toolchain digests recorded but never compared** — a drift between the two sequential
+   runs could produce an unattributable FAIL_TO_PASS. Fixed: refuse on mismatch.
+5. **The TOCTOU digest check only covered half the window** — it caught a mutation
+   before `runner.Run`'s own internal snapshot, not a mutation to the live directory
+   WHILE Run was executing. Fixed: `Capture` snapshots once up front and passes that
+   already-private snapshot's path as `SourceDir` — nothing about the live directory
+   afterward can affect what was tested.
+
+**Not accepted, will raise as a counter-argument next round**: codex's finding that
+`checker.Grade` should re-verify the causal journal chain inside `CodingProofEvidence`
+itself. Verified directly against `checker.go`'s own package doc, which ALREADY documents
+today's Producer-string trust model as an explicit topknot ceiling ("producer strings are
+declared, not yet cryptographically attested; upgrade when the journal-receipt evidence
+kind lands (T21)") — applying to EVERY evidence kind, not a new gap `CodingProofEvidence`
+introduces. Threading journal offsets/parent chains into `Evidence` would be the first
+evidence kind to break that documented, accepted separation.
+
+Dispatching round 2 re-verification (codex+agy) against `4aedfb8`.
