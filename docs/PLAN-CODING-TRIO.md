@@ -1402,3 +1402,51 @@ build before Slice 3 gives a real consumer to those events, not before.
 
 Next: Slice 2 (TIA shadow-mode, `internal/coding/impact`) or Slice 3 (symedit
 RenameSymbol) per the plan's own build order (Slice 2 before Slice 3).
+
+## Status 2026-09-10 — Slice 2 impact.go fix (5b7c1ba)
+
+Pre-existing bug in `internal/coding/impact.Graph.Affected` fixed (found during Slice 2
+research, codex): TIA package selection excluded any package with zero test files, even
+though `go test ./...` compiles (and can fail on) every directly-matched package
+regardless of test presence — an untested leaf's compile error was invisible to
+selection. `Package.Match` (from `go list -test -json`) now defines `isTarget()`;
+`Graph.tests` renamed `Graph.targets`.
+
+**4 review rounds, codex+agy (kilo still dead), 4 real bugs beyond the initial fix:**
+- R1: terminal test-owner edges leaked non-target packages into the result (missing
+  `g.targets[owner]` guard); `TestAffectedTestOnlyEdgeDoesNotPropagateTransitively`
+  fixture was false-green (missing `Match`, so its own detector couldn't have caught a
+  regression); `BuildGraph` didn't skip the synthetic `.test` harness at all, polluting
+  `g.known` + adding dead stdlib edges.
+- R2 (agy PASS, codex FAIL — genuine split, not full convergence): the `.test`-suffix
+  skip was overbroad — would discard a REAL matched package whose own import path
+  happens to end in `.test`. Fixed by also requiring `len(Match)==0`.
+- R3 (agy PASS again — missed it; codex FAIL again, deeper): `Match==0` alone still
+  isn't unique — a real, unmatched DEPENDENCY package ending in `.test` also has empty
+  Match, and would be wrongly skipped, breaking a production edge chain through it.
+  Closed with a 3rd discriminator: `Package.Name=="main"` (verified live via
+  `go list -test -json` that this triple uniquely identifies the synthetic entry).
+- R4: both PASS.
+
+**Lesson reinforced**: a PASS from one reviewer while the other still finds a real,
+deeper bug on the SAME finding (R2, R3) is not "good enough, 1-of-2 passed" — codex kept
+finding genuinely deeper counterexamples on the same code area across 2 more rounds
+after agy's first PASS. Independent verification of every claim (both round-2's overbroad
+heuristic AND round-3's still-insufficient guard were checked myself via real
+`go list -test -json` runs before accepting, per anti-anchoring discipline) beats
+trusting either agent's verdict alone.
+
+Every finding RED-proven via real disable/re-run/restore cycles. Full repo suite green
+throughout all 4 rounds. Pushed to `origin/main` (5b7c1ba).
+
+Next: continue Slice 2 per the converged research (codex+agy) from before this fix —
+file-to-package mapping (`FileChange`/`DiffFileMaps`/`FileIndex.ResolveChanges` in
+`internal/coding/impact`), per-file digest exposure in `internal/coding/runner`
+(`DigestTreeFiles`, reusing `copyTreeInto`'s existing per-file entries), the new
+`internal/coding/tia` orchestration package (`ShadowSpec`/`ShadowResult`/`RunShadow`,
+governed `go list -deps -test -json` via `runner.Run`, reusing `evidence.ParseTestJSON`
+for the selected/full test runs), and a `coding.tia_shadow` journal event (shape TBD —
+codex's proposal is more detailed, e.g. `RecallEvaluated bool`, and specifically requires
+actually EXECUTING the selected-subset run rather than a name-only comparison against
+full-suite failures, since a dependent package can still catch a dependency's compile
+failure).
