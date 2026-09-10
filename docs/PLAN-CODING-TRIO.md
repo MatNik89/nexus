@@ -1072,3 +1072,49 @@ Dispatching a third re-verification round now (codex+agy) — if this closes cle
 0's gopls piece is considered done for its current proof-of-concept scope (single trivial
 module), with the 2 deliberately-deferred items (PATH content-hash pinning,
 server-initiated-request handling) tracked as their own future increments.
+
+## Status 2026-09-10 — re-verification round 3: BOTH codex and agy FAIL, same real race (90816de)
+
+**Both reviewers independently reproduced the SAME defect this time** (not a disagreement
+to adjudicate — genuine convergence on a real bug my round-2 fix missed): `sandbox.
+prepareLaunch`'s own deadline check (`time.Until(dl) <= 0`) is a SYNCHRONOUS wall-clock
+comparison, entirely independent of the `context` package's own timer goroutine that
+asynchronously sets `context.Cause(ctx)` once `ctx.Done()` fires. `prepareLaunch` can
+return "attempt deadline already passed" microseconds BEFORE that timer goroutine has
+actually run — so `context.Cause(execCtx)`, checked immediately after `Launch`/
+`LaunchInteractive` fails, can still read nil at that exact moment. codex reproduced this
+2/10 runs; agy reproduced it independently 1/20 runs on its own re-run.
+
+**Fixed (`90816de`)** per codex's diagnosis: `prepareLaunch`'s deadline-passed error now
+wraps `context.DeadlineExceeded`, and a new shared `selfDeadlineCancelled(execCtx, err)`
+helper checks `context.Cause(execCtx) OR errors.Is(err, context.DeadlineExceeded/
+Canceled)` — the wrapped error is the synchronous, race-free signal for exactly the window
+`context.Cause` alone missed. Applied uniformly to both launch-error branches (run.go,
+gopls.go) and both post-Wait branches (same helper, not just the launch path this time).
+100 combined re-run iterations post-fix: clean.
+
+**agy's second hypothesis (Handle.Kill() only signals the leader PID, not the whole
+process group) investigated and NOT accepted as the root cause** — it conflicts with the
+codebase's own long-established, already-tested design: `--unshare-pid` makes the bwrap
+leader PID 1 of its OWN PID namespace, and the kernel's own namespace-death cascade
+(proven for years by the already-passing `TestBackendTimeoutKillsTree`) kills everything
+inside when PID 1 dies, without needing process-group signaling. Re-running that test and
+the `InteractiveProcess` kill tests in isolation (no concurrent load) showed no hang,
+consistent with the observed hang being resource contention (3 agents simultaneously
+stress-testing real gopls+bwrap launches on this host) rather than a missing kill path.
+Added `syscall.Kill(-pid, SIGKILL)` anyway as strictly additive defense-in-depth (a no-op
+if the namespace cascade already handled it, ESRCH silently ignored) — cannot regress the
+proven behavior, only supplement it against agy's hypothesis in case it's ever right on a
+host where the cascade doesn't fire as expected.
+
+**This is now the THIRD round in a row where codex found something real** (round 1: 3
+HIGH + 1 MEDIUM; round 2: the launch-error branch entirely missing the check; round 3: the
+check itself racing an async timer) — reinforcing this session's own memory lesson: never
+treat "the fix looks right" as done without an adversarial round actually stress-testing
+it under the exact conditions (tight deadlines, concurrent load) that expose timing races
+a single clean test run cannot.
+
+Dispatching round 4 (codex+agy) against `90816de` — the specific, narrow question this
+time is whether the `errors.Is`-based fix genuinely closes the race (both reviewers should
+stress-run the same detector again) and whether the process-group-kill addition introduces
+any regression to the existing kill/attestation invariants.
