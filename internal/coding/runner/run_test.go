@@ -4,9 +4,11 @@ package runner
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -199,5 +201,49 @@ func TestRunNeverMutatesLiveSourceDir(t *testing.T) {
 
 	if before.Digest != after.Digest {
 		t.Fatalf("live SourceDir was mutated by Run: before=%s after=%s", before.Digest, after.Digest)
+	}
+}
+
+// Detector (PLAN-CODING-TRIO.md Slice 1): `go test -json`'s stdout stream
+// arrives on RunResult.Stdout uncontaminated by stderr, and Truncated is
+// false for an ordinary small run — the two properties Slice 1's
+// evidence classification depends on.
+func TestRunSeparatesStdoutFromStderrForJSONParsing(t *testing.T) {
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skipf("no go binary on PATH: %v", err)
+	}
+	b, rep := testBackend(t)
+	grants := s7.NewAuthority(time.Now, 5*time.Minute)
+	j := testJournal(t)
+
+	src := t.TempDir()
+	tinyModule(t, src)
+
+	result, err := Run(ctxT(), b, rep, grants, j, RunSpec{
+		SourceDir:   src,
+		Args:        []string{"test", "-C", "/work/src", "-json", "./..."},
+		GoBinary:    goBin,
+		Timeout:     150 * time.Second,
+		OperationID: "op-test-json-1",
+		TargetID:    "target-test-json",
+		RunID:       "run-test-json-1",
+		ProfileID:   "work",
+	})
+	if err != nil {
+		t.Fatalf("Run failed: %v\noutput: %s", err, result.Output)
+	}
+	if result.Truncated {
+		t.Fatalf("expected Truncated=false for a tiny module run")
+	}
+	if !strings.Contains(result.Stdout, `"Action"`) {
+		t.Fatalf("expected go test -json events on Stdout, got: %q", result.Stdout)
+	}
+	dec := json.NewDecoder(strings.NewReader(result.Stdout))
+	for dec.More() {
+		var event map[string]any
+		if err := dec.Decode(&event); err != nil {
+			t.Fatalf("Stdout is not a clean go test -json stream (stderr contamination?): %v\nstdout: %q", err, result.Stdout)
+		}
 	}
 }

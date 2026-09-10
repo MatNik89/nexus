@@ -62,6 +62,9 @@ type RunSpec struct {
 type RunResult struct {
 	ExitOK          bool // the `go` subprocess itself exited 0
 	Output          string
+	Stdout          string
+	Stderr          string
+	Truncated       bool // EITHER stream hit sandbox.maxProcessOutputBytes
 	SnapshotDigest  string
 	ToolchainDigest string
 	PolicyHash      string
@@ -202,11 +205,15 @@ func Run(ctx context.Context, backend sandbox.Backend, report sandbox.ProbeRepor
 	selfDeadlineAfterWait := waitErr != nil && selfDeadlineCancelled(execCtx, waitErr)
 	cancelExec()
 	output := proc.Output()
+	stdout, stderr, truncated := proc.Stdout(), proc.Stderr(), proc.Truncated()
 	proc.Close()
 
 	result := RunResult{
 		ExitOK:          waitErr == nil,
 		Output:          output,
+		Stdout:          stdout,
+		Stderr:          stderr,
+		Truncated:       truncated,
 		SnapshotDigest:  snapDigest,
 		ToolchainDigest: pin.HashDigest,
 		PolicyHash:      policy.PolicyHash(),

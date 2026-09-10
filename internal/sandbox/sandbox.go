@@ -88,14 +88,37 @@ type Process struct {
 	handle     *probe.Handle
 	policyHash string
 	closure    map[string]string
-	output     *boundedBuffer
+	stdout     *boundedBuffer
+	stderr     *boundedBuffer
 	started    bool
 	done       chan struct{}
 	doneOnce   sync.Once
 }
 
-// Output returns the combined stdout+stderr captured so far (bounded).
-func (p *Process) Output() string { return p.output.String() }
+// Output returns the combined stdout+stderr captured so far (bounded) —
+// diagnostic use only (no caller parses this format; verified against
+// every existing call site before splitting the underlying capture).
+func (p *Process) Output() string { return p.stdout.String() + p.stderr.String() }
+
+// Stdout/Stderr return each stream's own bounded capture SEPARATELY
+// (PLAN-CODING-TRIO.md Slice 1: authoritative `go test -json` parsing
+// needs a clean stdout stream — interleaved stderr can make an otherwise
+// valid JSON event stream unparsable). Safe to split into two distinct
+// buffers with no mutex: os/exec spawns one internal copy goroutine PER
+// stream when Stdout and Stderr are DIFFERENT writer objects, so each
+// buffer is written by exactly one goroutine, and both callers here only
+// read after Wait (which joins both copy goroutines) — the same
+// happens-before the combined single-buffer path already relied on.
+func (p *Process) Stdout() string { return p.stdout.String() }
+func (p *Process) Stderr() string { return p.stderr.String() }
+
+// Truncated reports whether EITHER stream hit its capture cap — a
+// caller building evidence from Stdout() MUST check this and refuse to
+// grade rather than silently classify from an incomplete stream
+// (PLAN-CODING-TRIO.md Slice 1, codex's finding: a truncation landing at
+// a complete JSON-object boundary parses successfully while omitting
+// later failures).
+func (p *Process) Truncated() bool { return p.stdout.truncated || p.stderr.truncated }
 
 // Wait blocks until exit or timeout kill; the process tree is dead after.
 func (p *Process) Wait() error {
@@ -473,12 +496,15 @@ func (b *Bwrap) Launch(ctx context.Context, policy CompiledPolicy) (*Process, er
 	if err != nil {
 		return nil, err
 	}
-	// One buffer for BOTH streams is safe WITHOUT a mutex: os/exec
-	// documents that when Stdout and Stderr are the same ==-comparable
-	// writer, at most one goroutine at a time calls Write (fresh-audit
-	// kilo F1 rejected on that guarantee — do not "fix" this).
-	out := &boundedBuffer{limit: 1 << 20}
-	if err := h.SetOutput(out, out); err != nil {
+	// SEPARATE buffers, one per stream (PLAN-CODING-TRIO.md Slice 1:
+	// authoritative `go test -json` parsing needs a clean stdout stream,
+	// and a truncation flag per stream — see Process.Stdout/Stderr/
+	// Truncated's doc comments for why this is still mutex-free).
+	// maxProcessOutputBytes is a topknot ceiling, not a measured limit:
+	// bump it if evidence work ever hits it on a real test suite.
+	stdout := &boundedBuffer{limit: maxProcessOutputBytes}
+	stderr := &boundedBuffer{limit: maxProcessOutputBytes}
+	if err := h.SetOutput(stdout, stderr); err != nil {
 		h.Close()
 		return nil, err
 	}
@@ -487,7 +513,7 @@ func (b *Bwrap) Launch(ctx context.Context, policy CompiledPolicy) (*Process, er
 		return nil, err
 	}
 	proc := &Process{handle: h, policyHash: policy.policyHash,
-		closure: h.ClosureHashes(), output: out, started: true,
+		closure: h.ClosureHashes(), stdout: stdout, stderr: stderr, started: true,
 		done: make(chan struct{})}
 	// Cancel-watch: S7 cancellation reaches the live tree.
 	go func() {
@@ -693,18 +719,28 @@ func digest(parts ...string) string {
 
 // boundedBuffer caps captured output (observation pruning lower bound;
 // T26 prunes further but the transport itself must never grow unbounded).
+// maxProcessOutputBytes bounds each of Process's stdout/stderr captures
+// (PLAN-CODING-TRIO.md Slice 1) — a topknot ceiling: bump it if evidence
+// work ever hits it on a real test suite, rather than going unbounded.
+const maxProcessOutputBytes = 32 << 20 // 32MiB
+
 type boundedBuffer struct {
-	buf   strings.Builder
-	limit int
+	buf       strings.Builder
+	limit     int
+	truncated bool
 }
 
 func (b *boundedBuffer) Write(p []byte) (int, error) {
 	room := b.limit - b.buf.Len()
 	if room <= 0 {
+		if len(p) > 0 {
+			b.truncated = true
+		}
 		return len(p), nil // swallow beyond the cap; the process still runs
 	}
 	if len(p) > room {
 		b.buf.Write(p[:room])
+		b.truncated = true
 		return len(p), nil
 	}
 	b.buf.Write(p)

@@ -259,9 +259,79 @@ func mustAttestErr(t *testing.T, b *Bwrap, p *Process, pol CompiledPolicy) strin
 func TestOutputBounded(t *testing.T) {
 	b, rep := backend(t)
 	hp := helperPath(t)
-	out, _ := runThrough(t, b, rep, Spec{Target: hp, Args: []string{"spew", strconv.Itoa(4 << 20)}, WorkDir: wdir(t)})
-	if len(out) > (1<<20)+1024 {
+	spewBytes := maxProcessOutputBytes + (4 << 20)
+	out, _ := runThrough(t, b, rep, Spec{Target: hp, Args: []string{"spew", strconv.Itoa(spewBytes)}, WorkDir: wdir(t)})
+	if len(out) > maxProcessOutputBytes+1024 {
 		t.Fatalf("output unbounded: %d bytes captured", len(out))
+	}
+}
+
+// Detector (PLAN-CODING-TRIO.md Slice 1, codex's finding): a caller
+// building evidence from Stdout()/Stderr() MUST be able to detect
+// truncation rather than silently classify from an incomplete stream —
+// Truncated() must report true once either stream exceeds its cap, and
+// false for an ordinary, well-under-the-cap run.
+func TestProcessTruncatedFlag(t *testing.T) {
+	b, rep := backend(t)
+	hp := helperPath(t)
+
+	pol, err := b.Compile(ctxT(), Spec{Target: hp, Args: []string{"spew", strconv.Itoa(maxProcessOutputBytes + (4 << 20))}, WorkDir: wdir(t)}, rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := b.Launch(ctxT(), pol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	p.Wait()
+	if !p.Truncated() {
+		t.Fatal("expected Truncated() to be true after exceeding the output cap")
+	}
+
+	polSmall, err := b.Compile(ctxT(), Spec{Target: hp, Args: []string{"print", "small"}, WorkDir: wdir(t)}, rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p2, err := b.Launch(ctxT(), polSmall)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p2.Close()
+	p2.Wait()
+	if p2.Truncated() {
+		t.Fatal("expected Truncated() to be false for a small, well-under-cap run")
+	}
+}
+
+// Detector: Stdout() and Stderr() are captured SEPARATELY, never
+// interleaved — a caller parsing `go test -json` from Stdout() must not
+// see stderr diagnostics mixed into the stream.
+func TestProcessStdoutStderrSeparated(t *testing.T) {
+	b, rep := backend(t)
+	hp := helperPath(t)
+	out, werr := runThrough(t, b, rep, Spec{Target: hp, Args: []string{"readfile", "/does/not/exist"}, WorkDir: wdir(t)})
+	_ = out
+	if werr == nil {
+		t.Fatal("expected readfile of a nonexistent path to fail")
+	}
+	// runThrough's own Output() is stdout+stderr combined (diagnostic
+	// use); verify the SPLIT accessors independently via a direct Launch.
+	pol, err := b.Compile(ctxT(), Spec{Target: hp, Args: []string{"readfile", "/does/not/exist"}, WorkDir: wdir(t)}, rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := b.Launch(ctxT(), pol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	p.Wait()
+	if p.Stdout() != "" {
+		t.Fatalf("expected empty Stdout() for a probehelper failure (writes only to stderr via fail()), got %q", p.Stdout())
+	}
+	if !strings.Contains(p.Stderr(), "read denied") {
+		t.Fatalf("expected the failure message on Stderr(), got %q", p.Stderr())
 	}
 }
 
