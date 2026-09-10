@@ -1367,3 +1367,38 @@ scope).
 
 Dispatching round 3 (confirmation only — verify the 2 fixes, confirm explicit agreement on
 deferring the validator-completeness item).
+
+## Status 2026-09-10 — Slice 1 CLOSED: round 3 PASS/PASS (6410330)
+
+**Both codex and agy PASS** on round 3 — genuine 3-round convergence, not a rubber stamp.
+codex explicitly confirmed both round-2 fixes CLOSED with file:line citations, ran the new
+real-bwrap mutation detector itself (113.72s, non-vacuous — confirmed the candidate test
+actually writes `mutated.txt` inside `/work/src` and the outer assertion requires refusal),
+and accepted the validator-completeness deferral with PRECISE reasoning matching the
+original scoping exactly: "Capture currently has no production caller or replay consumer,
+and its payloads are constructed through local typed structs rather than decoded from an
+untrusted boundary... This becomes blocking before the first production event registration
+or consumer trusts replayed coding-evidence payloads" — i.e. defer now, build before Slice 3
+actually wires a consumer, not before. Two purely cosmetic notes (a stale doc comment, an
+EventID string still containing "-completed-") fixed in `6410330`.
+
+**Slice 1 (proof-of-done / evidence manifest) is DONE.** Full build history: `cdef247`
+(sandbox stdout/stderr split) → `debc01b` (go test -json parsing) → `c3bdf8f` (checker
+extension) → `3b99b03` (journal event chaining) → `0a43597` (Capture orchestration,
+first cut) → 3 adversarial review rounds (`4aedfb8`, `f27842e`, `6410330`) folding 7 real
+bugs total (5 in round 1, 2 in round 2) plus one genuinely-adjudicated, formally-withdrawn
+finding (checker.Grade's trust-model scoping) — codex found real, concrete, independently
+reproducible defects in every round; agy's PASS missed every one of them until after the
+fix, confirming this session's own repeated lesson: never treat one clean run or one
+reviewer's PASS as sufficient for anything touching concurrency, causal ordering, or
+adversarial input.
+
+**Deliberately deferred to their own future increments** (both explicitly reviewer-
+accepted, not silently dropped): (1) content-hash-pinning the PATH-exposed `go` binary in
+the gopls session (Slice 0); (2) server-initiated JSON-RPC request handling in the gopls
+session (Slice 0); (3) registered journal `PayloadValidator`s + the full eventual field
+list (workspace path, argv/env, timing, proof ceiling) for Slice 1's two event types —
+build before Slice 3 gives a real consumer to those events, not before.
+
+Next: Slice 2 (TIA shadow-mode, `internal/coding/impact`) or Slice 3 (symedit
+RenameSymbol) per the plan's own build order (Slice 2 before Slice 3).
