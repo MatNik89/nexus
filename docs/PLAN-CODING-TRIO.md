@@ -1541,3 +1541,61 @@ suite, record the selection, measure recall) is fully implemented and reviewed.
 
 Next: Slice 3 (symedit RenameSymbol) — the last piece of the coding trio, per the plan's
 build order.
+
+## Status 2026-09-10 — Slice 3 first piece: symedit pure edit-shape layer (757a88d)
+
+`internal/coding/symedit` (edit.go): the pure parsing/validation/application layer for
+Slice 3's RenameSymbol — decodes gopls' raw `WorkspaceEdit` into the plan's decided
+closed subset (`documentChanges`/`TextDocumentEdit` only), resolves LSP (line, UTF-16
+character) positions into byte offsets against an immutable preimage, applies validated
+edits. No I/O, no syscalls, no S7 — deliberately the smallest independently-testable
+increment of Slice 3, mirroring how Slice 2 started with pure `impact.go` logic before
+its I/O orchestration.
+
+Self-review before dispatch caught 2 real bugs (workspace-root containment check
+accepted a sibling directory `/work/src2` as if inside `/work/src`; failed to reject
+`/etc/passwd`) plus a test off-by-one.
+
+**3 review rounds, codex+agy (kilo still dead), 8 more real bugs — each round deeper on
+the same theme (this is untrusted-ish data from an external process):**
+1. Required LSP fields (range/start/end/line/character/newText) decoded as valid Go
+   zero values when absent from JSON — `{"newText":"X"}` with no `range` silently became
+   an in-bounds insertion at byte 0. Fixed: every required field is now a pointer, nil
+   after decode is refused.
+2. A response with BOTH `changes` and `documentChanges` silently processed the latter,
+   dropping the former.
+3. An `AnnotatedTextEdit`'s `annotationId` was silently ignored, accepted as ordinary.
+4. Document version was never validated at all. Closed with a rule VERIFIED LIVE, twice,
+   against real gopls v0.23.0 (not guessed): the one file the session actually opened
+   always carries version 1; every other file touched by a cross-file rename always
+   carries version 0.
+5. (Deeper) the `openedFileRelPath` parameter driving that rule was itself unvalidated —
+   empty or foreign values silently degraded the check to "everything must be 0" instead
+   of failing closed, and nothing confirmed the opened file actually appeared in the
+   response at all.
+6. (Deeper still) the "closed, explicit subset" claim remained permissive: plain
+   `json.Unmarshal` silently ignores unknown fields anywhere in the structure, and
+   `annotationId: null` bypassed the `*string` nil-check (null and absent decode
+   identically to a pointer field). Closed with `strictUnmarshal`
+   (`DisallowUnknownFields`, recursive through the whole nested struct tree in one
+   Decode call) and a `json.RawMessage`-based presence check that correctly
+   distinguishes "key present with any value including null" from "key absent."
+7. A file URI carrying a query or fragment was silently accepted, never inspected
+   (2-of-2 convergence, non-blocking note both rounds, folded anyway since cheap).
+
+Round 3: both PASS. Full repo suite green throughout. Pushed (757a88d).
+
+**Lesson reinforced a third time this Slice-2/3 arc**: codex kept finding genuinely
+DEEPER bugs on the SAME code area across 3 full rounds (version validation → the
+parameter driving it → the decode strictness underneath it) — never re-litigating a
+settled point, always a NEW, more precise counterexample. Every claim (including my own
+empirical "version 1 for opened, 0 for everything else" rule) was verified directly
+against real gopls output or the vendored LSP source before being trusted, in both
+directions.
+
+Next: `internal/coding/workspace` — the durable, S7-governed, crash-recoverable
+multi-file transaction coordinator (invariant 4: sealed-bundle before/after images,
+openat2 descriptor-relative symlink defense, the full crash-recovery classification
+table, restart-time `PolicyWorkspaceRollback` with its own grant). This is Slice 3's
+largest remaining piece — `internal/foundation/sealedstore` (its storage dependency)
+already exists from earlier P1 work.
