@@ -311,3 +311,14 @@ func contains(s []string, v string) bool {
 	}
 	return false
 }
+
+// Detector: Targets returns every real target package, sorted, for use
+// as the "full suite" fallback set.
+func TestGraphTargetsReturnsSortedRealTargets(t *testing.T) {
+	g := BuildGraph(syntheticPkgs())
+	got := g.Targets()
+	want := []string{"mod/a", "mod/b", "mod/c", "mod/d", "mod/e", "mod/f"}
+	if !equalStrings(got, want) {
+		t.Fatalf("Targets() = %v, want %v", got, want)
+	}
+}

@@ -55,11 +55,26 @@ type TestKey struct {
 type ParsedRun struct {
 	Outcomes       map[TestKey]TestOutcome
 	FailedPackages []string // packages with THEIR OWN "fail" action, sorted
+	// TerminalPackages is every package that reached its OWN package-level
+	// TERMINAL action (Test=="" and Action is "pass", "fail", or "skip")
+	// — sorted. Added for Slice 2's tia orchestrator (code-review finding,
+	// codex, round 4+5): a package the run never finished — e.g. the
+	// `go test` process itself crashed or was OOM-killed mid-suite after
+	// only emitting that package's "start" (or nothing at all) — is
+	// otherwise indistinguishable from a package that legitimately has
+	// zero tests and passed cleanly; both leave zero per-test Outcomes
+	// and no FailedPackages entry. round-4's first attempt (a field
+	// tracking ANY event, including "start") was itself insufficient
+	// (round-5 finding): a package that emits "start" and then never
+	// reaches its own terminal pass/fail/skip must NOT count as covered.
+	// Only the package's own terminal action proves it actually finished.
+	TerminalPackages []string
 }
 
 func ParseTestJSON(stdout string) (ParsedRun, error) {
 	outcomes := make(map[TestKey]TestOutcome)
 	failedPackages := map[string]bool{}
+	terminalPackages := map[string]bool{}
 	scanner := bufio.NewScanner(strings.NewReader(stdout))
 	scanner.Buffer(make([]byte, 0, 64*1024), 16<<20) // a single JSON line rarely exceeds this; fail closed if it does
 	lineNo := 0
@@ -78,6 +93,12 @@ func ParseTestJSON(stdout string) (ParsedRun, error) {
 			return ParsedRun{}, fmt.Errorf("evidence: malformed go test -json line %d: %w", lineNo, err)
 		}
 		if ev.Test == "" {
+			if ev.Package != "" {
+				switch ev.Action {
+				case "pass", "fail", "skip":
+					terminalPackages[ev.Package] = true
+				}
+			}
 			if ev.Action == "fail" && ev.Package != "" {
 				failedPackages[ev.Package] = true
 			}
@@ -101,7 +122,12 @@ func ParseTestJSON(stdout string) (ParsedRun, error) {
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	return ParsedRun{Outcomes: outcomes, FailedPackages: names}, nil
+	terminal := make([]string, 0, len(terminalPackages))
+	for name := range terminalPackages {
+		terminal = append(terminal, name)
+	}
+	sort.Strings(terminal)
+	return ParsedRun{Outcomes: outcomes, FailedPackages: names, TerminalPackages: terminal}, nil
 }
 
 // TestDiff is the classified transition of every test key present in

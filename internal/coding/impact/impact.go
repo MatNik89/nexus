@@ -203,6 +203,20 @@ func BuildGraph(pkgs []Package) *Graph {
 // per invariant 5 (fail-safe toward closure), the caller must fall back
 // to the full suite rather than trust a partial answer; Affected reports
 // this via the second return value.
+// Targets returns every real, directly-matched workspace package
+// (isTarget()) this Graph knows about, sorted — the "full suite" package
+// set a caller falls back to when Affected reports resolved=false or a
+// file-to-package mapping cannot be resolved (PLAN-CODING-TRIO.md
+// invariant 5).
+func (g *Graph) Targets() []string {
+	targets := make([]string, 0, len(g.targets))
+	for t := range g.targets {
+		targets = append(targets, t)
+	}
+	sort.Strings(targets)
+	return targets
+}
+
 func (g *Graph) Affected(changed []string) (affected []string, resolved bool) {
 	resolved = true
 	visited := map[string]bool{}

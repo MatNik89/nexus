@@ -119,3 +119,52 @@ func assertEqual(t *testing.T, label string, got, want []string) {
 		t.Fatalf("%s: got %v, want %v", label, got, want)
 	}
 }
+
+// Detector (Slice 2 tia orchestrator requirement, code-review finding,
+// codex): TerminalPackages must record every package that reached its
+// OWN package-level TERMINAL action (pass/fail/skip) — including a
+// package with zero tests (a bare package-level "pass", never producing
+// a per-test outcome or a FailedPackages entry) — so a caller can
+// distinguish "legitimately covered, zero tests" from "never finished"
+// (e.g. the process crashed before reaching that package's own terminal
+// action).
+func TestParseTestJSONTracksTerminalPackagesIncludingNoTestPackages(t *testing.T) {
+	stream := `{"Action":"start","Package":"pkg/withtests"}
+{"Action":"pass","Package":"pkg/withtests","Test":"TestA"}
+{"Action":"pass","Package":"pkg/withtests"}
+{"Action":"start","Package":"pkg/notests"}
+{"Action":"pass","Package":"pkg/notests"}
+`
+	parsed, err := ParseTestJSON(stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"pkg/notests", "pkg/withtests"}
+	if len(parsed.TerminalPackages) != len(want) {
+		t.Fatalf("TerminalPackages = %v, want %v", parsed.TerminalPackages, want)
+	}
+	for i, w := range want {
+		if parsed.TerminalPackages[i] != w {
+			t.Fatalf("TerminalPackages = %v, want %v", parsed.TerminalPackages, want)
+		}
+	}
+}
+
+// Detector (code-review finding, codex, round 5: the exact deeper
+// counterexample that broke round-4's first attempt): a package that
+// emits ONLY a "start" action — and never reaches its own package-level
+// terminal pass/fail/skip, e.g. because the `go test` process crashed
+// mid-package — must NOT appear in TerminalPackages. "Started" is not
+// "finished."
+func TestParseTestJSONExcludesPackageThatOnlyStarted(t *testing.T) {
+	stream := `{"Action":"fail","Package":"pkg/a"}
+{"Action":"start","Package":"pkg/b"}
+`
+	parsed, err := ParseTestJSON(stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.TerminalPackages) != 1 || parsed.TerminalPackages[0] != "pkg/a" {
+		t.Fatalf("TerminalPackages = %v, want [pkg/a] (pkg/b only started, never reached a terminal action)", parsed.TerminalPackages)
+	}
+}
