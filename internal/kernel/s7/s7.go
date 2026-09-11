@@ -37,6 +37,7 @@ import (
 	"io"
 	"math"
 	mrand "math/rand/v2"
+	"reflect"
 	"sync"
 	"time"
 
@@ -756,6 +757,75 @@ func (a *Authority) Attempts(op contracts.OperationID) int {
 		return rec.attempts
 	}
 	return 0
+}
+
+// Target exposes the resource identity a currently-known operation's grant
+// is bound to — false only for an OperationID this Authority has never
+// Begin'd in this process, or one whose TERMINAL record was not carried
+// forward by rehydrate() across a restart (rehydrate() only reloads
+// Planned/FailedRetryable/Unknown/Authorized/Running into a.ops — a
+// same-process terminal operation, by contrast, stays queryable here
+// until the process itself restarts; Target and State share this exact
+// "not in a.ops" contract). Lets a caller that discovers a candidate
+// OperationID from some OTHER source (e.g. an owner's own journal
+// payload, which S7 never verifies matches the operation a companion
+// was actually Consumed against — Consume only enforces Companion.Key, a
+// structural field, not the payload's own JSON content) cross-check it
+// against S7's OWN authoritative binding before trusting it belongs to a
+// specific resource (code-review finding, workspace/scan.go's restart
+// scan).
+func (a *Authority) Target(op contracts.OperationID) (contracts.TargetID, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	rec, ok := a.ops[op]
+	if !ok {
+		return "", false
+	}
+	return rec.target, true
+}
+
+// MatchesPolicy reports whether a currently-known operation's bound
+// policy is deeply equal to want (false, ok=false for unknown/terminal-
+// and-not-rehydrated — the same contract Target/State share). Compares
+// by VALUE, never hands the internal Policy back to the caller: Policy
+// carries slice fields (RetryableCodes, FallbackTargets) that would
+// alias this Authority's own stored record if returned directly, letting
+// a caller mutate durable internal state through what looks like a
+// read-only accessor (code-review finding: a caller discovering a
+// candidate operation from an external source — see Target's own doc
+// comment — must be able to verify it was actually Begin'd under the
+// EXACT expected policy, e.g. the correct EffectClass/Durable shape, not
+// just the right target — an operation sharing a prefix AND a target but
+// begun under a foreign policy is an impossible governance narrative for
+// that owner, not a legitimate one it happens to also match).
+func (a *Authority) MatchesPolicy(op contracts.OperationID, want Policy) (matches bool, ok bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	rec, exists := a.ops[op]
+	if !exists {
+		return false, false
+	}
+	return reflect.DeepEqual(rec.policy, want), true
+}
+
+// BoundJournal exposes the *journal.Journal this Authority was
+// constructed from (New's own j argument — nil only for an in-memory-only
+// Authority built with no Durable-operation support at all). Lets a
+// caller holding a (*journal.Journal, *Authority) pair from two
+// DIFFERENT, independently-obtained sources prove they are actually
+// bound together (pointer identity — the SAME open journal, not merely
+// two journals sharing a profile) before trusting the Authority's
+// authoritative state to describe events replayed from that journal
+// (code-review finding: workspace/scan.go's restart scan independently
+// accepted a journal to replay and an authority to cross-check against,
+// with nothing proving they were the SAME journal — a caller passing a
+// mismatched pair could get a closed transaction from one journal
+// reported as MID_CRASH using a same-operation-ID UNKNOWN record that
+// actually belongs to a completely different journal).
+func (a *Authority) BoundJournal() *journal.Journal {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.j
 }
 
 // State exposes the authoritative attempt state (false for unknown).

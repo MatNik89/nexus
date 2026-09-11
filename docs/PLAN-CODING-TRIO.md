@@ -2677,3 +2677,409 @@ can or should solve. The restart-time SCAN and the governed
 `PolicyWorkspaceRollback` operation remain the next pieces of invariant 4
 steps 6/7, each its own reviewable increment per this program's established
 build order.
+
+## Status 2026-09-11 — restart-scan caller (invariant 4 steps 6/7's second piece)
+
+User authorization: "kreni na restart-scan caller." Builds the caller
+`recovery.go`'s doc comment explicitly deferred: the restart-time SCAN that
+finds every rehydrated-UNKNOWN `workspace.apply` operation and drives it
+through classification.
+
+New file `internal/coding/workspace/scan.go`: `RestartScan(rootFd, j,
+grants, store, runID) ([]ScanFinding, error)`. Scans the journal (via
+`Journal.Replay`) for `workspace.apply_started` events whose operation ID's
+prefix matches THIS root's own exact-intent identity (profile + device +
+inode — the same components `ApplyOperationID` derives), keeping the LATEST
+bundle digest per operation. For each operation S7 currently reports
+`AttemptUnknown` (the ONLY gate needed — see below), classifies its sealed
+bundle via `recovery.go`'s `ClassifyBundle` and:
+- NEVER_STARTED → `grants.Reconcile(op, false, build)` — exactly invariant
+  2's own "the remote effect is proven ABSENT" shape, the SAME pattern
+  `channel/telegram`'s `registerCommands` already uses for its own
+  rehydrated-UNKNOWN reconciliation. No new S7 primitive needed.
+- MID_CRASH (AllAfter or mixed) → reported, NEVER acted on. Requires the
+  governed `PolicyWorkspaceRollback` operation (invariant 4's own table),
+  which does not exist yet — its own, materially larger, next increment.
+  Acting without it would repeat the exact ungoverned-effect mistake
+  invariant 2's own S7-wiring (round 5) already closed once.
+- FOREIGN (including a missing/corrupt sealed bundle — invariant 4's own
+  table names this explicitly) → reported, never acted on, manual
+  reconciliation only, under any circumstance.
+- A closed transaction (`Report(Succeeded)` already landed) never appears in
+  the scan at all — not via a second explicit `workspace.mutation_committed`
+  check, but for free: `ApplyGoverned`'s `succeededBuild` commits that event
+  IN THE SAME ATOMIC BATCH as S7's own SUCCEEDED transition (this package's
+  own atomic-companion-pairing guarantee, fault-tested elsewhere via
+  `SetAppendFault`), so a closed operation can never simultaneously be
+  `AttemptUnknown` — the two are structurally mutually exclusive. (Self-
+  caught during my own RED-proof pass: an earlier version tracked
+  `EvMutationCommitted` as a SEPARATE explicit skip; ablating it left every
+  test green — dead code, removed. Deletion over addition.)
+
+Explicitly NOT built here (documented in scan.go's own doc comment):
+retrying a NEVER_STARTED operation after it reconciles — this function has
+no access to the original `FileMutation` set (only the sealed BEFORE/AFTER
+byte images survive a crash); a caller that wants the rename retried calls
+`ApplyGoverned` again, per its own existing doc comment.
+
+7 tests in `scan_test.go`, built on a new `crashApply` test helper that
+replicates `ApplyGoverned`'s own `Begin`/`Next`/`Consume`/`apply` sequence by
+hand but deliberately never calls `Report`/`Cancel` — simulating a real
+process crash between Consume and Report. A later `testDurableGrants(t, j)`
+call on the SAME journal rehydrates the operation to UNKNOWN via S7's own
+`rehydrate()`, exactly mirroring `s7`'s own established
+`TestDurableRestartPreservesCapAndBackoff` "reopen a fresh Authority on the
+same journal" pattern — not a synthetic shortcut. Covers: NEVER_STARTED
+reconciled (+ durability proven via a THIRD Authority); MID_CRASH reported
+without S7 action (+ proven no reconcile event was appended); FOREIGN (both
+via external mutation and via a deleted sealed-bundle file) reported without
+action; a closed/committed operation never appearing in findings; running
+the scan twice in a row finding nothing the second time (idempotency); two
+different workspace roots sharing one journal never leaking into each
+other's scan (exact-intent scoping).
+
+Self-caught, RED-proven simplification during my own fight-the-fix pass
+(before any external review): the first draft tracked
+`workspace.mutation_committed` events in a second map as a belt-and-
+suspenders skip for closed transactions. Ablating that map left EVERY test
+green — no test could distinguish it from dead code, because the
+`AttemptUnknown` state check alone already excludes closed operations by
+the atomic-pairing guarantee above. Removed rather than shipped as
+unprovable machinery (topknot: deletion over addition).
+
+Full verification: `go build ./...` clean, `go vet ./...` clean,
+`internal/coding/workspace -count=20` green, full `go test ./...` green.
+Every check independently RED-proven via ablation (the state-guard, the
+NeverStarted-only-reconcile guard, the missing-bundle-is-FOREIGN guard) —
+each reverted, confirmed the exact predicted failure, restored.
+
+**Confidence:** The 5 exhaustive per-operation states invariant 4's own
+table specifies (closed/never-started/mid-crash/foreign/missing-bundle) are
+each covered by a real crash-simulated test, not a hand-built fixture,
+and each guard is independently RED-provable. Explicitly NOT tested (a
+reasoned-through, not empirically verified, gap — flagging for review
+rather than hiding it): a multi-attempt operation (a caller-overridden
+`MaxAttempts>1` policy, one attempt failed-retryable, a SECOND attempt
+consumed then crashed) — I reasoned through why `validApplyFailedNarrative`
+still accepts the resulting Reconcile call's landing (the prior attempt's
+`CodeMutationRolledBack` carries forward as `rec.lastCode`, so Retry's own
+code requirement is satisfied) and why "latest apply_started digest wins"
+is the correct behavior, but built no test for it — `PolicyWorkspaceApply`'s
+own default (`MaxAttempts:1`) makes this path unreachable in the CURRENT
+default configuration, so I judged it lower priority than the 7 tests
+above, not a gap to silently skip. Weakest link: the exact-intent prefix
+match (`strings.HasPrefix`) trusts that no OTHER operation ID format could
+ever legitimately share this prefix — true today (only `ApplyOperationID`
+produces this shape), but worth re-checking if a future operation type's
+ID format is ever designed to nest under `workspace.apply:`.
+
+## Status 2026-09-11 — restart-scan caller round 1 FAIL + real fixes
+
+codex round 1 verdict: **FAIL**, two HIGH findings, both reproduced live.
+
+1. **HIGH — NEVER_STARTED reconciliation permanently terminalized the
+   operation, closing off retry forever.** `PolicyWorkspaceApply`'s own
+   `MaxAttempts:1` means the ONE attempt was already consumed before the
+   crash; `Reconcile(op, false, ...)` for a NEVER_STARTED finding therefore
+   always lands terminal FAILED immediately (budget exhausted), never
+   retryable — reproduced live: a second `ApplyGoverned` call on the SAME
+   operation afterward fails outright (`FAILED: ATTEMPT_NOT_AUTHORIZED`).
+   This is backwards: NEVER_STARTED is the SAFEST case to retry (nothing
+   was ever written), yet touching it made it permanently unretryable.
+   Fixed by narrowing scope: `RestartScan` no longer calls `Reconcile` at
+   all, for ANY classification — it REPORTS every finding, including
+   NEVER_STARTED, and acts on none of them, exactly matching MID_CRASH/
+   FOREIGN's own already-established "report only" contract. Advancing an
+   operation past UNKNOWN is now uniformly a FUTURE retry/recovery
+   driver's job — this piece's job is discovery + truthful classification,
+   nothing more. `ScanFinding.Reconciled` and the `runID` parameter
+   (no longer needed) were removed.
+
+2. **HIGH — discovery trusted a self-reported, unverified operation-ID
+   string instead of S7's own authoritative binding.** The scan read the
+   candidate operation's identity from `workspace.apply_started`'s OWN
+   payload `Op` field — a plain JSON string this package authors, which
+   S7's `Consume` never parses or cross-checks (it only enforces the
+   STRUCTURAL `Companion.Key == the operation being consumed`, not the
+   payload's own content). codex reproduced two live consequences: (a) a
+   companion whose payload `Op` field disagreed with its real
+   `Companion.Key` made the REAL crash-orphaned operation invisible to the
+   scan (filed under the wrong key) while a decoy string was scanned
+   instead; (b) an operation whose STRING happened to share this root's
+   exact-intent prefix, but whose S7-bound TARGET was for a different
+   resource, was classified and would have been acted on. Fixed two ways:
+   - Discovery now reads the candidate op's identity from S7's OWN
+     authoritative `s7.attempt_started` event (the value S7 itself wrote
+     when `Consume` durably started that exact attempt), never from the
+     companion's own payload. Since `s7.attempt_started` and its companion
+     are appended in ONE atomic batch (`Consume`'s own `appendLocked`
+     call, protected by this journal's single-write-owner discipline —
+     no other writer can interleave), the companion is reliably the VERY
+     NEXT event `Replay` delivers — used to pair the authoritative op with
+     the companion's own (digest-self-verified by `sealedstore.Store.Get`)
+     bundle digest, without ever trusting the companion's own `Op` field.
+   - Added `s7.Authority.Target(op) (contracts.TargetID, bool)` (new,
+     minimal, mirrors the existing `State` method exactly — additive only,
+     zero changes to any existing s7 API). `RestartScan` now cross-checks
+     every candidate's authoritative bound target against THIS root's own
+     `ApplyTargetID` before scanning it at all — a prefix collision bound
+     to a foreign target is excluded outright, not merely reported.
+
+2 new adversarial regression tests reproduce codex's exact repros
+(`TestRestartScanFindsRealOperationEvenWhenCompanionPayloadLies`,
+`TestRestartScanExcludesOperationWithForeignTarget`); the 7 existing tests
+updated for the narrowed no-Reconcile scope. Both new guards RED-proven via
+ablation (reverted each, confirmed the exact predicted failure, restored).
+`internal/coding/workspace -count=20` and `internal/kernel/s7 -count=20`
+both green, `go vet ./...` clean, full `go test ./...` re-run. codex round 2
+dispatched.
+
+**Confidence:** Both of codex's exact live repros are now closed and
+covered by regression tests built the same way codex constructed them (real
+`Begin`/`Next`/`Consume` calls, not hand-built journal rows). The
+authoritative-discovery redesign is structurally sound (S7's own
+single-write-owner + atomic-batch-append guarantees, not a heuristic), but
+is new reasoning this piece hasn't been adversarially re-hammered on yet —
+exactly the kind of subtle cross-package invariant this whole program has
+repeatedly needed multiple rounds to fully nail down. Weakest link: the
+`default` branch in the Replay switch (clearing `pendingOp` on any
+non-attempt_started/non-apply_started event) is reasoned through but has no
+dedicated test forcing a genuinely interleaved unrelated event between an
+attempt_started and a non-durable policy's absent companion — low risk
+since PolicyWorkspaceApply is always Durable:true in this package, but
+worth codex's attention.
+
+## Status 2026-09-11 — restart-scan caller round 2 FAIL + real fixes
+
+codex round 2 verdict: **FAIL**, two more HIGH findings (round 1's two
+findings confirmed CLOSED — the report-only narrowing and the payload/
+foreign-target regression tests both held; adjacency assumption
+independently re-verified sound: "Consume submits the started event and
+companion in one ordered AppendBatch; the journal actor cannot interleave
+another request within that batch").
+
+1. **HIGH — an UNKNOWN apply whose adjacent companion was missing/wrong
+   was silently OMITTED, not reported.** Worse for multi-attempt operations:
+   an EARLIER attempt's still-valid digest could remain in the discovery map
+   and get reused for a LATER attempt whose own companion never confirmed —
+   classifying against the WRONG (stale, superseded) bundle. codex
+   reproduced live: a real `Begin`→`Next`→`Consume` with a companion that
+   was VALID (passed `EvApplyFailed`'s own admission check) but the WRONG
+   EVENT TYPE (not `workspace.apply_started`) made the operation vanish
+   from `RestartScan`'s findings entirely, despite S7 authoritatively
+   confirming it UNKNOWN. Fixed by redesigning discovery around PER-ATTEMPT
+   tracking (`tracked[op] *string`, nil = "this attempt's digest not yet
+   confirmed"): every `s7.attempt_started` seen resets that op's tracked
+   digest to nil BEFORE checking whether a valid companion follows — so a
+   prior attempt's digest can never be mistaken for the current one — and
+   an op left with a nil digest at scan time now surfaces as
+   `TransactionForeign` (an authoritative S7 record proves an attempt truly
+   started; this piece just can't prove which bundle it belongs to) rather
+   than silently vanishing.
+
+2. **HIGH — the authoritative binding was still incomplete: S7's own
+   POLICY was never checked, only state+target.** codex reproduced live:
+   an operation begun with the EXACT right prefix and EXACT right target,
+   but under a foreign policy (`EffectReadOnly` instead of
+   `EffectIrreversible`), was reported by `RestartScan` as a legitimate
+   `TransactionNeverStarted` workspace-apply finding — an impossible
+   governance narrative (an irreversible mutation authorized under a
+   read-only effect class). Fixed by adding
+   `s7.Authority.MatchesPolicy(op, want Policy) (matches, ok bool)` (new,
+   additive-only, mirrors `Target`) — deliberately comparing by VALUE
+   (`reflect.DeepEqual`) rather than returning the internal `Policy` struct
+   directly, since `Policy` carries slice fields (`RetryableCodes`,
+   `FallbackTargets`) that would alias this Authority's own stored record
+   if handed back, letting a caller mutate durable internal state through
+   what looks like a read-only accessor. `RestartScan` now cross-checks
+   every candidate against `PolicyWorkspaceApply` alongside state and
+   target. Also fixed, per codex's own non-blocking note: `Target`'s doc
+   comment wrongly implied terminal operations return `ok=false` — they
+   don't, within the SAME process (only across a restart, when
+   `rehydrate()` doesn't carry terminal records forward); corrected to
+   match `State`'s own real contract.
+
+3 new tests reproduce codex's exact repros
+(`TestRestartScanTreatsBrokenCompanionAsForeignNotOmitted`,
+`TestRestartScanDoesNotReuseStaleDigestFromEarlierAttempt`,
+`TestRestartScanExcludesOperationWithForeignPolicy`). Both new guards
+RED-proven via ablation. Self-caught during my OWN construction of the
+multi-attempt test: a builder closure called `grants.Attempts(op)` LIVE
+from inside itself — the EXACT same-goroutine-relock deadlock class
+`ApplyGoverned`'s own doc comment already documents from the original
+S7-wiring review, and I reproduced it fresh in my own test code (the test
+suite genuinely hung, confirmed via a 159s kill). Fixed by capturing
+`attemptNo` ONCE outside each closure (`buildFor(attemptNo int) func(...)
+Companion`), matching the established safe pattern exactly — caught before
+ever reaching codex, not by it.
+
+`internal/coding/workspace -count=20` and `internal/kernel/s7 -count=20`
+both green, `go vet ./...` clean, full `go test ./...` re-run. codex round
+3 dispatched.
+
+**Confidence:** Both of round 2's exact live repros are closed and covered
+by regression tests built the same way codex constructed them. The
+per-attempt tracking redesign is a genuine structural improvement (FOREIGN
+is now reachable for every way a companion binding can break, not just the
+"wrong op string" case round 1 found), and `MatchesPolicy` closes the
+policy gap the SAME way `Target` closed the target gap — but this is now
+THREE consecutive rounds where codex found a real gap in "how do I trust a
+candidate operation is genuinely mine," each narrower than the last
+(identity → target → policy). Weakest link, flagging proactively before
+round 3 finds it: I have not checked whether there is a FOURTH binding
+property (beyond state/target/policy) S7 tracks that a forged-but-matching
+operation could still diverge on — worth asking round 3 to specifically
+hunt for one, given the pattern.
+
+## Status 2026-09-11 — restart-scan caller round 3 FAIL + real fix
+
+codex round 3 verdict: **FAIL**, one more HIGH finding (round 2's two
+findings confirmed CLOSED — per-attempt tracking and `MatchesPolicy` both
+held under fresh adversarial re-review, including an explicit re-check that
+`reflect.DeepEqual` is the right equality notion for `Policy` here: "the
+canonical JSON preserves every field, slice order, and nil-vs-empty
+distinction").
+
+Explicitly asked to hunt for a FOURTH "is this candidate genuinely mine"
+gap (after identity → target → policy across the first three rounds) —
+codex found one: **`RestartScan` accepted `j *journal.Journal` and
+`grants *s7.Authority` as two INDEPENDENT parameters with nothing proving
+they were actually bound to each other.** Reproduced live with two real
+journals: journal A held a fully closed (SUCCEEDED) transaction; journal B
+— sharing the SAME profile+root+plan-digest, hence deriving the IDENTICAL
+`OperationID` — held an UNKNOWN crash-orphaned attempt for that same op
+string. `RestartScan(rootFd, journalA, grantsB, store)` reported journal
+A's CLOSED transaction as MID_CRASH, using journal B's authority to answer
+state/target/policy while replaying journal A's own events — a direct
+violation of the "a closed transaction can never appear in findings"
+guarantee every prior round's fix depended on, because that guarantee only
+holds when the journal being replayed and the authority being queried
+describe the SAME history.
+
+Fixed by adding `s7.Authority.BoundJournal() *journal.Journal` (new,
+minimal, exposes the `*journal.Journal` `Authority` was actually
+constructed from via `s7.New` — `Authority` already stores this internally
+for its own future appends) and having `RestartScan` refuse outright, fail
+closed, at the very top, whenever `grants.BoundJournal() != j` (pointer
+identity — the SAME open journal, not merely two journals sharing a
+profile). 1 new regression test
+(`TestRestartScanRefusesMismatchedJournalAndAuthority`) reproduces codex's
+exact two-journal repro AND verifies the genuinely-matched pairing still
+behaves correctly afterward. RED-proven via ablation (reverted the check,
+confirmed the exact predicted failure, restored).
+
+`internal/coding/workspace -count=20` and `internal/kernel/s7 -count=20`
+both green, `go vet ./...` clean, full `go test ./...` re-run. codex round
+4 dispatched.
+
+**Confidence:** This closes the FOURTH consecutive "is this candidate
+genuinely mine" binding property (identity → target → policy → journal
+provenance) — each of the four is now independently verified and
+regression-tested. Given the pattern's own trajectory, I explicitly asked
+round 4 to hunt for a fifth; if none surfaces, this piece's discovery
+surface should be considered adversarially exhausted for this class of
+gap. Weakest link, unchanged from round 2: the untested multi-attempt
+interleaving space beyond the two specific scenarios now covered
+(broken-latest-companion, and broken-latest-after-a-valid-earlier-one) —
+still lower priority than a real production gap, but worth another pass
+if round 4 has capacity.
+
+## Status 2026-09-11 — restart-scan caller round 4 FAIL + real fix
+
+codex round 4 verdict: **FAIL**, one more HIGH finding — round 3's journal-
+provenance fix confirmed CLOSED. Explicitly asked to hunt for a FIFTH
+"is this candidate genuinely mine" gap after four consecutive rounds found
+one (identity → target → policy → journal provenance) — codex found one
+more, closing the pattern: **the policy check itself, added in round 2 to
+CLOSE a gap, silently OMITTED legitimate operations whose policy legitimately
+differed from the package's CURRENT `PolicyWorkspaceApply`.** Unlike target
+(a provable different-resource collision with a rightful owner elsewhere),
+policy is a TUNABLE — `governed.go` already documents callers overriding it
+for retry-driving, and the package default itself can change across an
+upgrade. codex reproduced live: set the documented two-attempt override, crash
+a real operation under it, restore the default (simulating restart/upgrade),
+rehydrate — `RestartScan` returned zero findings for a genuine crash-orphan,
+repeating the exact silent-omission failure class round 2 finding 1 already
+closed once for broken companions.
+
+Fixed the same way that precedent established: a policy mismatch no longer
+silently excludes the operation — it surfaces as `TransactionForeign`
+(this piece cannot durably distinguish "legitimate policy drift" from "a
+genuine foreign-policy collision" without persisting a policy identity of
+its own — a larger redesign outside this increment's scope; codex's own
+suggested fix named this exact minimal option). The existing round-2 foreign-
+policy test was renamed/re-asserted to expect FOREIGN instead of zero
+findings (its underlying scenario — a genuinely foreign policy — is still
+correctly excluded from being reported as a LEGITIMATE finding, just no
+longer silently dropped either). 1 new test
+(`TestRestartScanReportsPolicyDriftedOperationAsForeign`) reproduces
+codex's exact policy-drift repro. RED-proven via ablation.
+
+`internal/coding/workspace -count=20` and `internal/kernel/s7 -count=20`
+both green, `go vet ./...` clean, full `go test ./...` re-run. codex round 5
+dispatched.
+
+**Confidence:** All four prior "is this genuinely mine" bindings
+(identity/target/policy/journal-provenance) are now regression-tested, and
+the ONE binding that turned out to be legitimately mutable (policy) now
+fails safe (report, never omit) rather than fails silent. Given codex has
+found a real, narrower gap in EVERY one of the first 4 rounds, round 5 is
+asked again whether a sixth exists — if none surfaces this piece's
+discovery surface should be considered adversarially exhausted for this
+gap class. Weakest link, unchanged: the untested wider multi-attempt
+interleaving space beyond the specific scenarios now covered.
+
+## Status 2026-09-11 — restart-scan caller CLOSED: round 5 PASS
+
+codex round 5 verdict: **PASS** (initial response garbled/truncated in
+transit — re-requested a clean restatement, which confirmed the same
+verdict with full detail). No sixth "is this candidate genuinely mine" gap
+found, closing the 4-round chain (identity → target → policy-collision →
+journal-provenance → policy-drift-omission). Explicitly re-confirmed FOREIGN
+is the correct terminal answer for policy mismatch/drift for THIS increment
+("without a durable workspace-policy identity/version, automatic
+reconciliation cannot distinguish [legitimate evolution from unauthorized
+policy]... refinement should wait until a stable policy identity is
+persisted" — matches this piece's own explicitly-scoped ceiling). Multi-
+attempt interleaving re-checked fresh: "no new defect found... Consume's
+ordered atomic batch prevents another journal append from interleaving
+between the S7 event and its companion."
+
+Full ownership chain, as it now stands, per codex's own summary: operation
+identity from S7's `attempt_started` (never the companion payload); root
+ownership via descriptor-derived target; journal provenance via
+`BoundJournal`'s pointer identity; policy mismatch/drift → FOREIGN; missing/
+malformed latest companion → FOREIGN; sealed-store digest verification
+means a wrong store supplies either identical bytes or causes FOREIGN.
+
+3 non-blocking ceilings noted (topknot: notes, not blockers — none are
+substantive design flaws): different anomaly causes collapse into the same
+FOREIGN state (limited diagnostics, safe); a future recovery driver that
+performs writes must re-check S7 state immediately before acting (this
+report-only scanner provides no atomic scan-and-act transaction — already
+explicitly out of scope, matches this piece's own documented boundary);
+`BoundJournal() *journal.Journal` could be narrower as
+`IsBoundTo(*journal.Journal) bool` (no correctness/security defect either
+way).
+
+Final state, 5 rounds total: `internal/coding/workspace/scan.go`
+(`RestartScan`, per-attempt digest tracking, state/target/policy/journal-
+provenance cross-checks, all report-only), 3 new `s7.Authority` accessors
+(`Target`, `MatchesPolicy`, `BoundJournal` — all additive-only, mirror
+existing `State`), 14 tests in `scan_test.go` covering the exhaustive
+per-state table plus every binding-gap regression codex found. Full
+verification: `go build`/`go vet` clean, `internal/coding/workspace
+-count=20` and `internal/kernel/s7 -count=20` both green, full `go test
+./...` green across all 44 packages. Committing and pushing.
+
+**Confidence:** High on the discovery/classification surface specifically —
+5 rounds of genuinely adversarial review, each finding a REAL, narrower gap
+in "how do I trust a candidate operation is genuinely mine," until round 5
+found none. Unchanged limitation, honestly scoped from this piece's own
+first line: this is discovery + classification ONLY. Advancing any
+NEVER_STARTED/MID_CRASH finding past UNKNOWN — retrying, or rolling back
+through the still-unbuilt governed `PolicyWorkspaceRollback` — remains
+entirely a FUTURE piece's job. Weakest link, per codex's own final note: a
+future scan-and-act driver built on top of this needs its OWN atomicity
+discipline (re-verify S7 state immediately before acting), since this
+report-only scanner's findings are a snapshot, not a held lock.
