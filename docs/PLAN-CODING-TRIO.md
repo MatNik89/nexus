@@ -3083,3 +3083,269 @@ entirely a FUTURE piece's job. Weakest link, per codex's own final note: a
 future scan-and-act driver built on top of this needs its OWN atomicity
 discipline (re-verify S7 state immediately before acting), since this
 report-only scanner's findings are a snapshot, not a held lock.
+
+## Status 2026-09-11 — PolicyWorkspaceRollback: write primitive (invariant 4 step 7, first piece)
+
+User authorization: "kreni na PolicyWorkspaceRollback." Following this whole
+program's own established build order — a pure primitive before the
+governed S7 operation that wraps it (`transaction.go`'s `apply()` came
+before `governed.go`'s `ApplyGoverned`; `recovery.go`'s `ClassifyBundle`
+came before `scan.go`'s `RestartScan`) — this first piece builds the
+ROLLBACK WRITE PRIMITIVE only: `internal/coding/workspace/rollback.go`,
+`RollbackBundle(ctx, rootFd, b) ([]FileClassification, TransactionState,
+error)`.
+
+Restores every file currently classified AFTER back to its sealed BEFORE
+image (or removes it, for a file that did not exist before), driven purely
+from the sealed `Bundle`'s own recorded images — no in-memory
+prepared/written bookkeeping survives a crash, unlike `apply()`'s own
+same-process rollback (`rollbackAndReport`). Each file's device+inode is
+captured FRESH, immediately before its own restore attempt (mirroring
+`apply()`'s own "precondition checked at the operation's own capture
+point" discipline), while the CONTENT/MODE that must still be found there
+is the bundle's own recorded After image — reused verbatim from the SAME
+`writeFileBeneath`/`removeFileWithExpectedIdentity` atomic exchange-verify-
+restore primitives `transaction.go` already built and proved (no new
+descriptor-relative I/O invented here). Idempotent (a file already at
+BEFORE is a no-op — safe to call again after a partial prior attempt);
+refuses outright, writing nothing at all, if the bundle is ALREADY FOREIGN
+before the attempt starts; a per-file restore failure during the attempt
+does not abort the pass (best-effort, every other file still attempted);
+the returned classification is always a FRESH `ClassifyBundle` pass taken
+AFTER attempting every restore, reporting the state actually achieved —
+never assumed from write success/failure alone.
+
+Reuses `TransactionState`'s existing three values rather than inventing new
+ones (topknot: minimize owned concepts) — `TransactionNeverStarted` now
+also means "the rollback is complete, all-BEFORE achieved" in this
+caller's context, `TransactionMidCrash` means "still mixed, safe to retry,"
+`TransactionForeign` means "refuse, manual reconciliation only" — exactly
+matching invariant 4's own reconciliation predicate for the write side.
+
+7 tests in `rollback_test.go`, built on `realMidCrashBundle` (runs a REAL
+successful `apply()` — actual files on disk — then treats the result as if
+`mutation_committed` never landed, the SAME "successful apply is
+indistinguishable from mid-crash on disk" pattern `recovery_test.go`'s own
+`TestClassifyBundleOfARealSuccessfulApplyIsIndistinguishableFromMidCrash`
+established). Covers: existing-file restore, newly-created-file removal,
+convergence from a partially-rolled-back multi-file state, refusing an
+already-FOREIGN bundle without writing, no-op on an already-all-BEFORE
+bundle, writing nothing under a pre-cancelled context, and — caught by my
+own fight-the-fix pass, not by review — a genuine multi-file gap a
+single-file Foreign test couldn't have caught: with one file FOREIGN and
+ANOTHER genuinely AFTER, the whole-bundle upfront refusal is what stops
+the second file from being wrongly restored; the per-file loop check alone
+is not sufficient (RED-proven: ablating the whole-bundle refusal left the
+legitimate-AFTER file restored anyway, corrupting the recovery narrative).
+A SEPARATE per-file "skip already-BEFORE" check was fight-the-fix-verified
+to be efficiency-only, NOT independently load-bearing (ablating it caused
+no corruption, only wasted syscalls, since `restoreOneFile`'s own digest
+check already refuses a no-op restore) — kept, but honestly documented as
+such rather than overclaimed.
+
+Full verification: `go build`/`go vet` clean, `internal/coding/workspace
+-count=20` green, full `go test ./...` in progress. Every genuinely
+load-bearing guard RED-proven via ablation.
+
+Explicitly NOT built here, as the next increment: the S7-GOVERNED
+`PolicyWorkspaceRollback` operation itself — its own durable grant
+(`Begin`/`Next`/`Consume`/`Report`/`Reconcile` lifecycle), exact-intent
+identity binding the ORIGINAL operation's own identity + profile +
+workspace identity + the sealed-bundle digest (invariant 4 §2's own spec),
+the retry-driving loop around THIS primitive when a pass leaves the bundle
+MID_CRASH, and the handoff back to the original Apply operation's own
+`Reconcile(false)`+`Next` once rollback fully succeeds. Also not built:
+wiring this into `scan.go`'s `RestartScan` (its own MID_CRASH findings are
+currently report-only, by design, exactly because this governed operation
+did not exist yet when that piece converged).
+
+**Confidence:** The write primitive itself is proven against 7 real,
+crash-shaped scenarios, with one genuine multi-file gap self-caught before
+ever reaching codex (a meaningfully different outcome from the single-file
+test that would have missed it — a lesson worth remembering for the next
+piece's own test design). Not yet adversarially reviewed by codex — that
+review is the next step before this is considered converged, matching every
+other piece's own discipline this session. Explicitly unverified: behavior
+under REAL concurrent external mutation racing the restore loop itself
+(the tests simulate pre-existing drift, not a mutation landing mid-loop);
+the S7-governed wrapper's own retry/reconciliation semantics (a separate,
+larger, later increment).
+
+## Status 2026-09-11 — rollback write primitive round 1 FAIL + real fixes
+
+codex round 1 verdict: **FAIL**, three HIGH findings + one MEDIUM ("detector
+weakness" against my own claim), all reproduced live.
+
+1. **HIGH — exported without S7 governance.** `RollbackBundle` was
+   reachable from any internal package with no grant governing it — a
+   direct violation of invariant 2's "every physical attempt carries an
+   AttemptGrant," the EXACT reason `transaction.go`'s own `apply` was
+   unexported during the original S7-wiring review. Fixed: renamed to
+   `rollbackBundle` (unexported), staying private until the governed
+   `PolicyWorkspaceRollback` operation exists to be its sole caller —
+   mirrors `apply`/`ApplyGoverned`'s own relationship exactly.
+
+2. **HIGH — restore/cancellation failures silently erased.** Every
+   `restoreOneFile` error and a cancellation were discarded; the final
+   re-classify could show a clean `TransactionNeverStarted` even though
+   the write's OWN durability was never proven (codex reproduced live via
+   an injected `fsyncDirHook` failure: content lands correctly, the
+   trailing directory fsync fails, and the old code reported bare success
+   with no trace of the failure). Fixed: every per-file failure and a
+   cancellation are now `errors.Join`-ed into the returned error
+   ALONGSIDE the classification — a caller must check both, never treat
+   `TransactionNeverStarted` as durably-complete success without also
+   checking the error is nil.
+
+3. **HIGH — a directly-constructed malformed Bundle could cause a write
+   before being recognized as ambiguous.** `DecodeBundle`'s own shape
+   validation (duplicate targets, mode ranges, etc.) was never applied to
+   a `Bundle` value NOT obtained through it — codex reproduced live: two
+   records naming the SAME file, sharing the current AFTER image but
+   different BEFORE images, caused a real write based on the first
+   (ambiguous) record before the second record's failure ever surfaced
+   the problem. Fixed: extracted `DecodeBundle`'s own per-file validation
+   into `validateBundleShape` (pure, behavior-preserving refactor —
+   `DecodeBundle`'s own existing tests all still pass unchanged) and
+   `rollbackBundle` now calls it BEFORE any classification or write.
+
+4. **MEDIUM (my own "efficiency only" claim was wrong)** — the per-file
+   "skip if already BEFORE" check IS genuinely load-bearing, just not for
+   the reason I originally tested: for a NO-OP mutation (Before
+   byte-identical to After), the current on-disk state is
+   content-indistinguishable from AFTER, so `restoreOneFile`'s own digest
+   check would happily "restore" it anyway — an unnecessary physical
+   rewrite that changes the file's inode. My original single-file test
+   couldn't catch this (a single no-op file classifies
+   `TransactionNeverStarted` upfront and never reaches the per-file loop
+   at all); codex's repro needed a genuinely MIXED bundle (one no-op
+   file, one real change) to force `TransactionMidCrash` and actually
+   reach the loop. Doc comment corrected to stop overclaiming
+   "efficiency only."
+
+New tests reproduce all three HIGH repros plus the no-op-mutation case
+exactly as codex constructed them; the existing cancellation test's
+assertion was updated to match the new (correct) error-reporting contract.
+Every fix RED-proven via ablation — including the malformed-bundle case,
+where ablating `validateBundleShape` reproduced a REAL write on the
+duplicate-named file before the ambiguity was caught, exactly matching
+codex's own repro shape.
+
+`internal/coding/workspace -count=20` green, `go vet ./...` clean, full
+`go test ./...` re-run. codex round 2 dispatched.
+
+**Confidence:** All four findings closed with regression tests built the
+same way codex constructed them, not simplified reproductions. The
+`validateBundleShape` extraction is a pure refactor — `recovery.go`'s own
+8 `DecodeBundle` tests all still pass unchanged, confirming zero behavior
+drift on the already-converged code it was extracted from. Weakest link,
+unchanged: real concurrent external mutation racing the restore loop
+itself remains untested (the tests simulate pre-existing drift, not a
+mutation landing mid-loop) — and now a second one, freshly introduced:
+the exact CONTENTS of the joined `errors.Join` result are not yet
+individually asserted on (tests check `err != nil`, not that each
+constituent error is present and well-formed) — worth codex's attention.
+
+## Status 2026-09-11 — rollback write primitive round 2 FAIL + real fix
+
+codex round 2 verdict: **FAIL**, one more HIGH finding (all four round-1
+fixes confirmed correct on fresh re-review — the `validateBundleShape`
+extraction independently checked "not just tests still pass" against the
+actual diff and confirmed behavior-preserving; unexporting `rollbackBundle`
+confirmed via an exhaustive symbol/caller grep to leave `ApplyGoverned` as
+the only exported mutation entrypoint anywhere in the package).
+
+New finding: the per-file pre-check (`ctx.Err()` checked BEFORE each
+restore) cannot catch cancellation landing DURING the LAST file's own
+restore attempt — e.g. inside its trailing directory fsync — since after
+that restore call returns, the loop simply runs out of files with no
+further pre-check ever firing, falling straight through to the final
+re-classify with the cancellation completely unobserved. codex reproduced
+live: cancelling the context from inside an injected `fsyncDirHook`
+(landing exactly during the one-and-only restore's own fsync) produced a
+clean `NEVER_STARTED, nil` result — content correct, but a real
+cancellation silently lost. This is the SAME final-boundary race
+`apply()`'s own `ctx.Err()` check (right before declaring `Committed:
+true`) already exists to guard against.
+
+Fixed: added one more `ctx.Err()` check immediately after the per-file
+loop ends (guarded against double-reporting via a `cancelledDuringLoop`
+flag, so the pre-check's own message isn't duplicated when THAT is what
+caught it). New test
+`TestRollbackBundleReportsCancellationDuringFinalRestore` reproduces
+codex's exact repro. RED-proven via ablation.
+
+Also acted on codex's own "test note" (not a blocking finding, but cheap
+and directly actionable): the cancellation and durability-failure tests
+now assert `errors.Is(err, context.Canceled)` / `errors.Is(err,
+sentinelErr)` instead of bare `err != nil`, so a future regression
+swapping in an unrelated generic error would actually be caught.
+
+`internal/coding/workspace -count=20` green, `go vet ./...` clean, full
+`go test ./...` re-run. codex round 3 dispatched.
+
+**Confidence:** Every round-1 finding held under independent fresh
+re-review (not just "still green," but re-derived from the actual diff).
+The cancellation-boundary class of bug (missing a FINAL check after a
+per-item loop, not just per-item checks) is now the SECOND time this exact
+shape has surfaced in this package (the first being `apply()`'s own
+pre-existing final check, which is precisely why this rollback primitive
+should have had one from the start — a pattern worth remembering
+explicitly for any FUTURE per-item loop in this codebase, not just this
+one). Weakest link, unchanged: real concurrent external mutation racing
+the restore loop mid-pass (between two DIFFERENT files' restores within
+one call) remains untested — codex's own assessment is that the
+underlying descriptor primitives already fail closed for this case, but a
+dedicated orchestration-level detector doesn't exist yet.
+
+## Status 2026-09-11 — rollback write primitive CLOSED: round 3 PASS
+
+codex round 3 verdict: **PASS**. Independently re-verified the round-2
+cancellation fix covers all three mutation-window cases explicitly
+(before a restore, during a non-final restore, during/immediately-after
+the final restore) and confirmed `cancelledDuringLoop` only suppresses
+duplicate reporting, never a genuine unreported cancellation. Built and
+ran an ADDITIONAL disposable test of its own — a single final restore that
+BOTH cancels the context AND returns a distinct durability sentinel error
+— confirming `errors.Join`'s result satisfies `errors.Is` for both causes
+simultaneously, not just one. Re-confirmed `validateBundleShape` is still
+behavior-preserving and the governance bypass is fully closed via an
+exhaustive caller/export grep (no cross-package mutation route exists
+other than `ApplyGoverned`).
+
+Two proof ceilings explicitly acknowledged, neither blocking: cancellation
+arriving during the FINAL read-only re-classify pass itself is not
+observed by this primitive (all writes have already completed by then;
+codex's own judgment: "the future governed wrapper should still inspect
+both returned error/state and its attempt context" — a concern for the
+NEXT increment, not this one); cross-file external mutation racing
+between two DIFFERENT files' restores within one pass still lacks a
+dedicated orchestration-level detector (the underlying descriptor
+primitives already fail closed per-file; codex judged this a reasonable
+ceiling for this increment).
+
+Three review rounds total, closing (in order): (1) exported without S7
+governance, discarded restore/cancellation errors, a directly-constructed
+malformed bundle could write before validation, and a wrong "efficiency
+only" claim about the no-op-mutation skip guard; (2) cancellation landing
+during the LAST file's own restore (not just between restores) going
+unreported; (3) PASS. Final state: `internal/coding/workspace/rollback.go`
+(`rollbackBundle`, package-private), `recovery.go`'s new
+`validateBundleShape` extraction (shared with `DecodeBundle`, zero
+behavior change to it), 11 tests in `rollback_test.go`.
+
+Full verification: `go build`/`go vet` clean, `internal/coding/workspace
+-count=20` green, full `go test ./...` green across all 44 packages.
+Committing and pushing.
+
+**Confidence:** High on the write primitive's own correctness — 3 rounds
+of genuinely adversarial review, 4 real findings across the first two
+rounds, all closed with regression tests built the same way codex
+constructed its own repros (real fsync fault injection, real cancellation
+races, a real duplicate-target bundle), not simplified versions. This
+piece is STILL, deliberately, only the write primitive — `PolicyWorkspaceApply`'s
+own precedent (6 review rounds just to wire the FORWARD direction through
+S7) makes clear the governed `PolicyWorkspaceRollback` wrapper on top of
+this — its own grant lifecycle, retry-driving loop, and the handoff back
+to the original Apply operation's `Reconcile`+`Next` — is a materially
+larger, separate next increment, not a small follow-up.

@@ -64,29 +64,45 @@ func DecodeBundle(data []byte) (Bundle, error) {
 	if _, err := dec.Token(); err != io.EOF {
 		return Bundle{}, fmt.Errorf("workspace: sealed bundle has trailing data after its JSON value (fail closed)")
 	}
-	if len(b.Files) == 0 {
-		return Bundle{}, fmt.Errorf("workspace: sealed bundle names no files (fail closed)")
+	if err := validateBundleShape(b); err != nil {
+		return Bundle{}, err
 	}
+	return b, nil
+}
 
+// validateBundleShape is DecodeBundle's own per-file value validation,
+// factored out (pure extraction, no behavior change) so a caller that
+// already holds an in-memory Bundle NOT obtained through DecodeBundle —
+// rollback.go's rollbackBundle, specifically — can refuse the SAME
+// malformed shapes before ever attempting a write, not only at decode
+// time (code-review finding, rollback.go's own round 1 review, HIGH #3:
+// a directly-constructed Bundle with a duplicate (rel_dir, base_name)
+// target — never reachable through the real apply()→DecodeBundle path,
+// but reachable by ANY caller holding a Bundle value directly — caused
+// a real write before the ambiguity was ever detected).
+func validateBundleShape(b Bundle) error {
+	if len(b.Files) == 0 {
+		return fmt.Errorf("workspace: sealed bundle names no files (fail closed)")
+	}
 	const permBits = 0o777
 	seen := make(map[string]bool, len(b.Files))
 	for _, fr := range b.Files {
 		if fr.BaseName == "" {
-			return Bundle{}, fmt.Errorf("workspace: sealed bundle names a file with an empty base_name (fail closed)")
+			return fmt.Errorf("workspace: sealed bundle names a file with an empty base_name (fail closed)")
 		}
 		key := fr.RelDir + "\x00" + fr.BaseName
 		if seen[key] {
-			return Bundle{}, fmt.Errorf("workspace: sealed bundle names %q twice (fail closed)", key)
+			return fmt.Errorf("workspace: sealed bundle names %q twice (fail closed)", key)
 		}
 		seen[key] = true
 		if !fr.Existed && (len(fr.Before) != 0 || fr.BeforeMode != 0) {
-			return Bundle{}, fmt.Errorf("workspace: sealed bundle entry %q has existed=false but sets before/before_mode (fail closed)", fr.BaseName)
+			return fmt.Errorf("workspace: sealed bundle entry %q has existed=false but sets before/before_mode (fail closed)", fr.BaseName)
 		}
 		if fr.AfterMode&^permBits != 0 {
-			return Bundle{}, fmt.Errorf("workspace: sealed bundle entry %q has after_mode %#o outside the permission-bit vocabulary (fail closed)", fr.BaseName, fr.AfterMode)
+			return fmt.Errorf("workspace: sealed bundle entry %q has after_mode %#o outside the permission-bit vocabulary (fail closed)", fr.BaseName, fr.AfterMode)
 		}
 		if fr.Existed && fr.BeforeMode&^permBits != 0 {
-			return Bundle{}, fmt.Errorf("workspace: sealed bundle entry %q has before_mode %#o outside the permission-bit vocabulary (fail closed)", fr.BaseName, fr.BeforeMode)
+			return fmt.Errorf("workspace: sealed bundle entry %q has before_mode %#o outside the permission-bit vocabulary (fail closed)", fr.BaseName, fr.BeforeMode)
 		}
 		// apply itself now refuses to commit an after-mode lacking
 		// owner-read (transaction.go, codex review round 3, HIGH #1):
@@ -104,10 +120,10 @@ func DecodeBundle(data []byte) (Bundle, error) {
 		// via other-bits, captured and replaced successfully by apply,
 		// then rejected by an earlier version of this exact check).
 		if fr.AfterMode&0o400 == 0 {
-			return Bundle{}, fmt.Errorf("workspace: sealed bundle entry %q has after_mode %#o without the owner-read bit — impossible producer narrative (fail closed)", fr.BaseName, fr.AfterMode)
+			return fmt.Errorf("workspace: sealed bundle entry %q has after_mode %#o without the owner-read bit — impossible producer narrative (fail closed)", fr.BaseName, fr.AfterMode)
 		}
 	}
-	return b, nil
+	return nil
 }
 
 // FileState is one file's classification against a sealed Bundle's two
