@@ -73,9 +73,14 @@
 //     intent IDs plus S7 do not themselves "re-enforce S6" — the FUTURE
 //     model-facing caller must still pass through the real PEP and
 //     middleware before ever invoking this primitive.
-//   - Deliberately still NOT built here: the restart-time crash-recovery
-//     classification table and the governed PolicyWorkspaceRollback
-//     operation (invariant 4 steps 6/7); `contracts.EnvelopeParams`'s
+//   - Deliberately still NOT built here: the restart-time SCAN that
+//     finds every rehydrated-UNKNOWN workspace.apply operation and
+//     drives it through recovery.go's own classification (invariant 4
+//     step 6 — that classification logic itself now exists, in
+//     recovery.go, as its own reviewable increment) and the governed
+//     PolicyWorkspaceRollback operation restart recovery uses once
+//     classification says AllAfter/Mixed (invariant 4 step 6's later
+//     half); `contracts.EnvelopeParams`'s
 //     `SealedPayloadRef` wiring (codex round 2 accepted this deferral —
 //     no production GC/recovery consumer exists yet; PLAN-CODING-TRIO.md
 //     already recorded this exact gap during Slice 1 and deferred it to
@@ -96,6 +101,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/MatNik89/nexus/internal/foundation/sealedstore"
@@ -296,7 +302,7 @@ func strictDecodeEvent(raw json.RawMessage, out any) error {
 	if err := dec.Decode(out); err != nil {
 		return err
 	}
-	if _, err := dec.Token(); err == nil {
+	if _, err := dec.Token(); err != io.EOF {
 		return fmt.Errorf("workspace: trailing data after the JSON value")
 	}
 	return nil

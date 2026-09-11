@@ -347,7 +347,7 @@ func TestApplyPersistsReconstructableBeforeAndAfterBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var decoded bundle
+	var decoded Bundle
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		t.Fatal(err)
 	}

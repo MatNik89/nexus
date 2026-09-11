@@ -2357,3 +2357,323 @@ exactly as predicted, then restored.
 
 Full verification: `internal/coding/symedit` green (19 tests), `go vet` clean, `go build
 ./...` clean, full `go test ./...` green. Dispatched for codex round 3.
+
+## Status 2026-09-11 — crash-recovery classification (invariant 4 step 6, first piece)
+
+Explicit user authorization to start invariant 4 steps 6/7 (previously deferred as "large
+and undesigned" — every prior status section calls this out). Scoped to the SMALLEST
+reviewable first piece, matching this whole program's own established build order (a
+pure primitive before the governed operation that uses it, exactly like descriptor.go
+before transaction.go before governed.go): **classification only** — given a sealed
+`Bundle`, tell the caller what state the write set is ACTUALLY in on disk right now.
+Deliberately NOT built in this piece: the restart-time SCAN that finds every rehydrated-
+`UNKNOWN` `workspace.apply` operation and calls this classification (needs a caller
+outside this package — daemon startup, most likely); the governed
+`PolicyWorkspaceRollback` operation invariant 4 §2 specifies for the AllAfter/Mixed cases
+(its own new S7 durable operation type — a materially larger piece, its own reviewable
+increment); the `Reconcile(false)`/`Next` calls the classification table specifies happen
+AFTER classification decides what to do.
+
+New `internal/coding/workspace/recovery.go`:
+- `Bundle`/`FileRecord` — the SAME types `transaction.go`'s sealed-bundle JSON already
+  used, exported (capitalized) so a caller outside this file can decode a bundle read back
+  via `sealedstore.Store.Get` without knowing the JSON shape by hand — no wire-format
+  change, purely a visibility widen.
+- `DecodeBundle([]byte) (Bundle, error)` — strict decode (no unknown fields, no trailing
+  data, mirrors this codebase's own established discipline for every closed-shape
+  decoder), refuses an empty file list.
+- `FileState` (Before/After/Foreign) + `FileClassification` + `TransactionState`
+  (NeverStarted/MidCrash/Foreign) + `ClassifyBundle(rootFd int, b Bundle) ([]FileClassification, TransactionState, error)`
+  — re-reads every bundle file's CURRENT on-disk state via the SAME descriptor-pinned
+  rootFd discipline every other capture in this package uses, classifies each against the
+  bundle's captured before/after images (content digest + mode, matching Apply's own
+  precondition-check discipline exactly), and summarizes the whole transaction per
+  invariant 4 step 6's own exhaustive table. Foreign takes priority — one foreign file
+  makes the WHOLE transaction Foreign, even if every other file is a clean After.
+
+10 tests: all-before/all-after/mixed/any-foreign/new-file-never-created/missing-
+previously-existing-file/content-matches-but-mode-does-not (all pure, hand-built Bundle
+fixtures) + 3 `DecodeBundle` shape-validation tests + 1 integration test proving this
+layer's own documented boundary is real: classifying a REAL successful `apply()` call's
+own sealed bundle (read back exactly as a future restart scan would) is INDISTINGUISHABLE
+from MidCrash by design — this layer alone cannot tell "succeeded" from "crashed after the
+last write"; that distinction is deliberately deferred to the not-yet-built restart scan
+(which also checks whether `workspace.mutation_committed` exists in the journal).
+
+Full verification: `internal/coding/workspace` green at -count=20 (33 tests, 10 new),
+`internal/coding/symedit` green, `go vet` clean, `go build ./...` clean, full `go test
+./...` green. Every branch RED-proven by targeted ablation, including one gap caught
+mid-review by my own fight-the-fix pass (an untested mode-mismatch-with-matching-content
+case) — added its own dedicated test before considering the ablation complete, not just
+noted as a caveat. Dispatched for codex review.
+
+## Status 2026-09-11 — crash-recovery classification round 1 FAIL + real fixes
+
+codex round 1 verdict: **FAIL**, two HIGH findings, both reproduced live through
+the real package APIs (no hypotheticals):
+
+1. **`DecodeBundle` not actually strict.** The trailing-data check tested
+   `dec.Token()` returning `nil` as "has trailing data" — but invalid trailing
+   *garbage* (not just a second JSON value) makes `Token()` return a syntax
+   error, which the check let straight through. Fixed by matching this
+   package's own established `strictDecode` pattern (`internal/kernel/s7/s7.go`
+   `strictDecode`, already `err != io.EOF`): require exactly `io.EOF`, reject
+   everything else. The identical bug existed in `governed.go`'s
+   `strictDecodeEvent` — swept in the same fix.
+
+   Worse: the decoder validated unknown fields but not *required*-field
+   *presence* — a bundle entry missing `after`/`after_mode` decoded as a
+   zero-value (empty-file, mode-0) after-image instead of being refused, which
+   could make a genuinely MISSING on-disk file misclassify as `FileBefore`.
+   Fixed by decoding through a private `wireFileRecord` DTO with pointer
+   fields (`*bool`/`*[]byte`/`*uint32`) so JSON-absent is distinguishable from
+   a legitimate zero value; `DecodeBundle` now requires `existed`, `after`,
+   `after_mode` always, and `before`/`before_mode` whenever `existed=true`,
+   plus rejects duplicate `(rel_dir, base_name)` targets.
+
+2. **No-op mutation misclassified as a completed write.** `apply` does not
+   forbid a mutation whose `After` bytes+mode equal its `Before` image, and it
+   seals the bundle (`store.Put`) before ever checking `ctx.Err()`. codex
+   reproduced: existing unchanged file + a no-op mutation + a pre-cancelled
+   context → zero writes performed, but `classifyOneFile` checked the AFTER
+   image before the BEFORE image, so the overlapping match resolved to
+   `FileAfter` → `TransactionMidCrash`. A future restart-scan would then drive
+   a spurious rollback of a transaction that never touched disk. Fixed by
+   swapping `classifyOneFile`'s check order: BEFORE is tested first, so an
+   ambiguous overlap resolves conservatively as "nothing happened here yet."
+
+Both fixes RED-proven via ablation against the real defect before restoring:
+- `TestDecodeBundleRefusesInvalidTrailingGarbage` — reverting the `io.EOF`
+  check → FAIL exactly as predicted (garbage accepted).
+- `TestDecodeBundleRefusesMissingRequiredAfterFields` — reverting the
+  presence checks → FAIL exactly as predicted (missing fields silently
+  zero-filled).
+- `TestClassifyBundleNoOpMutationCancelledBeforeWriteIsNeverStarted` —
+  reverting the BEFORE/AFTER check order → FAIL with `state = MID_CRASH, want
+  NEVER_STARTED`, the exact symptom codex reported.
+
+3 new tests added (13 total in recovery_test.go), all GREEN restored;
+`go vet ./...` clean; `internal/coding/workspace -count=20` green; full `go
+test ./...` re-run. codex round 2 dispatched.
+
+**Confidence:** DecodeBundle's shape/presence validation and the
+BEFORE/AFTER overlap resolution are now verified against the exact
+counterexamples codex constructed. Not independently re-audited for OTHER
+malformed-shape variants beyond what round 1 found — that's what round 2 is
+for. Weakest link: `classifyOneFile`'s conservative BEFORE-first resolution
+is a heuristic (favor false-negative-as-safe over false-positive-as-unsafe),
+not a proof — it's correct because a real content-changing mutation can never
+have `After == Before`, but that invariant lives in `apply`'s caller
+discipline, not in a type the compiler enforces.
+
+## Status 2026-09-11 — crash-recovery classification round 2 FAIL + real fix
+
+codex round 2 verdict: **FAIL**, one HIGH finding (round 1's other two findings
+CLOSED and confirmed — trailing-garbage rejection and the BEFORE/AFTER overlap
+fix both held). The new finding: round 1's own fix introduced a producer/
+consumer incompatibility. Reproduced live:
+
+`apply(existing empty file)` → `sealedstore.Get` → `DecodeBundle` rejected
+its own producer's artifact with `existed=true but is missing required field
+"before"/"before_mode"`.
+
+Root cause: `FileRecord.Before`/`BeforeMode` carry `,omitempty` in
+`transaction.go`, so a real (empty) before-image gets DROPPED from the wire —
+but round 1's presence-tracking decoder (`*[]byte`/`*uint32` pointer fields)
+demanded it be present whenever `existed=true`. A second round-trip break:
+`FileMutation.After == nil` legitimately means "create an empty file" — the
+encoder emits `"after":null`, and `*[]byte` decodes an explicit JSON `null`
+identically to an absent key, so that legitimate bundle was rejected too.
+Presence-pointers cannot distinguish "key absent" from "key present with its
+zero value" for byte-slice content — Go's own JSON semantics make those two
+cases indistinguishable on the wire once `omitempty`/`nil` are involved.
+
+Fix: dropped the whole presence-tracking DTO. `DecodeBundle` now decodes
+directly into `Bundle` — the SAME shape `apply`'s own `json.Marshal` produces
+— guaranteeing symmetric round-tripping by construction, then validates
+*values* (not presence) after decode: empty `base_name` refused, duplicate
+`(rel_dir, base_name)` refused, `existed=false` paired with a nonzero
+`before`/`before_mode` refused (an internally inconsistent record — codex's
+own suggested fix), and `after_mode`/`before_mode` outside the `0o777`
+permission-bit vocabulary refused (also codex's suggestion, closes the "mode
+4294967295" counterexample). `existed=true` with an OMITTED before-image is
+now accepted (classification naturally resolves it as `FileForeign` if it
+can't verify the file, matching invariant 5's fail-safe-toward-closure — this
+is deliberately NOT re-added as a decode-time requirement, since that's
+exactly what broke round-tripping).
+
+Declined one item from codex's "concrete fix" list: presence-tracking
+`rel_dir`. `rel_dir=""` (root directory) is a fully legitimate value,
+indistinguishable in meaning from an omitted key — there is no malformed
+state this would catch that isn't already caught by the `(rel_dir,
+base_name)` duplicate check or the base_name-empty check. Flagging this as a
+disagreement rather than silently skipping it; will revisit if round 3 finds
+a concrete exploit through it.
+
+RED-proven via ablation before restoring: reverting the existed-false/before
+consistency check → FAIL exactly as predicted; reverting the mode-range check
+→ FAIL exactly as predicted. Added 2 round-trip regression tests reproducing
+codex's exact repro (existing-empty-file bundle, new-empty-file bundle via
+`After: nil`) — both GREEN against the fix, both would have failed against
+round 1's version. 18 tests total in recovery_test.go now.
+
+`internal/coding/workspace -count=20` green, `go vet ./...` clean, full `go
+test ./...` re-run. codex round 3 dispatched.
+
+**Confidence:** The two concrete round-trip repros codex gave are now covered
+by regression tests and pass. Not proven: that no OTHER apply-producible
+shape still breaks round-tripping — decoding into the exact same struct
+apply encodes from makes an unknown regression class far less likely than
+round 1's parallel-DTO approach, but it's not a formal proof of encoder/
+decoder symmetry. Weakest link: the `existed=true`-with-omitted-before case
+now silently falls through to classification-time Foreign resolution rather
+than being caught at decode time — correct per invariant 5, but relies on
+classifyOneFile's hash comparison actually failing safe, not on an explicit
+decode-time check.
+
+## Status 2026-09-11 — crash-recovery classification round 3 FAIL + real fix
+
+codex round 3 verdict: **FAIL**, one HIGH finding (rounds 1+2's findings all
+CLOSED and confirmed, including the empty-file round-trip repros and the
+declined rel_dir presence-tracking — codex independently agreed that decision
+is safe: "omitted rel_dir and explicit rel_dir:'' have the same root-directory
+meaning... I found no distinct unsafe state").
+
+New finding: `FileMutation.Mode` permits ANY permission value, including
+`0000` (no owner-read). `apply` happily commits such a mutation — but restart
+classification (`classifyOneFile`) must reopen the file `O_RDONLY` to hash
+it, and no pre-chmod descriptor survives a crash. codex reproduced live: a
+new file created at mode 0 and an existing readable file replaced with mode
+0 both commit successfully through `apply`, decode successfully through
+`DecodeBundle`, and then `ClassifyBundle` fails outright with `permission
+denied` — a legitimate transaction that a restart scan could never classify
+at all, not even to FOREIGN (the whole point of invariant 4 step 6 is that
+classification ALWAYS produces an answer).
+
+Fixed at the source, not just the symptom: `apply` (`transaction.go`) now
+refuses any mutation whose target mode lacks the owner-read bit
+(`m.Mode.Perm()&0o400 == 0`) in the SAME upfront pre-check pass as the
+existing duplicate-target check — fail closed, before any write, no
+mutations partially applied. `DecodeBundle` (`recovery.go`) gained the
+matching decode-time guard: `after_mode` (always) and `before_mode` (when
+`existed=true`) without the owner-read bit are refused as "impossible
+producer narratives," now that `apply` itself never legitimately produces
+one — defense in depth against a bundle from a future/different producer.
+
+Both RED-proven via ablation: reverting the `apply`-side check →
+`TestApplyRefusesUnreadableAfterMode` fails exactly as predicted (the mutation
+commits instead of being refused); reverting the `DecodeBundle`-side check →
+`TestDecodeBundleRefusesModeWithoutOwnerRead` fails exactly as predicted.
+2 new tests (20 total in recovery_test.go). Existing workspace suite (`apply`,
+`ApplyGoverned`, rollback, cancellation tests) all still green — no mode-0
+usage anywhere else in the suite to collide with the new refusal.
+
+`internal/coding/workspace -count=20` green, `go vet ./...` clean, full `go
+test ./...` re-run. codex round 4 dispatched.
+
+**Confidence:** The exact repro codex gave (mode-0 create and mode-0 replace,
+both through the real `apply`/`ClassifyBundle` pipeline) is now refused
+before any write, and the decode-side belt-and-suspenders check is
+independently RED-proven. Not proven: whether some OTHER mode value combined
+with a symlink/special-file edge case could still produce an unreadable
+after-image outside the mode-bit check's coverage (e.g. a target directory
+itself losing execute/search permission, which isn't checked here at all —
+out of scope unless round 4 surfaces it as a real reproducible gap, since
+`WalkDirBeneath`'s own descriptor-pinned discipline already governs
+directory traversal, not this piece).
+
+## Status 2026-09-11 — crash-recovery classification round 4 FAIL + real fix
+
+codex round 4 verdict: **FAIL**, one HIGH finding (round 3's fix confirmed
+correct on the after_mode side; rounds 1-3's other findings all still CLOSED,
+including the nested-directory question round 4 was specifically asked to
+check — codex found no defect: `apply` never mutates directory permissions,
+and both capture and classification are descriptor-relative via
+`WalkDirBeneath`, so an external directory permission change simply fails
+closed as an error rather than a silent misclassification).
+
+New finding: round 3's `before_mode` owner-read check was a wrong
+"symmetric" assumption. The after-mode rule is sound BECAUSE every file
+`apply` *writes* is owned by the NEXUS process itself — but `before_mode` is
+the captured mode of a PRE-EXISTING file, which can legitimately belong to a
+DIFFERENT UID and be readable only through group/other permission bits.
+`apply`'s own `CaptureFileBeneath` already proved the file was readable AT
+capture time (it's how `before` got captured at all) — mode bits alone don't
+encode ownership, so requiring the owner-read bit specifically on
+`before_mode` is simply false. codex reproduced with a real cross-UID
+fixture (mode 0044, owned by a different UID via bubblewrap uid-mapping,
+readable through other-bits): `apply` legitimately captured and replaced it,
+but `DecodeBundle` rejected its own producer's bundle as an "impossible
+producer narrative" — precisely the round-1/2 failure mode recurring for a
+third owner-read-adjacent reason.
+
+Fixed: removed the `before_mode&0o400==0` check entirely, keeping only the
+`after_mode` owner-read requirement (justified by "every file apply *writes*
+is owned by NEXUS," which genuinely does not apply to `before_mode`).
+Replaced the wrong test assertion
+(`TestDecodeBundleRefusesModeWithoutOwnerRead`'s second case) with
+`TestDecodeBundleAcceptsBeforeModeWithoutOwnerReadBit`, reproducing codex's
+exact repro value (`before_mode: 36` = `0o044`) as a decode-level unit test
+(no bubblewrap/uid-mapping needed at the unit level — the decoder's contract
+doesn't care HOW the mode got there, only that it must be accepted).
+RED-proven via ablation: reintroducing the wrong before_mode check →
+`TestDecodeBundleAcceptsBeforeModeWithoutOwnerReadBit` fails with the exact
+error codex's live repro produced, character for character. 21 tests total
+in recovery_test.go now.
+
+`internal/coding/workspace -count=20` green, `go vet ./...` clean, full `go
+test ./...` re-run. codex round 5 dispatched.
+
+**Confidence:** This is the third consecutive round where a decode-time
+"require X" check turned out to reject something `apply` can legitimately
+produce (round 1: presence of before/after; round 2: same via a different
+mechanism; round 4: before_mode's owner-read bit). The pattern itself is
+now a signal: worth treating the NEXT candidate "require" check on
+`DecodeBundle` with active suspicion — verify against a REAL `apply`-produced
+artifact before proposing it, not just against a hand-built malformed shape.
+Weakest link unchanged: no formal proof that `apply`'s encoder and
+`DecodeBundle`'s validation are exhaustively symmetric — only reproduced-repro
+coverage, which is why each round's fix keeps surfacing a new
+producer/consumer mismatch instead of a wholly new defect class.
+
+## Status 2026-09-11 — crash-recovery classification CLOSED: round 5 PASS
+
+codex round 5 verdict: **PASS**. Cross-checked every `DecodeBundle`
+validation rule against real `apply`-produced artifacts (not just hand-built
+malformed JSON) as explicitly asked: empty base_name, duplicate target,
+existed=false/before consistency, mode-range, and after_mode owner-read all
+agree with `apply`'s own producer language — none of them reject anything
+`apply` can legitimately produce. Also independently verified the after_mode
+owner-read assumption itself is sound at the mechanism level: `writeFileBeneath`
+creates the replacement file itself and applies the exact permission bits via
+`Fchmod` (`descriptor.go:237/251`) — no path exists for `apply` to produce an
+after-file NEXUS doesn't own, setgid directories or symlinks included.
+
+Five review rounds total, closing (in order): (1) `DecodeBundle`'s trailing-
+data check + presence-tracking gap; (2) round 1's own presence-tracking DTO
+breaking round-trips on `apply`'s legitimate empty-file bundles; (3) mode-0
+(no owner-read) making a committed transaction permanently unclassifiable;
+(4) the `before_mode` owner-read check wrongly generalizing the after_mode
+rule to a case where the ownership assumption doesn't hold. Final state:
+`internal/coding/workspace/recovery.go` (`DecodeBundle`, `ClassifyBundle`,
+`classifyOneFile`, `FileState`/`TransactionState`), one new owner-read
+pre-check in `transaction.go`'s `apply`, one matching trailing-data fix swept
+into `governed.go`'s `strictDecodeEvent`, 22 tests in `recovery_test.go`.
+
+Full verification: `go build ./...` clean, `go vet ./...` clean,
+`internal/coding/workspace -count=20` green (55 tests), full `go test ./...`
+green across all 44 packages. Committing and pushing.
+
+**Confidence:** High on what this piece actually claims — read-only,
+descriptor-relative classification of a sealed bundle against invariant 4
+step 6's table, verified against 5 rounds of adversarial review including
+live cross-UID and unreadable-mode reproductions. Explicitly NOT proven (per
+codex's own "proof ceiling" note, consistent across all 5 rounds): classification
+reads the filesystem as a SEQUENCE of independent reads, not an atomic
+snapshot — a concurrent external mutation between classifying file A and
+file B is a real gap the future restart-scan/rollback executor must close
+with its own mutation-time revalidation, not something this read-only piece
+can or should solve. The restart-time SCAN and the governed
+`PolicyWorkspaceRollback` operation remain the next pieces of invariant 4
+steps 6/7, each its own reviewable increment per this program's established
+build order.

@@ -5,21 +5,21 @@
 // 1/3/4/5 of 7).
 //
 // SCOPE OF THIS PIECE (deliberately): a same-process transaction — one
-// sealed before/after bundle persisted BEFORE any write (step 1), a
-// caller-supplied durable-binding hook invoked while the bundle's pin is
-// still held and before any write (the seam step 2's S7/journal pairing
-// will use once it exists), each file replaced atomically in order
-// through writeFileBeneath (step 3), and ordinary (non-crash) mid-
-// transaction failure rolled back to the sealed before-images (step 5).
-// NOT YET built here, as a LATER increment: the actual S7 `Consume`
-// companion-batch pairing behind the bindDurable hook, the restart-time
-// crash-recovery classification table (step 6), and the governed
-// `PolicyWorkspaceRollback` operation restart recovery uses (also step
-// 6) — those need S7/journal wiring this package does not yet have, and
-// are their own reviewable increment once this one has converged
-// (matching this whole program's "smallest reviewable increment" build
-// order: descriptor.go's primitives were reviewed and merged before this
-// file was written).
+// sealed before/after bundle persisted BEFORE any write (step 1), each
+// file replaced atomically in order through writeFileBeneath (step 3),
+// and ordinary (non-crash) mid-transaction failure rolled back to the
+// sealed before-images (step 5). The bindDurable hook's real S7 Consume
+// pairing (step 2) is built in governed.go; restart-time classification
+// (step 6, "what state is file X actually in") is built in recovery.go.
+// Still NOT built anywhere in this package, as a LATER increment: the
+// restart-time SCAN that finds every rehydrated-UNKNOWN operation and
+// calls recovery.go's classification (needs a caller outside this
+// package — daemon startup, most likely) and the governed
+// `PolicyWorkspaceRollback` operation restart recovery uses once
+// classification says AllAfter/Mixed (its own new S7 durable operation
+// type — a materially larger piece, its own reviewable increment,
+// matching this whole program's "smallest reviewable increment" build
+// order).
 package workspace
 
 import (
@@ -93,11 +93,16 @@ type FileMutation struct {
 	CheckExpectedMode  bool
 }
 
-// fileRecord is one mutation's captured before/after state, serialized
-// into the sealed bundle — invariant 4 requires durably RECONSTRUCTABLE
-// bytes, not just a digest, so recovery never needs to re-derive content
-// a crash could otherwise lose.
-type fileRecord struct {
+// FileRecord is one mutation's captured before/after state, as
+// persisted in a sealed Bundle — invariant 4 requires durably
+// RECONSTRUCTABLE bytes, not just a digest, so restart-time recovery
+// never needs to re-derive content a crash could otherwise lose.
+// Exported (round-6-of-S7-wiring precedent: widen visibility for a
+// genuine cross-cutting need, never speculatively) so recovery.go's own
+// restart-time classification — and any future caller outside this
+// package that reads a sealed bundle back — can decode it without
+// knowing the JSON shape by hand.
+type FileRecord struct {
 	RelDir     string `json:"rel_dir"`
 	BaseName   string `json:"base_name"`
 	Existed    bool   `json:"existed"`
@@ -107,8 +112,10 @@ type fileRecord struct {
 	AfterMode  uint32 `json:"after_mode"`
 }
 
-type bundle struct {
-	Files []fileRecord `json:"files"`
+// Bundle is the complete sealed record of one Apply transaction's
+// write set — see FileRecord.
+type Bundle struct {
+	Files []FileRecord `json:"files"`
 }
 
 // Result reports what Apply actually did.
@@ -276,6 +283,18 @@ func apply(ctx context.Context, rootFd int, store *sealedstore.Store, mutations 
 			return Result{}, fmt.Errorf("workspace: apply: duplicate target %q/%q in one mutation set (fail closed)", m.RelDir, m.BaseName)
 		}
 		seen[key] = true
+		// Owner-read is required, not merely permitted: restart-time
+		// recovery classification must reopen this file O_RDONLY to hash
+		// it (descriptor.go's CaptureFileBeneath), and no pre-chmod
+		// descriptor survives a crash. A committed after-mode without
+		// the owner-read bit makes a legitimate transaction permanently
+		// unclassifiable (codex review round 3, HIGH #1 — reproduced
+		// live: apply(mode=0000) commits successfully, then
+		// ClassifyBundle fails "permission denied" trying to read it
+		// back).
+		if m.Mode.Perm()&0o400 == 0 {
+			return Result{}, fmt.Errorf("workspace: apply: %q's target mode %o lacks the owner-read bit — restart-time recovery could never reopen it to classify (fail closed, no write performed)", m.BaseName, m.Mode.Perm())
+		}
 	}
 
 	prep := make([]prepared, 0, len(mutations))
@@ -285,7 +304,7 @@ func apply(ctx context.Context, rootFd int, store *sealedstore.Store, mutations 
 		}
 	}()
 
-	records := make([]fileRecord, 0, len(mutations))
+	records := make([]FileRecord, 0, len(mutations))
 	for _, m := range mutations {
 		if err := validateBaseName(m.BaseName); err != nil {
 			return Result{}, err
@@ -331,14 +350,14 @@ func apply(ctx context.Context, rootFd int, store *sealedstore.Store, mutations 
 			beforeDev: dev, beforeIno: ino, before: before,
 			beforeMode: beforeMode, beforeDigest: beforeDigest,
 		})
-		records = append(records, fileRecord{
+		records = append(records, FileRecord{
 			RelDir: m.RelDir, BaseName: m.BaseName, Existed: existed,
 			Before: before, BeforeMode: uint32(beforeMode.Perm()),
 			After: m.After, AfterMode: uint32(m.Mode.Perm()),
 		})
 	}
 
-	raw, err := json.Marshal(bundle{Files: records})
+	raw, err := json.Marshal(Bundle{Files: records})
 	if err != nil {
 		return Result{}, fmt.Errorf("workspace: apply: marshal sealed bundle: %w", err)
 	}
