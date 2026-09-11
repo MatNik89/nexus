@@ -19,10 +19,39 @@
 // exists. Sealed-bundle storage path resolution (which profile's
 // sealedstore directory) is the CALLER's responsibility — Apply accepts
 // an already-open *sealedstore.Store, it never resolves or opens one
-// itself. The plan's Prepare-phase "format+type-check the staged result"
-// step is NOT implemented here — explicitly deferred, not silently
-// dropped: this orchestration's Plan is a validated, byte-exact EDIT
-// SET, not yet a compiler-checked one.
+// itself.
+//
+// Invariant 3's Prepare-phase "format+type-check the staged result" step
+// is PARTIALLY built here: verifyStagedSyntaxIsValid stages every edit
+// (via ApplyEdits, the SAME function Apply itself uses) and refuses the
+// whole Plan unless the result parses as valid Go — catching a byte-
+// offset error severe enough to corrupt the file's own syntax. This is
+// deliberately NARROWER than a full "format+type-check": an earlier
+// version of this check also required the staged result to be
+// byte-identical to gofmt's own output, on the theory that a correct
+// gopls rename should always already be gofmt-clean — code-review
+// finding, codex, round 1 HIGH: FALSE in two real cases this codebase
+// already has an explicit, tested contract for — a file using CRLF line
+// endings (gofmt normalizes CRLF to LF; edit_test.go's own
+// TestParseWorkspaceEditPreservesCRLF requires CRLF survive byte-exact)
+// and a file that was already not gofmt-clean BEFORE this edit (gofmt
+// would reformat the WHOLE file, including parts this edit never
+// touched, which is not a defect IN the edit). Both would have been
+// wrongly refused. Never silently reformats the content instead of
+// refusing (silently changing content after PlanDigest binds it would
+// undermine PlanDigest's own tamper-evidence guarantee) — it just
+// doesn't attempt gofmt-cleanliness at all, only parseability, and does
+// so via go/parser.ParseFile rather than go/format.Source (code-review
+// finding, codex round 2 HIGH #1: format.Source's own contract accepts a
+// bare declaration/statement fragment as "valid," not only a complete
+// file — a byte offset severe enough to delete the package clause would
+// have silently passed). The full TYPE-check half (semantic validity: unresolved references, duplicate
+// declarations, anything syntax alone can't catch) is NOT built here —
+// that needs running the staged result through a real `go build`/
+// `go vet`, which means staging it into a disposable snapshot and
+// running it through Slice 0's already-governed sandboxed runner.Run, a
+// materially larger piece of its own — explicitly deferred, not
+// silently dropped.
 package symedit
 
 import (
@@ -31,6 +60,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"go/parser"
+	"go/token"
 	"io/fs"
 	"strings"
 
@@ -102,6 +133,16 @@ var afterGoplsRename = func() {}
 // real ABA entirely within the gopls call's own window, without a real
 // (flaky) goroutine race or any change to runner's own internals.
 var beforeGoplsRename = func() {}
+
+// beforeStagedSyntaxCheck is a test seam: the identity function in
+// production, it lets rename_test.go inject an edit into the REAL edits
+// Prepare is about to pass to verifyStagedSyntaxIsValid — through a REAL
+// end-to-end gopls session — proving that call is actually wired in
+// (code-review finding, codex round 1 HIGH #2: the 4 pure unit tests for
+// verifyStagedSyntaxIsValid never exercised whether Prepare actually
+// calls it; ablating the production call left the real-gopls suite
+// green).
+var beforeStagedSyntaxCheck = func(edits []FileEdit) []FileEdit { return edits }
 
 // Prepare runs a read-only gopls rename session and validates its
 // response into a Plan. rootFd MUST already be an open descriptor
@@ -245,6 +286,11 @@ func Prepare(ctx context.Context, rootFd int, backend *sandbox.Bwrap, report san
 	if err != nil {
 		return Plan{}, fmt.Errorf("symedit: prepare: %w", err)
 	}
+	edits = beforeStagedSyntaxCheck(edits) // test seam: no-op in production
+
+	if err := verifyStagedSyntaxIsValid(edits, preimages); err != nil {
+		return Plan{}, fmt.Errorf("symedit: prepare: %w", err)
+	}
 
 	planDigest, err := computePlanDigest(req.NewName, req.FileRelPath, edits, preimages)
 	if err != nil {
@@ -261,6 +307,46 @@ func Prepare(ctx context.Context, rootFd int, backend *sandbox.Bwrap, report san
 		ToolchainDigest:   res.ToolchainDigest,
 		PolicyHash:        res.PolicyHash,
 	}, nil
+}
+
+// verifyStagedSyntaxIsValid is invariant 3's own explicit requirement,
+// narrowed to syntax only (see this file's own package doc comment for
+// the full scope note and why gofmt-cleanliness was dropped): stages
+// every edit via ApplyEdits — the SAME function Apply itself uses, so
+// this checks EXACTLY the bytes Apply will later write, not a
+// separately-computed approximation — and refuses the whole Plan unless
+// the result parses as a COMPLETE Go source file via go/parser.ParseFile
+// (not go/format.Source — code-review finding, codex round 2 HIGH #1:
+// format.Source's own documented contract accepts a bare list of
+// declarations or statements as "valid," not only a complete file, so it
+// fails OPEN for exactly the class of corruption — e.g. a byte offset
+// severe enough to delete the package clause — this check exists to
+// catch).
+func verifyStagedSyntaxIsValid(edits []FileEdit, preimages map[string]Preimage) error {
+	for _, fe := range edits {
+		pre, ok := preimages[fe.RelPath]
+		if !ok {
+			return fmt.Errorf("%s has no preimage recorded (fail closed)", fe.RelPath)
+		}
+		after, err := ApplyEdits(pre.Content, fe.Edits)
+		if err != nil {
+			return fmt.Errorf("staging %s: %w", fe.RelPath, err)
+		}
+		// go/parser.ParseFile, not go/format.Source (code-review finding,
+		// codex round 2 HIGH #1): format.Source's own documented contract
+		// accepts EITHER a complete file OR a bare list of declarations OR
+		// a bare list of statements — it exists to format snippets, not to
+		// validate a COMPLETE .go file. A byte-offset bug severe enough to
+		// delete the package clause (or otherwise reduce the file to a
+		// declaration/statement fragment) would still make format.Source
+		// return nil, silently failing OPEN exactly where this check
+		// exists to fail closed. ParseFile has no such fragment leniency —
+		// it always requires a complete source file.
+		if _, err := parser.ParseFile(token.NewFileSet(), "", after, 0); err != nil {
+			return fmt.Errorf("%s does not parse as a complete Go source file after staging the edit (fail closed): %w", fe.RelPath, err)
+		}
+	}
+	return nil
 }
 
 // planMutations (below) recomputes plan's own PlanDigest and refuses if

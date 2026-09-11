@@ -787,3 +787,181 @@ func TestSplitRelPath(t *testing.T) {
 		}
 	}
 }
+
+// Detector: a well-formed edit (a straightforward identifier rename)
+// stages valid Go — verifyStagedSyntaxIsValid must accept it.
+func TestVerifyStagedSyntaxIsValidAcceptsWellFormedEdit(t *testing.T) {
+	content := []byte("package main\n\nfunc Foo() int { return 1 }\n")
+	edits := []FileEdit{
+		{RelPath: "main.go", Edits: []TextEdit{
+			{StartByte: 19, EndByte: 22, NewText: "Bar"},
+		}},
+	}
+	preimages := map[string]Preimage{"main.go": {Content: content}}
+	if err := verifyStagedSyntaxIsValid(edits, preimages); err != nil {
+		t.Fatalf("expected a well-formed edit to pass: %v", err)
+	}
+}
+
+// Detector (invariant 3's own explicit requirement): an edit whose byte
+// offsets are wrong enough to leave the staged result syntactically
+// invalid Go must be refused, not silently offered as a Plan.
+func TestVerifyStagedSyntaxIsValidRefusesInvalidSyntax(t *testing.T) {
+	content := []byte("package main\n\nfunc Foo() int { return 1 }\n")
+	edits := []FileEdit{
+		{RelPath: "main.go", Edits: []TextEdit{
+			// Deletes past the identifier into the surrounding syntax,
+			// leaving invalid Go.
+			{StartByte: 9, EndByte: 25, NewText: "Bar"},
+		}},
+	}
+	preimages := map[string]Preimage{"main.go": {Content: content}}
+	if err := verifyStagedSyntaxIsValid(edits, preimages); err == nil {
+		t.Fatal("expected an error: the staged result is not valid Go")
+	}
+}
+
+// Detector (code-review finding, codex round 1 HIGH #1 — the earlier
+// version of this check also required gofmt-byte-identity and wrongly
+// refused BOTH cases below; both are now accepted):
+//  1. A CRLF file: gofmt normalizes CRLF to LF, but this codebase has an
+//     explicit, already-tested contract (edit_test.go's own
+//     TestParseWorkspaceEditPreservesCRLF) that CRLF must survive
+//     byte-exact — a gofmt-identity check would reject every legitimate
+//     CRLF rename.
+//  2. A file that was already NOT gofmt-clean BEFORE this edit: gofmt
+//     would reformat the WHOLE file, including parts this edit never
+//     touched — that is not a defect IN the edit.
+//
+// Both are syntactically valid Go, so verifyStagedSyntaxIsValid (syntax
+// only, never gofmt-identity) must accept both.
+func TestVerifyStagedSyntaxIsValidAcceptsCRLFAndPreExistingUnformattedFiles(t *testing.T) {
+	crlf := []byte("package p\r\n\r\nfunc Old() {}\r\n")
+	crlfEdits := []FileEdit{
+		{RelPath: "f.go", Edits: []TextEdit{{StartByte: 18, EndByte: 21, NewText: "New"}}},
+	}
+	if err := verifyStagedSyntaxIsValid(crlfEdits, map[string]Preimage{"f.go": {Content: crlf}}); err != nil {
+		t.Fatalf("expected a CRLF rename to pass: %v", err)
+	}
+
+	// Pre-existing extra blank lines gofmt would collapse — valid Go,
+	// never gofmt-clean, unrelated to the edit below.
+	unformatted := []byte("package main\n\n\n\nfunc Foo() int { return 1 }\n")
+	unformattedEdits := []FileEdit{
+		{RelPath: "main.go", Edits: []TextEdit{{StartByte: 21, EndByte: 24, NewText: "Bar"}}},
+	}
+	if err := verifyStagedSyntaxIsValid(unformattedEdits, map[string]Preimage{"main.go": {Content: unformatted}}); err != nil {
+		t.Fatalf("expected a rename on a pre-existing-unformatted file to pass: %v", err)
+	}
+}
+
+// Detector: a touched file with no recorded preimage must be refused —
+// verifyStagedSyntaxIsValid must never silently skip a file it cannot
+// stage.
+func TestVerifyStagedSyntaxIsValidRefusesMissingPreimage(t *testing.T) {
+	edits := []FileEdit{
+		{RelPath: "missing.go", Edits: []TextEdit{{StartByte: 0, EndByte: 0, NewText: "x"}}},
+	}
+	if err := verifyStagedSyntaxIsValid(edits, map[string]Preimage{}); err == nil {
+		t.Fatal("expected an error: missing.go has no preimage")
+	}
+}
+
+// Detector (code-review finding, codex round 2 HIGH #1): go/format.Source
+// accepts a bare list of declarations, or a bare list of statements, as
+// "valid" — NOT only a complete source file. A byte-offset bug severe
+// enough to delete the package clause entirely would previously have
+// been silently accepted. verifyStagedSyntaxIsValid uses go/parser.ParseFile
+// instead, which has no such leniency: it always requires a complete file.
+func TestVerifyStagedSyntaxIsValidRefusesDeclarationOnlyFragment(t *testing.T) {
+	content := []byte("package main\n\nfunc Foo() int { return 1 }\n")
+	edits := []FileEdit{
+		// Replaces the ENTIRE file with a bare declaration — no package
+		// clause. format.Source accepts this (it's a valid "declaration
+		// list"); a real .go file parser must not.
+		{RelPath: "main.go", Edits: []TextEdit{{StartByte: 0, EndByte: len(content), NewText: "func Bar() {}\n"}}},
+	}
+	preimages := map[string]Preimage{"main.go": {Content: content}}
+	if err := verifyStagedSyntaxIsValid(edits, preimages); err == nil {
+		t.Fatal("expected an error: the staged result has no package clause — it is a declaration fragment, not a complete Go file")
+	}
+}
+
+// Detector: the SAME leniency gap, for a bare statement list (also
+// accepted by format.Source, also not a valid complete .go file).
+func TestVerifyStagedSyntaxIsValidRefusesStatementOnlyFragment(t *testing.T) {
+	content := []byte("package main\n\nfunc Foo() int { return 1 }\n")
+	edits := []FileEdit{
+		{RelPath: "main.go", Edits: []TextEdit{{StartByte: 0, EndByte: len(content), NewText: "x := 1\nreturn x\n"}}},
+	}
+	preimages := map[string]Preimage{"main.go": {Content: content}}
+	if err := verifyStagedSyntaxIsValid(edits, preimages); err == nil {
+		t.Fatal("expected an error: the staged result has no package clause — it is a statement fragment, not a complete Go file")
+	}
+}
+
+// Detector (code-review finding, codex round 1 HIGH #2): the wiring
+// itself — that Prepare actually CALLS verifyStagedSyntaxIsValid on the
+// real edits it just parsed from a real gopls response — had no
+// RED-capable detector; the 4 unit tests above only exercise the pure
+// function directly. Ablating the production call in Prepare left the
+// full real-gopls suite green. Uses the beforeStagedSyntaxCheck seam
+// (mirrors this file's own beforeGoplsRename/afterGoplsRename pattern)
+// to inject an edit that stages invalid Go into the REAL edits Prepare
+// is about to check, through a REAL end-to-end gopls session — if
+// Prepare's own call to verifyStagedSyntaxIsValid is ever removed or
+// disconnected, this test turns RED (Prepare would return a plan
+// instead of refusing).
+func TestPrepareRefusesWhenStagedSyntaxIsInvalid(t *testing.T) {
+	goBin := realGoBinary(t)
+	goplsBin := realGoplsBinary(t)
+	backend, report := testBackend(t)
+	grants := s7.NewAuthority(time.Now, 5*time.Minute)
+	j := testJournal(t)
+
+	mainGoContent := []byte("package main\n\nfunc Foo() int { return 1 }\n\nfunc main() { _ = Foo() }\n")
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "go.mod"), []byte("module example.com/tiny\n\ngo 1.21\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "main.go"), mainGoContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rootFd, err := workspace.OpenRoot(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(rootFd)
+
+	orig := beforeStagedSyntaxCheck
+	defer func() { beforeStagedSyntaxCheck = orig }()
+	beforeStagedSyntaxCheck = func(edits []FileEdit) []FileEdit {
+		for i := range edits {
+			if edits[i].RelPath == "main.go" {
+				// REPLACES (not appends to — avoiding an overlap conflict
+				// with gopls's own real edits) main.go's whole edit list
+				// with a single, IN-BOUNDS edit spanning the entire file,
+				// staging a bare declaration fragment: valid input to
+				// go/format.Source (it accepts a declaration list), but not
+				// a complete .go file (no package clause) — exactly the
+				// codex round-2 HIGH #1 leniency gap, exercised through the
+				// real parser this wiring test proves is actually called,
+				// not just through the unit-level fragment tests above.
+				edits[i].Edits = []TextEdit{{StartByte: 0, EndByte: len(mainGoContent), NewText: "func Bar() {}\n"}}
+			}
+		}
+		return edits
+	}
+
+	req := runner.RenameRequest{
+		SourceDir: src, FileRelPath: "main.go",
+		Line: 2, Character: 5, NewName: "Bar",
+		GoBinary: goBin, GoplsBinary: goplsBin, Timeout: 60 * time.Second,
+		OperationID: "op-badsyntax-1", TargetID: "target-badsyntax",
+		RunID: "run-badsyntax-1", ProfileID: "work",
+	}
+	if _, err := Prepare(ctxT(), rootFd, backend, report, grants, j, req); err == nil {
+		t.Fatal("expected Prepare to refuse: the injected edit stages invalid Go")
+	}
+}

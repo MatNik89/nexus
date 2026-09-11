@@ -2276,3 +2276,84 @@ retry scheduler for RenameSymbol specifically remains unbuilt).
 Final verification before this status: `go build ./...` clean, `go vet ./...` clean,
 `internal/coding/workspace` green at -count=20, `internal/coding/symedit` green,
 `internal/kernel/s7` green, full `go test ./...` green.
+
+## Status 2026-09-11 — Prepare-phase staged-formatting check (invariant 3, format half)
+
+Next smallest piece after S7/journal wiring: invariant 3's own explicit Prepare-phase
+requirement, "format+type-check the staged result" — previously explicitly deferred in
+full. Scoped down to its FORMAT half only (the type-check half needs staging into a
+disposable snapshot and running a real `go build`/`go vet` through Slice 0's sandboxed
+runner — a materially larger piece of its own, still explicitly deferred, not silently
+dropped).
+
+New `symedit.verifyStagedFormatting(edits, preimages)`: stages every touched file's edit
+via `ApplyEdits` — the SAME function `Apply` itself later uses, so this checks EXACTLY the
+bytes that will be written, not a separately-computed approximation — and refuses the
+whole Plan unless the result both parses as valid Go (`go/format.Source`'s own parse step,
+catching every syntax error a bad byte offset could produce) and is byte-identical to
+gofmt's own output. Rationale: `gopls` performs a byte-offset rename, never a reformat, so
+a CORRECT `WorkspaceEdit` against valid Go source should always already be gofmt-clean —
+a mismatch is treated as a real edit-shape defect (a wrong byte offset, a straddled
+multi-line edit), never silently reformatted away, since silently changing content after
+capture would also undermine `PlanDigest`'s own tamper-evidence guarantee. Wired into
+`Prepare`, right after `ParseWorkspaceEdit` succeeds and before `PlanDigest` is computed.
+
+4 new pure unit tests (no gopls needed, stdlib-only): accepts a well-formed edit; refuses
+one that stages invalid Go syntax; refuses one that stages syntactically valid but NOT
+gofmt-clean Go; refuses a touched file with no recorded preimage. The existing real-gopls
+end-to-end test (`TestApplyGovernedEndToEndRenameWiresRealS7Grant`) continues to pass with
+this check now active — confirms it is not a false-positive trap against genuine `gopls`
+output.
+
+Full verification: `internal/coding/symedit` green (including all real-gopls tests),
+`go vet` clean, `go build ./...` clean, full `go test ./...` running, will confirm
+separately. Dispatched for codex review.
+
+## Status 2026-09-11 — staged-syntax check round 1 FAIL + real fixes
+
+Round 1 (**FAIL, 2 HIGH**), both real:
+
+1. **The gofmt-byte-identity half of the check rejected two real, already-contracted
+   cases.** Codex reproduced both live: a CRLF file (gofmt normalizes CRLF→LF, but
+   `edit_test.go`'s own `TestParseWorkspaceEditPreservesCRLF` already requires CRLF
+   survive byte-exact) and a file that was already not gofmt-clean BEFORE the edit
+   (gofmt reformats the WHOLE file, including parts the edit never touched — not a
+   defect IN the edit). **Fixed by narrowing, not patching**: dropped the
+   gofmt-byte-identity requirement entirely — `verifyStagedSyntaxIsValid` (renamed from
+   `verifyStagedFormatting` for honesty) now checks ONLY that the staged result parses as
+   valid Go (`go/format.Source`'s own parse step, its formatted output never compared
+   against). New test proves both previously-broken cases now pass; the "refuses
+   unformatted" test — whose own premise was the bug — is gone, replaced by this
+   acceptance test.
+2. **The Prepare-phase wiring itself had no RED-capable detector.** Codex proved it by
+   ablating the production call and running the full real-gopls suite — stayed green. New
+   `beforeStagedSyntaxCheck` test seam (mirrors this file's own
+   `beforeGoplsRename`/`afterGoplsRename` pattern) lets a test inject an edit that stages
+   invalid Go into the REAL edits a REAL end-to-end gopls-driven `Prepare` call is about to
+   check. RED-proven directly: ablating the production call reproduces codex's own
+   finding exactly (the test fails, Prepare wrongly returns a plan).
+
+Full verification: `internal/coding/symedit` green (17 tests, all real-gopls tests still
+passing), `go vet` clean, `go build ./...` clean, full `go test ./...` green. Dispatched
+for codex round 2.
+
+## Status 2026-09-11 — staged-syntax check round 2 FAIL + real fix
+
+Round 2 (**FAIL, 1 HIGH**): both round-1 findings independently re-verified closed. New
+finding: `go/format.Source`'s own documented contract accepts EITHER a complete file OR a
+bare list of declarations OR a bare list of statements as "valid" — it exists to format
+snippets, not to validate a complete `.go` file. Codex reproduced live: replacing an entire
+valid file with `func Bar() {}\n` (no package clause at all) made the check return `nil`.
+**Fixed**: switched from `go/format.Source` to `go/parser.ParseFile`, which has no such
+fragment leniency — it always requires a complete source file. 2 new regression tests
+(declaration-only fragment, statement-only fragment, both previously silently accepted).
+Also fixed the round-1 wiring test per codex's own suggestion: its injected edit used an
+out-of-bounds `EndByte: 999`, which could have been caught by `ApplyEdits`'s own bounds
+validation rather than actually reaching the parser; it now replaces the whole file (an
+in-bounds edit) with a declaration fragment, so the wiring test genuinely exercises the
+same leniency gap the fix closes, not just "some error occurred." RED-proven: reverted to
+`format.Source` and confirmed all 3 tests (2 new fragment tests + the wiring test) fail
+exactly as predicted, then restored.
+
+Full verification: `internal/coding/symedit` green (19 tests), `go vet` clean, `go build
+./...` clean, full `go test ./...` green. Dispatched for codex round 3.
