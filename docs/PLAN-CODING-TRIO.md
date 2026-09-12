@@ -3950,3 +3950,116 @@ entirely rather than iterating the same heuristic further.
 **Next**: continuing autonomously per the coding-trio plan — real
 type-check and the S6 tool-boundary remain open (see
 [[nexus-coding-trio-plan]]).
+
+## Prepare-phase staged TYPE-CHECK (invariant 3, remaining half)
+
+`internal/coding/symedit/typecheck.go`, `verifyStagedTypeChecks` — the
+TYPE-check half of invariant 3's "format+type-check the staged result"
+(the format/syntax half, `verifyStagedSyntaxIsValid`, converged earlier).
+Stages every edit into a disposable `runner.CreateSnapshot` — never the
+live workspace — and runs a real, governed compile through Slice 0's
+`runner.Run`, refusing the whole Plan unless it exits clean.
+
+Four rounds were needed, each converging on the SAME class of problem
+from a different angle: whatever Go command was chosen kept being either
+too narrow (missed a real semantic defect) or too broad (refused a
+perfectly valid rename for reasons unrelated to type-correctness).
+
+### Round 1 — codex + kilo FAIL (both independently live-reproduced)
+
+`go build ./...` never compiles `_test.go` files at all — a rename
+touching a test file (ordinary: renaming a symbol tests reference) could
+stage an undefined reference there and the check returned nil anyway
+(FALSE GREEN). codex additionally live-reproduced, end-to-end through a
+real gopls session + sandbox + S7 + Prepare + ApplyGoverned, that this
+function's own `runner.CreateSnapshot(sourceDir)` call is a NEW read of
+the source tree Prepare's own `digestBefore`/`digestAfter` sandwich does
+not cover — a caller could swap `sourceDir`'s pathname to a clean tree
+between Prepare's digest checks and this function's own snapshot, making
+a broken ORIGINAL (descriptor-pinned) tree get committed via
+`ApplyGoverned` while the type-check "passed" against the swapped-in
+clean tree. Fixed: added `TypeCheckOperationID`/`TypeCheckTargetID` to
+`runner.RenameRequest` (mirroring Slice 1's `evidence.Capture` Base/
+Candidate split) for a separate governed attempt; required a
+`wantDigest` parameter (the caller's already-authenticated
+`digestBefore`/`digestAfter`) that this function's own fresh snapshot
+digest must match exactly, closing the TOCTOU the same way Prepare
+already closes `RunGoplsRename`'s own `res.SnapshotDigest`.
+
+### Round 2 — codex + kilo FAIL (again both independently live-reproduced), agy PASS via unverified reasoning
+
+Switched to `go vet ./...` to close round 1's test-file gap — but `go
+vet` runs its FULL default analyzer set (printf, buildtag, etc.), so ANY
+unrelated, pre-existing analyzer finding anywhere in the staged tree
+refused an otherwise perfectly valid rename: the fix that closed round
+1's false-NEGATIVE introduced a false-POSITIVE. agy PASSed by asserting
+this was "acceptable/in-scope" without live-reproducing the counter-case
+— overturned per this session's standing rule (2 independent live
+reproductions of the identical bug outweigh 1 reasoning-only dismissal).
+`go test -run=^$` alone does not help either (empirically verified: it
+runs the same limited vet subset internally). Fixed with `-vet=off`
+added: `go test -vet=off -run=^$ -count=1 ./...`, empirically verified in
+both directions before implementing.
+
+### Round 3 — codex + kilo FAIL (again both independently live-reproduced), agy PASS via a factually incorrect claim
+
+`-run=^$` only suppresses ORDINARY test functions — the generated test
+BINARY still runs, so package `init()` and any `TestMain` still EXECUTE.
+codex's PoC: a compiling `TestMain` calling `os.Exit(7)` refused an
+otherwise fully valid rename. kilo independently reproduced the same
+class with `os.Exit(1)`. agy PASSed while explicitly asserting
+`TestMain`/`init()` "are not executed" — empirically false, verified
+independently before either agent's report — the SECOND consecutive
+round agy passed by reasoning-only dismissal of a bug two other agents
+live-reproduced. Fixed by switching to `-c -o /dev/null`: `go test
+-vet=off -c -o /dev/null ./...` — `-c` compiles the test binary but
+genuinely never runs it, closing all three rounds' failure modes
+simultaneously (verified empirically, together, before dispatch): a
+`_test.go` undefined reference still refused; an unrelated pre-existing
+vet finding no longer refused; a `TestMain` that would exit nonzero no
+longer refused, because it never executes. `/dev/null` confirmed
+reachable inside the sandbox (`internal/sandbox/probe.go`'s own `--dev
+/dev` bwrap bind, read from source, not assumed).
+
+### Round 4 — unanimous convergence: PASS × 3
+
+All three agents ran genuine adversarial live probes this round
+(including agy, breaking its two-round pattern). codex verified live
+that `-c -o /dev/null` never triggers package initializers/`TestMain`
+even when compiling (only actually RUNNING a binary does), that `-o
+/dev/null` with `./...` across multiple test-bearing packages does not
+mask a failure in one package while another succeeds (each package
+compiled/reported independently), and that Go's own toolchain explicitly
+supports `/dev/null` as the multi-package `-c` output sink. kilo
+independently reproduced all of the same dimensions, plus confirmed
+`-vet=off` is still load-bearing (removing it reintroduces round 2's
+false positive) and that a package with no `_test.go` files is still
+non-test-compiled. agy this round also live-tested (package-level var
+initializers, test-file `init()`, `TestMain`, test bodies — zero
+side-effect files created, confirmed via a marker-file probe) and
+concurred. One cosmetic NOTE (codex): a stale comment in
+`typecheck_test.go` still said "Switched to `go vet`" — fixed inline.
+
+`internal/coding/symedit` full suite green (38 tests, ~75s — real
+gopls/sandbox/compile sessions); `go vet ./...` clean; full `go test
+./...` green. **Invariant 3's Prepare-phase "format+type-check the
+staged result" requirement is now FULLY CLOSED** (format half converged
+earlier, type-check half converged here after 4 rounds).
+
+Lesson reinforced twice in one piece: **agy passed two consecutive
+rounds by reasoning-only dismissal of a bug codex AND kilo both
+independently live-reproduced** — the same "never treat a PASS without
+live reproduction as sufficient to overrule a live-reproduced FAIL"
+principle from the rollback/linkage pieces, now observed as a *repeated*
+per-agent pattern rather than a one-off. Also: the actual fix was never
+a better heuristic on the SAME axis (choosing a different `go`
+subcommand/flag combination that happened to compile more files) — round
+4's `-c -o /dev/null` succeeded only once the goal was reframed as
+"achieve a GENUINE compile-only property," not "find a command that
+happens to pass today's test." Each of rounds 1-3's fixes chose a
+command that solved the LAST known counterexample while quietly
+retaining a different, not-yet-discovered execution/analysis side
+effect.
+
+**Next**: S6 tool-boundary remains the last open item in the coding-trio
+plan (see [[nexus-coding-trio-plan]]).

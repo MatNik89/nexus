@@ -45,13 +45,13 @@
 // finding, codex round 2 HIGH #1: format.Source's own contract accepts a
 // bare declaration/statement fragment as "valid," not only a complete
 // file — a byte offset severe enough to delete the package clause would
-// have silently passed). The full TYPE-check half (semantic validity: unresolved references, duplicate
-// declarations, anything syntax alone can't catch) is NOT built here —
-// that needs running the staged result through a real `go build`/
-// `go vet`, which means staging it into a disposable snapshot and
-// running it through Slice 0's already-governed sandboxed runner.Run, a
-// materially larger piece of its own — explicitly deferred, not
-// silently dropped.
+// have silently passed). The TYPE-check half (semantic validity:
+// unresolved references, duplicate declarations, anything syntax alone
+// can't catch) is built in typecheck.go's verifyStagedTypeChecks: stages
+// the same edits into a disposable snapshot (never the live workspace)
+// and runs a real, analyzer-free compile
+// (`go test -vet=off -run=^$ -count=1 ./...`) through Slice 0's
+// already-governed sandboxed runner.Run.
 package symedit
 
 import (
@@ -289,6 +289,11 @@ func Prepare(ctx context.Context, rootFd int, backend *sandbox.Bwrap, report san
 	edits = beforeStagedSyntaxCheck(edits) // test seam: no-op in production
 
 	if err := verifyStagedSyntaxIsValid(edits, preimages); err != nil {
+		return Plan{}, fmt.Errorf("symedit: prepare: %w", err)
+	}
+
+	if err := verifyStagedTypeChecks(ctx, backend, report, grants, j, req.SourceDir, req.GoBinary, digestAfter, edits, preimages,
+		req.TypeCheckOperationID, req.TypeCheckTargetID, req.RunID, req.ProfileID); err != nil {
 		return Plan{}, fmt.Errorf("symedit: prepare: %w", err)
 	}
 

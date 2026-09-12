@@ -139,6 +139,7 @@ func TestApplyGovernedEndToEndRenameWiresRealS7Grant(t *testing.T) {
 		Line: 2, Character: 5, NewName: "Bar",
 		GoBinary: goBin, GoplsBinary: goplsBin, Timeout: 60 * time.Second,
 		OperationID: "op-governed-rename-1", TargetID: "target-governed-rename",
+		TypeCheckOperationID: "op-governed-rename-1-tc", TypeCheckTargetID: "target-governed-rename-tc",
 		RunID: "run-governed-rename-1", ProfileID: "work",
 	}
 
@@ -502,6 +503,7 @@ func TestPrepareRefusesWhenSourceChangesDuringGoplsAnalysis(t *testing.T) {
 		Line: 2, Character: 5, NewName: "Bar",
 		GoBinary: goBin, GoplsBinary: goplsBin, Timeout: 60 * time.Second,
 		OperationID: "op-drift-1", TargetID: "target-drift",
+		TypeCheckOperationID: "op-drift-1-tc", TypeCheckTargetID: "target-drift-tc",
 		RunID: "run-drift-1", ProfileID: "work",
 	}
 
@@ -543,6 +545,7 @@ func TestPrepareRefusesMismatchedRootFdAndSourceDir(t *testing.T) {
 		Line: 0, Character: 0, NewName: "Bar",
 		GoBinary: "go", GoplsBinary: "gopls", Timeout: 5 * time.Second,
 		OperationID: "op-mismatch-1", TargetID: "target-mismatch",
+		TypeCheckOperationID: "op-mismatch-1-tc", TypeCheckTargetID: "target-mismatch-tc",
 		RunID: "run-mismatch-1", ProfileID: "work",
 	}
 
@@ -607,6 +610,7 @@ func TestPrepareRefusesSourceDirPathnameSwappedDuringGoplsAnalysis(t *testing.T)
 		Line: 2, Character: 5, NewName: "Bar",
 		GoBinary: goBin, GoplsBinary: goplsBin, Timeout: 60 * time.Second,
 		OperationID: "op-swap-1", TargetID: "target-swap",
+		TypeCheckOperationID: "op-swap-1-tc", TypeCheckTargetID: "target-swap-tc",
 		RunID: "run-swap-1", ProfileID: "work",
 	}
 
@@ -687,6 +691,7 @@ func TestPrepareRefusesSourceDirSwappedForByteIdenticalDirectory(t *testing.T) {
 		Line: 2, Character: 5, NewName: "Bar",
 		GoBinary: goBin, GoplsBinary: goplsBin, Timeout: 60 * time.Second,
 		OperationID: "op-swap-identical-1", TargetID: "target-swap-identical",
+		TypeCheckOperationID: "op-swap-identical-1-tc", TypeCheckTargetID: "target-swap-identical-tc",
 		RunID: "run-swap-identical-1", ProfileID: "work",
 	}
 
@@ -759,6 +764,7 @@ func TestPrepareRefusesWhenSnapshotDigestDoesNotMatchPreAnalysisDigest(t *testin
 		Line: 2, Character: 5, NewName: "Bar",
 		GoBinary: goBin, GoplsBinary: goplsBin, Timeout: 60 * time.Second,
 		OperationID: "op-snapshot-aba-1", TargetID: "target-snapshot-aba",
+		TypeCheckOperationID: "op-snapshot-aba-1-tc", TypeCheckTargetID: "target-snapshot-aba-tc",
 		RunID: "run-snapshot-aba-1", ProfileID: "work",
 	}
 
@@ -959,6 +965,7 @@ func TestPrepareRefusesWhenStagedSyntaxIsInvalid(t *testing.T) {
 		Line: 2, Character: 5, NewName: "Bar",
 		GoBinary: goBin, GoplsBinary: goplsBin, Timeout: 60 * time.Second,
 		OperationID: "op-badsyntax-1", TargetID: "target-badsyntax",
+		TypeCheckOperationID: "op-badsyntax-1-tc", TypeCheckTargetID: "target-badsyntax-tc",
 		RunID: "run-badsyntax-1", ProfileID: "work",
 	}
 	if _, err := Prepare(ctxT(), rootFd, backend, report, grants, j, req); err == nil {

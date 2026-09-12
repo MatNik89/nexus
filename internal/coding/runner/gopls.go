@@ -50,6 +50,19 @@ type RenameRequest struct {
 	TargetID    contracts.TargetID
 	RunID       contracts.RunID
 	ProfileID   contracts.ProfileID
+
+	// TypeCheckOperationID/TypeCheckTargetID identify the SEPARATE,
+	// non-durable coding-run (PolicyCodingRun) symedit.Prepare issues to
+	// type-check the STAGED edit result (a real, analyzer-free compile
+	// against a disposable snapshot, catching unresolved references and other
+	// semantic defects syntax-only parsing can't) — required (fail
+	// closed) whenever Prepare is called. Distinct from OperationID/
+	// TargetID above: S7 requires a fresh Begin per operation identity,
+	// and this is a second, separate governed attempt sharing the SAME
+	// RunID/ProfileID (mirrors Slice 1's evidence.Capture, whose own
+	// Base/CandidateOperationID likewise share one RunID/ProfileID).
+	TypeCheckOperationID contracts.OperationID
+	TypeCheckTargetID    contracts.TargetID
 }
 
 // LSPError mirrors a JSON-RPC error object.
