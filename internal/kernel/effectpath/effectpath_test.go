@@ -207,6 +207,24 @@ func TestInProcessToolNeverSpawns(t *testing.T) {
 	}
 }
 
+// TestInProcessGovernedDispatchesThroughInProcessExecutor: ExecInProcessGoverned
+// (2026-09-12, owner-approved third kind — a Go-native tool that
+// independently drives its OWN already-S6.2-governed subprocess launches,
+// e.g. rename_symbol) routes through the SAME InProcessExecutor as
+// ExecInProcess — never the sandbox executor. The two kinds differ only
+// in the declared guarantee (contracts.ExecutionKind's own doc comment),
+// not in dispatch.
+func TestInProcessGovernedDispatchesThroughInProcessExecutor(t *testing.T) {
+	h := build(t, ModeDefault, map[contracts.ToolID]Decision{"read": DecisionAllow})
+	c := call(t, "read", contracts.EffectReadOnly, contracts.ExecInProcessGoverned)
+	if _, err := h.path.RunTool(context.Background(), c, grantFor(t, h, "op-1", c)); err != nil {
+		t.Fatal(err)
+	}
+	if *h.inprocN != 1 || h.sandbox.launches != 0 {
+		t.Fatalf("ExecInProcessGoverned did not dispatch through InProcessExecutor: inproc=%d launches=%d", *h.inprocN, h.sandbox.launches)
+	}
+}
+
 // A READ-ONLY process tool STILL goes through the sandbox executor
 // (ledger literal name).
 func TestReadOnlyProcessStillSandboxed(t *testing.T) {

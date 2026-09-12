@@ -281,6 +281,10 @@ javni kandidati stvarni; Kilo Code = to-beat meta bez javne licence. **S3 STATUS
 
 **4.1 tool-registry (MEHANIZAM):** typed schema po alatu (`ToolSpec{ID,SchemaHash,EffectClass,ExecutionKind}`; ExecutionKind∈{ExecInProcess,ExecProcess} pečati grananje za effect-path),
 dispatch, timeout, result-envelope, permission-wrapper. **RED:** poziv bez validne sheme→reject. **Pareto:** FastMCP+smolagents+OpenAI-SDK.
+**AMENDED 2026-09-12** (owner-approved): ExecutionKind gained a THIRD value, ExecInProcessGoverned
+(a Go-native tool whose own implementation independently drives already-S6.2-governed subprocess
+launches, e.g. rename_symbol) — same InProcessExecutor dispatch as ExecInProcess. Current source
+of truth: docs/ARCHITECTURE-ESSENTIALS.md E8 + internal/kernel/contracts.ExecutionKind.
 
 **4.2 shell/exec (MEHANIZAM, coding):** structured one-shot exec kao v1; per-OS shell-sesija iza capability-probea. `ExecutionKind=ExecProcess`. Tree-kill NIJE ovdje — predaje exec-spec; kill je UNUTAR S6.2.Launch/S1.2 (owner-invarijanta).
 **RED:** timeout→cijelo procesno stablo ubijeno (P1.2). **Pareto:** OpenHands+

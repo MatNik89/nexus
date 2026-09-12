@@ -8,6 +8,13 @@ ranijih DESIGN-*.md (navedeno po fixu).
 ## K1+K2 — EffectPath: sandbox U putu + InProcess/Sandboxed grananje
 Nadjačava `DESIGN-memory-effectpath-kilo.md` §B (RunTool bez S6.2 + proc.Spawn za sve).
 
+**AMENDED 2026-09-12** (owner-approved): `ExecutionKind` gained a THIRD value,
+`ExecInProcessGoverned`, for a Go-native tool whose own implementation independently
+drives already-S6.2-governed subprocess launches (e.g. `rename_symbol`). It dispatches
+through the same `InProcessExecutor` as `ExecInProcess` below. Current source of truth:
+`docs/ARCHITECTURE-ESSENTIALS.md` E8 + `internal/kernel/contracts.ExecutionKind`'s own
+doc comment. The snippet below is the frozen K1+K2 record and is NOT updated in place.
+
 ```go
 // KANONSKI tipovi su u DESIGN-S0 (contracts): ExecutionKind{ExecInProcess,ExecProcess},
 // EffectPhase{PhaseBeforeCommit,PhaseAfterCommit,PhaseUnknown}, CommitReceipt, ToolResult.Commit,

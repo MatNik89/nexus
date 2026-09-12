@@ -108,9 +108,20 @@ Activator/RollbackVault machinery above activates with the first dynamic consume
 `S3.Loop → sealed ToolSpec.ExecutionKind → S6.0.Decide → S6.9.Before →
 {InProcessExecutor | SandboxedProcessExecutor(S6.2.Launch + S1.2)} → S6.9.After/OnError → S7`.
 Branch on the sealed `ExecutionKind`; unknown kind → REJECT, never inproc. Read-only shell is
-still a process → sandboxed. In-process tools NEVER spawn. Concrete executor types inside the
-`EffectPath` struct — an unsandboxed executor cannot be injected.
-→ DESIGN-FIXES-r2 K1/K2 (canonical code).
+still a process → sandboxed. `ExecInProcess` tools NEVER spawn — an absolute, auditable
+guarantee. **`ExecInProcessGoverned`** (2026-09-12, owner-approved) is the honest third kind
+for a Go-native tool whose OWN implementation is itself responsible for routing its own
+subprocess launches through the real S6.2 sandbox (`rename_symbol`'s gopls/`go test`
+sessions, via `internal/coding/runner`/`internal/sandbox`), at a finer grain than this
+effect-path's own single-process model. EffectPath provides NO sandboxing of its own for
+this kind — it dispatches through the SAME `InProcessExecutor` as `ExecInProcess` (identical
+mechanics); the split is for honest labeling/auditing (so `ExecInProcess` itself never needs
+a per-tool exception), not a different execution path. The sandboxing obligation is the
+HANDLER's; see `docs/SECTION-MAP.md`'s own owner-invariant amendment for one known,
+pre-existing, tracked exception (`runner.ResolveToolchain`'s toolchain-discovery `go env`
+call) this kind does not itself close. Concrete executor types inside the `EffectPath`
+struct — an unsandboxed executor cannot be injected.
+→ DESIGN-FIXES-r2 K1/K2 (canonical code); `internal/kernel/contracts.ExecutionKind` (2026-09-12).
 
 ## E9 — Effect taxonomy instead of the impossible cancel
 "Cancel mid-tool → no side-effect" DOES NOT EXIST. Instead: `CommitReceipt` + phases

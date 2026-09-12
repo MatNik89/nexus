@@ -59,6 +59,26 @@ FAZA P (distribucija/service, →O):
 sandbox=**S6.2** (svaki subprocess) · process-tree=**S1.2** (unutar S6.2.Launch) · retry/cancel=**S7** ·
 journal-write=**P0.3/EventJournal paket** (jedini writer; NE S0.3). Effect-path fix: DESIGN-FIXES-r2 K1/K2.
 
+**AMENDED 2026-09-12** (owner-approved; codex round-2 review finding, live-verified): "every
+subprocess" has one known, PRE-EXISTING, tracked exception — `internal/coding/runner`'s own
+`ResolveToolchain`/`goEnvJSON` helper (used by every Slice 0/1/2/3 caller: evidence.Capture,
+tia.RunShadow, symedit.Prepare/RunGoplsRename) runs `go env` through a raw, unsandboxed
+`exec.Command`, before any S6.2/S7 involvement — not something newly introduced by this piece
+(`ExecInProcessGoverned`, `internal/kernel/contracts.ExecutionKind`), which is only the first
+place to name it explicitly. Not closed this round (out of proportion for this piece — touches
+already multi-round-converged Slice 0 code); tracked as a known gap, not silently ignored.
+
+**PIECE-2 DESIGN OBLIGATION** (kilo + agy round-3 review, independently raised — recorded here
+so it cannot be missed): `RunSpec.GoBinary`/`RenameRequest.GoBinary` are caller-supplied fields,
+executed via the unsandboxed `goEnvJSON` call above BEFORE any S6.2/S7 involvement. When
+`rename_symbol` is registered as a model-facing tool (piece 2, not yet built), its handler MUST
+supply `GoBinary`/`GoplsBinary` itself from trusted host/config resolution — NEVER from
+`c.Arguments` (model/JSON-supplied input) — or this pre-existing, currently-benign gap becomes a
+model-reachable host-code-execution primitive that bypasses S6.2 entirely. Piece 2 must also add
+a dedicated test asserting `Specs()["rename_symbol"].ExecutionKind == ExecInProcessGoverned`
+exactly, verifying the assembled spec+handler composition (not just the enum constant in
+isolation) — closing the author-time mislabeling risk piece 1's own review identified.
+
 **P0 -min rezovi (HARDQ A2, jednoglasno, 2026-09-03):** K1 rubovi S7/S5 za P0 walking-skeleton
 zadovoljavaju se IMENOVANIM -min ugovorima (isti mehanizam kao S8.1-min/S11.1-min/S16.6-det):
 `s7-min` = AttemptGrant + cancel + no-retry (retryable→FAILED_TERMINAL) · `s5-min` = AtomicWriter ·

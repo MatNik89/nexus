@@ -121,6 +121,13 @@ All four independently converged on (unchanged from v1/v2, still holds):
 1. **`internal/exectool` remains the sole physical-process-launch owner** — Slice 0 gives
    it the new capability this plan needs (staged workdir input, closed toolchain
    child-closure); nothing in `internal/coding/*` calls `os/exec` directly.
+   **AMENDED 2026-09-12** (codex round-3 review finding, self-identified as internally
+   superseded): this sentence was reversed by this SAME plan's own later Slice 0 design
+   status sections below (the direct `sandbox.Backend` caller shape) — `internal/coding/
+   runner` DOES call `os/exec`/`exec.Command` directly (`toolchain.go`'s `goEnvJSON`, and
+   the sandboxed `go build`/`go test`/gopls launches throughout `runner.Run`/
+   `RunGoplsRename`). Kept here only as a historical record of the ORIGINAL cross-slice
+   invariant as first stated; not the current design.
 2. **S7 governs every dispatched effect attempt — subprocess OR in-process — never pure
    internal computation that performs no effect** (`EffectPath.RunTool` consumes the
    grant regardless of executor — `effectpath.go:431,445`; S7 authorizes one physical

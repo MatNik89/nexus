@@ -434,7 +434,13 @@ func (p *EffectPath) RunTool(ctx context.Context, call contracts.ToolCall, grant
 		Execute(context.Context, contracts.ToolCall) (contracts.ToolResult, error)
 	}
 	switch call.ExecutionKind {
-	case contracts.ExecInProcess:
+	case contracts.ExecInProcess, contracts.ExecInProcessGoverned:
+		// Both dispatch identically (a plain Go call) — the two kinds
+		// differ only in the DECLARED guarantee (contracts.ExecutionKind's
+		// own doc comment): ExecInProcess never touches the OS process
+		// boundary at all; ExecInProcessGoverned is for a tool whose own
+		// implementation independently drives already-S6.2-governed
+		// subprocess launches. Not a different execution path here.
 		exec = p.inproc
 	case contracts.ExecProcess:
 		exec = p.sbproc

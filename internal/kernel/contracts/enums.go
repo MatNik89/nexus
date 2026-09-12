@@ -114,16 +114,40 @@ var retryNames = map[Retryability]string{
 
 // ExecutionKind seals how a tool executes (DESIGN-FIXES-r2): unknown kind
 // is rejected by the effect path, NEVER run in-process.
+//
+// ExecInProcess is an ABSOLUTE guarantee: a tool declaring this kind never
+// touches the OS process boundary — no exec, no subprocess, ever. That
+// guarantee is what lets `EffectPath` treat every ExecInProcess tool as
+// safe-by-construction with respect to the sandbox (nothing to sandbox).
+//
+// ExecInProcessGoverned (2026-09-12, owner-approved architectural
+// decision; full rationale and known gaps: docs/ARCHITECTURE-ESSENTIALS.md
+// E8, docs/SECTION-MAP.md's own owner-invariant amendment) is for the
+// DIFFERENT case: a Go-native tool whose own implementation is itself
+// responsible for routing its own subprocess launches through the real
+// S6.2 sandbox (e.g. `rename_symbol`, via `internal/coding/runner`), at
+// a finer grain than EffectPath's own single-process
+// SandboxedProcessExecutor model assumes. EffectPath provides NO
+// sandboxing of its own for this kind — it dispatches through the SAME
+// InProcessExecutor as ExecInProcess (identical mechanics). The
+// obligation to sandbox is the HANDLER's, not EffectPath's; this kind
+// exists so that obligation is truthfully named rather than silently
+// implied by mislabeling the tool ExecInProcess. Deliberately a
+// SEPARATE kind rather than an exception carved into ExecInProcess:
+// that keeps ExecInProcess's own guarantee absolute and auditable
+// (e.g. "grep for exec.Command reachable from any ExecInProcess
+// handler" needs no per-handler exception list).
 type ExecutionKind uint8
 
 const (
 	ExecInvalid ExecutionKind = iota
 	ExecInProcess
 	ExecProcess
+	ExecInProcessGoverned
 )
 
 var execKindNames = map[ExecutionKind]string{
-	ExecInProcess: "IN_PROCESS", ExecProcess: "PROCESS",
+	ExecInProcess: "IN_PROCESS", ExecProcess: "PROCESS", ExecInProcessGoverned: "IN_PROCESS_GOVERNED",
 }
 
 // EffectPhase classifies when an effect committed (DESIGN-FIXES-r2 /

@@ -220,6 +220,11 @@ const (
     ExecInProcess ExecutionKind = iota + 1 // edit/read/grep/memory — čista Go funkcija
     ExecProcess                            // bash/exec/python — OBAVEZNO kroz S6.2.Launch
 )
+// AMENDED 2026-09-12 (owner-approved): a THIRD value, ExecInProcessGoverned, was added
+// for a Go-native tool (e.g. rename_symbol) that independently drives its own already-
+// S6.2-governed subprocess launches — dispatches through the same InProcessExecutor as
+// ExecInProcess. This frozen S0 record is not updated in place; current source of truth
+// is docs/ARCHITECTURE-ESSENTIALS.md E8 + internal/kernel/contracts.ExecutionKind.
 
 type EffectPhase uint8 // commit-faza učinka; executor atestira (REVIEW2 N4-C03)
 const (
@@ -246,7 +251,7 @@ type ToolCall struct {
     Arguments          CanonicalJSON
     ArgumentsSchemaHash Digest
     Effect             EffectClass
-    ExecutionKind      ExecutionKind   // ExecInProcess|ExecProcess — resolved iz zapečaćenog S4 ToolSpec (REVIEW2 V-K1)
+    ExecutionKind      ExecutionKind   // ExecInProcess|ExecProcess (+ExecInProcessGoverned, 2026-09-12 — see AMENDED note above) — resolved iz zapečaćenog S4 ToolSpec (REVIEW2 V-K1)
     Deadline           time.Time
     AttemptNo          uint32
     IdempotencyKey     Optional[IdempotencyKey]
