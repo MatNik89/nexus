@@ -1701,3 +1701,756 @@ func TestRollbackEventValidatorsRejectInconsistentOp(t *testing.T) {
 		t.Fatalf("expected a consistent payload to be accepted: %v", err)
 	}
 }
+
+// Detector: the invariant 4 §2 linkage itself, end to end — a real
+// crash-orphaned Apply operation, fully and durably rolled back via
+// RollbackGoverned, then linked via LinkOriginalApplyAfterRollback,
+// lands FAILED_RETRYABLE (within budget) so a future Next call can
+// attempt the mutation again.
+func TestLinkOriginalApplyAfterRollbackLandsRetryEligibleWithinBudget(t *testing.T) {
+	origApplyPolicy := PolicyWorkspaceApply
+	PolicyWorkspaceApply = s7.Policy{EffectClass: contracts.EffectIrreversible, MaxAttempts: 2, Durable: true,
+		RetryableCodes: []string{s7.CodeMutationRolledBack}}
+	defer func() { PolicyWorkspaceApply = origApplyPolicy }()
+	origRollbackPolicy := PolicyWorkspaceRollback
+	PolicyWorkspaceRollback = s7.Policy{EffectClass: contracts.EffectIrreversible, MaxAttempts: 5, Durable: true,
+		RetryableCodes: []string{s7.CodeRollbackIncomplete}}
+	defer func() { PolicyWorkspaceRollback = origRollbackPolicy }()
+
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("package old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rootFd, err := OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(rootFd)
+	store := newTestStore(t)
+	j := testDurableJournal(t)
+	originalOp, _, grants := midCrashOriginalOp(t, rootFd, store, j, "plan-linkage")
+
+	result, err := RollbackGoverned(context.Background(), rootFd, store, originalOp, grants, j, "run-linkage-rollback")
+	if err != nil || !result.Succeeded {
+		t.Fatalf("precondition: rollback must succeed: err=%v result=%+v", err, result)
+	}
+
+	// The original op's own S7 state is untouched by the rollback op's
+	// own success — it remains UNKNOWN until explicitly linked.
+	if state, _ := grants.State(originalOp); state != contracts.AttemptUnknown {
+		t.Fatalf("precondition: original op state = %v, want UNKNOWN before linking", state)
+	}
+
+	if err := LinkOriginalApplyAfterRollback(rootFd, store, originalOp, grants, j, "run-linkage-link"); err != nil {
+		t.Fatalf("LinkOriginalApplyAfterRollback failed: %v", err)
+	}
+	if state, ok := grants.State(originalOp); !ok || state != contracts.AttemptFailedRetryable {
+		t.Fatalf("original op state = %v (ok=%v), want FAILED_RETRYABLE", state, ok)
+	}
+	got, readErr := os.ReadFile(filepath.Join(root, "a.go"))
+	if readErr != nil || string(got) != "package old\n" {
+		t.Fatalf("expected the file durably restored to BEFORE: got=%q err=%v", got, readErr)
+	}
+}
+
+// Detector: an EXHAUSTED Apply retry budget lands terminal (FAILED), not
+// UNKNOWN or an error — the crash_recovered code-normalization applied
+// proactively in LinkOriginalApplyAfterRollback must cover LandingTerminal
+// too, mirroring the lesson already learned on the rollback operation's
+// own side (round 6/7).
+func TestLinkOriginalApplyAfterRollbackLandsTerminalWhenExhausted(t *testing.T) {
+	origApplyPolicy := PolicyWorkspaceApply
+	PolicyWorkspaceApply = s7.Policy{EffectClass: contracts.EffectIrreversible, MaxAttempts: 1, Durable: true,
+		RetryableCodes: []string{s7.CodeMutationRolledBack}}
+	defer func() { PolicyWorkspaceApply = origApplyPolicy }()
+	origRollbackPolicy := PolicyWorkspaceRollback
+	PolicyWorkspaceRollback = s7.Policy{EffectClass: contracts.EffectIrreversible, MaxAttempts: 5, Durable: true,
+		RetryableCodes: []string{s7.CodeRollbackIncomplete}}
+	defer func() { PolicyWorkspaceRollback = origRollbackPolicy }()
+
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("package old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rootFd, err := OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(rootFd)
+	store := newTestStore(t)
+	j := testDurableJournal(t)
+	originalOp, _, grants := midCrashOriginalOp(t, rootFd, store, j, "plan-linkage-exhausted")
+
+	result, err := RollbackGoverned(context.Background(), rootFd, store, originalOp, grants, j, "run-linkage-rollback-exhausted")
+	if err != nil || !result.Succeeded {
+		t.Fatalf("precondition: rollback must succeed: err=%v result=%+v", err, result)
+	}
+
+	// A SECOND, fresh restart: midCrashOriginalOp's own rehydration
+	// PERFORMED the RUNNING->UNKNOWN crash-recovered append durably (its
+	// in-memory rec.lastCode still reflects the OLD, pre-append row), but
+	// only a LATER, separate reload actually reads the now-persisted
+	// lastCode="crash_recovered" column back — the SAME two-restart
+	// shape required to exercise this exact hazard on the rollback
+	// operation's own side (round 4/6/7 above).
+	grants2 := testDurableGrants(t, j)
+	if err := LinkOriginalApplyAfterRollback(rootFd, store, originalOp, grants2, j, "run-linkage-link-exhausted"); err != nil {
+		t.Fatalf("LinkOriginalApplyAfterRollback failed on an exhausted budget (should land terminal, not error): %v", err)
+	}
+	if state, ok := grants2.State(originalOp); !ok || state != contracts.AttemptFailed {
+		t.Fatalf("original op state = %v (ok=%v), want FAILED (terminal)", state, ok)
+	}
+}
+
+// Detector: calling the linkage TWICE refuses the second time — the
+// operation is no longer UNKNOWN after the first Reconcile lands.
+func TestLinkOriginalApplyAfterRollbackRefusesWhenAlreadyReconciled(t *testing.T) {
+	origApplyPolicy := PolicyWorkspaceApply
+	PolicyWorkspaceApply = s7.Policy{EffectClass: contracts.EffectIrreversible, MaxAttempts: 2, Durable: true,
+		RetryableCodes: []string{s7.CodeMutationRolledBack}}
+	defer func() { PolicyWorkspaceApply = origApplyPolicy }()
+	origRollbackPolicy := PolicyWorkspaceRollback
+	PolicyWorkspaceRollback = s7.Policy{EffectClass: contracts.EffectIrreversible, MaxAttempts: 5, Durable: true,
+		RetryableCodes: []string{s7.CodeRollbackIncomplete}}
+	defer func() { PolicyWorkspaceRollback = origRollbackPolicy }()
+
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("package old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rootFd, err := OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(rootFd)
+	store := newTestStore(t)
+	j := testDurableJournal(t)
+	originalOp, _, grants := midCrashOriginalOp(t, rootFd, store, j, "plan-linkage-twice")
+
+	result, err := RollbackGoverned(context.Background(), rootFd, store, originalOp, grants, j, "run-linkage-rollback-twice")
+	if err != nil || !result.Succeeded {
+		t.Fatalf("precondition: rollback must succeed: err=%v result=%+v", err, result)
+	}
+	if err := LinkOriginalApplyAfterRollback(rootFd, store, originalOp, grants, j, "run-linkage-link-twice-1"); err != nil {
+		t.Fatalf("first link should succeed: %v", err)
+	}
+	if err := LinkOriginalApplyAfterRollback(rootFd, store, originalOp, grants, j, "run-linkage-link-twice-2"); err == nil {
+		t.Fatal("expected the second link to refuse: original op is no longer UNKNOWN")
+	}
+}
+
+// Detector: LinkOriginalApplyAfterRollback must refuse an operation
+// bound to a DIFFERENT policy than PolicyWorkspaceApply. Reuses the SAME
+// fixture pattern scan_test.go's own
+// TestRestartScanReportsForeignPolicyOperationAsForeign uses (a real
+// Begin/Next/apply-with-precancelled-ctx crash), since RestartScan
+// itself now provides this check (round 1 finding, codex+kilo — see
+// LinkOriginalApplyAfterRollback's own doc comment).
+func TestLinkOriginalApplyAfterRollbackRefusesForeignlyBoundOperation(t *testing.T) {
+	root := t.TempDir()
+	rootFd, err := OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(rootFd)
+	store := newTestStore(t)
+	j := testDurableJournal(t)
+	grants := testDurableGrants(t, j)
+
+	rootDev, rootIno := mustRootDevIno(t, rootFd)
+	op := ApplyOperationID(testProfile, rootDev, rootIno, "plan-foreign-policy-linkage")
+	target := ApplyTargetID(testProfile, rootDev, rootIno)
+	foreignPolicy := s7.Policy{EffectClass: contracts.EffectReadOnly, MaxAttempts: 1, Durable: true}
+	if err := grants.Begin(op, target, foreignPolicy); err != nil {
+		t.Fatal(err)
+	}
+	grant, err := grants.Next(op, func(l s7.Landing) s7.Companion {
+		return s7.Companion{Key: op, Params: envelope(j, op, "run-foreign", 0, EvApplyFailed,
+			applyFailedPayload{Op: string(op), AttemptNo: 0, Landing: int(l.Kind)})}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	bindDurable := func(digest string) error {
+		return grants.Consume(grant, s7.Companion{Key: op, Params: envelope(j, op, "run-foreign", grant.AttemptNo, EvApplyStarted,
+			applyStartedPayload{Op: string(op), BundleDigest: digest})})
+	}
+	if _, err := apply(cctx, rootFd, store, []FileMutation{
+		{BaseName: "a.go", After: []byte("package a\n"), Mode: 0o644},
+	}, bindDurable); err == nil {
+		t.Fatal("expected apply to refuse under a pre-cancelled context")
+	}
+
+	grants2 := testDurableGrants(t, j) // "restart"
+	if state, ok := grants2.State(op); !ok || state != contracts.AttemptUnknown {
+		t.Fatalf("precondition: op must rehydrate UNKNOWN, got %v (ok=%v)", state, ok)
+	}
+	if err := LinkOriginalApplyAfterRollback(rootFd, store, op, grants2, j, "run-foreign-link"); err == nil {
+		t.Fatal("expected refusal: op is bound to a foreign policy, not PolicyWorkspaceApply")
+	}
+}
+
+// Detector (round 1 HIGH finding, codex+kilo, live-reproduced by both):
+// LinkOriginalApplyAfterRollback must refuse when NO rollback of
+// originalOp ever happened at all — the exact scenario an earlier
+// version durably (and wrongly) reported as "mutation rolled back."
+func TestLinkOriginalApplyAfterRollbackRefusesWhenNoRollbackEverHappened(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("package old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rootFd, err := OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(rootFd)
+	store := newTestStore(t)
+	j := testDurableJournal(t)
+	originalOp, _, grants := midCrashOriginalOp(t, rootFd, store, j, "plan-linkage-never-rolled-back")
+
+	if err := LinkOriginalApplyAfterRollback(rootFd, store, originalOp, grants, j, "run-linkage-no-rollback"); err == nil {
+		t.Fatal("expected refusal: no rollback of originalOp was ever performed")
+	}
+	got, readErr := os.ReadFile(filepath.Join(root, "a.go"))
+	if readErr != nil || string(got) != "package new\n" {
+		t.Fatalf("workspace must be untouched (still AFTER): got=%q err=%v", got, readErr)
+	}
+	if state, ok := grants.State(originalOp); !ok || state != contracts.AttemptUnknown {
+		t.Fatalf("original op must remain UNKNOWN, not reconciled without proof: state=%v ok=%v", state, ok)
+	}
+}
+
+// Detector: a rollback operation that has STARTED but not yet SUCCEEDED
+// (still MID_CRASH, still retrying) must not let the linkage through
+// either — Succeeded is the specific, durable proof required, not merely
+// "a rollback op exists."
+func TestLinkOriginalApplyAfterRollbackRefusesWhenRollbackNotYetSucceeded(t *testing.T) {
+	origRollbackPolicy := PolicyWorkspaceRollback
+	PolicyWorkspaceRollback = s7.Policy{EffectClass: contracts.EffectIrreversible, MaxAttempts: 5, Durable: true,
+		RetryableCodes: []string{s7.CodeRollbackIncomplete}}
+	defer func() { PolicyWorkspaceRollback = origRollbackPolicy }()
+
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("package old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rootFd, err := OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(rootFd)
+	store := newTestStore(t)
+	j := testDurableJournal(t)
+	originalOp, _, grants := midCrashOriginalOp(t, rootFd, store, j, "plan-linkage-incomplete-rollback")
+
+	origFn := rollbackFn
+	rollbackFn = func(ctx context.Context, rootFd int, b Bundle) ([]FileClassification, TransactionState, error) {
+		return []FileClassification{{BaseName: "a.go", State: FileAfter}}, TransactionMidCrash, errors.New("injected: rollback still in progress")
+	}
+	_, rerr := RollbackGoverned(context.Background(), rootFd, store, originalOp, grants, j, "run-linkage-incomplete")
+	rollbackFn = origFn
+	if rerr == nil {
+		t.Fatal("precondition: rollback attempt should report incomplete")
+	}
+
+	if err := LinkOriginalApplyAfterRollback(rootFd, store, originalOp, grants, j, "run-linkage-incomplete-link"); err == nil {
+		t.Fatal("expected refusal: the rollback operation has not yet succeeded")
+	}
+	if state, ok := grants.State(originalOp); !ok || state != contracts.AttemptUnknown {
+		t.Fatalf("original op must remain UNKNOWN, not reconciled without proof: state=%v ok=%v", state, ok)
+	}
+}
+
+// Detector (round 2 HIGH finding, agy, live-reproduced): a rollback that
+// durably succeeded in the PAST does not, by itself, prove the workspace
+// is STILL clean right now. Here, a real rollback succeeds, then a
+// concurrent writer moves the file to neither BEFORE nor AFTER content
+// (FOREIGN) before linkage is ever called.
+func TestLinkOriginalApplyAfterRollbackRefusesWhenWorkspaceDriftedToForeign(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "a.go")
+	if err := os.WriteFile(target, []byte("package old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rootFd, err := OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(rootFd)
+	store := newTestStore(t)
+	j := testDurableJournal(t)
+	originalOp, _, grants := midCrashOriginalOp(t, rootFd, store, j, "plan-linkage-drift-foreign")
+
+	result, err := RollbackGoverned(context.Background(), rootFd, store, originalOp, grants, j, "run-linkage-drift-rollback")
+	if err != nil || !result.Succeeded {
+		t.Fatalf("precondition: rollback must succeed: err=%v result=%+v", err, result)
+	}
+
+	// A concurrent writer drifts the workspace to neither BEFORE nor
+	// AFTER content, AFTER the rollback's own durable success.
+	if err := os.WriteFile(target, []byte("neither before nor after"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := LinkOriginalApplyAfterRollback(rootFd, store, originalOp, grants, j, "run-linkage-drift-link"); err == nil {
+		t.Fatal("expected refusal: the workspace has drifted to FOREIGN since the rollback succeeded")
+	}
+	if state, ok := grants.State(originalOp); !ok || state != contracts.AttemptUnknown {
+		t.Fatalf("original op must remain UNKNOWN, not reconciled without proof: state=%v ok=%v", state, ok)
+	}
+}
+
+// Detector (round 2 HIGH finding, agy, live-reproduced): the same drift
+// hazard for MID_CRASH — a concurrent writer re-applies the AFTER
+// content after the rollback already succeeded.
+func TestLinkOriginalApplyAfterRollbackRefusesWhenWorkspaceDriftedToMidCrash(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "a.go")
+	if err := os.WriteFile(target, []byte("package old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rootFd, err := OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(rootFd)
+	store := newTestStore(t)
+	j := testDurableJournal(t)
+	originalOp, _, grants := midCrashOriginalOp(t, rootFd, store, j, "plan-linkage-drift-midcrash")
+
+	result, err := RollbackGoverned(context.Background(), rootFd, store, originalOp, grants, j, "run-linkage-drift-rollback-2")
+	if err != nil || !result.Succeeded {
+		t.Fatalf("precondition: rollback must succeed: err=%v result=%+v", err, result)
+	}
+
+	// A concurrent writer re-applies the AFTER content, AFTER the
+	// rollback's own durable success.
+	if err := os.WriteFile(target, []byte("package new\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := LinkOriginalApplyAfterRollback(rootFd, store, originalOp, grants, j, "run-linkage-drift-link-2"); err == nil {
+		t.Fatal("expected refusal: the workspace has drifted back to MID_CRASH since the rollback succeeded")
+	}
+	if state, ok := grants.State(originalOp); !ok || state != contracts.AttemptUnknown {
+		t.Fatalf("original op must remain UNKNOWN, not reconciled without proof: state=%v ok=%v", state, ok)
+	}
+}
+
+// Detector (round 2 HIGH finding, codex, live-reproduced): a standalone,
+// structurally-valid workspace.rollback_committed event — appended
+// directly to the journal, bypassing S7 entirely, with NO rollback S7
+// operation ever having gone through a real
+// Begin/Next/Consume/Report(Succeeded) lifecycle — must not authorize
+// the linkage. rollbackOperationHasSucceededNarrative must cross-reference
+// S7's OWN "s7.attempt_reported" event, not just the application-level
+// companion.
+func TestLinkOriginalApplyAfterRollbackRefusesStandaloneForgedCommittedEvent(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "a.go")
+	if err := os.WriteFile(target, []byte("package old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rootFd, err := OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(rootFd)
+	store := newTestStore(t)
+	j := testDurableJournal(t)
+	originalOp, digest, grants := midCrashOriginalOp(t, rootFd, store, j, "plan-linkage-forged-committed")
+
+	// Restore the file to BEFORE directly — no real rollback S7 operation
+	// is ever Begun/Next/Consumed/Reported.
+	if err := os.WriteFile(target, []byte("package old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rollbackOp := RollbackOperationID(originalOp, digest)
+	forged := envelope(j, rollbackOp, "run-forge", 1, EvRollbackCommitted,
+		rollbackCommittedPayload{Op: string(rollbackOp), OriginalOp: string(originalOp), BundleDigest: digest})
+	if _, err := j.Append(context.Background(), forged); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := LinkOriginalApplyAfterRollback(rootFd, store, originalOp, grants, j, "run-linkage-forged-link"); err == nil {
+		t.Fatal("expected refusal: no S7 rollback operation ever reported Succeeded, only a forged companion event exists")
+	}
+	if state, ok := grants.State(originalOp); !ok || state != contracts.AttemptUnknown {
+		t.Fatalf("original op must remain UNKNOWN, not reconciled without proof: state=%v ok=%v", state, ok)
+	}
+}
+
+// Detector (round 2 HIGH finding, codex, live-reproduced): the residual
+// window between confirming the rollback's durable proof and actually
+// reconciling the original Apply op. Uses beforeFinalLinkageCheckHook to
+// inject a drift EXACTLY in that window (not before RestartScan runs,
+// which the earlier drift tests already cover) — isolating that the
+// FINAL re-classification, not merely the earlier RestartScan-time
+// check, is what catches it.
+func TestLinkOriginalApplyAfterRollbackRefusesDriftBetweenProofAndReconcile(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "a.go")
+	if err := os.WriteFile(target, []byte("package old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rootFd, err := OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(rootFd)
+	store := newTestStore(t)
+	j := testDurableJournal(t)
+	originalOp, _, grants := midCrashOriginalOp(t, rootFd, store, j, "plan-linkage-drift-window")
+
+	result, err := RollbackGoverned(context.Background(), rootFd, store, originalOp, grants, j, "run-linkage-drift-window-rollback")
+	if err != nil || !result.Succeeded {
+		t.Fatalf("precondition: rollback must succeed: err=%v result=%+v", err, result)
+	}
+
+	origHook := beforeFinalLinkageCheckHook
+	beforeFinalLinkageCheckHook = func() {
+		if err := os.WriteFile(target, []byte("package new\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	defer func() { beforeFinalLinkageCheckHook = origHook }()
+
+	if err := LinkOriginalApplyAfterRollback(rootFd, store, originalOp, grants, j, "run-linkage-drift-window-link"); err == nil {
+		t.Fatal("expected refusal: the workspace drifted between the durable proof check and the final reconcile")
+	}
+	if state, ok := grants.State(originalOp); !ok || state != contracts.AttemptUnknown {
+		t.Fatalf("original op must remain UNKNOWN, not reconciled without proof: state=%v ok=%v", state, ok)
+	}
+}
+
+// Detector (round 3 HIGH finding, codex, live-reproduced): a REAL S7
+// Succeeded report for the correct rollback operation, atomically paired
+// with a DIFFERENT companion (never workspace.rollback_committed),
+// followed by a SEPARATE, standalone workspace.rollback_committed event
+// — two independently-true facts that were never part of the SAME
+// atomic batch — must not be mistaken for a genuine durable success.
+// rollbackOperationHasSucceededNarrative must require ADJACENCY, not mere
+// co-existence.
+func TestLinkOriginalApplyAfterRollbackRefusesSplicedProof(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "a.go")
+	if err := os.WriteFile(target, []byte("package old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rootFd, err := OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(rootFd)
+	store := newTestStore(t)
+	j := testDurableJournal(t)
+	originalOp, digest, grants := midCrashOriginalOp(t, rootFd, store, j, "plan-linkage-spliced")
+
+	// Restore the file directly — no real durability verification ever
+	// ran for this rollback operation.
+	if err := os.WriteFile(target, []byte("package old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rollbackOp := RollbackOperationID(originalOp, digest)
+	rootDev, rootIno := mustRootDevIno(t, rootFd)
+	rtarget := ApplyTargetID(testProfile, rootDev, rootIno)
+	if err := grants.Begin(rollbackOp, rtarget, PolicyWorkspaceRollback); err != nil {
+		t.Fatal(err)
+	}
+	started := func() s7.Companion {
+		return s7.Companion{Key: rollbackOp, Params: envelope(j, rollbackOp, "run-splice", 1, EvRollbackStarted,
+			rollbackStartedPayload{Op: string(rollbackOp), OriginalOp: string(originalOp), BundleDigest: digest})}
+	}
+	grant, err := grants.Next(rollbackOp, func(l s7.Landing) s7.Companion {
+		return s7.Companion{Key: rollbackOp, Params: envelope(j, rollbackOp, "run-splice", 0, EvRollbackFailed,
+			rollbackFailedPayload{Op: string(rollbackOp), AttemptNo: 0, Landing: int(l.Kind)})}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := grants.Consume(grant, started()); err != nil {
+		t.Fatal(err)
+	}
+	// A REAL S7 Succeeded report for the correct op — but paired with
+	// rollback_started, never rollback_committed.
+	if err := grants.Report(rollbackOp, s7.OutcomeSucceeded, "", func(s7.Landing) s7.Companion { return started() }); err != nil {
+		t.Fatal(err)
+	}
+	// Separately, append a structurally-valid rollback_committed for the
+	// SAME op — unpaired with the report above.
+	standalone := envelope(j, rollbackOp, "run-splice", 1, EvRollbackCommitted,
+		rollbackCommittedPayload{Op: string(rollbackOp), OriginalOp: string(originalOp), BundleDigest: digest})
+	if _, err := j.Append(context.Background(), standalone); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := LinkOriginalApplyAfterRollback(rootFd, store, originalOp, grants, j, "run-linkage-spliced-link"); err == nil {
+		t.Fatal("expected refusal: the success report and the committed companion were never part of the same atomic batch")
+	}
+	if state, ok := grants.State(originalOp); !ok || state != contracts.AttemptUnknown {
+		t.Fatalf("original op must remain UNKNOWN, not reconciled without proof: state=%v ok=%v", state, ok)
+	}
+}
+
+// Detector (positive counterpart to the spliced-proof fix above): a
+// rollback operation that reaches Succeeded via Reconcile(true, ...)
+// (reconcileRehydratedRollback's own crash-recovery path — a DIFFERENT
+// S7 batch shape than Report's, s7.operation_reconciled instead of
+// s7.attempt_reported) must still be recognized as genuine durable
+// proof. Built on the SAME fixture as
+// TestRollbackGovernedRecoversFromCrashDuringPriorRollbackAttemptThatFullySucceeded.
+func TestLinkOriginalApplyAfterRollbackRecognizesReconcileBasedSuccess(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("package old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rootFd, err := OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(rootFd)
+	store := newTestStore(t)
+	j := testDurableJournal(t)
+	originalOp, digest, grants := midCrashOriginalOp(t, rootFd, store, j, "plan-linkage-reconcile-success")
+
+	rop := RollbackOperationID(originalOp, digest)
+	rootDev, rootIno := mustRootDevIno(t, rootFd)
+	rtarget := ApplyTargetID(testProfile, rootDev, rootIno)
+	if err := grants.Begin(rop, rtarget, PolicyWorkspaceRollback); err != nil {
+		t.Fatal(err)
+	}
+	rgrant, err := grants.Next(rop, func(l s7.Landing) s7.Companion {
+		return s7.Companion{Key: rop, Params: envelope(j, rop, "run-crash", 0, EvRollbackFailed,
+			rollbackFailedPayload{Op: string(rop), AttemptNo: 0, Landing: int(l.Kind)})}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rcompanion := s7.Companion{Key: rop, Params: envelope(j, rop, "run-crash", rgrant.AttemptNo, EvRollbackStarted,
+		rollbackStartedPayload{Op: string(rop), OriginalOp: string(originalOp), BundleDigest: digest})}
+	if err := grants.Consume(rgrant, rcompanion); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := store.Get(digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := DecodeBundle(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, state, rerr := rollbackBundle(context.Background(), rootFd, b); rerr != nil || state != TransactionNeverStarted {
+		t.Fatalf("precondition: real rollback must fully succeed: state=%v err=%v", state, rerr)
+	}
+	// No Report — this IS the simulated crash.
+
+	grants2 := testDurableGrants(t, j) // "restart"
+	result, err := RollbackGoverned(context.Background(), rootFd, store, originalOp, grants2, j, "run-restart")
+	if err != nil || !result.Succeeded {
+		t.Fatalf("precondition: self-recovery via Reconcile must succeed: err=%v result=%+v", err, result)
+	}
+	if state, ok := grants2.State(rop); !ok || state != contracts.AttemptSucceeded {
+		t.Fatalf("precondition: rollback op state = %v (ok=%v), want SUCCEEDED", state, ok)
+	}
+
+	if err := LinkOriginalApplyAfterRollback(rootFd, store, originalOp, grants2, j, "run-linkage-reconcile-success-link"); err != nil {
+		t.Fatalf("expected the reconcile-based success to be recognized as genuine proof: %v", err)
+	}
+	// The default PolicyWorkspaceApply (MaxAttempts:1) is already
+	// exhausted by the one crashed attempt, so this correctly lands
+	// terminal FAILED rather than FAILED_RETRYABLE — the retry-budget
+	// question is not what this test is about; what matters is that the
+	// linkage did NOT refuse (proving the Reconcile-based success WAS
+	// recognized).
+	if state, ok := grants2.State(originalOp); !ok || (state != contracts.AttemptFailedRetryable && state != contracts.AttemptFailed) {
+		t.Fatalf("original op state = %v (ok=%v), want FAILED_RETRYABLE or FAILED (either way, no longer UNKNOWN)", state, ok)
+	}
+}
+
+// round 4 HIGH finding (codex, live-reproduced twice via go test -overlay):
+// rollbackOperationHasSucceededNarrative's adjacency check proves two event
+// shapes were adjacent in the journal, never that they came from the SAME
+// atomic S7 batch — a caller holding the same (*journal.Journal, *s7.
+// Authority) pair this package's own functions already hold can drive a
+// rollback op to a genuine RUNNING state and then hand-append events
+// matching s7.Authority.Report's or Reconcile's exact production shape,
+// bypassing both Authority.Report and RollbackGoverned's own durability
+// verification entirely. Closing that at the journal layer would need a
+// new provenance primitive (batch identity, or an owner-restricted append
+// path) that exists nowhere in this codebase today — out of scope for
+// this slice. The fix applied instead: LinkOriginalApplyAfterRollback's
+// final pre-Reconcile check no longer trusts ClassifyBundle's content-
+// only read; it calls the SAME verifyDurabilityBeforeSuccess RollbackGoverned
+// itself gates its own Report(Succeeded) on, which fsyncs and identity-
+// pins the CURRENT on-disk bytes fresh, right now — true regardless of
+// whether the rollback op's journal narrative was genuine or forged. The
+// two tests below prove exactly that boundary: when the current bytes
+// really, durably are BEFORE, a forged narrative no longer matters (the
+// safety property Reconcile relies on already holds by construction); when
+// they are NOT, forging the narrative buys nothing — the fresh check still
+// refuses.
+
+func TestLinkOriginalApplyAfterRollbackAcceptsForgedNarrativeWhenContentDurablyMatchesBefore(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "a.go")
+	if err := os.WriteFile(target, []byte("package old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rootFd, err := OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(rootFd)
+	store := newTestStore(t)
+	j := testDurableJournal(t)
+	originalOp, digest, grants := midCrashOriginalOp(t, rootFd, store, j, "probe-r4-report-accept")
+	rollbackOp := RollbackOperationID(originalOp, digest)
+	dev, ino := mustRootDevIno(t, rootFd)
+	if err := grants.Begin(rollbackOp, ApplyTargetID(testProfile, dev, ino), PolicyWorkspaceRollback); err != nil {
+		t.Fatal(err)
+	}
+	grant, err := grants.Next(rollbackOp, func(l s7.Landing) s7.Companion {
+		return s7.Companion{Key: rollbackOp, Params: envelope(j, rollbackOp, "probe", 0, EvRollbackFailed,
+			rollbackFailedPayload{Op: string(rollbackOp), OriginalOp: string(originalOp), BundleDigest: digest, AttemptNo: 0, Landing: int(l.Kind), Code: l.Code})}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := s7.Companion{Key: rollbackOp, Params: envelope(j, rollbackOp, "probe", grant.AttemptNo, EvRollbackStarted,
+		rollbackStartedPayload{Op: string(rollbackOp), OriginalOp: string(originalOp), BundleDigest: digest})}
+	if err := grants.Consume(grant, started); err != nil {
+		t.Fatal(err)
+	}
+	// The real content really IS restored to BEFORE bytes here — just not
+	// through RollbackGoverned's own governed path.
+	if err := os.WriteFile(target, []byte("package old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	reported := envelope(j, rollbackOp, "probe-forge", grant.AttemptNo, s7.EvAttemptReported, struct {
+		Op        string `json:"op"`
+		AttemptNo int    `json:"attempt_no"`
+		Outcome   int    `json:"outcome"`
+		Landing   int    `json:"landing"`
+	}{string(rollbackOp), grant.AttemptNo, int(s7.OutcomeSucceeded), int(s7.LandingSucceeded)})
+	terminal := envelope(j, rollbackOp, "probe-forge", grant.AttemptNo, s7.EvOperationTerminal, struct {
+		Op    string `json:"op"`
+		State string `json:"state"`
+	}{string(rollbackOp), contracts.AttemptSucceeded.String()})
+	committed := envelope(j, rollbackOp, "probe-forge", grant.AttemptNo, EvRollbackCommitted,
+		rollbackCommittedPayload{Op: string(rollbackOp), OriginalOp: string(originalOp), BundleDigest: digest})
+	// Exact production-looking order in one atomic journal batch, but
+	// bypassing Authority.Report and RollbackGoverned entirely.
+	if _, err := j.AppendBatch(context.Background(), []contracts.EnvelopeParams{reported, terminal, committed}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := LinkOriginalApplyAfterRollback(rootFd, store, originalOp, grants, j, "probe-link"); err != nil {
+		t.Fatalf("expected link to proceed: the CURRENT bytes are durably BEFORE regardless of the forged narrative, and verifyDurabilityBeforeSuccess re-proves that fresh: %v", err)
+	}
+	if state, ok := grants.State(originalOp); !ok || state == contracts.AttemptUnknown {
+		t.Fatalf("original op state = %v (ok=%v), want a real terminal/retryable landing, not still UNKNOWN", state, ok)
+	}
+}
+
+func TestLinkOriginalApplyAfterRollbackRefusesForgedNarrativeWhenContentNotActuallyBefore(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "a.go")
+	if err := os.WriteFile(target, []byte("package old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rootFd, err := OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(rootFd)
+	store := newTestStore(t)
+	j := testDurableJournal(t)
+	originalOp, digest, grants := midCrashOriginalOp(t, rootFd, store, j, "probe-r4-report-refuse")
+	rollbackOp := RollbackOperationID(originalOp, digest)
+	dev, ino := mustRootDevIno(t, rootFd)
+	if err := grants.Begin(rollbackOp, ApplyTargetID(testProfile, dev, ino), PolicyWorkspaceRollback); err != nil {
+		t.Fatal(err)
+	}
+	grant, err := grants.Next(rollbackOp, func(l s7.Landing) s7.Companion {
+		return s7.Companion{Key: rollbackOp, Params: envelope(j, rollbackOp, "probe", 0, EvRollbackFailed,
+			rollbackFailedPayload{Op: string(rollbackOp), OriginalOp: string(originalOp), BundleDigest: digest, AttemptNo: 0, Landing: int(l.Kind), Code: l.Code})}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := s7.Companion{Key: rollbackOp, Params: envelope(j, rollbackOp, "probe", grant.AttemptNo, EvRollbackStarted,
+		rollbackStartedPayload{Op: string(rollbackOp), OriginalOp: string(originalOp), BundleDigest: digest})}
+	if err := grants.Consume(grant, started); err != nil {
+		t.Fatal(err)
+	}
+	// Deliberately do NOT restore content to BEFORE — the forged narrative
+	// below claims success but the workspace never actually got there.
+
+	reported := envelope(j, rollbackOp, "probe-forge", grant.AttemptNo, s7.EvAttemptReported, struct {
+		Op        string `json:"op"`
+		AttemptNo int    `json:"attempt_no"`
+		Outcome   int    `json:"outcome"`
+		Landing   int    `json:"landing"`
+	}{string(rollbackOp), grant.AttemptNo, int(s7.OutcomeSucceeded), int(s7.LandingSucceeded)})
+	terminal := envelope(j, rollbackOp, "probe-forge", grant.AttemptNo, s7.EvOperationTerminal, struct {
+		Op    string `json:"op"`
+		State string `json:"state"`
+	}{string(rollbackOp), contracts.AttemptSucceeded.String()})
+	committed := envelope(j, rollbackOp, "probe-forge", grant.AttemptNo, EvRollbackCommitted,
+		rollbackCommittedPayload{Op: string(rollbackOp), OriginalOp: string(originalOp), BundleDigest: digest})
+	if _, err := j.AppendBatch(context.Background(), []contracts.EnvelopeParams{reported, terminal, committed}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := LinkOriginalApplyAfterRollback(rootFd, store, originalOp, grants, j, "probe-link"); err == nil {
+		t.Fatal("expected refusal: the forged narrative claims success but the workspace was never actually restored to BEFORE — the fresh durability re-check must catch this regardless of narrative")
+	}
+	if state, ok := grants.State(originalOp); !ok || state != contracts.AttemptUnknown {
+		t.Fatalf("original op must remain UNKNOWN, not reconciled from an unproven narrative: state=%v ok=%v", state, ok)
+	}
+}
+
+// Detector: proves the round-4 fix's swap (ClassifyBundle -> verifyDurabilityBeforeSuccess)
+// is actually load-bearing on THIS call path, not merely reachable — a
+// genuinely-succeeded rollback (no forgery anywhere) must still be refused
+// when the final content fsync fails, via the SAME fault-injection seam
+// TestRollbackGovernedRefusesWhenFileContentFsyncFails already establishes
+// for RollbackGoverned's own Report call.
+func TestLinkOriginalApplyAfterRollbackRefusesWhenFinalFileFsyncFails(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("package old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rootFd, err := OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(rootFd)
+	store := newTestStore(t)
+	j := testDurableJournal(t)
+	originalOp, _, grants := midCrashOriginalOp(t, rootFd, store, j, "plan-linkage-fsync-fail")
+
+	result, err := RollbackGoverned(context.Background(), rootFd, store, originalOp, grants, j, "run-linkage-fsync-fail-rollback")
+	if err != nil || !result.Succeeded {
+		t.Fatalf("precondition: rollback must succeed: err=%v result=%+v", err, result)
+	}
+
+	origFileHook := fsyncFileHook
+	defer func() { fsyncFileHook = origFileHook }()
+	fsyncFileHook = func(fd int) error {
+		return errors.New("injected file content fsync failure")
+	}
+
+	if err := LinkOriginalApplyAfterRollback(rootFd, store, originalOp, grants, j, "run-linkage-fsync-fail-link"); err == nil {
+		t.Fatal("expected refusal: verifyDurabilityBeforeSuccess's own file-content fsync failed, so linkage must not reconcile the original Apply")
+	}
+	if state, ok := grants.State(originalOp); !ok || state != contracts.AttemptUnknown {
+		t.Fatalf("original op must remain UNKNOWN when the final durability re-check itself fails: state=%v ok=%v", state, ok)
+	}
+}
+
+
+

@@ -3810,3 +3810,143 @@ operation call `Reconcile(false)` and become eligible for `Next`
 again") — calling `Reconcile(false)` on the ORIGINAL Apply operation
 once THIS rollback operation's own success is durable. Same review
 discipline (all three agents in parallel, every round) applies.
+
+## Invariant 4 §2 — LINKAGE step: `LinkOriginalApplyAfterRollback`
+
+`internal/coding/workspace/governed_rollback.go`. Reconciles the
+ORIGINAL Apply operation (`grants.Reconcile(originalOp, false, build)`)
+once its own S7-governed rollback (`RollbackGoverned`/
+`PolicyWorkspaceRollback`) is durably proven succeeded — the piece
+explicitly deferred at the end of the rollback-wrapper's own 8 rounds
+above.
+
+### Round 1 — codex + kilo FAIL, self-caught bug during the fix
+
+Both independently found the same class of hole an earlier draft had:
+trusting the CALLER's own claim that a corresponding rollback already
+succeeded — a durable `CodeMutationRolledBack` assertion made on an
+unenforced sequencing promise, exactly the "durable claim without
+proof" invariant 2 already forbids. codex additionally live-reproduced
+two narrower authentication gaps: an `originalOp` bound to a DIFFERENT
+workspace target still passed its lone `MatchesPolicy` check, and
+`grants`/`j` being unbound from each other went undetected. Fixed by
+reusing `scan.go`'s own `RestartScan` (closing the two narrower findings
+for free, the same way the rollback wrapper's own round 1 was closed)
+plus a NEW `rollbackOperationHasSucceededNarrative` journal-replay
+helper. Self-caught during implementation: the first attempt checked
+`grants.State(rollbackOp) == Succeeded`, which broke on a restart
+between the rollback and the link, since S7's own `rehydrate()` never
+reloads a TERMINAL operation into memory — fixed by replaying the
+journal directly instead of trusting `grants.State`.
+
+### Round 2 — agy + codex FAIL, both live-reproduced
+
+agy: a durably-succeeded rollback in the PAST doesn't mean the
+workspace is STILL clean right NOW — something else could have drifted
+it to `MID_CRASH`/`FOREIGN` since. Fixed by requiring
+`finding.State == TransactionNeverStarted` from the scan. codex, two
+findings: (1) a standalone forged `workspace.rollback_committed` event
+with no real S7 lifecycle behind it satisfied the original check — fixed
+by cross-checking S7's own `s7.attempt_reported` event exists for the
+same op; (2) a scan-to-Reconcile drift window — fixed with a final
+re-classification immediately before `Reconcile`, using a new
+`beforeFinalLinkageCheckHook` test seam for isolated RED/GREEN proof.
+
+### Round 3 — codex FAIL (live-reproduced), kilo/agy PASS
+
+codex proved the round-2 fix's two-independent-booleans design (S7
+success event exists AND commit event exists) never verified the two
+facts came from the SAME atomic S7 batch — live-reproduced by pairing a
+REAL `Report(Succeeded)` with a DIFFERENT companion, then separately
+appending a standalone `rollback_committed`. Fixed by rewriting
+`rollbackOperationHasSucceededNarrative` to require strict adjacency (a
+`pending` state variable mirroring `RestartScan`'s own `pendingOp`
+discipline exactly) — any interleaving event of a different shape resets
+it. Discovered while fixing: a rollback op can reach Succeeded via TWO
+different S7 batch shapes (`Report`'s 3-event batch with a transparent
+terminal marker, and `Reconcile(true,…)`'s 2-event batch with none) —
+both now recognized. New tests: the spliced-proof attack (RED on old
+code, GREEN on new — ablation-proven) and its positive counterpart
+proving the Reconcile-batch-shape is still recognized.
+
+### Round 4 — codex FAIL (live-reproduced TWICE), kilo/agy PASS
+
+codex proved the round-3 adjacency fix, however precisely it checks
+event ORDER, can never prove events came from the SAME atomic
+`AppendBatch` call within a single trust domain: a caller holding the
+same `(*journal.Journal, *s7.Authority)` pair this function itself takes
+can drive a rollback op to a genuine RUNNING state, then hand-craft the
+terminal events matching `Authority.Report`'s/`Reconcile`'s exact
+production shape via plain `Journal.Append`/`AppendBatch` calls,
+bypassing `Authority.Report` and `RollbackGoverned`'s own durability
+verification entirely — reproduced live via `go test -overlay` for BOTH
+the Report-shaped 3-event batch and the Reconcile-shaped 2-event batch.
+
+Independently verified before accepting: read `contracts.Envelope`/
+`EnvelopeParams` (no batch/transaction-identity field), `journal.Append`/
+`AppendBatch` (no per-event-type ACL), and S7's `ActorType`/`ActorID`
+stamping (a plain caller-set field, not an unforgeable binding) — no
+primitive exists anywhere in this codebase to make the JOURNAL NARRATIVE
+itself unforgeable within a single trust domain. Building one (an
+owner-restricted append path, or a durable batch-identity marker) would
+be a new, invasive primitive touching the core journal contract (P0.3,
+HARDQ B7) — out of proportion for this slice.
+
+**Fix — re-scoped the threat model instead of chasing another
+event-order heuristic**: `LinkOriginalApplyAfterRollback`'s final
+pre-`Reconcile` check no longer trusts `ClassifyBundle`'s content-only
+read (which never fsyncs or identity-pins). It now calls
+`verifyDurabilityBeforeSuccess` — the SAME function `RollbackGoverned`
+itself gates its own `Report(Succeeded)` on — which freshly fsyncs and
+identity-pins the CURRENT on-disk bytes right before `Reconcile`. This
+makes the durable-BEFORE property true by fresh, real I/O at that
+instant, regardless of whether the rollback op's own journal narrative
+was genuine or forged. `rollbackOperationHasSucceededNarrative` (renamed
+from `...DurablySucceeded` to make the narrowing explicit) is kept only
+as a coarse narrative sanity gate on invariant 4 §2's LETTER ("a
+rollback was tracked"); the SAFETY property comes entirely from the
+fresh durability re-check. Three new tests, one RED/GREEN
+ablation-proven: `...AcceptsForgedNarrativeWhenContentDurablyMatchesBefore`
+(codex's exact PoC, now asserting the accepted outcome — forged
+narrative + genuinely durable content = safe to proceed),
+`...RefusesForgedNarrativeWhenContentNotActuallyBefore` (same forged
+narrative, content never restored — must still refuse, proving
+content-durability governs, not narrative), and
+`...RefusesWhenFinalFileFsyncFails` (a genuinely-succeeded, non-forged
+rollback with `fsyncFileHook` injected to fail during linkage itself —
+proves the `ClassifyBundle`→`verifyDurabilityBeforeSuccess` swap is
+actually load-bearing on this call path).
+
+### Round 5 — unanimous convergence: PASS × 3
+
+All three agents independently re-derived the mechanism from source
+(not the round-4 summary) and evaluated the re-scoping on its own
+merits. codex additionally live-reproduced a linkage-specific
+inode-substitution attempt against the new check (byte-identical
+replacement content swapped in mid-fsync) — correctly refused. kilo
+walked the narrative-gate-vs-durability-gate distinction to its logical
+conclusion independently and concurred it's the right decomposition
+given the single-trust-domain architecture. agy's structured two-axis
+review (spec + standards) found no additional defect. Only NOTE: codex
+flagged that several doc comments above (written before round 4) still
+described `rollbackOperationHasSucceededNarrative`'s journal record as
+"airtight proof" — stale relative to the round-4/5 narrowing. Fixed
+inline (rewrote the stale comments, no behavior change) without a
+further review round, per this session's own "cosmetic never fails a
+review" discipline.
+
+`internal/coding/workspace -count=20`, `internal/kernel/s7 -count=20`,
+`go vet ./...`, full `go test ./...` all green. **Invariant 4 §2 LINKAGE
+step CLOSED after 5 rounds.** Notable lesson reinforced: round 4's fix
+(tighter adjacency checking) was itself defeated one round later — the
+eventual fix wasn't a better heuristic on the same axis (journal-
+narrative interpretation) but a re-scoping onto a DIFFERENT, already-
+hardened mechanism (fresh durability re-verification) that made the
+whole class of narrative-forgery attacks irrelevant to safety, not just
+harder. When an event-order/heuristic fix keeps getting defeated by
+sharper counterexamples on the same axis, look for a different axis
+entirely rather than iterating the same heuristic further.
+
+**Next**: continuing autonomously per the coding-trio plan — real
+type-check and the S6 tool-boundary remain open (see
+[[nexus-coding-trio-plan]]).

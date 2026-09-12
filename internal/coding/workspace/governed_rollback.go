@@ -535,6 +535,16 @@ func fsyncFileBeneath(rootFd int, dirRel, baseName string) (dev, ino uint64, err
 // half of verifyDurabilityBeforeSuccess was fault-injectable).
 var fsyncFileHook = unix.Fsync
 
+// beforeFinalLinkageCheckHook is a test seam marking the exact window
+// LinkOriginalApplyAfterRollback's own final re-classification exists to
+// close — between confirming the rollback's durable Succeeded proof and
+// the final ClassifyBundle call immediately before Reconcile. A no-op in
+// production; tests substitute it to inject a concurrent drift into
+// precisely that window, RED/GREEN-proving the final check is
+// load-bearing and not merely redundant with the earlier RestartScan-time
+// check.
+var beforeFinalLinkageCheckHook = func() {}
+
 // RollbackGoverned makes ONE governed rollback attempt against
 // originalOp's own currently-authoritative sealed bundle (discovered and
 // authenticated via RestartScan — see this file's own doc comment for
@@ -895,4 +905,307 @@ func reconcileRehydratedRollback(op, originalOp contracts.OperationID, bundleDig
 		return result, false, fmt.Errorf("workspace: rollback governed: rollback operation's retry budget is exhausted, manual reconciliation required")
 	}
 	return result, true, nil
+}
+
+// LinkOriginalApplyAfterRollback implements invariant 4 §2's own required
+// linkage — the piece this file's own top-of-file doc comment explicitly
+// deferred as a separate, later increment: "ONLY after the rollback
+// operation itself succeeds may the ORIGINAL Apply operation call
+// Reconcile(false) and become eligible for Next again."
+//
+// round 1 finding (codex + kilo independently, live-reproduced by both):
+// an earlier version trusted the CALLER's own claim that a corresponding
+// rollback had already succeeded — a durable "mutation rolled back"
+// assertion (CodeMutationRolledBack) made on nothing but an unenforced
+// sequencing promise, exactly the "durable claim without proof" invariant
+// 2 exists to forbid. codex additionally live-reproduced two narrower
+// authentication gaps in that same version: an originalOp bound by S7 to
+// a DIFFERENT workspace target still passed its lone MatchesPolicy
+// check, and grants/j being unbound from each other (a different
+// journal than the one grants was rehydrated from) went undetected,
+// silently committing the durable companion to grants' OWN journal
+// rather than the caller-supplied one.
+//
+// Current contract (converged round 5, after round 1/2/4 hardening):
+// this function requires TWO independent things before ever touching
+// originalOp, neither trusted alone. (1) scan.go's own RestartScan
+// (rootFd, j, grants, store) — the SAME already-many-times-reviewed
+// machinery RollbackGoverned itself reuses — authenticates originalOp
+// (target/policy/journal-binding via its own wantTarget/MatchesPolicy/
+// BoundJournal checks) and classifies its bundle. (2)
+// rollbackOperationHasSucceededNarrative(j, rollbackOp) is a JOURNAL
+// replay (deliberately not grants.State(rollbackOp), which S7's own
+// rehydrate() never repopulates for a TERMINAL op after a restart —
+// self-caught while RED/GREEN-proving the exhausted-budget test below)
+// confirming SOME process tracked this exact rollbackOp through S7 to a
+// terminal-succeeded landing. Round 4 (codex, live-reproduced twice)
+// proved narrative (2) is NOT unforgeable: a first-party caller holding
+// the same (*journal.Journal, *s7.Authority) pair this function itself
+// takes can hand-craft events matching S7's own production shapes. So
+// (2) is kept only as a coarse sanity gate on the INVARIANT'S LETTER
+// ("a rollback was tracked"); the actual SAFETY property this function
+// relies on comes from a THIRD, later check — a fresh call to
+// verifyDurabilityBeforeSuccess, the same durability proof
+// RollbackGoverned gates its own Report(Succeeded) on — re-run here,
+// right before Reconcile, regardless of what (2) said. See that call
+// site below for the full rationale.
+//
+// The inherited code on originalOp's own Reconcile landing is NOT
+// always empty: this operation ALSO underwent S7's own restart
+// rehydration (RUNNING -> UNKNOWN, durably setting lastCode to
+// CodeCrashRecovered — the SAME events.go mechanism this file's own
+// crash_recovered normalization fix, round 4/6/7 above, already had to
+// account for on the ROLLBACK operation's side) — so the SAME
+// normalization is applied here, RED/GREEN-proven via ablation using a
+// real two-restart sequence, matching that earlier fix exactly.
+
+// s7AttemptReportedPayload is the minimal shape this package reads back
+// from S7's OWN "s7.attempt_reported" event — s7's own reportedPayload
+// is unexported, and this package only needs the authoritative Op and
+// Outcome fields (matching scan.go's own s7AttemptStartedPayload
+// precedent for the identical reason).
+type s7AttemptReportedPayload struct {
+	Op      string `json:"op"`
+	Outcome int    `json:"outcome"`
+}
+
+// s7TerminalPayload and s7ReconcilePayload are the minimal shapes this
+// package reads back from S7's OWN "s7.operation_terminal" and
+// "s7.operation_reconciled" events — s7's own terminalPayload/
+// reconcilePayload are unexported, same reason as above.
+type s7TerminalPayload struct {
+	Op string `json:"op"`
+}
+type s7ReconcilePayload struct {
+	Op    string `json:"op"`
+	State string `json:"state"`
+}
+
+// rollbackOperationHasSucceededNarrative replays j's own durable history
+// and reports whether rollbackOp has a durable (survives any number of
+// restarts), ATOMICALLY-PAIRED record of S7's OWN authoritative success
+// event for that SAME op, immediately followed (nothing else
+// interleaved, except S7's own terminal marker for the SAME op, which
+// Report's own batch always emits in between) by the workspace.
+// rollback_committed companion.
+//
+// This is a NARRATIVE gate, not a durability proof: round 4 (codex,
+// live-reproduced twice) showed that a first-party caller holding the
+// same (*journal.Journal, *s7.Authority) pair LinkOriginalApplyAfterRollback
+// itself takes can hand-craft events matching this exact shape without
+// ever running RollbackGoverned's real durability verification. Kept
+// anyway because it still enforces invariant 4 §2's LETTER (some
+// rollback attempt for this op really was tracked to success) at
+// negligible cost — LinkOriginalApplyAfterRollback's own SAFETY property
+// never depends on this function alone; it re-verifies durability fresh
+// via verifyDurabilityBeforeSuccess before ever calling Reconcile.
+//
+// round 2 HIGH finding (codex, live-reproduced): checking the
+// application-level companion ALONE is insufficient — a standalone,
+// structurally-valid workspace.rollback_committed event, durably
+// appended with no corresponding S7 operation ever having gone through
+// a real Begin/Next/Consume/Report(Succeeded) lifecycle, satisfied that
+// version of this check.
+//
+// round 3 HIGH finding (codex, live-reproduced): the round-2 fix's OWN
+// two-independent-booleans design was ALSO insufficient — a REAL S7
+// Succeeded report for rollbackOp, atomically paired with a DIFFERENT
+// companion (e.g. workspace.rollback_started, never rollback_committed),
+// plus a SEPARATE, standalone workspace.rollback_committed appended
+// later, satisfied both booleans independently even though durability
+// was never actually proven for that report. Fixed by requiring
+// ADJACENCY, not mere co-existence: this now mirrors RestartScan's own
+// pendingOp discipline exactly (scan.go) — a durable "success" marker
+// starts a pending window that ONLY the immediately-following event can
+// satisfy; ANY other interleaving event (a different op, a different
+// event type, or the SAME op's marker paired with something else)
+// closes the window emptyhanded.
+//
+// TWO distinct S7 batch shapes both count as a genuine success marker,
+// since a rollback operation can reach Succeeded via either path:
+//   - Report(Succeeded) (the normal, single-process attempt path):
+//     s7.attempt_reported(Outcome=Succeeded) + s7.operation_terminal +
+//     the owner's companion, in that order — the terminal marker is
+//     transparent (expected, not a break) only for the SAME op.
+//   - Reconcile(true, ...) (reconcileRehydratedRollback's own crash-
+//     recovery path, invariant 4 §2's own "mixed state -> Reconcile"
+//     machinery): s7.operation_reconciled(State=SUCCEEDED) + the
+//     owner's companion, directly adjacent, no terminal marker.
+//
+// A malformed or foreign payload on any event type here is treated as
+// "not a match" (closing any pending window), never trusted blind —
+// already fail-closed at write time by rollbackEventValidators for the
+// companion, and by S7's own append path for its internal events; this
+// replay only ever reads what this package and S7 itself durably wrote.
+func rollbackOperationHasSucceededNarrative(j *journal.Journal, rollbackOp contracts.OperationID) (bool, error) {
+	succeeded := false
+	pending := contracts.OperationID("") // set by a genuine success marker for rollbackOp; cleared by anything else
+	err := j.Replay(0, func(ev journal.Event) error {
+		switch ev.Envelope.EventType {
+		case s7.EvAttemptReported:
+			var p s7AttemptReportedPayload
+			if jerr := json.Unmarshal(ev.Envelope.Payload, &p); jerr == nil && p.Op == string(rollbackOp) && p.Outcome == int(s7.OutcomeSucceeded) {
+				pending = rollbackOp
+			} else {
+				pending = ""
+			}
+		case s7.EvOperationTerminal:
+			var p s7TerminalPayload
+			// Transparent ONLY immediately after this SAME op's own
+			// success marker — Report's own batch shape for a terminal
+			// landing always interleaves this before the owner's
+			// companion; anything else means it belongs to some other
+			// sequence entirely and must not extend a stale window.
+			if jerr := json.Unmarshal(ev.Envelope.Payload, &p); !(jerr == nil && pending == rollbackOp && p.Op == string(rollbackOp)) {
+				pending = ""
+			}
+		case s7.EvOperationReconcile:
+			var p s7ReconcilePayload
+			if jerr := json.Unmarshal(ev.Envelope.Payload, &p); jerr == nil && p.Op == string(rollbackOp) && p.State == contracts.AttemptSucceeded.String() {
+				pending = rollbackOp
+			} else {
+				pending = ""
+			}
+		case EvRollbackCommitted:
+			if pending == rollbackOp {
+				var p rollbackCommittedPayload
+				if jerr := json.Unmarshal(ev.Envelope.Payload, &p); jerr == nil && p.Op == string(rollbackOp) {
+					succeeded = true
+				}
+			}
+			pending = ""
+		default:
+			pending = ""
+		}
+		return nil
+	})
+	if err != nil {
+		return false, fmt.Errorf("replay rollback history: %w", err)
+	}
+	return succeeded, nil
+}
+
+func LinkOriginalApplyAfterRollback(rootFd int, store *sealedstore.Store, originalOp contracts.OperationID, grants *s7.Authority, j *journal.Journal, runID contracts.RunID) error {
+	if originalOp == "" || !runID.Valid() {
+		return fmt.Errorf("workspace: link original apply after rollback: original op and run id are both required (fail closed)")
+	}
+	findings, err := RestartScan(rootFd, j, grants, store)
+	if err != nil {
+		return fmt.Errorf("workspace: link original apply after rollback: restart scan: %w", err)
+	}
+	var finding *ScanFinding
+	for i := range findings {
+		if findings[i].Op == originalOp {
+			finding = &findings[i]
+			break
+		}
+	}
+	if finding == nil || finding.BundleDigest == "" {
+		return fmt.Errorf("workspace: link original apply after rollback: %q is not a currently eligible (UNKNOWN, target/policy-matched, bundle-confirmed) workspace.apply operation for this root (fail closed)", originalOp)
+	}
+	// round 2 HIGH finding (agy, live-reproduced): a durably-succeeded
+	// rollback in the past does not, by itself, mean the workspace is
+	// STILL clean right now — something else (an external writer, a
+	// later unrelated crash) could have moved it to MID_CRASH or FOREIGN
+	// since. CodeMutationRolledBack asserts a CURRENT fact ("the
+	// complete write set now equals the sealed BEFORE state", invariant
+	// 4 §2), not merely a historical one — the SAME "verify now, don't
+	// trust history alone" discipline verifyDurabilityBeforeSuccess
+	// already applies elsewhere in this file.
+	if finding.State != TransactionNeverStarted {
+		return fmt.Errorf("workspace: link original apply after rollback: original operation's bundle currently classifies %s, not NEVER_STARTED — workspace is not verified clean at BEFORE right now (fail closed)", finding.State)
+	}
+	rollbackOp := RollbackOperationID(originalOp, finding.BundleDigest)
+	// grants.State is an IN-MEMORY-ONLY view: S7's own rehydrate() never
+	// loads a TERMINAL (Succeeded/Failed/Cancelled) operation back into
+	// memory on restart — there is nothing left for it to DO with one, so
+	// tracking it would be pure waste for every other caller in this
+	// codebase. But that means a rollback op that durably succeeded in
+	// an EARLIER process, before whatever restart produced THIS grants
+	// instance, reads back as "not found" here, not Succeeded — checking
+	// grants.State would wrongly refuse a genuinely-succeeded rollback
+	// across any restart boundary (self-caught while RED/GREEN-proving
+	// the exhausted-budget test above, which deliberately restarts
+	// between the rollback and the link). So this reads the journal
+	// directly instead — see rollbackOperationHasSucceededNarrative's own
+	// doc comment for exactly what that record does and does not prove.
+	succeeded, herr := rollbackOperationHasSucceededNarrative(j, rollbackOp)
+	if herr != nil {
+		return fmt.Errorf("workspace: link original apply after rollback: %w", herr)
+	}
+	if !succeeded {
+		return fmt.Errorf("workspace: link original apply after rollback: rollback operation %q has no durable workspace.rollback_committed record — refusing to reconcile the original Apply operation without proof (fail closed)", rollbackOp)
+	}
+	// round 2 HIGH finding (codex, live-reproduced): the scan above and
+	// the journal replay above are each a point-in-time read: a
+	// concurrent writer could drift the workspace between the (clean)
+	// scan and this moment, before the mutating Reconcile call below —
+	// a residual check-then-act window verifyDurabilityBeforeSuccess's
+	// own doc comment already names as the smallest one this package can
+	// close without OS-level exclusive locking.
+	//
+	// round 4 HIGH finding (codex, live-reproduced TWICE): journal-event-
+	// shape matching — however precisely it checks adjacency, as
+	// rollbackOperationHasSucceededNarrative above now does — can never be
+	// made to PROVE the historical narrative is genuine within a single
+	// trust domain: any first-party caller holding the SAME (*journal.
+	// Journal, *s7.Authority) pair this function itself takes can, with
+	// no more privilege than this function already has, hand-craft
+	// events matching s7.Authority.Report's or Reconcile's exact
+	// production shape (codex reproduced both the Report-shaped 3-event
+	// batch and the Reconcile-shaped 2-event batch, each via a genuinely
+	// real S7 lifecycle up to that point but a forged terminal step,
+	// using go test -overlay counterexamples). Closing that at the
+	// journal layer would need a new provenance primitive (an owner-
+	// restricted append path or a durable batch-identity marker) that
+	// does not exist anywhere in this codebase today (checked: Envelope/
+	// EnvelopeParams carry no such field, journal.Append/AppendBatch
+	// enforce no per-event-type ACL) — out of proportion for this slice
+	// and outside this file's charter to add unilaterally.
+	//
+	// So rollbackOperationHasSucceededNarrative is kept ONLY as a coarse
+	// narrative sanity gate (a rollback attempt for this exact op/
+	// target/policy WAS tracked and reported terminal-succeeded by SOME
+	// process) — it is deliberately NOT this function's source of truth
+	// for durability. That source of truth is exactly what
+	// RollbackGoverned's own Report(Succeeded) call already trusts:
+	// verifyDurabilityBeforeSuccess's fresh fsync + identity-pinned
+	// reclassification of the CURRENT on-disk state, called again here,
+	// at the last possible moment before Reconcile. Calling the SAME
+	// function RollbackGoverned itself gates its own success on means
+	// the durable-BEFORE property this Reconcile relies on is established
+	// by real, fresh I/O at THIS instant — true regardless of whether the
+	// rollback op's own journal narrative was genuine or forged, and
+	// regardless of whether the original writer of the current bytes
+	// ever fsynced them. A mere ClassifyBundle content-only re-check (the
+	// round-2 fix's original shape) cannot make that claim: it never
+	// fsyncs and never identity-pins, so forged-but-content-matching
+	// bytes that were never durably committed could still vanish on the
+	// next crash after Reconcile had already marked the original Apply
+	// rolled back.
+	beforeFinalLinkageCheckHook()
+	raw, rerr := store.Get(finding.BundleDigest)
+	if rerr != nil {
+		return fmt.Errorf("workspace: link original apply after rollback: re-verify: fetch sealed bundle: %w", rerr)
+	}
+	b, rerr := DecodeBundle(raw)
+	if rerr != nil {
+		return fmt.Errorf("workspace: link original apply after rollback: re-verify: decode sealed bundle: %w", rerr)
+	}
+	if rerr := verifyDurabilityBeforeSuccess(rootFd, b); rerr != nil {
+		return fmt.Errorf("workspace: link original apply after rollback: re-verify durability: %w", rerr)
+	}
+	attemptNo := grants.Attempts(originalOp)
+	build := func(l s7.Landing) s7.Companion {
+		code := l.Code
+		if code != s7.CodeMutationRolledBack && (l.Kind == s7.LandingRetry || l.Kind == s7.LandingTerminal) {
+			code = s7.CodeMutationRolledBack
+		}
+		return s7.Companion{Key: originalOp, Params: envelope(j, originalOp, runID, attemptNo, EvApplyFailed,
+			applyFailedPayload{Op: string(originalOp), AttemptNo: attemptNo, Landing: int(l.Kind), Code: code})}
+	}
+	if err := grants.Reconcile(originalOp, false, build); err != nil {
+		return fmt.Errorf("workspace: link original apply after rollback: %w", err)
+	}
+	return nil
 }
