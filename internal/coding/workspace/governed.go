@@ -187,34 +187,40 @@ type applyFailedPayload struct {
 }
 
 // validApplyFailedNarrative is the EXACT (attempt_no, landing, code)
-// compatibility table for the workspace.apply_failed event — not just a
-// closed landing enum (code-review finding, codex round 4 MEDIUM #3: a
-// closed enum alone still admits impossible combinations no legitimate
-// caller in THIS package ever produces, e.g. attempt_no=0 with Unknown,
-// or Retry paired with an unrelated known S7 code). Mirrors s7.Events's
-// own validReport, scoped to what THIS owner actually emits:
-//   - any non-empty code other than s7.CodeMutationRolledBack is
-//     rejected outright — this owner never uses any other code.
+// compatibility table shared by every workspace.*_failed event owner in
+// this package — not just a closed landing enum (code-review finding,
+// codex round 4 MEDIUM #3: a closed enum alone still admits impossible
+// combinations no legitimate caller in THIS package ever produces, e.g.
+// attempt_no=0 with Unknown, or Retry paired with an unrelated known S7
+// code). Mirrors s7.Events's own validReport, scoped to what a SINGLE
+// owner actually emits — retryableCode is THAT owner's own one
+// closed retryable code (s7.CodeMutationRolledBack for
+// workspace.apply_failed, s7.CodeRollbackIncomplete for
+// workspace.rollback_failed — generalized, not duplicated, when the
+// rollback wiring needed the identical table shape for its own single
+// retryable code):
+//   - any non-empty code other than retryableCode is rejected outright —
+//     this owner never uses any other code.
 //   - Cancelled: any attempt_no (0 = never consumed); code "" (never
-//     consumed) or CodeMutationRolledBack when attempt_no>=1 — S7's own
-//     Cancel preserves the PRIOR report's code as rec.lastCode when
-//     building its companion, so cancelling an operation that already
-//     landed FAILED_RETRYABLE/CodeMutationRolledBack once (a legitimate
-//     step in a caller-driven retry) carries that code forward (code-
-//     review finding, codex round 5 HIGH #1 — a live reproduction, not
+//     consumed) or retryableCode when attempt_no>=1 — S7's own Cancel
+//     preserves the PRIOR report's code as rec.lastCode when building
+//     its companion, so cancelling an operation that already landed
+//     FAILED_RETRYABLE/retryableCode once (a legitimate step in a
+//     caller-driven retry) carries that code forward (code-review
+//     finding, codex round 5 HIGH #1 — a live reproduction, not
 //     hypothetical: rejecting this outright made the durable Cancel
 //     append itself fail, stranding the operation AUTHORIZED forever).
-//   - Terminal: any attempt_no, code "" or CodeMutationRolledBack (Next's
-//     own exhaustion-before-any-grant path can terminalize at
-//     attempt_no=0 via a passed deadline, carrying whatever code was
-//     last reported, possibly "").
+//   - Terminal: any attempt_no, code "" or retryableCode (Next's own
+//     exhaustion-before-any-grant path can terminalize at attempt_no=0
+//     via a passed deadline, carrying whatever code was last reported,
+//     possibly "").
 //   - Retry: requires a consumed attempt (attempt_no>=1) AND
-//     CodeMutationRolledBack — the only landing/code pair Report itself
-//     ever proposes for a verified-clean rollback.
+//     retryableCode — the only landing/code pair Report itself ever
+//     proposes for a verified-clean rollback/restore.
 //   - Unknown: requires a consumed attempt (attempt_no>=1) and code "".
 //   - Succeeded: never valid — this is exclusively the FAILURE companion.
-func validApplyFailedNarrative(attemptNo, landing int, code string) bool {
-	if code != "" && code != s7.CodeMutationRolledBack {
+func validApplyFailedNarrative(attemptNo, landing int, code string, retryableCode string) bool {
+	if code != "" && code != retryableCode {
 		return false
 	}
 	// A non-empty code requires a prior CONSUMED attempt to have produced
@@ -237,7 +243,7 @@ func validApplyFailedNarrative(attemptNo, landing int, code string) bool {
 	case s7.LandingCancelled, s7.LandingTerminal:
 		return true
 	case s7.LandingRetry:
-		return attemptNo >= 1 && code == s7.CodeMutationRolledBack
+		return attemptNo >= 1 && code == retryableCode
 	case s7.LandingUnknown:
 		return attemptNo >= 1 && code == ""
 	default:
@@ -245,13 +251,17 @@ func validApplyFailedNarrative(attemptNo, landing int, code string) bool {
 	}
 }
 
-// Events registers the closed workspace.* event set. Each validator
-// strictly decodes (no unknown fields, no trailing data) and checks the
-// closed shapes above — an admitted event that later turns out
-// malformed is exactly the "self-certification" gap invariant 5 warns
-// against.
+// Events registers the closed workspace.* event set — the Apply
+// direction's own three events here, merged with the Rollback
+// direction's own three (governed_rollback.go's rollbackEventValidators,
+// kept in that file so this one doesn't need to know rollback's own
+// payload shapes) — ONE map, ONE entry point, so no caller can forget to
+// register half of it. Each validator strictly decodes (no unknown
+// fields, no trailing data) and checks the closed shapes above — an
+// admitted event that later turns out malformed is exactly the
+// "self-certification" gap invariant 5 warns against.
 func Events() map[string]journal.PayloadValidator {
-	return map[string]journal.PayloadValidator{
+	m := map[string]journal.PayloadValidator{
 		EvApplyStarted: func(raw json.RawMessage) error {
 			var p applyStartedPayload
 			if err := strictDecodeEvent(raw, &p); err != nil {
@@ -286,12 +296,16 @@ func Events() map[string]journal.PayloadValidator {
 			if p.Op == "" || p.AttemptNo < 0 {
 				return fmt.Errorf("workspace: apply_failed requires op and attempt_no>=0 (0 means no attempt was ever consumed)")
 			}
-			if !validApplyFailedNarrative(p.AttemptNo, p.Landing, p.Code) {
+			if !validApplyFailedNarrative(p.AttemptNo, p.Landing, p.Code, s7.CodeMutationRolledBack) {
 				return fmt.Errorf("workspace: apply_failed names an impossible narrative (attempt_no=%d, landing=%d, code=%q)", p.AttemptNo, p.Landing, p.Code)
 			}
 			return nil
 		},
 	}
+	for name, v := range rollbackEventValidators() {
+		m[name] = v
+	}
+	return m
 }
 
 // strictDecodeEvent decodes exactly ONE JSON value with no unknown

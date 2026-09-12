@@ -127,7 +127,7 @@ var knownCodes = map[string]bool{
 	CodeTransportPreWire: true, CodeHTTP429: true, CodeHTTP4xx: true, CodeHTTP5xx: true,
 	CodeTransportPostWrite: true, CodeMalformedReply: true, CodeLocalRefused: true,
 	CodeInvalidGeneral: true, CodeCrashRecovered: true, CodeHTTP400Format: true,
-	CodeReceiptNotDurable: true, CodeMutationRolledBack: true,
+	CodeReceiptNotDurable: true, CodeMutationRolledBack: true, CodeRollbackIncomplete: true,
 }
 
 // Validate rejects a policy that cannot be honoured or serialised.
@@ -198,6 +198,19 @@ const (
 	// may report FailedRetryable"). Never used for an UNVERIFIED or
 	// partial rollback — that lands UNKNOWN instead, never retried blind.
 	CodeMutationRolledBack = "mutation_rolled_back"
+	// CodeRollbackIncomplete: a governed restart-time rollback attempt
+	// restored SOME but not ALL of a sealed bundle's write set back to
+	// its captured before-images this pass (a mixed BEFORE/AFTER state
+	// remains) — the underlying primitive (workspace.rollbackBundle) is
+	// idempotent and re-verifies fresh identity on every call, so the
+	// SAME rollback operation may safely retry within its budget
+	// (PLAN-CODING-TRIO.md invariant 4 §2: "a mixed BEFORE/AFTER state
+	// remaining -> rollback Reconcile(false) then Next on that SAME
+	// rollback operation"). Never used for a FOREIGN or otherwise
+	// unverifiable result — that lands UNKNOWN instead, never retried
+	// blind, the same discipline CodeMutationRolledBack's own doc
+	// comment already establishes for the forward-direction analogue.
+	CodeRollbackIncomplete = "rollback_incomplete"
 )
 
 // Policy constants — the ONE place retry policy lives (no config knob;

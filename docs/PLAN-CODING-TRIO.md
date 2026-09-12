@@ -3349,3 +3349,464 @@ S7) makes clear the governed `PolicyWorkspaceRollback` wrapper on top of
 this — its own grant lifecycle, retry-driving loop, and the handoff back
 to the original Apply operation's `Reconcile`+`Next` — is a materially
 larger, separate next increment, not a small follow-up.
+
+## Status 2026-09-11 — PolicyWorkspaceRollback S7 wrapper (invariant 4 step 7, second/final piece)
+
+User authorization: "kreni na PolicyWorkspaceRollback S7 wrapper." Builds
+the S7-governed operation the write primitive (`rollback.go`) was
+deliberately scoped to defer — mirrors `governed.go`'s own
+`ApplyGoverned`/`apply` relationship exactly.
+
+New file `internal/coding/workspace/governed_rollback.go`: `RollbackGoverned`
+makes ONE governed rollback attempt per call, exactly matching
+`ApplyGoverned`'s own single-attempt-per-call shape. Identity
+(`RollbackOperationID`) binds the ORIGINAL Apply operation's own identity
+(embedded verbatim — already carries profile + workspace root + plan
+digest) plus the sealed-bundle digest being rolled back (invariant 4 §2's
+own spec); target reuses `ApplyTargetID` directly (the rollback affects
+the exact same workspace root). Durable `workspace.rollback_started`
+companion pairs atomically with S7's own Consume, BEFORE any write —
+proven by a fault-injection test on EITHER half of that batch (mirrors
+invariant 2's own required detector, and `ApplyGoverned`'s identical
+proof). `PolicyWorkspaceRollback` deliberately does NOT copy
+`PolicyWorkspaceApply`'s own single-attempt default: `rollbackBundle`'s own
+idempotent, fresh-identity-per-call design makes retrying the SAME
+operation safe with no precondition-rebuilding step (unlike Apply's own
+retry, which specifically needed `UpdateMutationsAfterRollback` because
+`writeFileBeneath`'s atomic exchange always mints a new inode) — a real
+default retry budget (`MaxAttempts:5`) is therefore correct here, not an
+opt-in override.
+
+Outcome branching implements invariant 4 §2's own reconciliation
+predicate exactly: all-BEFORE achieved with no attempt error →
+`Report(Succeeded)`; still mixed (`TransactionMidCrash`) → `Report(FailedRetryable,
+CodeRollbackIncomplete)` (new closed S7 code, mirrors `CodeMutationRolledBack`'s
+own precedent); `TransactionForeign`, OR any non-cancellation attempt error
+AT ALL — even alongside a state that LOOKS like clean success — →
+`Report(Unknown)`, never a guess (this is the file's own central safety
+property: `rollbackBundle`'s contract explicitly allows a "content
+correct, durability unproven" outcome, and this wrapper must never let
+that be mistaken for success); cancellation (including AttemptContext
+derivation failing) → `Cancel`, matching `ApplyGoverned`'s identical
+cancellation-vs-code-carrying-failure distinction.
+
+`validApplyFailedNarrative` (governed.go, 5-times-reviewed in the original
+S7-wiring piece) generalized to take its retryable code as a parameter —
+pure, behavior-preserving change, reused for BOTH `workspace.apply_failed`
+(`CodeMutationRolledBack`) and the new `workspace.rollback_failed`
+(`CodeRollbackIncomplete`) rather than duplicating the whole compatibility
+table. `Events()` extended to merge in the three new rollback event
+validators from this file — one unified entry point, no caller can forget
+to register half of it.
+
+12 tests in `governed_rollback_test.go`: real end-to-end success (both
+durable events land, S7 reaches SUCCEEDED); identity/digest validation;
+each outcome branch (using a `rollbackFn` test seam — mirrors
+`governed.go`'s own `applyFn`/`deriveAttemptContext` seam pattern —
+for the two branches, MidCrash and Foreign, that are genuinely hard to
+construct via real filesystem timing); the central "error alongside
+clean-looking state" safety property; cancellation (both from
+`rollbackFn` and from `AttemptContext` derivation failing); a REAL retry
+after a seam-forced incomplete first attempt reaching SUCCEEDED on a
+second real call to the SAME operation; the required atomicity
+fault-injection detector; exact-intent identity determinism. Every
+safety-critical branch RED-proven via ablation — including reproducing,
+live, exactly the bug the central safety property exists to prevent
+(removing the `rollbackErr != nil` branch made a durability-failed
+attempt silently report success).
+
+`internal/coding/workspace -count=20` and `internal/kernel/s7 -count=20`
+both green, `go vet ./...` clean, full `go test ./...` re-run.
+
+### Round 1 review — 7 real findings (6 codex + 1 kilo), all fixed
+
+Per the owner's explicit correction ("zašto kilo i agyju ne zadaješ
+zadatke? imaš njih trojicu, radi kako spada") this round dispatched to
+ALL THREE herdr agents in parallel for the first time this session
+(codex, kilo, agy — previously codex-solo, justified only by kilo/agy
+being genuinely quota-blocked much earlier in the session; that
+assumption was stale and not re-checked before this piece). codex found
+6 issues, kilo found 1 additional distinct issue, agy PASSed without
+catching anything (judged unreliable per the session's own epistemic
+discipline — a review that finds nothing is usually a failed review).
+
+1. **Codex HIGH #1** — `originalOp` (and, in the pre-fix version,
+   `bundleDigest` too) accepted as bare caller input with zero
+   cross-check: a forged or stale operation string/digest pair could be
+   "rolled back" against any target. **Fix**: `bundleDigest` removed
+   from `RollbackGoverned`'s signature entirely; the caller supplies
+   ONLY `originalOp`, and this function now calls `scan.go`'s own
+   `RestartScan` and requires `originalOp` to appear among its
+   findings — which already proves (via already-5-times-reviewed
+   machinery) that S7 authoritatively reports it UNKNOWN, it targets
+   this root, it matches `PolicyWorkspaceApply`, and its bundle digest
+   was confirmed via the same atomic `s7.attempt_started`/
+   `workspace.apply_started` pairing `RestartScan` itself verifies.
+   `scan.go` gained one additive field, `ScanFinding.BundleDigest`, for
+   exactly this reuse (zero behavior change to any existing `scan.go`
+   test).
+2. **Codex HIGH #2** — no `grants.BoundJournal() == j` check. **Fix**:
+   closed for free by the `RestartScan` reuse above (it already refuses
+   when `grants` is not bound to `j`).
+3. **Codex HIGH #3** — a crash DURING the rollback operation's own
+   attempt permanently strands it UNKNOWN (`Next` refuses an UNKNOWN
+   operation forever; there was no `Reconcile` path for the rollback
+   op's OWN identity). **Fix**: new self-recovery block +
+   `reconcileRehydratedRollback` helper — before ever calling `Begin`,
+   checks whether THIS SAME rollback operation is already UNKNOWN and,
+   if so, re-classifies the bundle and Reconciles it first, falling
+   through to a genuine new attempt only when that leaves it
+   retry-eligible.
+4. **Codex HIGH #4** — the cancellation branch was checked FIRST in the
+   outcome switch, masking a FOREIGN result or a real error joined
+   alongside a cancellation (`errors.Join(context.Canceled, other)`).
+   **Fix**: reordered the switch (state checked before error); added
+   `isPureCancellation`, which recursively walks an `errors.Join` tree
+   to distinguish "purely cancellation" from "cancellation mixed with
+   something else."
+5. **Codex HIGH #5** — an unrecognized `TransactionState` fell through
+   to a `default:` that reported Succeeded. **Fix**: explicit
+   `case state == TransactionNeverStarted:` with a genuine `default:` →
+   Unknown for anything else, fail closed.
+6. **Codex MEDIUM #6** — the durable event validators never
+   cross-checked `Op == RollbackOperationID(OriginalOp, BundleDigest)`
+   internal consistency (S7 itself only checks the structural
+   `Companion.Key`, never the payload JSON's own content). **Fix**:
+   added the explicit cross-check to both `EvRollbackStarted` and
+   `EvRollbackCommitted` validators.
+7. **Kilo's distinct finding** — the pre-fix switch checked
+   `rollbackErr != nil` BEFORE `state == TransactionMidCrash`, so the
+   realistic "MidCrash + a real non-cancellation per-file error" case —
+   `rollbackBundle`'s own documented NORMAL "partial progress, safe to
+   retry" shape — always landed Unknown instead of FailedRetryable,
+   making the entire `MaxAttempts:5` retry budget UNREACHABLE in
+   production for the one case it exists for. Reproduced live twice
+   (via the `rollbackFn` seam and via the real primitive with an
+   injected chmod-0555 write failure). **Fix**, reconciled with codex's
+   finding 4 by following `ApplyGoverned`'s own established precedent
+   (which checks `ErrRollbackIncomplete` BEFORE its cancellation
+   check): the final priority order checks `TransactionForeign`, then
+   `TransactionMidCrash`, BOTH unconditionally before any error-based
+   branching at all; only `TransactionNeverStarted` needs the
+   pure-cancellation-vs-real-error sub-branching.
+
+A second, self-inflicted control-flow bug surfaced while RED/GREEN-
+proving finding 3's own fix with a REAL (not seam-forced) crash-during-
+rollback scenario: gating the finding-3 self-recovery check behind
+"`originalOp`'s CURRENT scan state is MID_CRASH" made it unreachable in
+EXACTLY the case it exists for — a prior rollback attempt that fully
+restored every file (so `originalOp` now legitimately reads back
+NEVER_STARTED) but crashed before its own `Report` landed. Fixed by
+moving the self-recovery check to run BEFORE the MID_CRASH eligibility
+gate, independent of `finding.State`; the gate now only refuses when
+there is no prior rollback-op record to recover AND `originalOp` itself
+isn't currently MID_CRASH. `governed_rollback_test.go` rewritten in full
+(14 tests) using `scan_test.go`'s own `crashApply` helper to build REAL
+crash-orphaned `workspace.apply` operations for every scenario (the
+round-1 test file used a bare-string `testApplyOp` fixture that never
+Begin'd a real S7 operation — invalid against the new
+`RestartScan`-authenticated signature). Every fixed/new guard RED-proven
+via ablation, including the second self-inflicted bug above and the
+finding-7/finding-4 reconciled ordering. `internal/coding/workspace
+-count=20` and `internal/kernel/s7 -count=20` both green, `go vet ./...`
+clean, full `go test ./...` re-run green.
+
+**Confidence:** all 7 round-1 findings plus the self-inflicted ordering
+bug are RED/GREEN-proven against real crash-orphan fixtures, not just
+seam-forced branches. Weakest link: `TestRollbackGovernedRefusesUnauthenticatedOriginalOp`
+ablation-verified the `finding == nil` refusal path, but did not
+construct a forged finding carrying a REAL, existing bundle digest for
+some OTHER operation to probe the authentication boundary more
+adversarially — worth flagging to round 2's reviewers specifically.
+Round 2 review dispatched to all three agents in parallel next.
+
+**Explicitly NOT built here** (documented in the file's own doc comment,
+matching this whole program's decomposition discipline one more time):
+the LINKAGE step — calling `Reconcile(false)` on the ORIGINAL Apply
+operation once THIS rollback operation's own success is durable
+(invariant 4 §2: "ONLY after the rollback operation itself succeeds may
+the ORIGINAL Apply operation call Reconcile(false) and become eligible
+for Next again"). That has its own non-trivial error-handling questions
+(what happens if the rollback succeeds but the original op's own
+Reconcile then fails?) deserving its own reviewable increment. Also not
+built: any caller that actually discovers a MID_CRASH finding (via
+`scan.go`'s `RestartScan`, already report-only by its own explicit
+design) and INVOKES `RollbackGoverned` — that orchestration remains
+future work.
+
+**Confidence:** The governed wrapper's own lifecycle — identity, atomic
+Consume pairing, every outcome branch, real multi-attempt retry — is
+proven against both real end-to-end scenarios and seam-forced edge cases,
+mirroring `ApplyGoverned`'s own already-6-times-reviewed shape closely
+enough that I expect FEWER review rounds than that piece needed (most of
+the hard design questions — exact-intent identity, atomic companion
+pairing, cancellation-vs-failure distinction — were already settled
+there and just re-applied here). Not yet adversarially reviewed by
+codex — that is the next step. Weakest link, flagging proactively: this
+is the FIRST piece in this whole program where a policy's retry budget
+was set to a NON-trivial default (`MaxAttempts:5`) rather than 1 — the
+reasoning (idempotent, fresh-identity-per-call primitive, no
+precondition-staleness hazard) is sound but genuinely NEW territory this
+session hasn't adversarially tested before; worth codex's particular
+attention.
+
+### Round 2 review — 4 more findings, all fixed
+
+1. **HIGH (kilo+agy independently live-reproduced)** —
+   `reconcileRehydratedRollback`'s own `Reconcile(false)` companion built
+   a `LandingRetry` with `Code: l.Code` verbatim; S7's own `Reconcile`
+   populates that from `rec.lastCode`, which is `""` for an operation
+   Consumed but never Reported even once (a genuine first crash) —
+   `validApplyFailedNarrative` requires an EXACT match against the
+   retryable code for `LandingRetry`, so the empty code durably rejected
+   this very companion, permanently stranding the operation UNKNOWN.
+   **Fix**: substitute `CodeRollbackIncomplete` whenever `LandingRetry`'s
+   own code comes back empty.
+2. **HIGH (codex)** — the self-recovery eligibility gate refused whenever
+   `finding.State != MID_CRASH`, stranding a legitimately
+   `FAILED_RETRYABLE` rollback op forever once the physical write set
+   happened to already read NEVER_STARTED (e.g. an earlier attempt in
+   the SAME retry sequence finished the writes but reported a
+   non-cancellation error alongside a clean classification). **Fix**:
+   any EXISTING rollback-op record (not just UNKNOWN) falls through to
+   `Begin`+`Next` — safe unconditionally, since `rollbackFn`'s own
+   upfront classification is a zero-write no-op whenever the bundle
+   already reads NEVER_STARTED.
+3. **HIGH (codex)** — self-recovery trusted an UNKNOWN op by identity
+   string alone, no target/policy cross-check — a differently-bound op
+   that merely COLLIDES with this deterministic string was reconciled to
+   SUCCEEDED with zero verification it was ever this package's own
+   attempt. **Fix**: added `grants.Target()`/`MatchesPolicy()` checks
+   before self-recovery, mirroring `RestartScan`'s own precedent.
+4. **codex diagnostic** — the MID_CRASH branch discarded `rollbackErr`
+   entirely, breaking `errors.Is`/`errors.As` against the real
+   underlying cause. **Fix**: wrapped via `%w`. Also fixed agy's
+   `isPureCancellation` gap (didn't recurse a single `%w`-wrapped
+   `errors.Join` tree).
+
+`internal/coding/workspace -count=20`, `internal/kernel/s7 -count=20`,
+`go vet ./...`, full `go test ./...` all green. Round 3 dispatched to
+all three agents in parallel next.
+
+### Round 3 — the reconciliation lesson of this whole piece
+
+kilo and agy PASSed, explicitly accepting as "legitimate deferral" a
+documented-but-unfixed concern: `rollbackBundle`'s own per-file skip
+("already matches BEFORE, leave untouched") is a pure CONTENT/MODE check
+with no memory of whether an EARLIER attempt's write to reach that
+content genuinely completed its own durability barrier (fsync). Their
+reasoning: "retrying is always safe by construction, so this is out of
+scope."
+
+**codex FAILED round 3, live-reproducing that this deferral was
+actually wrong**: a real two-file, two-attempt sequence where attempt 1
+restores file A but A's own directory fsync fails (content correct,
+durability unproven) while cancellation stops file B before its own
+restore even starts (bundle correctly, safely MID_CRASH); attempt 2
+restores B cleanly but SKIPS A entirely (rollback.go's own converged
+"already matches BEFORE" skip) — the bundle now reads NEVER_STARTED with
+NO error at all, and the un-augmented code reported SUCCEEDED despite
+A's own restore durability never having been proven. **This is the key
+reconciliation lesson of this whole piece: kilo/agy accepted a
+plausible-sounding scope argument without independently reproducing it;
+codex actually wrote a live test and disproved it. Trust live
+reproduction over reasoning-only acceptance** — this lesson recurred,
+almost identically, in round 4/5 and again in round 7 below.
+
+codex ALSO found two MEDIUM issues in round 3: `rollback_failed`'s
+payload didn't require/check `OriginalOp`+`BundleDigest` identity
+binding (unlike started/committed); the FOREIGN branch discarded its own
+`rollbackErr` (same diagnostic-loss bug already fixed for MID_CRASH).
+
+**Fix (round 3)**: added `rollbackFailedPayload.UnverifiedDurability
+bool`, set whenever the post-attempt classification showed ANY file
+already at `FileBefore` while the bundle overall was still MID_CRASH.
+Before EVER reporting Succeeded, a new
+`rollbackOpHasUnverifiedDurabilityHistory` helper replayed the
+operation's own journal history for this flag; if found, Succeeded was
+refused (Unknown instead). Added `OriginalOp`/`BundleDigest` to
+`rollbackFailedPayload` + validator Op-consistency check; wrapped
+`rollbackErr` into the FOREIGN branch's own error. New regression tests:
+`TestRollbackGovernedNeverClaimsSuccessOverAnUnverifiedDurabilityBarrier`,
+`TestRollbackFailedValidatorRejectsUnboundOperationIdentity`,
+`TestRollbackGovernedPreservesUnderlyingErrorWhenForeign`. All RED/GREEN
+via ablation. Full suite green — this round-3 state was what survived
+the machine reset described below.
+
+### Round 4/5 — the round-3 signal itself was wrong, twice
+
+The owner's machine reset mid-session between round 3's fix and its next
+review dispatch. On resuming, the round-3 code was found intact and
+still green, but a self-authored scratch repro test
+(`zz_repro_r4_test.go`) was ALSO found in the working tree, already
+proving round 3's own `UnverifiedDurability` signal was a FALSE
+POSITIVE: `anyFileClassifiedBefore(classes)` cannot distinguish a file
+THIS attempt itself durably restored (write+fsync both proven) from one
+merely SKIPPED because it was already Before when the attempt started —
+flagging it on EVERY ordinary partial-progress MID_CRASH landing,
+permanently stranding the retry budget for the common case, not just the
+genuine-durability-failure case.
+
+**First correction attempt** (still wrong): key the flag on
+`state == TransactionMidCrash && rollbackErr != nil &&
+!isPureCancellation(rollbackErr)` instead of classification alone —
+passed the repro test and the round-3 regression test, so it was
+dispatched for review.
+
+**codex, kilo, AND agy independently, unanimously FAILED this**, each
+live-reproducing the SAME class of false positive from a different
+angle: a real per-file error on a file that never even reached BEFORE
+(e.g. transient EACCES/ENOSPC on a temp-file create, content untouched)
+still poisoned the WHOLE operation's future success; a real error on one
+file could equally blame an entirely UNRELATED file that restored
+cleanly in the SAME attempt. `rollback.go`'s own joined `attemptErrs`
+carries no per-file attribution, so no formula built from
+"`rollbackErr` present" alone (nor from classification alone) can be
+both sound and complete at that API boundary.
+
+**The actual fix**: abandon inferring past durability entirely.
+`verifyDurabilityBeforeSuccess` (new helper) re-PROVES it, fresh,
+immediately before EVER reporting Succeeded: `writeFileBeneath`'s own
+contract guarantees a file can only classify BEFORE after its own
+content fsync already succeeded (a content-fsync failure returns early,
+before any rename) — so the ONLY thing that can still be unproven for a
+BEFORE file is its containing directory's own rename-fsync, and
+fsyncing that directory again, right now, either durably proves it (if
+transient and cleared) or genuinely still fails — real, fresh proof
+either way, no cross-attempt history, no per-file error attribution.
+This DELETED the `UnverifiedDurability` payload field,
+`anyFileClassifiedBefore`, and `rollbackOpHasUnverifiedDurabilityHistory`
+entirely. Also fixed in the same round: the crash_recovered
+code-normalization bug (`reconcileRehydratedRollback`'s `LandingRetry`
+code only handled an empty inherited code, not S7's own
+`CodeCrashRecovered` from a second restart-only rehydration with no
+attempt in between — codex live-reproduced the durable-append rejection
+this caused). New regression tests:
+`TestRollbackGovernedDoesNotFlagAProvenDurableMidCrashPass`,
+`TestRollbackGovernedTransientErrorOnUntouchedFileDoesNotBlockLaterSuccess`,
+`TestRollbackGovernedUnrelatedCleanFileNotBlamedForAnotherFilesFailure`,
+`TestRollbackGovernedNormalizesCrashRecoveredCodeOnSecondRehydration`,
+plus the round-3 durability test REWRITTEN (its fsync-failure mock had
+to model a PERSISTENT failure, identified by `(dev,ino)`, not a
+call-count heuristic, to keep testing the real hazard under the new
+design) with a new sibling proving the positive case
+(`TestRollbackGovernedSucceedsOnceAPersistentDurabilityFailureHeals`).
+All RED/GREEN via ablation, full suite green.
+
+### Round 6 — codex again: two more real bugs the redesign missed
+
+kilo and agy PASSed. **codex FAILED** with two HIGH findings:
+
+1. The premise "a file can only classify BEFORE after its own content
+   fsync already succeeded" is only true for files `rollback.go` itself
+   wrote THIS attempt — a file already reading BEFORE (skipped by
+   `rollback.go`'s own converged skip logic) could have gotten there via
+   an external/in-place writer that never fsynced its content, and
+   directory-only re-fsync doesn't prove that. **Fix**:
+   `verifyDurabilityBeforeSuccess` now ALSO re-fsyncs each existing
+   file's own content (new `fsyncFileBeneath` helper + `fsyncFileHook`
+   test seam mirroring `fsyncDirHook`), not just its directory. New test:
+   `TestRollbackGovernedRefusesWhenFileContentFsyncFails`.
+2. The round 4/5 crash_recovered normalization only handled
+   `LandingRetry`; an EXHAUSTED retry budget produces `LandingTerminal`
+   carrying the SAME inherited `CodeCrashRecovered`, never normalized,
+   durably rejecting the exhaustion companion. **Fix**: normalize for
+   BOTH `LandingRetry` and `LandingTerminal` (the only two kinds
+   `Reconcile(false)` can produce here). New test:
+   `TestRollbackGovernedNormalizesCrashRecoveredCodeOnExhaustedTerminalLanding`.
+
+codex ALSO found, and fixed in the same round: `verifyDurabilityBeforeSuccess`
+ran its fsync barriers against a STALE classification (`rollbackFn`'s
+own return value) with no re-check afterward — a concurrent writer
+landing in that window could make a file FOREIGN while the stale
+classification still drove Succeeded. **Fix**: re-run `ClassifyBundle`
+fresh, AFTER every fsync barrier, and require it to still read
+`TransactionNeverStarted`. New test:
+`TestRollbackGovernedRefusesStaleClassificationInvalidatedByConcurrentWriter`.
+All three RED/GREEN via ablation, full suite green.
+
+### Round 7 — kilo/agy accept a residual as out-of-scope; codex disproves it live, again
+
+kilo and agy both independently flagged the SAME race shape in round 6
+— round 6's fresh-reclassification fix compares content/mode only,
+never inode identity, so a concurrent writer could theoretically swap in
+a byte-identical-content replacement inode — but both judged it an
+acceptable, out-of-scope residual (closing it further "would require
+exclusive locking the codebase has explicitly ruled out").
+
+**codex FAILED, live-reproducing it 3/3 times** via a Go build overlay:
+`fsyncFileHook`'s own real fsync landed on inode A; before the function
+returned, a concurrent rename installed inode B (identical BEFORE
+bytes, deliberately never fsynced) over the target; the directory fsync
+and final reclassification both passed (content/mode matched); S7
+durably reported SUCCEEDED despite the OBSERVED inode never having been
+fsynced. Codex's own framing: "this is now a correctness blocker
+because fresh fsync is the mechanism authorizing durable success —
+another content-only reclassification is insufficient." **This is the
+round-3 lesson recurring for the third time in this piece**: a
+reasoned, plausible-sounding scope boundary, independently accepted by
+two reviewers, that a live reproduction overturns.
+
+**Fix**: `verifyDurabilityBeforeSuccess` now captures the EXACT
+`(dev,ino)` identity of every fd it fsyncs — each file's own fd
+(`fsyncFileBeneath` now returns identity, not just an error) and each
+directory's own fd — during the fsync pass. AFTER the fresh
+reclassification confirms `TransactionNeverStarted`, a SECOND pass
+re-opens each file (`StatBeneath`) and each directory
+(`WalkDirBeneath`+`Fstat`) BY NAME again and requires the CURRENT
+identity to exactly match what was captured. Any mismatch refuses. This
+is NOT new machinery — it mirrors the SAME capture-identity-then-verify
+pattern already used within a single write elsewhere in this file
+(`writeFileBeneath`'s own RENAME_EXCHANGE identity check;
+`restoreOneFile`'s `TargetExpectation` capture), applied across this
+function's own two passes instead of within one write. New regression
+test, directly reproducing codex's own overlay scenario as a permanent
+in-repo test: `TestRollbackGovernedRefusesWhenFsyncedInodeIsReplacedBeforeFinalClassification`.
+RED/GREEN via ablation, full suite green.
+
+### Round 8 — unanimous convergence: PASS × 3
+
+All three agents independently verified the identity-pinning fix,
+including live counterexample attempts against the exact points the
+dispatch asked them to probe (directory-substitution variant, ordering
+of the two identity-recheck loops, fd-capture-vs-hardlink/bind-mount/
+overlayfs edge cases). **kilo went further than a reasoning pass and
+independently live-reproduced the DIRECTORY-substitution variant** (a
+different file than codex's own test covered — a `fr.Existed == false`
+bundle where only the directory identity check exists), confirming that
+half of the fix is ALSO load-bearing, not merely the file-identity half
+codex's own test already covered. codex (mid-round, one turn interrupted
+by an unrelated content-safety false-positive on constructing yet
+another overlay PoC — re-prompted with explicit defensive-local-repo
+framing and asked to re-derive by reasoning instead, since the
+underlying mechanism was already proven live in round 7) and agy both
+independently confirmed the residual window is the theoretical
+minimum — a concurrent substitution landing strictly AFTER a given
+entity's own identity re-check but before the eventual
+`Report(Succeeded)`/`Reconcile(true)` journal append — smaller than
+round 7's own accepted residual, not a new or larger exposure, and not
+closable further without OS-level exclusive locking (explicitly out of
+scope for this whole codebase). Only cosmetic NOTEs remained (a
+redundant `WalkDirBeneath` open pass-2 could reuse from pass-1; a
+string-concatenated map key could be a struct key instead) — none
+material enough to block convergence per this session's own "cosmetic
+never fails a review" discipline.
+
+`internal/coding/workspace -count=20`, `internal/kernel/s7 -count=20`,
+`go vet ./...`, full `go test ./...` all green. **PolicyWorkspaceRollback
+S7 wrapper CLOSED after 8 rounds** — by far the most-reviewed piece in
+this whole program, and the clearest illustration yet of this session's
+own standing lesson: a reasoned, plausible scope boundary accepted by
+two independent reviewers was overturned by live reproduction THREE
+separate times in this one piece (rounds 3, 4/5, and 7) before genuine
+convergence. Never skip live reproduction in favor of reasoning-only
+acceptance, however plausible the reasoning sounds, and never treat two
+PASSes as sufficient to overrule one FAIL that carries a live
+counterexample.
+
+**Next**: the explicitly-deferred LINKAGE step (invariant 4 §2: "ONLY
+after the rollback operation itself succeeds may the ORIGINAL Apply
+operation call `Reconcile(false)` and become eligible for `Next`
+again") — calling `Reconcile(false)` on the ORIGINAL Apply operation
+once THIS rollback operation's own success is durable. Same review
+discipline (all three agents in parallel, every round) applies.

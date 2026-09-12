@@ -106,6 +106,20 @@ type ScanFinding struct {
 	Op      contracts.OperationID
 	State   TransactionState
 	Classes []FileClassification
+	// BundleDigest is Op's own AUTHORITATIVE latest sealed-bundle digest
+	// — confirmed via the SAME s7.attempt_started/workspace.apply_started
+	// atomic-pairing discovery this whole scan already performs, never a
+	// caller-supplied value. Empty when no confirmed digest exists for
+	// this finding (the broken-companion and policy-mismatch FOREIGN
+	// cases below never reach a confirmed digest at all). A caller that
+	// needs to act on a MID_CRASH finding (governed_rollback.go's
+	// RollbackGoverned, specifically) uses THIS field rather than
+	// accepting a bundle digest as its own input — exactly so a forged
+	// or stale digest can never be substituted for the real one (code-
+	// review finding: governed_rollback.go's own round-1 review, HIGH
+	// #1 — an earlier version trusted a caller-supplied bundle digest
+	// with no cross-check against S7's own authoritative record at all).
+	BundleDigest string
 }
 
 // s7AttemptStartedPayload is the minimal shape this package reads back
@@ -258,5 +272,5 @@ func classify(op contracts.OperationID, rootFd int, store *sealedstore.Store, di
 		// than letting a transient I/O error masquerade as a clean state.
 		return ScanFinding{Op: op, State: TransactionForeign}
 	}
-	return ScanFinding{Op: op, State: state, Classes: classes}
+	return ScanFinding{Op: op, State: state, Classes: classes, BundleDigest: digest}
 }
