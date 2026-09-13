@@ -940,10 +940,9 @@ func TestResumeRehydratesOriginalContext(t *testing.T) {
 	var bodies []string
 	step := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		buf := make([]byte, 1<<16)
-		n, _ := r.Body.Read(buf)
+		buf, _ := io.ReadAll(r.Body)
 		mu.Lock()
-		bodies = append(bodies, string(buf[:n]))
+		bodies = append(bodies, string(buf))
 		mu.Unlock()
 		step++
 		reply := `{"action":"tool","tool_id":"memory_remember","arguments":{"content":"fact"}}`
