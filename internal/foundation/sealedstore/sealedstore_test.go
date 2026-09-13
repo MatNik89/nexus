@@ -68,6 +68,95 @@ func TestPutSameContentIsIdempotent(t *testing.T) {
 	}
 }
 
+// Detector: MaxEntries refuses a NEW entry once the quota is reached,
+// fail closed — codex round-2 review's own suggested safe alternative to
+// full GC ("a fail-closed store quota could bound growth without
+// deleting any possibly-live artifact").
+func TestPutRefusesNewEntryOverQuota(t *testing.T) {
+	s := open(t)
+	s.MaxEntries = 2
+	if _, p1, err := s.Put([]byte("one")); err != nil {
+		t.Fatal(err)
+	} else {
+		defer p1.Release()
+	}
+	if _, p2, err := s.Put([]byte("two")); err != nil {
+		t.Fatal(err)
+	} else {
+		defer p2.Release()
+	}
+	if _, _, err := s.Put([]byte("three — over quota")); err == nil {
+		t.Fatal("expected the quota to refuse a third distinct entry")
+	}
+}
+
+// Detector: MaxEntries never blocks re-Put of an ALREADY-STORED digest —
+// the quota bounds NEW growth, not re-affirming an existing artifact's
+// pin (which adds no new entry to the directory at all).
+func TestPutOverQuotaStillAllowsExistingDigest(t *testing.T) {
+	s := open(t)
+	s.MaxEntries = 1
+	data := []byte("already stored")
+	_, p1, err := s.Put(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p1.Release()
+	if _, p2, err := s.Put(data); err != nil {
+		t.Fatalf("re-Put of an existing digest should succeed even at quota: %v", err)
+	} else {
+		p2.Release()
+	}
+}
+
+// Detector: MaxEntries == 0 (the zero value, every existing caller's
+// default) is unlimited — no quota enforced at all.
+func TestPutMaxEntriesZeroIsUnlimited(t *testing.T) {
+	s := open(t)
+	for i := 0; i < 5; i++ {
+		if _, p, err := s.Put([]byte{byte(i)}); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		} else {
+			p.Release()
+		}
+	}
+}
+
+// Detector: MaxTotalBytes refuses a NEW entry that would push total
+// stored bytes over the ceiling, fail closed — an entry-COUNT quota
+// alone does not bound disk USAGE when a single entry can be large
+// (code-review finding, codex, round 3 MEDIUM).
+func TestPutRefusesNewEntryOverByteQuota(t *testing.T) {
+	s := open(t)
+	s.MaxTotalBytes = 10
+	if _, p1, err := s.Put([]byte("12345")); err != nil {
+		t.Fatal(err)
+	} else {
+		defer p1.Release()
+	}
+	if _, _, err := s.Put([]byte("123456789012")); err == nil {
+		t.Fatal("expected the byte quota to refuse an entry that would exceed it")
+	}
+}
+
+// Detector: MaxTotalBytes never blocks re-Put of an ALREADY-STORED
+// digest, same discipline as MaxEntries.
+func TestPutOverByteQuotaStillAllowsExistingDigest(t *testing.T) {
+	s := open(t)
+	data := []byte("already stored, exactly at the ceiling")
+	s.MaxTotalBytes = int64(len(data))
+	p1, err := func() (*Pin, error) { _, p, err := s.Put(data); return p, err }()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p1.Release()
+	if _, p2, err := s.Put(data); err != nil {
+		t.Fatalf("re-Put of an existing digest should succeed even at the byte quota: %v", err)
+	} else {
+		p2.Release()
+	}
+}
+
 // Detector (RED-capable — corruption must never be silently trusted):
 // tampering with a stored artifact's bytes on disk must make Get refuse,
 // not return the tampered content.

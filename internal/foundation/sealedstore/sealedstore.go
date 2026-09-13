@@ -51,6 +51,28 @@ type Store struct {
 	mu        sync.Mutex
 	pins      map[string]int // digest -> live pin count
 	closeOnce sync.Once
+
+	// MaxEntries bounds Put's own growth: zero (the default) means
+	// unlimited. A caller sets this AFTER Open when it wants a fail-
+	// closed quota — safe growth-bounding for a production consumer with
+	// no correct cross-consumer GC.loadLive wired yet (PLAN-CODING-TRIO.md's
+	// own "bounded storage growth, not 'keep forever'" requirement):
+	// refusing a NEW entry once the ceiling is hit can never delete a
+	// possibly-live artifact, unlike GC's mark-and-sweep, so it needs no
+	// liveness knowledge at all — the tradeoff is a hard refusal instead
+	// of silent unbounded growth, not automatic cleanup (code-review
+	// finding, codex, round 2: "a fail-closed store quota could bound
+	// growth without deleting any possibly-live artifact").
+	MaxEntries int
+	// MaxTotalBytes bounds Put by actual disk usage, zero meaning
+	// unlimited — an ENTRY count alone does not bound growth when a
+	// single entry can be huge: a coding-run consumer's snapshot input
+	// permits up to 500MB (runner.MaxSnapshotBytes), base64-encoded into
+	// one sealed bundle, so a handful of large entries could exhaust
+	// disk long before any entry-count ceiling triggers (code-review
+	// finding, codex, round 3 MEDIUM). Checked alongside MaxEntries in
+	// the SAME directory scan.
+	MaxTotalBytes int64
 }
 
 // Open binds a Store to dir, which the CALLER must already have created as
@@ -152,6 +174,22 @@ func (s *Store) Put(data []byte) (digest string, pin *Pin, err error) {
 	} else if !os.IsNotExist(rerr) {
 		s.releasePinLocked(digest)
 		return "", nil, fmt.Errorf("sealedstore: put %s: %w", digest, rerr)
+	}
+
+	if s.MaxEntries > 0 || s.MaxTotalBytes > 0 {
+		count, totalBytes, lerr := s.statAllLocked()
+		if lerr != nil {
+			s.releasePinLocked(digest)
+			return "", nil, fmt.Errorf("sealedstore: put %s: checking quota: %w", digest, lerr)
+		}
+		if s.MaxEntries > 0 && count >= s.MaxEntries {
+			s.releasePinLocked(digest)
+			return "", nil, fmt.Errorf("sealedstore: put %s: store quota reached (%d entries, fail closed) — no possibly-live artifact was deleted to make room", digest, s.MaxEntries)
+		}
+		if s.MaxTotalBytes > 0 && totalBytes+int64(len(data)) > s.MaxTotalBytes {
+			s.releasePinLocked(digest)
+			return "", nil, fmt.Errorf("sealedstore: put %s: store byte quota reached (%d bytes stored, %d more requested, %d max, fail closed) — no possibly-live artifact was deleted to make room", digest, totalBytes, len(data), s.MaxTotalBytes)
+		}
 	}
 
 	if err := s.writeAtLocked(digest, data); err != nil {
@@ -319,4 +357,24 @@ func (s *Store) listNames() ([]string, error) {
 	f := os.NewFile(uintptr(fd), s.dir)
 	defer f.Close()
 	return f.Readdirnames(-1)
+}
+
+// statAllLocked returns the current entry count and total byte size of
+// every entry directly in the store directory — a single descriptor-
+// relative scan feeding BOTH quota checks (MaxEntries, MaxTotalBytes).
+// Caller must already hold s.mu.
+func (s *Store) statAllLocked() (count int, totalBytes int64, err error) {
+	names, err := s.listNames()
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, name := range names {
+		var st unix.Stat_t
+		if err := unix.Fstatat(s.dirFd, name, &st, 0); err != nil {
+			return 0, 0, fmt.Errorf("stat %s: %w", name, err)
+		}
+		count++
+		totalBytes += st.Size
+	}
+	return count, totalBytes, nil
 }

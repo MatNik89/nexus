@@ -30,6 +30,9 @@ import (
 	"github.com/MatNik89/nexus/internal/channel"
 	"github.com/MatNik89/nexus/internal/channel/health"
 	"github.com/MatNik89/nexus/internal/channel/telegram"
+	"github.com/MatNik89/nexus/internal/coding/runner"
+	"github.com/MatNik89/nexus/internal/coding/symedit"
+	"github.com/MatNik89/nexus/internal/coding/workspace"
 	"github.com/MatNik89/nexus/internal/foundation/config"
 	"github.com/MatNik89/nexus/internal/foundation/egress"
 	"github.com/MatNik89/nexus/internal/foundation/pathx"
@@ -41,6 +44,7 @@ import (
 	"github.com/MatNik89/nexus/internal/sandbox"
 	"github.com/MatNik89/nexus/internal/schedule"
 	"github.com/MatNik89/nexus/internal/security/redact"
+	"golang.org/x/sys/unix"
 )
 
 func TestCompositionRootServesConversation(t *testing.T) {
@@ -2019,4 +2023,209 @@ func TestNewCommandResetsHistory(t *testing.T) {
 	if err != nil || !strings.Contains(reply2, "Novi razgovor") {
 		t.Fatalf("redelivered /new not idempotent: %q err=%v", reply2, err)
 	}
+}
+
+// Detector (S6 tool-boundary, piece 2): rename_symbol_prepare is actually
+// reachable through the PRODUCTION composition root — buildDaemon binds
+// it (b.sealed != nil), the planner offers it in its spec set, and a real
+// tool-call round trip through the daemon's OWN EffectPath executes the
+// real gopls + staged-compile pipeline and returns a plan_digest. Proves
+// main.go's wiring, not just symedit's own package-internal tests.
+func TestRenameSymbolToolWiredIntoProductionDaemon(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("no go binary on PATH")
+	}
+	if _, err := exec.LookPath("gopls"); err != nil {
+		t.Skip("no gopls binary on PATH")
+	}
+	if _, err := sandbox.NewBwrap().Probe(context.Background()); err != nil {
+		t.Skip("bwrap sandbox unavailable")
+	}
+
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "go.mod"), []byte("module example.com/wiring\n\ngo 1.21\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fixture := []byte("package main\n\nfunc Foo() int { return 1 }\n\nfunc main() { _ = Foo() }\n")
+	if err := os.WriteFile(filepath.Join(src, "main.go"), fixture, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	step := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		step++
+		reply := ""
+		switch step {
+		case 1: // rename request → tool call
+			reply = `{"action":"tool","tool_id":"rename_symbol_prepare","arguments":{"file":"main.go","line":2,"character":5,"new_name":"Bar"}}`
+		default: // tool observation → final (echo it back so the test can inspect it)
+			var req struct {
+				Messages []struct{ Role, Content string } `json:"messages"`
+			}
+			json.NewDecoder(r.Body).Decode(&req)
+			reply = "prepared: " + req.Messages[len(req.Messages)-1].Content
+		}
+		b, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{
+			"message": map[string]string{"role": "assistant", "content": reply}}}})
+		w.Write(b)
+	}))
+	t.Cleanup(srv.Close)
+	host := strings.TrimPrefix(srv.URL, "http://")
+	t.Setenv("NEXUS_RENAME_WIRING_KEY", "sk-rename-wiring")
+	base := filepath.Join(t.TempDir(), "nexus")
+	if err := os.MkdirAll(base, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfgJSON := fmt.Sprintf(`{"provider_base_url":%q,"provider_key_env":"NEXUS_RENAME_WIRING_KEY",
+		"provider_model":"root-model","egress_allow":[%q],"default_profile":"private",
+		"coding_workspace_roots":[%q]}`, srv.URL, host, "private:"+src)
+	if err := os.WriteFile(filepath.Join(base, "config.json"), []byte(cfgJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	layout := pathx.Layout{Base: base}
+	resolved, err := config.Resolve(filepath.Join(base, "config.json"), "", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := buildDaemon(layout, resolved)
+	if err != nil {
+		t.Fatalf("production composition root failed: %v", err)
+	}
+	t.Cleanup(func() { b.j.Close() })
+	if b.sealed == nil {
+		t.Fatal("rename_symbol was not bound by buildDaemon despite go/gopls/bwrap all being available")
+	}
+	t.Cleanup(func() { b.sealed.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	sock := socketPath(layout)
+	go b.d.Serve(ctx, sock)
+	for i := 0; i < 100; i++ {
+		if c, err := net.Dial("unix", sock); err == nil {
+			c.Close()
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	var out strings.Builder
+	if err := repl.Run(strings.NewReader("rename Foo to Bar\n"), &out, sock, false); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "plan_digest") {
+		t.Fatalf("rename_symbol_prepare did not run through the production daemon: %q", out.String())
+	}
+}
+
+// Detector (S6 tool-boundary piece 2, codex round-2 review finding: "the
+// production test only exercises rename_symbol_prepare... and therefore
+// misses" a production apply failing on unregistered journal event
+// types): a real Prepare + ApplyGoverned pair, run against the EXACT
+// journal/authority/sealed-store buildDaemon assembles for production,
+// must actually COMMIT — proving cmd/nexus/main.go's events registration
+// (memory/schedule/.../runner/workspace) covers every event type
+// ApplyGoverned itself emits (workspace.apply_started,
+// workspace.mutation_committed), not just rename_symbol_prepare's own
+// read-only coding.run event.
+func TestRenameSymbolApplyEventsRegisteredInProductionDaemon(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("no go binary on PATH")
+	}
+	if _, err := exec.LookPath("gopls"); err != nil {
+		t.Skip("no gopls binary on PATH")
+	}
+	bwrapBackend := sandbox.NewBwrap()
+	report, berr := bwrapBackend.Probe(context.Background())
+	if berr != nil {
+		t.Skip("bwrap sandbox unavailable")
+	}
+
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "go.mod"), []byte("module example.com/applywiring\n\ngo 1.21\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fixture := []byte("package main\n\nfunc Foo() int { return 1 }\n\nfunc main() { _ = Foo() }\n")
+	if err := os.WriteFile(filepath.Join(src, "main.go"), fixture, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{
+			"message": map[string]string{"role": "assistant", "content": "unused"}}}})
+		w.Write(b)
+	}))
+	t.Cleanup(srv.Close)
+	host := strings.TrimPrefix(srv.URL, "http://")
+	t.Setenv("NEXUS_APPLY_WIRING_KEY", "sk-apply-wiring")
+	base := filepath.Join(t.TempDir(), "nexus")
+	if err := os.MkdirAll(base, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfgJSON := fmt.Sprintf(`{"provider_base_url":%q,"provider_key_env":"NEXUS_APPLY_WIRING_KEY",
+		"provider_model":"root-model","egress_allow":[%q],"default_profile":"private",
+		"coding_workspace_roots":[%q]}`, srv.URL, host, "private:"+src)
+	if err := os.WriteFile(filepath.Join(base, "config.json"), []byte(cfgJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	layout := pathx.Layout{Base: base}
+	resolved, err := config.Resolve(filepath.Join(base, "config.json"), "", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := buildDaemon(layout, resolved)
+	if err != nil {
+		t.Fatalf("production composition root failed: %v", err)
+	}
+	t.Cleanup(func() { b.j.Close() })
+	if b.sealed == nil {
+		t.Fatal("rename_symbol was not bound by buildDaemon despite go/gopls/bwrap all being available")
+	}
+	t.Cleanup(func() { b.sealed.Close() })
+
+	rootFd, err := workspace.OpenRoot(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(rootFd)
+	var st unix.Stat_t
+	if err := unix.Fstat(rootFd, &st); err != nil {
+		t.Fatal(err)
+	}
+	target := workspace.ApplyTargetID("private", uint64(st.Dev), st.Ino)
+	req := runner.RenameRequest{
+		SourceDir: src, FileRelPath: "main.go", Line: 2, Character: 5, NewName: "Bar",
+		GoBinary: mustLookPath(t, "go"), GoplsBinary: mustLookPath(t, "gopls"), Timeout: symedit.DefaultRenameTimeout,
+		OperationID: "op-apply-wiring", TargetID: target,
+		TypeCheckOperationID: "op-apply-wiring-typecheck", TypeCheckTargetID: target,
+		RunID: "run-apply-wiring", ProfileID: "private",
+	}
+	plan, err := symedit.Prepare(context.Background(), rootFd, bwrapBackend, report, b.authority, b.j, req)
+	if err != nil {
+		t.Fatalf("prepare (against the real production journal) failed: %v", err)
+	}
+	result, err := symedit.ApplyGoverned(context.Background(), rootFd, b.sealed, plan, b.authority, b.j, "run-apply-wiring-apply")
+	if err != nil {
+		t.Fatalf("apply against the REAL production journal failed (this is exactly the gap "+
+			"missing workspace.Events() registration produces): %v", err)
+	}
+	if !result.Committed {
+		t.Fatal("apply did not commit against the real production journal")
+	}
+	got, err := os.ReadFile(filepath.Join(src, "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "package main\n\nfunc Bar() int { return 1 }\n\nfunc main() { _ = Bar() }\n"
+	if string(got) != want {
+		t.Fatalf("file on disk = %q, want %q", got, want)
+	}
+}
+
+func mustLookPath(t *testing.T, name string) string {
+	t.Helper()
+	p, err := exec.LookPath(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
 }

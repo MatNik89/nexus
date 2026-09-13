@@ -57,6 +57,30 @@ type Config struct {
 	// (never trims). Default 64000; zero/negative is rejected at Resolve —
 	// "unlimited" does not exist.
 	ContextHardLimitTokens int `json:"context_hard_limit_tokens"`
+	// CodingWorkspaceRoots is the DENY-DEFAULT allowlist of directories a
+	// coding tool (rename_symbol) may operate in, one entry per profile:
+	// "<profile_id>:<absolute path>" (owner decision, 2026-09-03 coding-
+	// trio S6 tool-boundary: "one fixed root per profile, set in config,
+	// never model-chosen"). A profile absent here has NO coding-tool
+	// access at all — empty is the safe default, not an error. Reuses
+	// the existing kindStringList schema/validation machinery rather than
+	// adding a new map-typed key kind to this already-hardened, closed
+	// config schema (topknot: proportionate diff over a new primitive).
+	CodingWorkspaceRoots []string `json:"coding_workspace_roots"`
+}
+
+// CodingWorkspaceRoot returns the one configured coding-workspace root for
+// profile, and whether one is configured at all. Fail-closed: an absent
+// entry (the default for every profile) means no coding tool may touch
+// anything for that profile — this is never inferred from the profile ID.
+func (c Config) CodingWorkspaceRoot(profile contracts.ProfileID) (string, bool) {
+	prefix := string(profile) + ":"
+	for _, entry := range c.CodingWorkspaceRoots {
+		if rest, ok := strings.CutPrefix(entry, prefix); ok {
+			return rest, true
+		}
+	}
+	return "", false
 }
 
 // Origin records which layer supplied each key.
@@ -111,6 +135,7 @@ var keySchema = map[string]keyKind{
 	"sandbox_disabled":          kindBool,
 	"timezone":                  kindString,
 	"context_hard_limit_tokens": kindInt,
+	"coding_workspace_roots":    kindStringList,
 }
 
 // value is one typed, presence-aware layer entry.
@@ -360,6 +385,8 @@ func applyValue(c *Config, key string, v value) error {
 		c.SandboxDisabled = v.b
 	case "context_hard_limit_tokens":
 		c.ContextHardLimitTokens = v.n
+	case "coding_workspace_roots":
+		c.CodingWorkspaceRoots = v.list
 	default:
 		return fmt.Errorf("unknown key %q", key)
 	}
@@ -402,6 +429,33 @@ func ValidateBounds(c Config) error {
 	}
 	if !c.DefaultProfile.Valid() {
 		errs = append(errs, errors.New("default_profile is required"))
+	}
+	// coding_workspace_roots: each entry "<profile_id>:<absolute path>", one
+	// per profile — a coding tool boundary decision (2026-09-12), so held to
+	// the same fail-closed rigor as exec_allow. Wildcards and non-absolute
+	// paths are already excluded by requiring an absolute path; a duplicate
+	// or malformed profile prefix is ambiguous (which root wins?) and
+	// refused rather than silently taking the first/last match.
+	seenProfiles := map[string]bool{}
+	for _, entry := range c.CodingWorkspaceRoots {
+		profile, path, ok := strings.Cut(entry, ":")
+		if !ok || profile == "" || path == "" {
+			errs = append(errs, fmt.Errorf("coding_workspace_roots: %q must be \"<profile_id>:<absolute path>\" (rejected)", entry))
+			continue
+		}
+		if !contracts.ProfileID(profile).Valid() {
+			errs = append(errs, fmt.Errorf("coding_workspace_roots: %q has an invalid profile id (rejected)", entry))
+			continue
+		}
+		if strings.Contains(path, "*") || !strings.HasPrefix(path, "/") {
+			errs = append(errs, fmt.Errorf("coding_workspace_roots: %q must be an absolute path without wildcards (rejected)", entry))
+			continue
+		}
+		if seenProfiles[profile] {
+			errs = append(errs, fmt.Errorf("coding_workspace_roots: profile %q has more than one entry (ambiguous, rejected)", profile))
+			continue
+		}
+		seenProfiles[profile] = true
 	}
 	if len(errs) > 0 {
 		return fmt.Errorf("config bounds: %w", errors.Join(errs...))

@@ -325,3 +325,61 @@ func TestContextHardLimitBoundsAndDefault(t *testing.T) {
 		t.Fatalf("env limit: %v %d", err, res.Config.ContextHardLimitTokens)
 	}
 }
+
+// Detector (S6 tool-boundary, piece 2): a profile with no configured
+// coding_workspace_roots entry has no coding-tool access at all — the
+// fail-closed default, never inferred from the profile id.
+func TestCodingWorkspaceRootAbsentByDefault(t *testing.T) {
+	dir := t.TempDir()
+	res, err := Resolve(filepath.Join(dir, "missing.json"), filepath.Join(dir, "missing2.json"), noEnv, map[string]string{"default_profile": "work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root, ok := res.Config.CodingWorkspaceRoot("work"); ok {
+		t.Fatalf("expected no root configured, got %q", root)
+	}
+}
+
+// Detector: a valid "profile:absolute-path" entry resolves via
+// CodingWorkspaceRoot for THAT profile only — a different profile still
+// gets nothing.
+func TestCodingWorkspaceRootResolvesPerProfile(t *testing.T) {
+	dir := t.TempDir()
+	global := write(t, dir, "g.json", `{"coding_workspace_roots":["work:/home/matej/HARNESS/nexus"]}`)
+	res, err := Resolve(global, filepath.Join(dir, "missing.json"), noEnv, map[string]string{"default_profile": "work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, ok := res.Config.CodingWorkspaceRoot("work")
+	if !ok || root != "/home/matej/HARNESS/nexus" {
+		t.Fatalf("work root = %q (ok=%v), want /home/matej/HARNESS/nexus", root, ok)
+	}
+	if _, ok := res.Config.CodingWorkspaceRoot("private"); ok {
+		t.Fatal("private profile must not inherit work's root")
+	}
+}
+
+// Detector: malformed entries, wildcards, relative paths, invalid profile
+// ids, and duplicate profile entries are all rejected (fail closed, same
+// rigor as exec_allow).
+func TestCodingWorkspaceRootsBoundsRejected(t *testing.T) {
+	dir := t.TempDir()
+	cases := []struct {
+		name, body, wantErrSubstr string
+	}{
+		{"missing colon", `{"coding_workspace_roots":["work-no-colon"]}`, `must be "<profile_id>:<absolute path>"`},
+		{"empty path", `{"coding_workspace_roots":["work:"]}`, `must be "<profile_id>:<absolute path>"`},
+		{"empty profile", `{"coding_workspace_roots":[":/abs/path"]}`, `must be "<profile_id>:<absolute path>"`},
+		{"relative path", `{"coding_workspace_roots":["work:relative/path"]}`, "must be an absolute path"},
+		{"wildcard path", `{"coding_workspace_roots":["work:/abs/*"]}`, "must be an absolute path without wildcards"},
+		{"invalid profile id", "{\"coding_workspace_roots\":[\"wor\\u0001k:/abs/path\"]}", "invalid profile id"},
+		{"duplicate profile", `{"coding_workspace_roots":["work:/abs/one","work:/abs/two"]}`, "more than one entry"},
+	}
+	for _, tc := range cases {
+		g := write(t, dir, tc.name+".json", tc.body)
+		_, err := Resolve(g, filepath.Join(dir, "missing.json"), noEnv, nil)
+		if err == nil || !strings.Contains(err.Error(), tc.wantErrSubstr) {
+			t.Fatalf("%s: want error containing %q, got %v", tc.name, tc.wantErrSubstr, err)
+		}
+	}
+}

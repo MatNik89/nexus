@@ -33,10 +33,15 @@ func testBackend(t *testing.T) (*sandbox.Bwrap, sandbox.ProbeReport) {
 	return b, rep
 }
 
+// testJournal registers the REAL Events() validator (not a nil bypass) —
+// every test in this package that journals a coding.run event through it
+// is therefore also proving that validator accepts the actual payloads
+// journalRunEvent/journalGoplsRenameEvent produce, against the exact
+// same production-hardening path buildDaemon wires in (events_test.go
+// covers the validator's own reject paths directly).
 func testJournal(t *testing.T) *journal.Journal {
 	t.Helper()
-	j, err := journal.Open(filepath.Join(t.TempDir(), "journal.db"), "work", redact.None{},
-		map[string]journal.PayloadValidator{"coding.run": nil})
+	j, err := journal.Open(filepath.Join(t.TempDir(), "journal.db"), "work", redact.None{}, Events())
 	if err != nil {
 		t.Fatal(err)
 	}

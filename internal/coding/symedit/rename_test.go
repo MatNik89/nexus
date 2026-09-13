@@ -794,6 +794,98 @@ func TestSplitRelPath(t *testing.T) {
 	}
 }
 
+// Detector: every edit replacing exactly newName is accepted.
+func TestVerifyEditsReplaceRequestedNameAcceptsConsistentEdits(t *testing.T) {
+	edits := []FileEdit{
+		{RelPath: "a.go", Edits: []TextEdit{{StartByte: 0, EndByte: 3, NewText: "Bar"}}},
+		{RelPath: "b.go", Edits: []TextEdit{{StartByte: 5, EndByte: 8, NewText: "Bar"}}},
+	}
+	if err := verifyEditsReplaceRequestedName(edits, "Bar"); err != nil {
+		t.Fatalf("consistent edits rejected: %v", err)
+	}
+}
+
+// Detector (code-review finding, codex, round 3 HIGH, live-reproduced):
+// a gopls response replacing text with something OTHER than the
+// requested new_name (e.g. "Baz" instead of "Bar") must be refused
+// fail-closed, never silently committed under the WRONG claimed name.
+func TestVerifyEditsReplaceRequestedNameRejectsWrongReplacement(t *testing.T) {
+	edits := []FileEdit{
+		{RelPath: "a.go", Edits: []TextEdit{{StartByte: 0, EndByte: 3, NewText: "Baz"}}},
+	}
+	err := verifyEditsReplaceRequestedName(edits, "Bar")
+	if err == nil || !strings.Contains(err.Error(), `"Baz"`) {
+		t.Fatalf("expected a rejection naming the wrong replacement, got: %v", err)
+	}
+}
+
+// Detector: every edit replacing the SAME old text is accepted — the
+// actual SAFETY gate wired into Prepare (rename.go), distinct from
+// originalSymbolName's own PREVIEW-TEXT-only degradation (tool.go).
+func TestVerifyEditsReplaceSameOldTextAcceptsConsistentEdits(t *testing.T) {
+	content := []byte("Foo\nFoo\n")
+	edits := []FileEdit{
+		{RelPath: "a.go", Edits: []TextEdit{{StartByte: 0, EndByte: 3}}},
+		{RelPath: "a.go", Edits: []TextEdit{{StartByte: 4, EndByte: 7}}},
+	}
+	preimages := map[string]Preimage{"a.go": {Content: content}}
+	if err := verifyEditsReplaceSameOldText(edits, preimages); err != nil {
+		t.Fatalf("consistent old text rejected: %v", err)
+	}
+}
+
+// Detector (code-review finding, codex, round 4 HIGH, live-reproduced):
+// two edits replacing DIFFERENT original text — folding two distinct
+// symbols into one supposed single-symbol rename — must be refused
+// fail-closed by Prepare itself, not just degraded in the preview.
+func TestVerifyEditsReplaceSameOldTextRejectsConflictingOldText(t *testing.T) {
+	content := []byte("Foo\nBar\n")
+	edits := []FileEdit{
+		{RelPath: "a.go", Edits: []TextEdit{{StartByte: 0, EndByte: 3}}}, // "Foo"
+		{RelPath: "a.go", Edits: []TextEdit{{StartByte: 4, EndByte: 7}}}, // "Bar" — conflicts
+	}
+	preimages := map[string]Preimage{"a.go": {Content: content}}
+	err := verifyEditsReplaceSameOldText(edits, preimages)
+	if err == nil || !strings.Contains(err.Error(), `"Foo"`) || !strings.Contains(err.Error(), `"Bar"`) {
+		t.Fatalf("expected a rejection naming both conflicting values, got: %v", err)
+	}
+}
+
+// Detector: originalSymbolName agrees across every edit that replaces
+// the SAME old text — the ordinary, well-formed case.
+func TestOriginalSymbolNameAgreesAcrossEdits(t *testing.T) {
+	content := []byte("Foo\nFoo\n") // two occurrences, byte-unambiguous
+	plan := Plan{
+		Edits: []FileEdit{
+			{RelPath: "a.go", Edits: []TextEdit{{StartByte: 0, EndByte: 3}}}, // first "Foo"
+			{RelPath: "a.go", Edits: []TextEdit{{StartByte: 4, EndByte: 7}}}, // second "Foo"
+		},
+		Preimages: map[string]Preimage{"a.go": {Content: content}},
+	}
+	name, ok := originalSymbolName(plan)
+	if !ok || name != "Foo" {
+		t.Fatalf("originalSymbolName = (%q, %v), want (\"Foo\", true)", name, ok)
+	}
+}
+
+// Detector (code-review finding, codex, round 3 HIGH, live-reproduced):
+// when two edits disagree about what text they replace, originalSymbolName
+// must refuse to guess — returning ok=false, never silently reporting
+// only the FIRST slice found and hiding the inconsistency.
+func TestOriginalSymbolNameRefusesConflictingEdits(t *testing.T) {
+	content := []byte("Foo\nBar\n") // two DIFFERENT occurrences, byte-unambiguous
+	plan := Plan{
+		Edits: []FileEdit{
+			{RelPath: "a.go", Edits: []TextEdit{{StartByte: 0, EndByte: 3}}}, // "Foo"
+			{RelPath: "a.go", Edits: []TextEdit{{StartByte: 4, EndByte: 7}}}, // "Bar" — conflicts
+		},
+		Preimages: map[string]Preimage{"a.go": {Content: content}},
+	}
+	if name, ok := originalSymbolName(plan); ok {
+		t.Fatalf("expected ok=false on conflicting old text, got (%q, true)", name)
+	}
+}
+
 // Detector: a well-formed edit (a straightforward identifier rename)
 // stages valid Go — verifyStagedSyntaxIsValid must accept it.
 func TestVerifyStagedSyntaxIsValidAcceptsWellFormedEdit(t *testing.T) {

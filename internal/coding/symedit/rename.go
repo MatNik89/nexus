@@ -286,6 +286,12 @@ func Prepare(ctx context.Context, rootFd int, backend *sandbox.Bwrap, report san
 	if err != nil {
 		return Plan{}, fmt.Errorf("symedit: prepare: %w", err)
 	}
+	if err := verifyEditsReplaceRequestedName(edits, req.NewName); err != nil {
+		return Plan{}, fmt.Errorf("symedit: prepare: %w", err)
+	}
+	if err := verifyEditsReplaceSameOldText(edits, preimages); err != nil {
+		return Plan{}, fmt.Errorf("symedit: prepare: %w", err)
+	}
 	edits = beforeStagedSyntaxCheck(edits) // test seam: no-op in production
 
 	if err := verifyStagedSyntaxIsValid(edits, preimages); err != nil {
@@ -312,6 +318,69 @@ func Prepare(ctx context.Context, rootFd int, backend *sandbox.Bwrap, report san
 		ToolchainDigest:   res.ToolchainDigest,
 		PolicyHash:        res.PolicyHash,
 	}, nil
+}
+
+// verifyEditsReplaceRequestedName refuses the plan unless EVERY TextEdit
+// replaces text with EXACTLY newName. ParseWorkspaceEdit validates the
+// edit RANGES (no overlap, in-bounds) but never checks WHAT they replace
+// text WITH — without this, a malformed or buggy gopls response could
+// return a DIFFERENT replacement (e.g. "Baz" when the caller asked for
+// "Bar") and every downstream check (plan_digest, preimage
+// re-verification, ApplyGoverned's own ExpectedBefore* checks) would
+// faithfully bind and commit that WRONG mutation, while the preview and
+// plan.NewName keep claiming the ORIGINALLY REQUESTED name the entire
+// time (code-review finding, codex, round 3 HIGH — live-reproduced via
+// an adversarial gopls-response overlay).
+func verifyEditsReplaceRequestedName(edits []FileEdit, newName string) error {
+	for _, fe := range edits {
+		for _, te := range fe.Edits {
+			if te.NewText != newName {
+				return fmt.Errorf("gopls's own edit for %q replaces text with %q, not the requested new_name %q (fail closed)", fe.RelPath, te.NewText, newName)
+			}
+		}
+	}
+	return nil
+}
+
+// verifyEditsReplaceSameOldText refuses the plan unless every edit's
+// pre-rename text (the preimage bytes at TextEdit.StartByte:EndByte) is
+// IDENTICAL across every edit. verifyEditsReplaceRequestedName alone is
+// not enough: two edits could both write the SAME requested NewName
+// while replacing two DIFFERENT original identifiers — a plan that
+// silently folds two distinct symbols into one rename, not the single-
+// symbol rename the caller asked for (code-review finding, codex, round
+// 4 HIGH, live-reproduced via an adversarial gopls-response overlay: a
+// plan with conflicting old identifiers but consistent NewText was
+// committed uncaught). tool.go's own originalSymbolName degrades this
+// SAME inconsistency gracefully for the PREVIEW TEXT (returns ok=false
+// rather than guessing) — this is the corresponding SAFETY gate that
+// actually refuses the plan, not just the display hint.
+func verifyEditsReplaceSameOldText(edits []FileEdit, preimages map[string]Preimage) error {
+	old := ""
+	found := false
+	for _, fe := range edits {
+		pre, ok := preimages[fe.RelPath]
+		if !ok {
+			continue
+		}
+		for _, te := range fe.Edits {
+			if te.StartByte < 0 || te.EndByte > len(pre.Content) || te.StartByte >= te.EndByte {
+				continue
+			}
+			this := string(pre.Content[te.StartByte:te.EndByte])
+			if this == "" {
+				continue
+			}
+			if !found {
+				old, found = this, true
+				continue
+			}
+			if this != old {
+				return fmt.Errorf("gopls's own edits replace inconsistent original text (%q and %q) — not a single-symbol rename (fail closed)", old, this)
+			}
+		}
+	}
+	return nil
 }
 
 // verifyStagedSyntaxIsValid is invariant 3's own explicit requirement,

@@ -28,6 +28,9 @@ import (
 	"github.com/MatNik89/nexus/internal/channel"
 	"github.com/MatNik89/nexus/internal/channel/health"
 	"github.com/MatNik89/nexus/internal/channel/telegram"
+	"github.com/MatNik89/nexus/internal/coding/runner"
+	"github.com/MatNik89/nexus/internal/coding/symedit"
+	"github.com/MatNik89/nexus/internal/coding/workspace"
 	"github.com/MatNik89/nexus/internal/conv"
 	"github.com/MatNik89/nexus/internal/exectool"
 	"github.com/MatNik89/nexus/internal/foundation/atomicwrite"
@@ -35,6 +38,7 @@ import (
 	"github.com/MatNik89/nexus/internal/foundation/config"
 	"github.com/MatNik89/nexus/internal/foundation/egress"
 	"github.com/MatNik89/nexus/internal/foundation/pathx"
+	"github.com/MatNik89/nexus/internal/foundation/sealedstore"
 	"github.com/MatNik89/nexus/internal/kernel/closure"
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
 	"github.com/MatNik89/nexus/internal/kernel/effectpath"
@@ -50,6 +54,7 @@ import (
 	"github.com/MatNik89/nexus/internal/sandbox"
 	"github.com/MatNik89/nexus/internal/schedule"
 	"github.com/MatNik89/nexus/internal/security/redact"
+	"golang.org/x/sys/unix"
 )
 
 var version = "0.0.1-p0"
@@ -147,6 +152,9 @@ func runDaemon() int {
 		return 2
 	}
 	defer b.j.Close()
+	if b.sealed != nil {
+		defer b.sealed.Close()
+	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	var chanProbe *closure.ProbeResult
@@ -356,6 +364,9 @@ type daemonBundle struct {
 	authority  *s7.Authority
 	prov       *provider.APIKey
 	sandboxOK  bool
+	// sealed is rename_symbol's before/after-image store; nil when the
+	// tool could not be bound (no sandbox probe, no go/gopls on PATH).
+	sealed *sealedstore.Store
 	// picker is the shared /cronjob calendar store: the adapter drives the
 	// ephemeral UI, the handler turns a completed pick into a durable reminder.
 	picker *telegram.PickerStore
@@ -549,6 +560,12 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 	for n, v := range s7.Events() {
 		events[n] = v
 	}
+	for n, v := range runner.Events() {
+		events[n] = v
+	}
+	for n, v := range workspace.Events() {
+		events[n] = v
+	}
 
 	journalPath, _ := layout.ProfileJournal(profile)
 	redactor := redact.NewKnownRefs(knownSecretRefs(resolved.Config))
@@ -615,14 +632,15 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 	// System EffectPath: the manager's programmatic dispatch (scheduled
 	// task runs) goes through the SAME sealed path as sessions —
 	// ModeDefault, merged sealed tools/rules.
-	allTools := mergedTools(memStore, redactor, oblManager)
 	// REAL sandbox (T25/T26): probe bwrap; a passing probe binds the exec
 	// tool, a failing one leaves every ExecProcess call fail-closed and
 	// the exec capability OFF (deny-default).
 	var execAdapter *exectool.Adapter
 	sbBackend := sandbox.NewBwrap()
-	if rep, perr := sbBackend.Probe(context.Background()); perr == nil {
-		if ad, aerr := exectool.New(sbBackend, rep, redactor, resolved.Config.ExecAllow); aerr == nil {
+	sbReport, sbErr := sbBackend.Probe(context.Background())
+	sandboxProbeOK := sbErr == nil
+	if sandboxProbeOK {
+		if ad, aerr := exectool.New(sbBackend, sbReport, redactor, resolved.Config.ExecAllow); aerr == nil {
 			execAdapter = ad
 		}
 	}
@@ -630,9 +648,94 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 	if execAdapter != nil {
 		execDoor = execAdapter
 	}
+	// rename_symbol (S6 tool-boundary, piece 2): ONLY bound when the
+	// sandbox probe passed (its own governed subprocess launches rely on
+	// the SAME probe report exectool uses) AND both the go and gopls
+	// binaries are resolvable on the host — same deny-default pattern as
+	// execAdapter above, never a hard startup failure.
+	var symeditTools map[contracts.ToolID]effectpath.InProcFunc
+	var sealed *sealedstore.Store
+	if sandboxProbeOK {
+		goBinary, goErr := exec.LookPath("go")
+		goplsBinary, goplsErr := exec.LookPath("gopls")
+		if goErr == nil && goplsErr == nil {
+			sealedDir := filepath.Join(profileDir, "sealed")
+			if pathx.EnsureDir(layout.Base, sealedDir) == nil {
+				if s, serr := sealedstore.Open(sealedDir); serr == nil {
+					// Growth bound (codex round-2 review finding: no
+					// production caller invokes Store.GC yet — see
+					// docs/SECTION-MAP.md's own deferred-GC rationale).
+					// One apply = one Put (transaction.go's own single
+					// whole-bundle write) — 2000 entries bounds growth to
+					// roughly 2000 total renames before further applies
+					// fail closed, generous for single-user volume while
+					// never risking deleting a possibly-live artifact.
+					s.MaxEntries = 2000
+					// A count alone does not bound disk USAGE: one entry
+					// can be up to ~500MB (runner.MaxSnapshotBytes,
+					// base64-encoded into the bundle) — 8GiB total bounds
+					// worst-case growth to a bounded fraction of typical
+					// disk (codex round-3 review finding).
+					s.MaxTotalBytes = 8 << 30
+					sealed = s
+					workspaceRoot := func(p contracts.ProfileID) (string, bool) {
+						return resolved.Config.CodingWorkspaceRoot(p)
+					}
+					// Restart-time discovery (S6 tool-boundary piece 2,
+					// codex round-2 review finding: piece 2 is the FIRST
+					// thing that makes ApplyGoverned production-reachable,
+					// so a crash mid-apply previously had NO startup-time
+					// visibility at all). RestartScan is read-only by its
+					// own design (scan.go's own doc comment: "discovery +
+					// classification... nothing more") — it takes no S7
+					// action and performs no rollback. codex round-3
+					// review, HIGH: log-only was not enough on its own —
+					// "at minimum unresolved/error states must disable
+					// mutation" — so an unresolved finding, OR the scan
+					// itself failing to run at all (OpenRoot/RestartScan
+					// error), now REFUSES to bind the mutation tools
+					// (fail closed) rather than merely logging and
+					// continuing. Automatically DRIVING RollbackGoverned
+					// from a finding remains a separate, deliberately
+					// deferred recovery-driver obligation
+					// (docs/SECTION-MAP.md) — an operator must resolve it
+					// (or a future driver must exist) before rename_symbol
+					// becomes available again.
+					scanClean := true
+					if root, ok := workspaceRoot(profile); ok {
+						rootFd, oerr := workspace.OpenRoot(root)
+						if oerr != nil {
+							scanClean = false
+							fmt.Fprintf(os.Stderr, "nexus daemon: coding-workspace restart scan could not open the workspace root for profile %q (rename_symbol disabled until resolved): %v\n", profile, oerr)
+						} else {
+							findings, serr := workspace.RestartScan(rootFd, j, authority, sealed)
+							unix.Close(rootFd)
+							if serr != nil {
+								scanClean = false
+								fmt.Fprintf(os.Stderr, "nexus daemon: coding-workspace restart scan failed for profile %q (rename_symbol disabled until resolved): %v\n", profile, serr)
+							} else if len(findings) > 0 {
+								scanClean = false
+								fmt.Fprintf(os.Stderr, "nexus daemon: coding-workspace restart scan found %d unresolved operation(s) for profile %q — rename_symbol disabled until manually reconciled:\n", len(findings), profile)
+								for _, f := range findings {
+									fmt.Fprintf(os.Stderr, "  op=%s state=%v\n", f.Op, f.State)
+								}
+							}
+						}
+					}
+					if scanClean {
+						symeditTools = symedit.Tools(workspaceRoot, goBinary, goplsBinary, sealed, sbBackend, sbReport, authority, j)
+					}
+				}
+			}
+		}
+	}
+	allTools := mergedTools(memStore, redactor, oblManager, symeditTools)
 	sysPep, err := effectpath.NewPEP(mergedRules(), effectpath.NewApprovals(nil, 5*time.Minute),
 		&journalAudit{j: j, profile: profile}, effectpath.ModeDefault)
 	if err != nil {
+		if sealed != nil {
+			sealed.Close()
+		}
 		j.Close()
 		return nil, err
 	}
@@ -641,6 +744,9 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 		effectpath.NewInProcessExecutor(allTools),
 		effectpath.NewSandboxedProcessExecutor(execDoor), authority)
 	if err != nil {
+		if sealed != nil {
+			sealed.Close()
+		}
 		j.Close()
 		return nil, err
 	}
@@ -670,6 +776,13 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 					specs[k] = v
 				}
 			}
+			if symeditTools != nil {
+				// The planner offers rename_symbol ONLY when it was
+				// actually bound above (deny-default — same discipline).
+				for k, v := range symedit.Specs() {
+					specs[k] = v
+				}
+			}
 			return pl.WithTools(specs, profile)
 		},
 		Authority: authority, Profile: profile,
@@ -692,13 +805,16 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 		},
 	})
 	if err != nil {
+		if sealed != nil {
+			sealed.Close()
+		}
 		j.Close()
 		return nil, err
 	}
 	return &daemonBundle{d: d, j: j, sched: sched, obl: oblManager,
 		chanCore: chanCore, egressSink: egressSink, health: healthOwner, approvals: approvals, profile: profile, cfg: resolved.Config,
 		sysPath: sysPath, authority: authority,
-		prov: prov, sandboxOK: execAdapter != nil}, nil
+		prov: prov, sandboxOK: execAdapter != nil, sealed: sealed}, nil
 }
 
 // systemMW is the order-only S6.9 seam for the system EffectPath.
@@ -721,13 +837,26 @@ func mergedRules() map[contracts.ToolID]effectpath.Decision {
 	for k, v := range exectool.Rules() {
 		rules[k] = v
 	}
+	// rename_symbol's rules exist regardless of whether the tool itself is
+	// bound (an unbound tool is simply never offered to the planner —
+	// registering its rule here costs nothing and keeps mergedRules the
+	// single source of truth PEP consults).
+	for k, v := range symedit.Rules() {
+		rules[k] = v
+	}
 	return rules
 }
 
-// mergedTools combines every tool family's handlers.
-func mergedTools(memStore *memory.Store, r redact.Redactor, m *obligation.Manager) map[contracts.ToolID]effectpath.InProcFunc {
+// mergedTools combines every tool family's handlers. symeditTools is nil
+// when rename_symbol could not be bound (no sandbox probe, no go/gopls on
+// PATH, or the sealed store failed to open) — deny-default, not a startup
+// failure.
+func mergedTools(memStore *memory.Store, r redact.Redactor, m *obligation.Manager, symeditTools map[contracts.ToolID]effectpath.InProcFunc) map[contracts.ToolID]effectpath.InProcFunc {
 	tools := memory.Tools(memStore, r)
 	for k, v := range obligation.Tools(m) {
+		tools[k] = v
+	}
+	for k, v := range symeditTools {
 		tools[k] = v
 	}
 	return tools

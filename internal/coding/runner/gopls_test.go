@@ -13,8 +13,29 @@ import (
 	"time"
 
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
+	"github.com/MatNik89/nexus/internal/kernel/journal"
 	"github.com/MatNik89/nexus/internal/kernel/s7"
 )
+
+// codingRunEventRecorded reports whether a "coding.run" event for runID
+// was actually committed to j — not just that RunGoplsRename returned an
+// error, since a rejected journal append is silently swallowed whenever
+// the caller's own execution error already takes precedence (gopls.go's
+// own documented behavior). Proves the append itself succeeded against
+// the REAL runner.Events() validator, not a test bypass.
+func codingRunEventRecorded(t *testing.T, j *journal.Journal, runID contracts.RunID) bool {
+	t.Helper()
+	found := false
+	if err := j.Replay(0, func(ev journal.Event) error {
+		if ev.Envelope.EventType == "coding.run" && ev.Envelope.RunID == runID {
+			found = true
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("replay journal: %v", err)
+	}
+	return found
+}
 
 func realGoplsBinary(t *testing.T) string {
 	t.Helper()
@@ -218,6 +239,39 @@ func TestFileURIForEscapesSpecialCharacters(t *testing.T) {
 
 // Detector (code-review finding, codex): a session killed by ITS OWN
 // deadline is classified as CANCELLED, not a failed attempt — mirrors
+// Detector (code-review finding, codex, round 4 HIGH, live-reproduced
+// via a closed-journal overlay): a SIMULTANEOUS execution failure AND
+// journal-append failure must not silently lose the append failure —
+// E4 (ARCHITECTURE-ESSENTIALS.md: EventJournal owns canonical events)
+// requires the returned error to reflect BOTH, not just whichever one
+// happened to be "first."
+func TestRunGoplsRenameCombinedExecutionAndJournalFailureIsNotHidden(t *testing.T) {
+	goBin := realGoBinary(t)
+	goplsBin := realGoplsBinary(t)
+	b, rep := testBackend(t)
+	j := testJournal(t)
+	j.Close() // force every subsequent j.Append to fail
+
+	src := t.TempDir()
+	tinyModule(t, src)
+	grants := s7.NewAuthority(time.Now, 5*time.Minute)
+	_, err := RunGoplsRename(ctxT(), b, rep, grants, j, RenameRequest{
+		SourceDir: src, FileRelPath: "main.go", Line: 0, Character: 5, NewName: "Bar",
+		GoBinary: goBin, GoplsBinary: goplsBin, Timeout: time.Millisecond,
+		OperationID: "op-combined-failure", TargetID: "target-combined-failure",
+		RunID: "run-combined-failure", ProfileID: "work",
+	})
+	if err == nil {
+		t.Fatal("expected an error: 1ms timeout against a closed journal")
+	}
+	if !strings.Contains(err.Error(), "cancelled by its own deadline") {
+		t.Fatalf("execution failure lost from combined error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "journal coding.run (gopls)") {
+		t.Fatalf("journal-append failure lost from combined error (E4 violation): %v", err)
+	}
+}
+
 // Run's identical classification (run.go). A 1ms Timeout cannot possibly
 // complete a real gopls session, so the deadline fires mid-session.
 func TestRunGoplsRenameClassifiesOwnDeadlineAsCancelled(t *testing.T) {
@@ -257,6 +311,15 @@ func TestRunGoplsRenameClassifiesOwnDeadlineAsCancelled(t *testing.T) {
 		// suggestion): S7 itself must record CANCELLED.
 		if state, ok := grants.State(op); !ok || state != contracts.AttemptCancelled {
 			t.Fatalf("iteration %d: S7 state = %v (ok=%v), want AttemptCancelled", i, state, ok)
+		}
+		// The coding.run audit event must ALSO have landed (code-review
+		// finding, codex, round 2: live coverage showed the pre-fix
+		// validator rejecting this exact failure-shape payload — a
+		// "green" error-string/S7-state check alone does not prove the
+		// audit record exists).
+		runID := contracts.RunID(fmt.Sprintf("run-test-rename-deadline-%d", i))
+		if !codingRunEventRecorded(t, j, runID) {
+			t.Fatalf("iteration %d: no coding.run event recorded for %s — the journal append was rejected/dropped", i, runID)
 		}
 	}
 }

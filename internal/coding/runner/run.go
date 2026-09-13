@@ -203,8 +203,17 @@ func Run(ctx context.Context, backend sandbox.Backend, report sandbox.ProbeRepor
 	}
 	execCtx, cancelExec, err := grants.AttemptContext(ctx, spec.OperationID, deadline)
 	if err != nil {
+		// POST-Consume: an attempt was durably STARTED (grants.Consume
+		// above already succeeded) before this failed — same "durably-
+		// started-then-immediately-failed attempts still need an audit
+		// event" reasoning as RunGoplsRename's identical branch
+		// (code-review finding, codex, round 5 HIGH, live-reproduced:
+		// this exact branch returned with no journal call at all).
 		reportOutcome(grants, spec.OperationID, s7.OutcomeUnknown, s7.CodeLocalRefused)
-		return RunResult{}, fmt.Errorf("runner: %w", err)
+		partial := RunResult{PolicyHash: policy.PolicyHash(), SnapshotDigest: snapDigest, ToolchainDigest: pin.HashDigest}
+		wrapped := fmt.Errorf("runner: %w", err)
+		_, jerr := journalRunEvent(ctx, j, spec, partial, wrapped)
+		return RunResult{}, jerr
 	}
 
 	proc, launchErr := backend.Launch(execCtx, policy)
@@ -277,7 +286,13 @@ func Run(ctx context.Context, backend sandbox.Backend, report sandbox.ProbeRepor
 		return result, jerr
 	}
 	if err := grants.Report(spec.OperationID, s7.OutcomeSucceeded, "", nil); err != nil {
-		return result, fmt.Errorf("runner: %w", err)
+		// Mirrors RunGoplsRename's identical Report-failure branch
+		// (code-review finding, codex, round 5 HIGH: this branch never
+		// called journalRunEvent at all).
+		wrapped := fmt.Errorf("runner: %w", err)
+		ev, jerr := journalRunEvent(ctx, j, spec, result, wrapped)
+		result.JournalEvent = ev
+		return result, jerr
 	}
 	ev, jerr := journalRunEvent(ctx, j, spec, result, nil)
 	result.JournalEvent = ev
@@ -351,10 +366,11 @@ func journalRunEvent(ctx context.Context, j *journal.Journal, spec RunSpec, resu
 	}
 	raw, marshalErr := json.Marshal(payload)
 	if marshalErr != nil {
+		wrapped := fmt.Errorf("runner: marshal coding.run payload: %w", marshalErr)
 		if runErr != nil {
-			return journal.Event{}, runErr
+			return journal.Event{}, errors.Join(runErr, wrapped)
 		}
-		return journal.Event{}, fmt.Errorf("runner: marshal coding.run payload: %w", marshalErr)
+		return journal.Event{}, wrapped
 	}
 	ev, appendErr := j.Append(ctx, contracts.EnvelopeParams{
 		SchemaID: "nexus.event", SchemaVersion: 1,
@@ -373,10 +389,18 @@ func journalRunEvent(ctx context.Context, j *journal.Journal, spec RunSpec, resu
 		PayloadHash:   "recomputed",
 	})
 	if appendErr != nil {
+		wrapped := fmt.Errorf("runner: journal coding.run: %w", appendErr)
 		if runErr != nil {
-			return journal.Event{}, runErr
+			// E4 (ARCHITECTURE-ESSENTIALS.md: EventJournal owns canonical
+			// events): a simultaneous execution failure and journal-
+			// append failure must not silently lose the append failure —
+			// mirrors gopls.go's own identical fix (code-review finding,
+			// codex, round 5 HIGH: run.go IS within rename_symbol's own
+			// blast radius via typecheck.go's call to Run, contradicting
+			// this piece's own earlier "out of scope" deferral).
+			return journal.Event{}, errors.Join(runErr, wrapped)
 		}
-		return journal.Event{}, fmt.Errorf("runner: journal coding.run: %w", appendErr)
+		return journal.Event{}, wrapped
 	}
 	return ev, runErr
 }

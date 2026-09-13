@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -205,6 +206,14 @@ func RunGoplsRename(ctx context.Context, backend *sandbox.Bwrap, report sandbox.
 	if err != nil {
 		return RenameResult{}, fmt.Errorf("runner: compile: %w", err)
 	}
+	// partial carries the digests every coding.run event requires
+	// (runner.Events()'s validator) on every failure/cancellation path
+	// below — mirrors Run's own identical partial at run.go:214. Without
+	// this, journalGoplsRenameEvent's zero-valued RenameResult{} fails
+	// validation and the append error is swallowed (runErr takes
+	// precedence), silently dropping the audit record for exactly the
+	// failures an audit trail exists to capture.
+	partial := RenameResult{SnapshotDigest: snapDigest, ToolchainDigest: pin.HashDigest, PolicyHash: policy.PolicyHash()}
 
 	if err := grants.Begin(req.OperationID, req.TargetID, PolicyCodingRun); err != nil {
 		return RenameResult{}, fmt.Errorf("runner: %w", err)
@@ -223,8 +232,16 @@ func RunGoplsRename(ctx context.Context, backend *sandbox.Bwrap, report sandbox.
 	}
 	execCtx, cancelExec, err := grants.AttemptContext(ctx, req.OperationID, deadline)
 	if err != nil {
+		// POST-Consume: an attempt was durably STARTED (grants.Consume
+		// above already succeeded) before this failed, so — unlike the
+		// pre-Consume Begin/Next/Consume failures above, where nothing
+		// yet began — this durably-started-then-immediately-failed
+		// attempt deserves its own coding.run audit event (code-review
+		// finding, codex, round 5 HIGH, live-reproduced: this exact
+		// branch returned with no journal call at all).
 		reportOutcome(grants, req.OperationID, s7.OutcomeUnknown, s7.CodeLocalRefused)
-		return RenameResult{}, fmt.Errorf("runner: %w", err)
+		wrapped := fmt.Errorf("runner: %w", err)
+		return RenameResult{}, journalGoplsRenameEvent(ctx, j, req, partial, wrapped)
 	}
 	defer cancelExec()
 
@@ -243,11 +260,12 @@ func RunGoplsRename(ctx context.Context, backend *sandbox.Bwrap, report sandbox.
 			// SAME deadline produce different S7 outcomes depending on
 			// unrelated scheduling timing.
 			grants.Cancel(req.OperationID, nil)
-			journalGoplsRenameEvent(ctx, j, req, RenameResult{}, err)
-			return RenameResult{}, fmt.Errorf("runner: launch cancelled by its own deadline: %w", err)
+			wrapped := fmt.Errorf("runner: launch cancelled by its own deadline: %w", err)
+			return RenameResult{}, journalGoplsRenameEvent(ctx, j, req, partial, wrapped)
 		}
 		reportOutcome(grants, req.OperationID, s7.OutcomeFailedTerminal, s7.CodeLocalRefused)
-		return RenameResult{}, fmt.Errorf("runner: launch: %w", err)
+		wrapped := fmt.Errorf("runner: launch: %w", err)
+		return RenameResult{}, journalGoplsRenameEvent(ctx, j, req, partial, wrapped)
 	}
 	defer proc.Close()
 
@@ -263,19 +281,19 @@ func RunGoplsRename(ctx context.Context, backend *sandbox.Bwrap, report sandbox.
 		// nothing durable happened downstream of it, so this is
 		// CANCELLED, not a failed attempt.
 		grants.Cancel(req.OperationID, nil)
-		journalGoplsRenameEvent(ctx, j, req, RenameResult{}, sessionErr)
-		return RenameResult{}, fmt.Errorf("runner: gopls session cancelled by its own deadline: %w", sessionErr)
+		wrapped := fmt.Errorf("runner: gopls session cancelled by its own deadline: %w", sessionErr)
+		return RenameResult{}, journalGoplsRenameEvent(ctx, j, req, partial, wrapped)
 	}
 	if sessionErr != nil {
 		reportOutcome(grants, req.OperationID, s7.OutcomeFailedTerminal, s7.CodeLocalRefused)
-		journalGoplsRenameEvent(ctx, j, req, RenameResult{}, sessionErr)
-		return RenameResult{}, fmt.Errorf("runner: gopls session: %w\nstderr: %s", sessionErr, proc.Stderr())
+		wrapped := fmt.Errorf("runner: gopls session: %w\nstderr: %s", sessionErr, proc.Stderr())
+		return RenameResult{}, journalGoplsRenameEvent(ctx, j, req, partial, wrapped)
 	}
 
 	if _, err := backend.AttestInteractive(ctx, proc, policy); err != nil {
 		reportOutcome(grants, req.OperationID, s7.OutcomeUnknown, s7.CodeLocalRefused)
-		journalGoplsRenameEvent(ctx, j, req, RenameResult{}, err)
-		return RenameResult{}, fmt.Errorf("runner: attest: %w", err)
+		wrapped := fmt.Errorf("runner: attest: %w", err)
+		return RenameResult{}, journalGoplsRenameEvent(ctx, j, req, partial, wrapped)
 	}
 	// A rename result the caller can act on requires S7 to have actually
 	// ACCEPTED the success landing — Report can legitimately refuse
@@ -284,8 +302,8 @@ func RunGoplsRename(ctx context.Context, backend *sandbox.Bwrap, report sandbox.
 	// result S7 never recorded as succeeded (code-review finding, codex;
 	// mirrors run.go's own propagation of this same Report call).
 	if err := grants.Report(req.OperationID, s7.OutcomeSucceeded, "", nil); err != nil {
-		journalGoplsRenameEvent(ctx, j, req, RenameResult{}, err)
-		return RenameResult{}, fmt.Errorf("runner: %w", err)
+		wrapped := fmt.Errorf("runner: %w", err)
+		return RenameResult{}, journalGoplsRenameEvent(ctx, j, req, partial, wrapped)
 	}
 
 	result := RenameResult{
@@ -296,8 +314,8 @@ func RunGoplsRename(ctx context.Context, backend *sandbox.Bwrap, report sandbox.
 	if raw, ok := renameResp["error"]; ok && len(raw) > 0 && string(raw) != "null" {
 		var lspErr LSPError
 		if err := json.Unmarshal(raw, &lspErr); err != nil {
-			journalGoplsRenameEvent(ctx, j, req, result, err)
-			return RenameResult{}, fmt.Errorf("runner: malformed LSP error object: %w", err)
+			wrapped := fmt.Errorf("runner: malformed LSP error object: %w", err)
+			return RenameResult{}, journalGoplsRenameEvent(ctx, j, req, result, wrapped)
 		}
 		result.Error = &lspErr
 	} else {
@@ -339,10 +357,11 @@ func journalGoplsRenameEvent(ctx context.Context, j *journal.Journal, req Rename
 	}
 	raw, marshalErr := json.Marshal(payload)
 	if marshalErr != nil {
+		wrapped := fmt.Errorf("runner: marshal coding.run (gopls) payload: %w", marshalErr)
 		if runErr != nil {
-			return runErr
+			return errors.Join(runErr, wrapped)
 		}
-		return fmt.Errorf("runner: marshal coding.run (gopls) payload: %w", marshalErr)
+		return wrapped
 	}
 	_, appendErr := j.Append(ctx, contracts.EnvelopeParams{
 		SchemaID: "nexus.event", SchemaVersion: 1,
@@ -360,10 +379,19 @@ func journalGoplsRenameEvent(ctx context.Context, j *journal.Journal, req Rename
 		PayloadHash: "recomputed",
 	})
 	if appendErr != nil {
+		wrapped := fmt.Errorf("runner: journal coding.run (gopls): %w", appendErr)
 		if runErr != nil {
-			return runErr
+			// E4 (ARCHITECTURE-ESSENTIALS.md: EventJournal owns canonical
+			// events): a simultaneous execution failure and journal-
+			// append failure must not silently lose the append failure —
+			// errors.Join keeps BOTH visible to errors.Is/As and to the
+			// caller's own error text (code-review finding, codex, round
+			// 4 HIGH, live-reproduced with a closed-journal overlay; this
+			// package's own callers below now propagate this return
+			// value instead of re-deriving and discarding it).
+			return errors.Join(runErr, wrapped)
 		}
-		return fmt.Errorf("runner: journal coding.run (gopls): %w", appendErr)
+		return wrapped
 	}
 	return runErr
 }
