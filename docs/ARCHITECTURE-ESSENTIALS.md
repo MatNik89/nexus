@@ -194,12 +194,23 @@ supersession, deterministic recency + exact/tag retrieval, bytes lossless. **NO 
 machinery in P0** (hard-questions: FSRS on facts would "forget" the user's server IP and
 violate PRD §6.2): Decay(FSRS-lite) + Audn move to P1 `memorija`, activated only on a
 measured retrieval problem, and NEVER applied to explicit facts (fact type exempt, S=∞);
-Dream/MemGit/MemAssoc = v2. **MEMORY_FORGET (reversible, recall ban) ≠ DATA_PURGE
+Dream/MemGit/MemAssoc = v2. **[CHANGE-RECORD, TASK/EPHEMERAL memory scope slice, commit
+24c0406+]** The S=∞ exemption above is now `scope`-CONDITIONAL, not blanket: `scope=user`
+(the default — everything that existed before this slice, unchanged) stays permanently
+decay-exempt exactly as originally stated; `scope=task`/`scope=ephemeral` are explicitly
+NOT exempt, so a future Decay slice can apply per-scope half-lives to them (restoring the
+original pre-HARDQ design's own `halfLife time.Duration // po scope-u` intent). Scope
+remains descriptive metadata WITHIN a profile (see the isolation sentence below — that
+constraint is about physical isolation, not about scope having zero behavior at all); its
+real behavior is this decay-eligibility split plus default-recall filtering
+(`internal/memory` `Scope`/`ScopeUser`/`ScopeTask`/`ScopeEphemeral`). **MEMORY_FORGET
+(reversible, recall ban) ≠ DATA_PURGE
 (irreversible, S6.7 overrides, deletes the tombstone too)** — USP #4; BOTH land with their
 normative Annex P2.1 contract (task-review fix — neither is a PRD §6 criterion; P0
 correction = append-only supersession). **Profile isolation is
 physical (HARDQ B3): one SQLite file per profile** (+ system DB with zero profile payloads);
-scope column stays only as a redundant tag; non-null `ProfileID` stamped at admission and
+scope column stays only as a redundant tag [amended above: redundant as an ISOLATION
+boundary, not behaviorally inert]; non-null `ProfileID` stamped at admission and
 carried immutably through the whole causal chain (envelope→run→tool→memory→obligation→
 occurrence→journal→inbox/outbox→approval); channel identity binds to a profile BEFORE
 admission (per-chat deny-default binding). Memory write-approval DEFAULT ON.

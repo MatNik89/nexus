@@ -18,7 +18,7 @@ import (
 
 func TestRememberPreviewAndApprovalGate(t *testing.T) {
 	_, work, _, _, _ := seedBoth(t)
-	preview, err := work.Propose(ctxT(), "f-1", "the wifi password is on the router", OriginExplicit)
+	preview, err := work.Propose(ctxT(), "f-1", "the wifi password is on the router", OriginExplicit, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +39,7 @@ func TestRememberPreviewAndApprovalGate(t *testing.T) {
 
 func TestRejectedInferenceNotRecallable(t *testing.T) {
 	_, work, _, _, _ := seedBoth(t)
-	if _, err := work.Propose(ctxT(), "f-inf", "user probably prefers TABASCOHINT sauce", OriginInferred); err != nil {
+	if _, err := work.Propose(ctxT(), "f-inf", "user probably prefers TABASCOHINT sauce", OriginInferred, ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := work.Reject(ctxT(), "f-inf"); err != nil {
@@ -74,7 +74,7 @@ func TestRejectedInferenceNotRecallable(t *testing.T) {
 // supersede-of-superseded refused, triple chain works.
 func TestSupersessionStrictlyLinear(t *testing.T) {
 	_, work, _, _, _ := seedBoth(t)
-	if _, err := work.Propose(ctxT(), "f-a", "the CARKEYFACT is in the drawer", OriginExplicit); err != nil {
+	if _, err := work.Propose(ctxT(), "f-a", "the CARKEYFACT is in the drawer", OriginExplicit, ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := work.Accept(ctxT(), "f-a"); err != nil {
@@ -186,7 +186,7 @@ func TestTagAndExactRetrieval(t *testing.T) {
 // session — and only in its profile.
 func TestFactSurvivesRestartOnlyInItsProfile(t *testing.T) {
 	_, work, private, workPath, privatePath := seedBoth(t)
-	if _, err := work.Propose(ctxT(), "f-r", "the RESTARTFACT lives here", OriginExplicit); err != nil {
+	if _, err := work.Propose(ctxT(), "f-r", "the RESTARTFACT lives here", OriginExplicit, ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := work.Accept(ctxT(), "f-r"); err != nil {
@@ -222,7 +222,7 @@ func TestRecallRecencyOrder(t *testing.T) {
 		{"f-old", "ORDERTOKEN first note"},
 		{"f-new", "ORDERTOKEN second note"},
 	} {
-		if _, err := work.Propose(ctxT(), f.id, f.content, OriginExplicit); err != nil {
+		if _, err := work.Propose(ctxT(), f.id, f.content, OriginExplicit, ""); err != nil {
 			t.Fatal(err)
 		}
 		if err := work.Accept(ctxT(), f.id); err != nil {
@@ -243,7 +243,7 @@ func TestRecallRecencyOrder(t *testing.T) {
 // observation to UNTRUSTED_EXTERNAL, and known secrets are redacted.
 func TestRecallObservationMonotoneTrustAndRedaction(t *testing.T) {
 	_, work, _, _, _ := seedBoth(t)
-	if _, err := work.Propose(ctxT(), "f-i", "user likely visits MONOTONETOKEN daily", OriginInferred); err != nil {
+	if _, err := work.Propose(ctxT(), "f-i", "user likely visits MONOTONETOKEN daily", OriginInferred, ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := work.Accept(ctxT(), "f-i"); err != nil {
@@ -312,7 +312,7 @@ func TestRecallObservationMonotoneTrustAndRedaction(t *testing.T) {
 // the canonical stream (Phase-3-r2 codex #1 tail).
 func TestReplayReconstructsFullState(t *testing.T) {
 	_, work, _, workPath, _ := seedBoth(t)
-	if _, err := work.Propose(ctxT(), "f-rej", "REPLAYREJECT idea", OriginInferred); err != nil {
+	if _, err := work.Propose(ctxT(), "f-rej", "REPLAYREJECT idea", OriginInferred, ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := work.Reject(ctxT(), "f-rej"); err != nil {
@@ -371,7 +371,7 @@ func TestSecretContentRefusedNotRewritten(t *testing.T) {
 	if err := s.SaveFact(ctxT(), "f-1", "my key is "+secret); err == nil {
 		t.Fatal("known-secret content accepted (would be silently rewritten by journal redaction)")
 	}
-	if _, err := s.Propose(ctxT(), "f-2", secret, OriginExplicit); err == nil {
+	if _, err := s.Propose(ctxT(), "f-2", secret, OriginExplicit, ""); err == nil {
 		t.Fatal("known-secret proposal accepted")
 	}
 	rows, _ := s.All(ctxT())
@@ -419,7 +419,7 @@ func TestTagLikeMetacharactersEscaped(t *testing.T) {
 // codex #7): approval never erases provenance.
 func TestFactLineageSurvivesToRecall(t *testing.T) {
 	_, work, _, _, _ := seedBoth(t)
-	if err := work.SaveFactLineage(ctxT(), "f-l", "LINEAGETOKEN fact", nil, []string{"tc-origin-1"}); err != nil {
+	if err := work.SaveFactLineage(ctxT(), "f-l", "LINEAGETOKEN fact", nil, []string{"tc-origin-1"}, ""); err != nil {
 		t.Fatal(err)
 	}
 	hits, err := work.Recall(ctxT(), "LINEAGETOKEN")
@@ -511,7 +511,7 @@ func TestV1SchemaDatabaseRebuildsAtOpen(t *testing.T) {
 // literal): predecessor lineage ∪ predecessor id ∪ correction call.
 func TestSupersessionUnionsLineageThroughTool(t *testing.T) {
 	_, work, _, _, _ := seedBoth(t)
-	if err := work.SaveFactLineage(ctxT(), "f-orig", "UNIONTOKEN v1", nil, []string{"source-block"}); err != nil {
+	if err := work.SaveFactLineage(ctxT(), "f-orig", "UNIONTOKEN v1", nil, []string{"source-block"}, ""); err != nil {
 		t.Fatal(err)
 	}
 	tools := Tools(work, redact.None{})

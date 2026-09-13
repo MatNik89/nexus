@@ -51,6 +51,35 @@ const (
 	StatusRejected Status = "rejected"
 )
 
+// Scope is a fact's durability/decay-eligibility class (S9.4 P1 — the
+// TASK/EPHEMERAL slice). It is descriptive metadata WITHIN a profile, not
+// a second physical isolation boundary alongside profile (HARDQ B3/E14:
+// "Profile isolation is physical... scope column stays only as a
+// redundant tag" — that constraint is about isolation, not about scope
+// having zero behavior at all). Its one real behavior: `ScopeUser` is
+// permanently decay-exempt (S=∞, unchanged from before this slice —
+// every fact ever written before this existed is `ScopeUser`);
+// `ScopeTask`/`ScopeEphemeral` are explicitly NOT exempt, so a future
+// Decay slice can apply per-scope half-lives to them (restoring the
+// original pre-HARDQ design's own intent — see
+// docs/DESIGN-memory-effectpath-kilo.md's `halfLife time.Duration // po
+// scope-u`). This amends the unconditional wording in
+// docs/ARCHITECTURE-ESSENTIALS.md E14 and docs/HARDQ-CONSOLIDATED.md B8 —
+// both carry an inline change-record pointing here. `ScopeAll` is a
+// QUERY-ONLY pseudo-value (never persisted) meaning "no scope filter" —
+// kept OUT of this closed set on purpose (agy round-3 note: "keep
+// query-only 'all' separate from the persisted Scope enum").
+type Scope string
+
+const (
+	ScopeUser      Scope = "user"
+	ScopeTask      Scope = "task"
+	ScopeEphemeral Scope = "ephemeral"
+	// ScopeAll is never stored — Recall/RecallTag treat it as "skip the
+	// scope filter entirely," never a value factPayload.validate() accepts.
+	ScopeAll Scope = "all"
+)
+
 // Memory event types (closed; registered into the journal's event set).
 const (
 	EvFactSaved      = "memory.fact_saved" // pre-approved explicit fact
@@ -58,9 +87,11 @@ const (
 	EvFactAccepted   = "memory.fact_accepted"
 	EvFactRejected   = "memory.fact_rejected"
 	EvFactSuperseded = "memory.fact_superseded"
-	// EvFactRemembered is Audn's own entry point (S9.4 P1, HARDQ B8 — fact-
-	// type stays decay-exempt; this is the CONTRADICTION-RESOLUTION half,
-	// not decay). Unlike every event above, the OUTCOME is not fixed by
+	// EvFactRemembered is Audn's own entry point (S9.4 P1, HARDQ B8 —
+	// this is the CONTRADICTION-RESOLUTION half, not decay; decay
+	// eligibility is `scope`-conditional as of the TASK/EPHEMERAL slice —
+	// see the `Scope` type doc comment, not a blanket fact-type exemption
+	// anymore). Unlike every event above, the OUTCOME is not fixed by
 	// the caller — Apply itself looks up the current latest-accepted fact
 	// sharing ClaimKey (if any) and decides ADD/SUPERSEDE/PROPOSE+CONTEST
 	// from what it finds, inside the SAME append transaction the leaf-
@@ -80,6 +111,43 @@ type factPayload struct {
 	// Lineage carries the SOURCE chain (tool call ids, block ids) —
 	// approval never erases provenance (Phase-3-r2 codex #7).
 	Lineage []string `json:"lineage,omitempty"`
+	// Scope defaults to ScopeUser when omitted (write side leaves it
+	// empty for byte-compat — see explicitDefaults; UnmarshalJSON below
+	// is the ONLY normalization point, not explicitDefaults, so there is
+	// exactly one place this can ever drift from — kilo round-3 note).
+	Scope Scope `json:"scope,omitempty"`
+}
+
+// UnmarshalJSON normalizes an empty/absent Scope to ScopeUser AS PART OF
+// DECODING ITSELF (code-review finding, codex+kilo, round 3, both
+// independently identical: normalizing in explicitDefaults/validate()
+// doesn't work, since there are multiple INDEPENDENT decode sites for a
+// factPayload — the journal validator, Projection.Apply, and
+// applyRemembered's own decode immediately before it computes
+// json.Marshal(p) for Audn's exact-intent retry check — and normalizing
+// one decoded copy never touches the others). A custom UnmarshalJSON is
+// structurally guaranteed to run at EVERY decode of a factPayload,
+// present or future, nested inside rememberPayload.New or
+// supersedePayload.New, with no per-call-site discipline required — it
+// correctly collapses all three ways "no explicit scope" can appear
+// (the key entirely absent, present as "", or a future `null`) to the
+// SAME Go zero value "" before this check runs, so a pre-v6 journal
+// event and a post-v6 explicit "scope":"user" call canonicalize
+// IDENTICALLY once decoded (required for Audn's retry-intent equality
+// to survive the v5→v6 schema boundary — the 5→6 version bump's generic
+// drop-and-rebuild-from-journal migration is what recomputes every
+// historical intent through this same normalization).
+func (f *factPayload) UnmarshalJSON(b []byte) error {
+	type alias factPayload // breaks the recursive UnmarshalJSON call
+	var a alias
+	if err := json.Unmarshal(b, &a); err != nil {
+		return err
+	}
+	if a.Scope == "" {
+		a.Scope = ScopeUser
+	}
+	*f = factPayload(a)
+	return nil
 }
 
 type decisionPayload struct {
@@ -211,6 +279,9 @@ func (f factPayload) validate() error {
 	if !f.Trust.Valid() || !f.Sensitivity.Valid() {
 		return fmt.Errorf("memory: trust and sensitivity classes are required (fail closed)")
 	}
+	if f.Scope != ScopeUser && f.Scope != ScopeTask && f.Scope != ScopeEphemeral {
+		return fmt.Errorf("memory: unknown scope (fail closed)")
+	}
 	for _, t := range f.Tags {
 		if strings.TrimSpace(t) == "" || strings.ContainsAny(t, " \t\n") {
 			return fmt.Errorf("memory: tags must be non-empty single tokens (fail closed)")
@@ -290,7 +361,20 @@ func (Projection) Name() string { return "memory_facts" }
 // unlike re-deriving the outcome from generic claim_key/id state after
 // the fact, which both editions before this one did and both got wrong
 // in a different way).
-func (Projection) Version() int { return 5 }
+// Version 6 adds `scope` (S9.4 P1, TASK/EPHEMERAL slice) and repoints
+// ix_mem_claim_key at (profile_id, scope, claim_key) instead of
+// (profile_id, claim_key) — claim_key ownership is now PARTITIONED by
+// scope: a `task`-scoped "server_ip" and a `user`-scoped "server_ip" are
+// independent claims that can never cross-supersede or shadow each other
+// (code-review finding, agy+kilo+codex, round 1, independently
+// identical: a scope-agnostic claim_key combined with scope-filtered
+// default recall created either a silent write deadlock or a silent
+// override of a durable fact by a transient one). The 5→6 rebuild
+// replays every historical event through the current Apply, which now
+// normalizes scope during decode (factPayload.UnmarshalJSON) — so a
+// pre-v6 fact's recomputed intent canonicalizes identically to a
+// post-v6 explicit "scope":"user" call.
+func (Projection) Version() int { return 6 }
 
 func (Projection) Reset(db *journal.ProjDB) error {
 	for _, stmt := range []string{
@@ -321,12 +405,13 @@ func (Projection) Init(db *journal.ProjDB) error {
 			trust INTEGER NOT NULL,
 			sensitivity INTEGER NOT NULL,
 			lineage TEXT NOT NULL DEFAULT '[]',
-			created INTEGER NOT NULL
+			created INTEGER NOT NULL,
+			scope TEXT NOT NULL DEFAULT 'user'
 		);
 		CREATE UNIQUE INDEX IF NOT EXISTS ux_mem_supersedes
 			ON mem_facts(supersedes) WHERE supersedes IS NOT NULL;
 		CREATE INDEX IF NOT EXISTS ix_mem_claim_key
-			ON mem_facts(profile_id, claim_key) WHERE claim_key IS NOT NULL;
+			ON mem_facts(profile_id, scope, claim_key) WHERE claim_key IS NOT NULL;
 		CREATE VIRTUAL TABLE IF NOT EXISTS mem_facts_fts USING fts5(content);
 		CREATE TABLE IF NOT EXISTS mem_remember_outcomes (
 			call_id TEXT PRIMARY KEY,
@@ -375,10 +460,10 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 			return lerr
 		}
 		res, err := tx.Exec(`INSERT INTO mem_facts
-			(id, profile_id, content, origin, status, supersedes, claim_key, contests, tags, trust, sensitivity, lineage, created)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			(id, profile_id, content, origin, status, supersedes, claim_key, contests, tags, trust, sensitivity, lineage, created, scope)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			f.ID, string(ev.Envelope.ProfileID), f.Content, string(f.Origin), string(status),
-			supersedes, claimKey, contests, tagBlob(f.Tags), int(f.Trust), int(f.Sensitivity), string(lineage), int64(ev.JournalOffset))
+			supersedes, claimKey, contests, tagBlob(f.Tags), int(f.Trust), int(f.Sensitivity), string(lineage), int64(ev.JournalOffset), string(f.Scope))
 		if err != nil {
 			return fmt.Errorf("memory: fact insert: %w", err)
 		}
@@ -400,17 +485,26 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 		// Leaf check INSIDE the append transaction (serialized by the one
 		// append actor): only an ACCEPTED fact with NO successor of any
 		// status can be corrected — strictly linear history. The unique
-		// index is the DB-level backstop.
+		// index is the DB-level backstop. Also fetches the predecessor's
+		// scope in the SAME query (code-review finding, codex+kilo, round
+		// 3, independently identical: the CLAIM_KEY lookup was scope-
+		// partitioned in round 1's fix, but this shared closure is ALSO
+		// reached via the NAMED supersedes=<id> path, where the caller
+		// supplies oldID directly — a task-scoped correction naming a
+		// user-scoped fact's id superseded it successfully, silently
+		// removing a durable fact from all default recall while its
+		// scope-hidden successor became unreachable too).
 		rows, err := tx.Query(`SELECT
 			(SELECT status FROM mem_facts WHERE id=?1),
+			(SELECT scope FROM mem_facts WHERE id=?1),
 			EXISTS(SELECT 1 FROM mem_facts WHERE supersedes=?1)`, oldID)
 		if err != nil {
 			return err
 		}
-		var status sql.NullString
+		var status, oldScope sql.NullString
 		var hasSuccessor bool
 		if rows.Next() {
-			if err := rows.Scan(&status, &hasSuccessor); err != nil {
+			if err := rows.Scan(&status, &oldScope, &hasSuccessor); err != nil {
 				rows.Close()
 				return err
 			}
@@ -423,6 +517,9 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 		}
 		if Status(status.String) != StatusAccepted {
 			return fmt.Errorf("memory: only an ACCEPTED fact can be superseded (fail closed)")
+		}
+		if oldScope.String != string(newF.Scope) {
+			return fmt.Errorf("memory: cannot supersede a %q-scope fact with a %q-scope correction — scopes must match (fail closed)", oldScope.String, newF.Scope)
 		}
 		if hasSuccessor {
 			return fmt.Errorf("memory: fact already has a successor — supersession is strictly linear (fail closed)")
@@ -466,7 +563,7 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 			// unless the current live owner (if any) IS the fact being
 			// superseded — that's the normal, expected case.
 			owner, oerr := tx.Query(`SELECT f.id FROM mem_facts f
-				WHERE f.profile_id=? AND f.claim_key=? AND `+latestAccepted, string(ev.Envelope.ProfileID), *claimKey)
+				WHERE f.profile_id=? AND f.scope=? AND f.claim_key=? AND `+latestAccepted, string(ev.Envelope.ProfileID), string(newF.Scope), *claimKey)
 			if oerr != nil {
 				return oerr
 			}
@@ -501,14 +598,16 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 	resolveContest := func(rowID, contestedID string) error {
 		rows, err := tx.Query(`SELECT
 			(SELECT status FROM mem_facts WHERE id=?1),
-			EXISTS(SELECT 1 FROM mem_facts WHERE supersedes=?1)`, contestedID)
+			(SELECT scope FROM mem_facts WHERE id=?1),
+			(SELECT scope FROM mem_facts WHERE id=?2),
+			EXISTS(SELECT 1 FROM mem_facts WHERE supersedes=?1)`, contestedID, rowID)
 		if err != nil {
 			return err
 		}
-		var status sql.NullString
+		var status, contestedScope, ownScope sql.NullString
 		var hasSuccessor bool
 		if rows.Next() {
-			if err := rows.Scan(&status, &hasSuccessor); err != nil {
+			if err := rows.Scan(&status, &contestedScope, &ownScope, &hasSuccessor); err != nil {
 				rows.Close()
 				return err
 			}
@@ -524,6 +623,14 @@ func (Projection) Apply(tx *journal.ProjTx, ev journal.Event) error {
 		}
 		if hasSuccessor {
 			return fmt.Errorf("memory: cannot resolve contest — the contested fact already has a successor (fail closed)")
+		}
+		// The proposal lookup that populates `contests` is already
+		// scope-partitioned (queryRows' AND f.scope=? filter at proposal
+		// time), so this can't fire today — same defense-in-depth parity
+		// with supersede's own scope check, not a live counterexample
+		// (code-review finding, kilo+agy round 1 code-review, both NOTE).
+		if contestedScope.String != ownScope.String {
+			return fmt.Errorf("memory: cannot resolve contest — scopes must match (fail closed)")
 		}
 		var contestedLineageRaw, ownLineageRaw string
 		lr, err := tx.Query(`SELECT lineage FROM mem_facts WHERE id=?`, contestedID)
@@ -780,8 +887,8 @@ func applyRemembered(tx *journal.ProjTx, ev journal.Event, raw json.RawMessage,
 		return recordOutcome("added", p.New.ID)
 	}
 	rows, err := tx.Query(`SELECT f.id, f.content, f.origin FROM mem_facts f
-		WHERE f.profile_id=? AND f.claim_key=? AND `+latestAccepted+`
-		ORDER BY f.rowid DESC LIMIT 1`, string(ev.Envelope.ProfileID), *p.ClaimKey)
+		WHERE f.profile_id=? AND f.scope=? AND f.claim_key=? AND `+latestAccepted+`
+		ORDER BY f.rowid DESC LIMIT 1`, string(ev.Envelope.ProfileID), string(p.New.Scope), *p.ClaimKey)
 	if err != nil {
 		return err
 	}
@@ -855,6 +962,8 @@ type Row struct {
 	// gate on anything.
 	ClaimKey        string
 	ContentionCount int
+	// Scope is this fact's durability/decay-eligibility class (S9.4 P1).
+	Scope Scope
 }
 
 // Store is the memory facade over the profile's ONE journal.
@@ -904,7 +1013,13 @@ func (s *Store) append(ctx context.Context, eventType string, payload any) error
 	return err
 }
 
-func explicitDefaults(id, content string, origin Origin, tags, lineage []string) factPayload {
+// scope is passed through VERBATIM, including empty — normalization
+// happens SOLELY in factPayload.UnmarshalJSON at decode time, never here
+// (kilo round-3 note: normalizing on the write side too would compete
+// with the single decode-time normalization point and risk the two
+// silently drifting; leaving it empty here also preserves byte-identical
+// journal payloads for every existing caller that never sets a scope).
+func explicitDefaults(id, content string, origin Origin, tags, lineage []string, scope Scope) factPayload {
 	trust := contracts.TrustToolTrusted
 	if origin == OriginInferred {
 		// Inferences derive from conversation context that may include
@@ -912,21 +1027,21 @@ func explicitDefaults(id, content string, origin Origin, tags, lineage []string)
 		trust = contracts.TrustUntrustedExternal
 	}
 	return factPayload{ID: id, Content: content, Origin: origin, Tags: tags,
-		Trust: trust, Sensitivity: contracts.SensitivityConfidential, Lineage: lineage}
+		Trust: trust, Sensitivity: contracts.SensitivityConfidential, Lineage: lineage, Scope: scope}
 }
 
 // SaveFact stores one already-approved EXPLICIT fact (the PEP approval
 // flow ran; T18 seeding path).
 func (s *Store) SaveFact(ctx context.Context, id, content string, tags ...string) error {
-	return s.SaveFactLineage(ctx, id, content, tags, nil)
+	return s.SaveFactLineage(ctx, id, content, tags, nil, "")
 }
 
 // SaveFactLineage carries the source chain (Phase-3-r2 codex #7).
-func (s *Store) SaveFactLineage(ctx context.Context, id, content string, tags, lineage []string) error {
+func (s *Store) SaveFactLineage(ctx context.Context, id, content string, tags, lineage []string, scope Scope) error {
 	if err := validUTF8(append([]string{id, content}, append(tags, lineage...)...)...); err != nil {
 		return err
 	}
-	return s.append(ctx, EvFactSaved, explicitDefaults(id, content, OriginExplicit, tags, lineage))
+	return s.append(ctx, EvFactSaved, explicitDefaults(id, content, OriginExplicit, tags, lineage, scope))
 }
 
 // RememberOutcome reports what applyRemembered ACTUALLY decided — a
@@ -953,7 +1068,7 @@ type RememberOutcome struct {
 // fresh inside the same transaction (code-review finding, kilo+codex,
 // round 1 HIGH, ABA fix codex round 2 HIGH — see applyRemembered's own
 // doc comment for the full rationale).
-func (s *Store) Remember(ctx context.Context, id, content string, origin Origin, claimKey, replacesID string, tags, lineage []string) (RememberOutcome, error) {
+func (s *Store) Remember(ctx context.Context, id, content string, origin Origin, claimKey, replacesID string, tags, lineage []string, scope Scope) (RememberOutcome, error) {
 	if err := validUTF8(append([]string{id, content, claimKey, replacesID}, append(tags, lineage...)...)...); err != nil {
 		return RememberOutcome{}, err
 	}
@@ -965,7 +1080,7 @@ func (s *Store) Remember(ctx context.Context, id, content string, origin Origin,
 		rid = &replacesID
 	}
 	if err := s.append(ctx, EvFactRemembered, rememberPayload{
-		New: explicitDefaults(id, content, origin, tags, lineage), ClaimKey: ck, ReplacesID: rid}); err != nil {
+		New: explicitDefaults(id, content, origin, tags, lineage, scope), ClaimKey: ck, ReplacesID: rid}); err != nil {
 		return RememberOutcome{}, err
 	}
 	// applyRemembered recorded its OWN decision, inside the same append
@@ -994,11 +1109,11 @@ func (s *Store) Remember(ctx context.Context, id, content string, origin Origin,
 
 // Propose enters a fact into the REVIEW state and returns the EXACT
 // content as its preview. Nothing proposed is recallable until accepted.
-func (s *Store) Propose(ctx context.Context, id, content string, origin Origin, tags ...string) (string, error) {
+func (s *Store) Propose(ctx context.Context, id, content string, origin Origin, scope Scope, tags ...string) (string, error) {
 	if err := validUTF8(append([]string{id, content}, tags...)...); err != nil {
 		return "", err
 	}
-	if err := s.append(ctx, EvFactProposed, explicitDefaults(id, content, origin, tags, nil)); err != nil {
+	if err := s.append(ctx, EvFactProposed, explicitDefaults(id, content, origin, tags, nil, scope)); err != nil {
 		return "", err
 	}
 	return content, nil
@@ -1027,7 +1142,7 @@ func (s *Store) Supersede(ctx context.Context, oldID, newID, content string, tag
 // SupersedeLineage carries the correction's own source chain; Apply
 // unions it with the predecessor's stored lineage.
 func (s *Store) SupersedeLineage(ctx context.Context, oldID, newID, content string, tags, lineage []string) error {
-	return s.SupersedeLineageWithClaim(ctx, oldID, newID, content, "", tags, lineage)
+	return s.SupersedeLineageWithClaim(ctx, oldID, newID, content, "", tags, lineage, "")
 }
 
 // SupersedeLineageWithClaim is SupersedeLineage plus an optional claimKey
@@ -1038,7 +1153,7 @@ func (s *Store) SupersedeLineage(ctx context.Context, oldID, newID, content stri
 // fact stays permanently invisible to claim_key lookups). The correction
 // still targets the id the caller NAMED explicitly; claimKey only labels
 // the RESULT.
-func (s *Store) SupersedeLineageWithClaim(ctx context.Context, oldID, newID, content, claimKey string, tags, lineage []string) error {
+func (s *Store) SupersedeLineageWithClaim(ctx context.Context, oldID, newID, content, claimKey string, tags, lineage []string, scope Scope) error {
 	if err := validUTF8(append([]string{oldID, newID, content, claimKey}, append(tags, lineage...)...)...); err != nil {
 		return err
 	}
@@ -1047,7 +1162,7 @@ func (s *Store) SupersedeLineageWithClaim(ctx context.Context, oldID, newID, con
 		ck = &claimKey
 	}
 	return s.append(ctx, EvFactSuperseded, supersedePayload{
-		OldID: oldID, New: explicitDefaults(newID, content, OriginExplicit, tags, lineage), ClaimKey: ck})
+		OldID: oldID, New: explicitDefaults(newID, content, OriginExplicit, tags, lineage, scope), ClaimKey: ck})
 }
 
 // latestAccepted is THE shared retrieval predicate: accepted, and not
@@ -1060,7 +1175,7 @@ const maxQueryLen = 256
 const resultLimit = 50
 
 func (s *Store) queryRows(ctx context.Context, where, order string, args ...any) ([]Row, error) {
-	q := `SELECT f.id, f.profile_id, f.content, f.origin, f.status, f.tags, f.trust, f.sensitivity, f.lineage, f.claim_key, f.contention_count
+	q := `SELECT f.id, f.profile_id, f.content, f.origin, f.status, f.tags, f.trust, f.sensitivity, f.lineage, f.claim_key, f.contention_count, f.scope
 		FROM mem_facts f WHERE ` + where + ` ORDER BY ` + order + ` LIMIT ` + fmt.Sprint(resultLimit)
 	rows, err := s.j.QueryProjection(ctx, q, args...)
 	if err != nil {
@@ -1070,10 +1185,10 @@ func (s *Store) queryRows(ctx context.Context, where, order string, args ...any)
 	var out []Row
 	for rows.Next() {
 		var r Row
-		var p, o, st, tags, lineage string
+		var p, o, st, tags, lineage, scope string
 		var tr, se int
 		var claimKey sql.NullString
-		if err := rows.Scan(&r.ID, &p, &r.Content, &o, &st, &tags, &tr, &se, &lineage, &claimKey, &r.ContentionCount); err != nil {
+		if err := rows.Scan(&r.ID, &p, &r.Content, &o, &st, &tags, &tr, &se, &lineage, &claimKey, &r.ContentionCount, &scope); err != nil {
 			return nil, fmt.Errorf("memory: %w", err)
 		}
 		json.Unmarshal([]byte(lineage), &r.Lineage)
@@ -1081,6 +1196,7 @@ func (s *Store) queryRows(ctx context.Context, where, order string, args ...any)
 		r.Origin, r.Status = Origin(o), Status(st)
 		r.Trust, r.Sensitivity = contracts.TrustClass(tr), contracts.Sensitivity(se)
 		r.ClaimKey = claimKey.String
+		r.Scope = Scope(scope)
 		if f := strings.Fields(tags); len(f) > 0 {
 			r.Tags = f
 		}
@@ -1102,22 +1218,84 @@ func checkQuery(q string) (string, error) {
 
 // Recall retrieves latest-accepted facts matching the FTS phrase, newest
 // first. No decay: age never filters (B8).
-func (s *Store) Recall(ctx context.Context, q string) ([]Row, error) {
+// scopeFilter returns an additional WHERE-clause fragment (plus its own
+// bind arg) for Recall/RecallTag's optional scope parameter. It is
+// VARIADIC-OPTIONAL, not a required new parameter, so every EXISTING
+// call site keeps compiling AND behaving byte-identically: omitting it
+// defaults to ScopeUser — exactly what every fact written before this
+// slice already implicitly is, so today's tests see today's exact
+// results with zero call-site changes. Passing ScopeAll explicitly skips
+// the filter (the plan's agreed model-facing "see everything" opt-in).
+// scopeFilter closed-set validates its scope argument (code-review
+// finding, codex, round 1 code-review, live-reproduced: a direct Store
+// caller passing an unrecognized Scope — bypassing the tool layer's own
+// parseScope check entirely — silently matched ZERO rows instead of
+// erroring, since the value is only ever used as an opaque bound SQL
+// arg). Store is a public API in its own right (used directly by tests
+// and any future non-tool consumer), so it needs the SAME fail-closed
+// guarantee the write side already has via factPayload.validate()'s
+// closed set — a wrong answer must never look identical to "no results."
+func scopeFilter(scope ...Scope) (string, []any, error) {
+	// More than one value is ambiguous — this parameter is an OPTIONAL
+	// single value (the variadic idiom for "0 or 1"), never a real
+	// multi-scope query API; silently using only the first would hide a
+	// caller's mistake (code-review finding, codex, round 1 code-review,
+	// live-reproduced: Recall(..., ScopeTask, ScopeUser) silently used
+	// only ScopeTask).
+	if len(scope) > 1 {
+		return "", nil, fmt.Errorf("memory: at most one scope may be given, got %d (fail closed)", len(scope))
+	}
+	sc := ScopeUser
+	if len(scope) > 0 {
+		sc = scope[0]
+	}
+	// An explicit Go zero-value Scope("") must mean the SAME default as
+	// omitting it entirely — exactly what the WRITE side already does
+	// (factPayload.UnmarshalJSON normalizes "" to ScopeUser). Rejecting
+	// it here, as the original closed-set switch did, made a variable
+	// holding a zero Scope succeed on write and fail on read (code-review
+	// finding, codex, round 1 code-review, live-reproduced): the read and
+	// write sides must agree on what "unset" means.
+	if sc == "" {
+		sc = ScopeUser
+	}
+	switch sc {
+	case ScopeAll:
+		return "", nil, nil
+	case ScopeUser, ScopeTask, ScopeEphemeral:
+		return " AND f.scope=?", []any{string(sc)}, nil
+	default:
+		return "", nil, fmt.Errorf("memory: unknown scope %q (fail closed)", sc)
+	}
+}
+
+// Recall retrieves latest-accepted facts matching the FTS phrase, newest
+// first. No decay: age never filters (B8). Defaults to ScopeUser-only
+// (today's behavior, unchanged); pass ScopeTask/ScopeEphemeral/ScopeAll
+// to see the working/task-scoped corpus (S9.4 P1).
+func (s *Store) Recall(ctx context.Context, q string, scope ...Scope) ([]Row, error) {
 	q, err := checkQuery(q)
 	if err != nil {
 		return nil, err
 	}
 	phrase := `"` + strings.ReplaceAll(q, `"`, `""`) + `"`
+	extra, extraArgs, err := scopeFilter(scope...)
+	if err != nil {
+		return nil, err
+	}
 	return s.queryRows(ctx,
-		`f.rowid IN (SELECT rowid FROM mem_facts_fts WHERE mem_facts_fts MATCH ?) AND `+latestAccepted,
-		"f.rowid DESC", phrase)
+		`f.rowid IN (SELECT rowid FROM mem_facts_fts WHERE mem_facts_fts MATCH ?) AND `+latestAccepted+extra,
+		"f.rowid DESC", append([]any{phrase}, extraArgs...)...)
 }
 
 // Search is an alias retrieval surface with the SAME predicate.
-func (s *Store) Search(ctx context.Context, q string) ([]Row, error) { return s.Recall(ctx, q) }
+func (s *Store) Search(ctx context.Context, q string, scope ...Scope) ([]Row, error) {
+	return s.Recall(ctx, q, scope...)
+}
 
 // RecallTag retrieves latest-accepted facts carrying the exact tag.
-func (s *Store) RecallTag(ctx context.Context, tag string) ([]Row, error) {
+// Defaults to ScopeUser-only, same as Recall.
+func (s *Store) RecallTag(ctx context.Context, tag string, scope ...Scope) ([]Row, error) {
 	tag, err := checkQuery(tag)
 	if err != nil {
 		return nil, err
@@ -1126,7 +1304,12 @@ func (s *Store) RecallTag(ctx context.Context, tag string) ([]Row, error) {
 	// "%" tag matches only a literal "%" tag, never everything
 	// (Phase-3-r2 codex #8).
 	esc := strings.NewReplacer("|", "||", "%", "|%", "_", "|_").Replace(tag)
-	return s.queryRows(ctx, `f.tags LIKE ? ESCAPE '|' AND `+latestAccepted, "f.rowid DESC", "% "+esc+" %")
+	extra, extraArgs, err := scopeFilter(scope...)
+	if err != nil {
+		return nil, err
+	}
+	return s.queryRows(ctx, `f.tags LIKE ? ESCAPE '|' AND `+latestAccepted+extra, "f.rowid DESC",
+		append([]any{"% " + esc + " %"}, extraArgs...)...)
 }
 
 // Exact retrieves the latest-accepted fact with BYTE-EXACT content.

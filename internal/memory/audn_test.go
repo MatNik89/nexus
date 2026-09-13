@@ -21,10 +21,10 @@ import (
 // supersedes id required from the caller.
 func TestAudnAutoSupersedesOnCleanExplicitUpdate(t *testing.T) {
 	s, _ := openProfile(t, testLayout(t), "work")
-	if _, err := s.Remember(ctxT(), "f-1", "server ip is 1.2.3.4", OriginExplicit, "server_ip", "", nil, nil); err != nil {
+	if _, err := s.Remember(ctxT(), "f-1", "server ip is 1.2.3.4", OriginExplicit, "server_ip", "", nil, nil, ""); err != nil {
 		t.Fatal(err)
 	}
-	out, err := s.Remember(ctxT(), "f-2", "server ip is 5.6.7.8", OriginExplicit, "server_ip", "f-1", nil, nil)
+	out, err := s.Remember(ctxT(), "f-2", "server ip is 5.6.7.8", OriginExplicit, "server_ip", "f-1", nil, nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,13 +56,13 @@ func TestAudnAutoSupersedesOnCleanExplicitUpdate(t *testing.T) {
 // current fact.
 func TestAudnRefusesWithoutCorrectReplacesID(t *testing.T) {
 	s, _ := openProfile(t, testLayout(t), "work")
-	if _, err := s.Remember(ctxT(), "f-1", "server ip is 1.2.3.4", OriginExplicit, "server_ip", "", nil, nil); err != nil {
+	if _, err := s.Remember(ctxT(), "f-1", "server ip is 1.2.3.4", OriginExplicit, "server_ip", "", nil, nil, ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Remember(ctxT(), "f-2", "server ip is 5.6.7.8", OriginExplicit, "server_ip", "", nil, nil); err == nil {
+	if _, err := s.Remember(ctxT(), "f-2", "server ip is 5.6.7.8", OriginExplicit, "server_ip", "", nil, nil, ""); err == nil {
 		t.Fatal("expected a refusal: replaces_id missing")
 	}
-	if _, err := s.Remember(ctxT(), "f-3", "server ip is 5.6.7.8", OriginExplicit, "server_ip", "wrong-id", nil, nil); err == nil {
+	if _, err := s.Remember(ctxT(), "f-3", "server ip is 5.6.7.8", OriginExplicit, "server_ip", "wrong-id", nil, nil, ""); err == nil {
 		t.Fatal("expected a refusal: replaces_id does not name the current owner")
 	}
 	hits, err := s.Recall(ctxT(), "server")
@@ -78,15 +78,15 @@ func TestAudnRefusesWithoutCorrectReplacesID(t *testing.T) {
 // time, inside the same transaction, never trusted from approval time.
 func TestAudnReplacesIDDetectsInterveningWrite(t *testing.T) {
 	s, _ := openProfile(t, testLayout(t), "work")
-	if _, err := s.Remember(ctxT(), "f-old", "server ip is 1.2.3.4", OriginExplicit, "server_ip", "", nil, nil); err != nil {
+	if _, err := s.Remember(ctxT(), "f-old", "server ip is 1.2.3.4", OriginExplicit, "server_ip", "", nil, nil, ""); err != nil {
 		t.Fatal(err)
 	}
 	// An intervening write changes who currently owns server_ip.
-	if _, err := s.Remember(ctxT(), "f-intervening", "server ip is 9.9.9.9", OriginExplicit, "server_ip", "f-old", nil, nil); err != nil {
+	if _, err := s.Remember(ctxT(), "f-intervening", "server ip is 9.9.9.9", OriginExplicit, "server_ip", "f-old", nil, nil, ""); err != nil {
 		t.Fatal(err)
 	}
 	// The STALE call still claims to be replacing f-old.
-	if _, err := s.Remember(ctxT(), "f-stale", "server ip is 5.6.7.8", OriginExplicit, "server_ip", "f-old", nil, nil); err == nil {
+	if _, err := s.Remember(ctxT(), "f-stale", "server ip is 5.6.7.8", OriginExplicit, "server_ip", "f-old", nil, nil, ""); err == nil {
 		t.Fatal("expected a refusal: replaces_id is stale, the intervening write already changed the current owner")
 	}
 	hits, err := s.Recall(ctxT(), "server")
@@ -106,20 +106,20 @@ func TestAudnReplacesIDDetectsInterveningWrite(t *testing.T) {
 func TestAudnReplacesIDSurvivesContentABACycle(t *testing.T) {
 	s, _ := openProfile(t, testLayout(t), "work")
 	const v = "server ip is 1.2.3.4"
-	if _, err := s.Remember(ctxT(), "a", v, OriginExplicit, "server_ip", "", nil, nil); err != nil {
+	if _, err := s.Remember(ctxT(), "a", v, OriginExplicit, "server_ip", "", nil, nil, ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Remember(ctxT(), "b", "server ip is 9.9.9.9", OriginExplicit, "server_ip", "a", nil, nil); err != nil {
+	if _, err := s.Remember(ctxT(), "b", "server ip is 9.9.9.9", OriginExplicit, "server_ip", "a", nil, nil, ""); err != nil {
 		t.Fatal(err)
 	}
 	// c's content cycles back to V — the SAME content "a" originally had.
-	if _, err := s.Remember(ctxT(), "c", v, OriginExplicit, "server_ip", "b", nil, nil); err != nil {
+	if _, err := s.Remember(ctxT(), "c", v, OriginExplicit, "server_ip", "b", nil, nil, ""); err != nil {
 		t.Fatal(err)
 	}
 	// A stale call, approved back when "a" (content V) was live, replays
 	// now — content-wise V still matches c's current content, but c's id
 	// is not "a".
-	if _, err := s.Remember(ctxT(), "stale", "server ip is 5.6.7.8", OriginExplicit, "server_ip", "a", nil, nil); err == nil {
+	if _, err := s.Remember(ctxT(), "stale", "server ip is 5.6.7.8", OriginExplicit, "server_ip", "a", nil, nil, ""); err == nil {
 		t.Fatal("expected a refusal: replaces_id names \"a\", not the current owner \"c\", despite matching content")
 	}
 	hits, err := s.Recall(ctxT(), "server")
@@ -135,10 +135,10 @@ func TestAudnReplacesIDSurvivesContentABACycle(t *testing.T) {
 // that was never inserted).
 func TestAudnNoOpOnIdenticalRestatement(t *testing.T) {
 	s, _ := openProfile(t, testLayout(t), "work")
-	if _, err := s.Remember(ctxT(), "f-1", "server ip is 1.2.3.4", OriginExplicit, "server_ip", "", nil, nil); err != nil {
+	if _, err := s.Remember(ctxT(), "f-1", "server ip is 1.2.3.4", OriginExplicit, "server_ip", "", nil, nil, ""); err != nil {
 		t.Fatal(err)
 	}
-	out, err := s.Remember(ctxT(), "f-2", "server ip is 1.2.3.4", OriginExplicit, "server_ip", "f-1", nil, nil)
+	out, err := s.Remember(ctxT(), "f-2", "server ip is 1.2.3.4", OriginExplicit, "server_ip", "f-1", nil, nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,13 +162,13 @@ func TestAudnNoOpOnIdenticalRestatement(t *testing.T) {
 // id" from "id already existed" without an explicit pre-check.
 func TestAudnReusedIDWithDifferentIntentIsRefused(t *testing.T) {
 	s, _ := openProfile(t, testLayout(t), "work")
-	if _, err := s.Remember(ctxT(), "f-1", "server ip is 1.2.3.4", OriginExplicit, "my_key", "", nil, nil); err != nil {
+	if _, err := s.Remember(ctxT(), "f-1", "server ip is 1.2.3.4", OriginExplicit, "my_key", "", nil, nil, ""); err != nil {
 		t.Fatal(err)
 	}
 	// Same id, but a DIFFERENT intent this time (replaces_id differs) —
 	// this is NOT a retry of the same call, it's id reuse for a second,
 	// distinct write. Must be refused, never silently reinterpreted.
-	if _, err := s.Remember(ctxT(), "f-1", "server ip is 1.2.3.4", OriginExplicit, "my_key", "f-1", nil, nil); err == nil {
+	if _, err := s.Remember(ctxT(), "f-1", "server ip is 1.2.3.4", OriginExplicit, "my_key", "f-1", nil, nil, ""); err == nil {
 		t.Fatal("expected a refusal: id reused for a different intent")
 	}
 	rows, err := s.All(ctxT())
@@ -187,11 +187,11 @@ func TestAudnReusedIDWithDifferentIntentIsRefused(t *testing.T) {
 func TestAudnReusedIDFromUnrelatedClaimIsRefused(t *testing.T) {
 	s, _ := openProfile(t, testLayout(t), "work")
 	// "collision" already exists, but for a totally different claim.
-	if _, err := s.Remember(ctxT(), "collision", "favorite color is blue", OriginExplicit, "favorite_color", "", nil, nil); err != nil {
+	if _, err := s.Remember(ctxT(), "collision", "favorite color is blue", OriginExplicit, "favorite_color", "", nil, nil, ""); err != nil {
 		t.Fatal(err)
 	}
 	// The real owner of "target_key" is a different fact entirely.
-	if _, err := s.Remember(ctxT(), "owner", "server ip is 1.2.3.4", OriginExplicit, "target_key", "", nil, nil); err != nil {
+	if _, err := s.Remember(ctxT(), "owner", "server ip is 1.2.3.4", OriginExplicit, "target_key", "", nil, nil, ""); err != nil {
 		t.Fatal(err)
 	}
 	// A call reuses "collision" as its id, but with a COMPLETELY
@@ -201,7 +201,7 @@ func TestAudnReusedIDFromUnrelatedClaimIsRefused(t *testing.T) {
 	// (code-review finding, codex, round 3 MEDIUM — the original
 	// counterexample this test is descended from — closed at the
 	// intent-guard level in round 4 rather than by attribution alone).
-	if _, err := s.Remember(ctxT(), "collision", "server ip is 1.2.3.4", OriginExplicit, "target_key", "owner", nil, nil); err == nil {
+	if _, err := s.Remember(ctxT(), "collision", "server ip is 1.2.3.4", OriginExplicit, "target_key", "owner", nil, nil, ""); err == nil {
 		t.Fatal("expected a refusal: \"collision\" was already used for a different remember call")
 	}
 	// Both pre-existing facts must be completely untouched by the
@@ -232,14 +232,14 @@ func TestAudnReusedIDFromPreAudnSaveFactIsRefused(t *testing.T) {
 	if err := s.SaveFact(ctxT(), "collision", "favorite color is blue"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Remember(ctxT(), "owner", "server ip is 1.2.3.4", OriginExplicit, "target_key", "", nil, nil); err != nil {
+	if _, err := s.Remember(ctxT(), "owner", "server ip is 1.2.3.4", OriginExplicit, "target_key", "", nil, nil, ""); err != nil {
 		t.Fatal(err)
 	}
 	// Reusing "collision" for a call whose content happens to match
 	// target_key's CURRENT value exactly — this would land on the
 	// identical-restatement no-op branch, which touches neither
 	// mem_facts nor (before this fix) mem_remember_outcomes for this id.
-	if _, err := s.Remember(ctxT(), "collision", "server ip is 1.2.3.4", OriginExplicit, "target_key", "owner", nil, nil); err == nil {
+	if _, err := s.Remember(ctxT(), "collision", "server ip is 1.2.3.4", OriginExplicit, "target_key", "owner", nil, nil, ""); err == nil {
 		t.Fatal("expected a refusal: \"collision\" already denotes a pre-Audn fact")
 	}
 	hits, err := s.Recall(ctxT(), "blue")
@@ -258,12 +258,12 @@ func TestAudnReusedIDFromPreAudnSaveFactIsRefused(t *testing.T) {
 // insert() path every caller shares.
 func TestAudnSaveFactCannotReuseIDReservedByRememberNoOp(t *testing.T) {
 	s, _ := openProfile(t, testLayout(t), "work")
-	if _, err := s.Remember(ctxT(), "owner", "server ip is 1.2.3.4", OriginExplicit, "target_key", "", nil, nil); err != nil {
+	if _, err := s.Remember(ctxT(), "owner", "server ip is 1.2.3.4", OriginExplicit, "target_key", "", nil, nil, ""); err != nil {
 		t.Fatal(err)
 	}
 	// This lands on the identical-restatement no-op branch: "reserved"
 	// never gets a mem_facts row, only a mem_remember_outcomes one.
-	out, err := s.Remember(ctxT(), "reserved", "server ip is 1.2.3.4", OriginExplicit, "target_key", "owner", nil, nil)
+	out, err := s.Remember(ctxT(), "reserved", "server ip is 1.2.3.4", OriginExplicit, "target_key", "owner", nil, nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -288,7 +288,7 @@ func TestAudnSaveFactCannotReuseIDReservedByRememberNoOp(t *testing.T) {
 func TestAudnRefusesInvalidUTF8ID(t *testing.T) {
 	s, _ := openProfile(t, testLayout(t), "work")
 	badID := string([]byte{'i', 'd', '-', 0xff})
-	if _, err := s.Remember(ctxT(), badID, "valid content", OriginExplicit, "key", "", nil, nil); err == nil {
+	if _, err := s.Remember(ctxT(), badID, "valid content", OriginExplicit, "key", "", nil, nil, ""); err == nil {
 		t.Fatal("expected a refusal: invalid UTF-8 id")
 	}
 	rows, err := s.All(ctxT())
@@ -461,7 +461,7 @@ func TestAudnIntentSurvivesRedactorReconfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out1, err := s1.Remember(ctxT(), "same-call", "server ip is 1.2.3.4", OriginExplicit, "server_ip", "", nil, nil)
+	out1, err := s1.Remember(ctxT(), "same-call", "server ip is 1.2.3.4", OriginExplicit, "server_ip", "", nil, nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -484,7 +484,7 @@ func TestAudnIntentSurvivesRedactorReconfiguration(t *testing.T) {
 	}
 	// The EXACT same logical retry — same id, same content, same
 	// claim_key, same replaces_id.
-	out2, err := s2.Remember(ctxT(), "same-call", "server ip is 1.2.3.4", OriginExplicit, "server_ip", "", nil, nil)
+	out2, err := s2.Remember(ctxT(), "same-call", "server ip is 1.2.3.4", OriginExplicit, "server_ip", "", nil, nil, "")
 	if err != nil {
 		t.Fatalf("genuine exact retry must not be refused after unrelated redactor reconfiguration: %v", err)
 	}
@@ -499,19 +499,19 @@ func TestAudnIntentSurvivesRedactorReconfiguration(t *testing.T) {
 // because its own outcome was already recorded by a prior attempt.
 func TestAudnRetryOfSameCallStaysIdempotent(t *testing.T) {
 	s, _ := openProfile(t, testLayout(t), "work")
-	if _, err := s.Remember(ctxT(), "f-1", "server ip is 1.2.3.4", OriginExplicit, "server_ip", "", nil, nil); err != nil {
+	if _, err := s.Remember(ctxT(), "f-1", "server ip is 1.2.3.4", OriginExplicit, "server_ip", "", nil, nil, ""); err != nil {
 		t.Fatal(err)
 	}
 	// Attempt 1 of a second call, id "f-2", targeting server_ip with the
 	// SAME content it already holds — a genuine no-op from the start.
-	out1, err := s.Remember(ctxT(), "f-2", "server ip is 1.2.3.4", OriginExplicit, "server_ip", "f-1", nil, nil)
+	out1, err := s.Remember(ctxT(), "f-2", "server ip is 1.2.3.4", OriginExplicit, "server_ip", "f-1", nil, nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Attempt 2: the exact same call retried (same id "f-2", nothing
 	// about the world has changed) — must succeed identically, not
 	// error on its own previously-recorded outcome.
-	out2, err := s.Remember(ctxT(), "f-2", "server ip is 1.2.3.4", OriginExplicit, "server_ip", "f-1", nil, nil)
+	out2, err := s.Remember(ctxT(), "f-2", "server ip is 1.2.3.4", OriginExplicit, "server_ip", "f-1", nil, nil, "")
 	if err != nil {
 		t.Fatalf("a retry of the same call must stay idempotent, not error: %v", err)
 	}
@@ -528,14 +528,14 @@ func TestAudnRetryOfSameCallStaysIdempotent(t *testing.T) {
 // re-run the decision logic.
 func TestAudnRetryOfSuccessfulAddPreservesOriginalOutcome(t *testing.T) {
 	s, _ := openProfile(t, testLayout(t), "work")
-	out1, err := s.Remember(ctxT(), "retry-add", "favorite color is blue", OriginExplicit, "favorite_color", "", nil, nil)
+	out1, err := s.Remember(ctxT(), "retry-add", "favorite color is blue", OriginExplicit, "favorite_color", "", nil, nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if out1.Kind != "added" {
 		t.Fatalf("first attempt outcome = %+v, want added", out1)
 	}
-	out2, err := s.Remember(ctxT(), "retry-add", "favorite color is blue", OriginExplicit, "favorite_color", "", nil, nil)
+	out2, err := s.Remember(ctxT(), "retry-add", "favorite color is blue", OriginExplicit, "favorite_color", "", nil, nil, "")
 	if err != nil {
 		t.Fatalf("a retry of a successful add must stay idempotent, not error: %v", err)
 	}
@@ -549,17 +549,17 @@ func TestAudnRetryOfSuccessfulAddPreservesOriginalOutcome(t *testing.T) {
 // report "superseded" on the retry, not "noop".
 func TestAudnRetryOfSuccessfulSupersedePreservesOriginalOutcome(t *testing.T) {
 	s, _ := openProfile(t, testLayout(t), "work")
-	if _, err := s.Remember(ctxT(), "old-fact", "birthday is march 3rd", OriginExplicit, "birthday", "", nil, nil); err != nil {
+	if _, err := s.Remember(ctxT(), "old-fact", "birthday is march 3rd", OriginExplicit, "birthday", "", nil, nil, ""); err != nil {
 		t.Fatal(err)
 	}
-	out1, err := s.Remember(ctxT(), "retry-change", "birthday is march 4th", OriginExplicit, "birthday", "old-fact", nil, nil)
+	out1, err := s.Remember(ctxT(), "retry-change", "birthday is march 4th", OriginExplicit, "birthday", "old-fact", nil, nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if out1.Kind != "superseded" {
 		t.Fatalf("first attempt outcome = %+v, want superseded", out1)
 	}
-	out2, err := s.Remember(ctxT(), "retry-change", "birthday is march 4th", OriginExplicit, "birthday", "old-fact", nil, nil)
+	out2, err := s.Remember(ctxT(), "retry-change", "birthday is march 4th", OriginExplicit, "birthday", "old-fact", nil, nil, "")
 	if err != nil {
 		t.Fatalf("a retry of a successful supersede must stay idempotent, not error: %v", err)
 	}
@@ -577,10 +577,10 @@ func TestAudnRetryOfSuccessfulSupersedePreservesOriginalOutcome(t *testing.T) {
 // not remain alongside the newly-accepted one.
 func TestAudnProposesInsteadOfOverridingExplicitFact(t *testing.T) {
 	s, _ := openProfile(t, testLayout(t), "work")
-	if _, err := s.Remember(ctxT(), "f-1", "birthday is march 3rd", OriginExplicit, "birthday", "", nil, nil); err != nil {
+	if _, err := s.Remember(ctxT(), "f-1", "birthday is march 3rd", OriginExplicit, "birthday", "", nil, nil, ""); err != nil {
 		t.Fatal(err)
 	}
-	out, err := s.Remember(ctxT(), "f-2", "birthday is april 1st", OriginInferred, "birthday", "f-1", nil, nil)
+	out, err := s.Remember(ctxT(), "f-2", "birthday is april 1st", OriginInferred, "birthday", "f-1", nil, nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -628,10 +628,10 @@ func TestAudnProposesInsteadOfOverridingExplicitFact(t *testing.T) {
 // live-reproduced: contention_count was never decremented on Reject).
 func TestAudnRejectingContestedProposalLeavesOriginalIntact(t *testing.T) {
 	s, _ := openProfile(t, testLayout(t), "work")
-	if _, err := s.Remember(ctxT(), "f-1", "birthday is march 3rd", OriginExplicit, "birthday", "", nil, nil); err != nil {
+	if _, err := s.Remember(ctxT(), "f-1", "birthday is march 3rd", OriginExplicit, "birthday", "", nil, nil, ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Remember(ctxT(), "f-2", "birthday is april 1st", OriginInferred, "birthday", "f-1", nil, nil); err != nil {
+	if _, err := s.Remember(ctxT(), "f-2", "birthday is april 1st", OriginInferred, "birthday", "f-1", nil, nil, ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Reject(ctxT(), "f-2"); err != nil {
@@ -646,7 +646,7 @@ func TestAudnRejectingContestedProposalLeavesOriginalIntact(t *testing.T) {
 	}
 	// f-1 must still be correctable afterward — a rejected contest must
 	// not permanently freeze it.
-	if _, err := s.Remember(ctxT(), "f-3", "birthday is march 4th", OriginExplicit, "birthday", "f-1", nil, nil); err != nil {
+	if _, err := s.Remember(ctxT(), "f-3", "birthday is march 4th", OriginExplicit, "birthday", "f-1", nil, nil, ""); err != nil {
 		t.Fatalf("f-1 must still be correctable after the contest was rejected: %v", err)
 	}
 }
@@ -657,10 +657,10 @@ func TestAudnRejectingContestedProposalLeavesOriginalIntact(t *testing.T) {
 // latest accepted at accept-time, not merely at contest-creation time.
 func TestAudnAcceptRefusesWhenContestedFactAlreadyHasSuccessor(t *testing.T) {
 	s, _ := openProfile(t, testLayout(t), "work")
-	if _, err := s.Remember(ctxT(), "f-1", "birthday is march 3rd", OriginExplicit, "birthday", "", nil, nil); err != nil {
+	if _, err := s.Remember(ctxT(), "f-1", "birthday is march 3rd", OriginExplicit, "birthday", "", nil, nil, ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Remember(ctxT(), "f-2", "birthday is april 1st", OriginInferred, "birthday", "f-1", nil, nil); err != nil {
+	if _, err := s.Remember(ctxT(), "f-2", "birthday is april 1st", OriginInferred, "birthday", "f-1", nil, nil, ""); err != nil {
 		t.Fatal(err)
 	}
 	// f-1 is corrected through the NAMED path before the contest is
@@ -682,10 +682,10 @@ func TestAudnAcceptRefusesWhenContestedFactAlreadyHasSuccessor(t *testing.T) {
 // inferred-overriding-explicit, not inferred-vs-inferred.
 func TestAudnAutoSupersedesInferredOverInferred(t *testing.T) {
 	s, _ := openProfile(t, testLayout(t), "work")
-	if _, err := s.Remember(ctxT(), "f-1", "seems to like coffee", OriginInferred, "drink_pref", "", nil, nil); err != nil {
+	if _, err := s.Remember(ctxT(), "f-1", "seems to like coffee", OriginInferred, "drink_pref", "", nil, nil, ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Remember(ctxT(), "f-2", "seems to like tea", OriginInferred, "drink_pref", "f-1", nil, nil); err != nil {
+	if _, err := s.Remember(ctxT(), "f-2", "seems to like tea", OriginInferred, "drink_pref", "f-1", nil, nil, ""); err != nil {
 		t.Fatal(err)
 	}
 	hits, err := s.Recall(ctxT(), "tea")
@@ -698,7 +698,7 @@ func TestAudnAutoSupersedesInferredOverInferred(t *testing.T) {
 // is irrelevant here (nothing to prove awareness of yet).
 func TestAudnAddsWhenNoExistingClaim(t *testing.T) {
 	s, _ := openProfile(t, testLayout(t), "work")
-	out, err := s.Remember(ctxT(), "f-1", "favorite color is blue", OriginExplicit, "favorite_color", "", nil, nil)
+	out, err := s.Remember(ctxT(), "f-1", "favorite color is blue", OriginExplicit, "favorite_color", "", nil, nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -716,10 +716,10 @@ func TestAudnAddsWhenNoExistingClaim(t *testing.T) {
 // behavior (no auto-resolution, no claim_key stored).
 func TestAudnEmptyClaimKeyBehavesLikeSaveFact(t *testing.T) {
 	s, _ := openProfile(t, testLayout(t), "work")
-	if _, err := s.Remember(ctxT(), "f-1", "the meeting is on friday", OriginExplicit, "", "", nil, nil); err != nil {
+	if _, err := s.Remember(ctxT(), "f-1", "the meeting is on friday", OriginExplicit, "", "", nil, nil, ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Remember(ctxT(), "f-2", "the meeting is on friday too", OriginExplicit, "", "", nil, nil); err != nil {
+	if _, err := s.Remember(ctxT(), "f-2", "the meeting is on friday too", OriginExplicit, "", "", nil, nil, ""); err != nil {
 		t.Fatal(err)
 	}
 	hits, err := s.Recall(ctxT(), "meeting")
@@ -737,7 +737,7 @@ func TestAudnEmptyClaimKeyBehavesLikeSaveFact(t *testing.T) {
 // boundary, same discipline as tags.
 func TestAudnRejectsMalformedClaimKey(t *testing.T) {
 	s, _ := openProfile(t, testLayout(t), "work")
-	if _, err := s.Remember(ctxT(), "f-1", "x", OriginExplicit, "two words", "", nil, nil); err == nil {
+	if _, err := s.Remember(ctxT(), "f-1", "x", OriginExplicit, "two words", "", nil, nil, ""); err == nil {
 		t.Fatal("expected a rejection: claim_key must be a single token")
 	}
 }
@@ -749,10 +749,10 @@ func TestAudnRejectsMalformedClaimKey(t *testing.T) {
 // "server_ip" become two silently divergent keys.
 func TestAudnRejectsClaimKeyWithSurroundingWhitespace(t *testing.T) {
 	s, _ := openProfile(t, testLayout(t), "work")
-	if _, err := s.Remember(ctxT(), "f-1", "x", OriginExplicit, "server_ip ", "", nil, nil); err == nil {
+	if _, err := s.Remember(ctxT(), "f-1", "x", OriginExplicit, "server_ip ", "", nil, nil, ""); err == nil {
 		t.Fatal("expected a rejection: claim_key has trailing whitespace")
 	}
-	if _, err := s.Remember(ctxT(), "f-2", "x", OriginExplicit, " server_ip", "", nil, nil); err == nil {
+	if _, err := s.Remember(ctxT(), "f-2", "x", OriginExplicit, " server_ip", "", nil, nil, ""); err == nil {
 		t.Fatal("expected a rejection: claim_key has leading whitespace")
 	}
 }
@@ -765,7 +765,7 @@ func TestAudnRejectsClaimKeyWithEmbeddedShadowCharacters(t *testing.T) {
 	s, _ := openProfile(t, testLayout(t), "work")
 	bad := []string{"server\r_ip", "server\u00a0ip", "server\x00ip", "server\u2028ip"}
 	for _, k := range bad {
-		if _, err := s.Remember(ctxT(), "f-x", "x", OriginExplicit, k, "", nil, nil); err == nil {
+		if _, err := s.Remember(ctxT(), "f-x", "x", OriginExplicit, k, "", nil, nil, ""); err == nil {
 			t.Fatalf("expected a rejection for embedded shadow character in claim_key %q", k)
 		}
 	}
@@ -788,7 +788,7 @@ func TestAudnRejectsClaimKeyWithInvisibleFormatCharacters(t *testing.T) {
 		"server\ufeff_ip", // BOM
 	}
 	for _, k := range bad {
-		if _, err := s.Remember(ctxT(), "f-x", "x", OriginExplicit, k, "", nil, nil); err == nil {
+		if _, err := s.Remember(ctxT(), "f-x", "x", OriginExplicit, k, "", nil, nil, ""); err == nil {
 			t.Fatalf("expected a rejection for invisible format character in claim_key %q", k)
 		}
 	}
@@ -801,7 +801,7 @@ func TestSupersedeWithClaimBootstrapsFutureAudnLookups(t *testing.T) {
 	if err := s.SaveFact(ctxT(), "f-old", "server ip is 1.2.3.4"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SupersedeLineageWithClaim(ctxT(), "f-old", "f-new", "server ip is 5.6.7.8", "server_ip", nil, nil); err != nil {
+	if err := s.SupersedeLineageWithClaim(ctxT(), "f-old", "f-new", "server ip is 5.6.7.8", "server_ip", nil, nil, ""); err != nil {
 		t.Fatal(err)
 	}
 	hits, err := s.Recall(ctxT(), "server")
@@ -809,7 +809,7 @@ func TestSupersedeWithClaimBootstrapsFutureAudnLookups(t *testing.T) {
 		t.Fatalf("the bootstrapped fact must now carry claim_key: %v %v", hits, err)
 	}
 	// A FUTURE claim_key-based correction must now find it.
-	out, err := s.Remember(ctxT(), "f-newer", "server ip is 9.9.9.9", OriginExplicit, "server_ip", "f-new", nil, nil)
+	out, err := s.Remember(ctxT(), "f-newer", "server ip is 9.9.9.9", OriginExplicit, "server_ip", "f-new", nil, nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -830,10 +830,10 @@ func TestSupersedeWithClaimRefusesSecondUnrelatedOwner(t *testing.T) {
 	if err := s.SaveFact(ctxT(), "b1", "fact B"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SupersedeLineageWithClaim(ctxT(), "a1", "a2", "fact A updated", "shared_key", nil, nil); err != nil {
+	if err := s.SupersedeLineageWithClaim(ctxT(), "a1", "a2", "fact A updated", "shared_key", nil, nil, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SupersedeLineageWithClaim(ctxT(), "b1", "b2", "fact B updated", "shared_key", nil, nil); err == nil {
+	if err := s.SupersedeLineageWithClaim(ctxT(), "b1", "b2", "fact B updated", "shared_key", nil, nil, ""); err == nil {
 		t.Fatal("expected a refusal: shared_key is already owned by a2, a different lineage")
 	}
 	all, err := s.All(ctxT())
@@ -851,7 +851,7 @@ func TestSupersedeWithClaimRefusesSecondUnrelatedOwner(t *testing.T) {
 	}
 	// Re-bootstrapping the SAME lineage (a2 itself, via a further named
 	// correction) must still work — that's the ordinary case.
-	if err := s.SupersedeLineageWithClaim(ctxT(), "a2", "a3", "fact A updated again", "shared_key", nil, nil); err != nil {
+	if err := s.SupersedeLineageWithClaim(ctxT(), "a2", "a3", "fact A updated again", "shared_key", nil, nil, ""); err != nil {
 		t.Fatalf("re-supersede of the SAME claim_key owner must still work: %v", err)
 	}
 }

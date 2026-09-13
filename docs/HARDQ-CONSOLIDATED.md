@@ -124,6 +124,15 @@ supersession, deterministic recency+exact/tag retrieval, bytes lossless. **Decay
 Audn move OUT of P0** → P1 `memorija` flag, activated only on a measured retrieval problem,
 and NEVER applied to explicit facts (fact-type exempt, `S=∞`). Amends E14/P0.13 scope.
 
+**[CHANGE-RECORD, TASK/EPHEMERAL memory scope slice, commit 24c0406+]** The S=∞ exemption
+is now `scope`-conditional: `scope=user` (default, unchanged) stays permanently exempt;
+`scope=task`/`scope=ephemeral` are explicitly NOT exempt, enabling a future Decay slice to
+apply per-scope half-lives to the working/task-scoped corpus specifically. This was reviewed
+across 3 rounds of adversarial plan review (agy+kilo+codex) before implementation — see
+`internal/memory`'s `Scope` type doc comment for the full rationale and the closed
+counterexamples (cross-scope claim_key shadowing, cross-scope named supersede) this
+redefinition required fixing alongside it.
+
 ### B9. Static capability snapshot for P0; transactional Activator deferred (codex#13, kilo#10, agy#12 — unanimous OVERENG)
 P0 has zero runtime activation (flags are compile-time; nothing dynamic loads). **P0 ships
 `Resolver.Resolve` as fail-closed validation (unknown/cycle/conflict → reject) + a sealed

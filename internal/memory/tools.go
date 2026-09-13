@@ -23,21 +23,28 @@ import (
 func Specs() map[contracts.ToolID]effectpath.ToolSpec {
 	return map[contracts.ToolID]effectpath.ToolSpec{
 		"memory_remember": {Effect: contracts.EffectReversible, ExecutionKind: contracts.ExecInProcess,
-			ArgsSchemaHash: "memory_remember.v4",
+			ArgsSchemaHash: "memory_remember.v5",
 			Description: `store a fact; args {"content":"...","supersedes":"<fact id, optional>",` +
 				`"claim_key":"<short token identifying what this fact is ABOUT, optional>",` +
 				`"replaces_id":"<the [id] shown next to that same thing in a recent memory_recall — ` +
-				`required together with claim_key WHENEVER one already exists>","tags":["..."]}. ` +
+				`required together with claim_key WHENEVER one already exists>","tags":["..."],` +
+				`"scope":"user"|"task"|"ephemeral" (optional, default "user")}. ` +
 				`claim_key lets NEXUS auto-detect when this fact contradicts an earlier one about the SAME ` +
 				`thing (e.g. "server_ip") instead of you needing to know its id for supersedes. You MUST call ` +
 				`memory_recall first and pass the exact [id] it showed as replaces_id — this proves you ` +
 				`actually looked at what you're replacing rather than guessing; a wrong or missing replaces_id ` +
 				`is refused. A clean, proven update auto-replaces the old one; an uncertain contradiction is ` +
 				`held for review instead of silently overwriting. You may also pass claim_key alongside ` +
-				`supersedes to label an EXISTING fact for future claim_key-based lookups.`},
+				`supersedes to label an EXISTING fact for future claim_key-based lookups. scope="user" ` +
+				`(default) is durable and always recalled; "task"/"ephemeral" are working notes for what ` +
+				`you're doing RIGHT NOW — they don't clutter default recall and can fade over time once a ` +
+				`future decay mechanism exists. A claim_key's ownership is scoped: a "task" note and a ` +
+				`"user" fact can share the same claim_key label without conflicting.`},
 		"memory_recall": {Effect: contracts.EffectReadOnly, ExecutionKind: contracts.ExecInProcess,
-			ArgsSchemaHash: "memory_recall.v1",
-			Description:    `retrieve facts; args {"query":"..."} or {"tag":"..."}`},
+			ArgsSchemaHash: "memory_recall.v2",
+			Description: `retrieve facts; args {"query":"..."} or {"tag":"..."}, plus optional ` +
+				`"scope":"user"|"task"|"ephemeral"|"all" (default "user" — durable facts only; pass ` +
+				`"task"/"ephemeral" to see working notes from that scope, or "all" to see every scope)`},
 	}
 }
 
@@ -80,9 +87,14 @@ func Tools(store *Store, r redact.Redactor) map[contracts.ToolID]effectpath.InPr
 				ClaimKey   string   `json:"claim_key,omitempty"`
 				ReplacesID string   `json:"replaces_id,omitempty"`
 				Tags       []string `json:"tags,omitempty"`
+				Scope      string   `json:"scope,omitempty"`
 			}
 			if err := json.Unmarshal(c.Arguments, &args); err != nil || args.Content == "" {
 				return contracts.ToolResult{}, fmt.Errorf("memory_remember: a non-empty content argument is required (fail closed)")
+			}
+			scope, err := parseScope(args.Scope, false)
+			if err != nil {
+				return contracts.ToolResult{}, err
 			}
 			id := "fact-" + string(c.ToolCallID)
 			// resultText is set per-branch so the reported outcome is
@@ -100,7 +112,7 @@ func Tools(store *Store, r redact.Redactor) map[contracts.ToolID]effectpath.InPr
 				// (if also given) still BOOTSTRAPS the corrected fact into
 				// future claim_key-based lookup (code-review finding,
 				// codex, round 1 HIGH).
-				if err := store.SupersedeLineageWithClaim(ctx, args.Supersedes, id, args.Content, args.ClaimKey, args.Tags, []string{string(c.ToolCallID)}); err != nil {
+				if err := store.SupersedeLineageWithClaim(ctx, args.Supersedes, id, args.Content, args.ClaimKey, args.Tags, []string{string(c.ToolCallID)}, scope); err != nil {
 					return contracts.ToolResult{}, err
 				}
 				resultText = fmt.Sprintf("remembered (%s): %s", id, args.Content)
@@ -116,7 +128,7 @@ func Tools(store *Store, r redact.Redactor) map[contracts.ToolID]effectpath.InPr
 				// bar (an earlier content-based version of this check was
 				// defeated by an ABA content-cycle counterexample — see
 				// applyRemembered's doc comment).
-				outcome, err := store.Remember(ctx, id, args.Content, OriginExplicit, args.ClaimKey, stripIDBrackets(args.ReplacesID), args.Tags, []string{string(c.ToolCallID)})
+				outcome, err := store.Remember(ctx, id, args.Content, OriginExplicit, args.ClaimKey, stripIDBrackets(args.ReplacesID), args.Tags, []string{string(c.ToolCallID)}, scope)
 				if err != nil {
 					return contracts.ToolResult{}, err
 				}
@@ -131,7 +143,7 @@ func Tools(store *Store, r redact.Redactor) map[contracts.ToolID]effectpath.InPr
 					resultText = fmt.Sprintf("remembered (%s): %s", outcome.EffectiveID, args.Content)
 				}
 			default:
-				if err := store.SaveFactLineage(ctx, id, args.Content, args.Tags, []string{string(c.ToolCallID)}); err != nil {
+				if err := store.SaveFactLineage(ctx, id, args.Content, args.Tags, []string{string(c.ToolCallID)}, scope); err != nil {
 					return contracts.ToolResult{}, err
 				}
 				resultText = fmt.Sprintf("remembered (%s): %s", id, args.Content)
@@ -157,6 +169,7 @@ func Tools(store *Store, r redact.Redactor) map[contracts.ToolID]effectpath.InPr
 			var args struct {
 				Query string `json:"query,omitempty"`
 				Tag   string `json:"tag,omitempty"`
+				Scope string `json:"scope,omitempty"`
 			}
 			if err := json.Unmarshal(c.Arguments, &args); err != nil || (args.Query == "" && args.Tag == "") {
 				return contracts.ToolResult{}, fmt.Errorf("memory_recall: a non-empty query or tag argument is required (fail closed)")
@@ -172,12 +185,15 @@ func Tools(store *Store, r redact.Redactor) map[contracts.ToolID]effectpath.InPr
 			if err := validUTF8(args.Query, args.Tag); err != nil {
 				return contracts.ToolResult{}, err
 			}
+			scope, err := parseScope(args.Scope, true)
+			if err != nil {
+				return contracts.ToolResult{}, err
+			}
 			var hits []Row
-			var err error
 			if args.Tag != "" {
-				hits, err = store.RecallTag(ctx, args.Tag)
+				hits, err = store.RecallTag(ctx, args.Tag, scope)
 			} else {
-				hits, err = store.Recall(ctx, args.Query)
+				hits, err = store.Recall(ctx, args.Query, scope)
 			}
 			if err != nil {
 				return contracts.ToolResult{}, err
@@ -246,6 +262,28 @@ func validRawUTF8(raw json.RawMessage) error {
 		return fmt.Errorf("memory: tool arguments must be valid UTF-8 (fail closed)")
 	}
 	return nil
+}
+
+// parseScope validates a model-facing scope string at the tool boundary,
+// fail-closed on anything unrecognized (S9.4 P1) — redundant with
+// factPayload.validate()'s own closed-set check on the write path (same
+// defense-in-depth pattern already accepted elsewhere in this package),
+// and the ONLY validation on the read path, since Recall/RecallTag never
+// route through factPayload at all. allowAll permits the query-only
+// ScopeAll pseudo-value (memory_recall only — never a legal write-side
+// scope, since it is never persisted).
+func parseScope(s string, allowAll bool) (Scope, error) {
+	switch Scope(s) {
+	case "", ScopeUser:
+		return ScopeUser, nil
+	case ScopeTask, ScopeEphemeral:
+		return Scope(s), nil
+	case ScopeAll:
+		if allowAll {
+			return ScopeAll, nil
+		}
+	}
+	return "", fmt.Errorf("memory: unknown scope %q (fail closed)", s)
 }
 
 func stripIDBrackets(s string) string {
