@@ -4068,5 +4068,21 @@ command that solved the LAST known counterexample while quietly
 retaining a different, not-yet-discovered execution/analysis side
 effect.
 
-**Next**: S6 tool-boundary remains the last open item in the coding-trio
-plan (see [[nexus-coding-trio-plan]]).
+**AMENDED 2026-09-13**: S6 tool-boundary — the last open item named above — is now
+CLOSED. Piece 1 (`ExecInProcessGoverned`, a third, honestly-named `ExecutionKind`
+distinct from `ExecInProcess`/`ExecProcess`, dispatching through the same
+`InProcessExecutor`) landed 2026-09-12 (`d816062`, 3 review rounds). Piece 2
+(`rename_symbol_prepare`/`rename_symbol_apply` registered as real `Specs()`/`Tools()`
+tools, plus `config.CodingWorkspaceRoots`, a deny-default one-root-per-profile
+allowlist) landed 2026-09-13 (`caf67aa`, 6 review rounds — the longest adversarial
+chain in this entire plan, codex finding a live-reproduced defect in every round: a
+missing production journal-event registration that made `rename_symbol_apply`
+completely nonfunctional; a malformed-gopls-response acceptance path that could
+silently commit a wrong rename; a concurrency race in the crash-safety latch; and a
+factually wrong "out of scope" deferral that a plain grep would have caught). Full
+history and lessons in [[nexus-coding-trio-plan]]'s own "S6 tool-boundary" sections.
+
+**The coding-trio plan (Slice 0 through Slice 3, plus this S6 tool-boundary item) is
+now fully closed.** No further open item is tracked in this document; the next NEXUS
+work item is undetermined from within this plan and should be picked up from the
+broader NEXUS roadmap.
