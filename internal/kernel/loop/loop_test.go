@@ -139,7 +139,7 @@ func buildFull(t *testing.T, policy Policy, ruleSpec map[string]string, actions 
 			rules[contracts.ToolID(tool)] = effectpath.DecisionAsk
 		}
 	}
-	pep, err := effectpath.NewPEP(rules,
+	pep, err := effectpath.NewPEP(rules, nil,
 		effectpath.NewApprovals(nil, time.Minute), nopAudit{}, effectpath.ModeDefault)
 	if err != nil {
 		t.Fatal(err)

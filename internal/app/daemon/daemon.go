@@ -41,6 +41,9 @@ type Deps struct {
 	Authority      *s7.Authority
 	Profile        contracts.ProfileID
 	Rules          map[contracts.ToolID]effectpath.Decision
+	// ArgGates additionally restricts specific tools by argument (S6.1) —
+	// consulted by every PEP this daemon constructs, exactly like Rules.
+	ArgGates map[contracts.ToolID]effectpath.ArgGate
 	Tools          map[contracts.ToolID]effectpath.InProcFunc
 	Audit          effectpath.AuditSink
 	// Redactor scrubs known secret references from every outbound error
@@ -202,7 +205,7 @@ func (d *Daemon) handle(ctx context.Context, conn net.Conn) {
 	}
 	// Per-session effect path: the mode lives HERE and nowhere reachable
 	// from message payloads.
-	pep, err := effectpath.NewPEP(d.deps.Rules, effectpath.NewApprovals(nil, 5*time.Minute), d.deps.Audit, mode)
+	pep, err := effectpath.NewPEP(d.deps.Rules, d.deps.ArgGates, effectpath.NewApprovals(nil, 5*time.Minute), d.deps.Audit, mode)
 	if err != nil {
 		writeFrame(conn, frame{Type: "error", Text: "session setup failed"})
 		return
@@ -620,7 +623,7 @@ func (d *Daemon) ResumeChannelTurn(ctx context.Context, identity string, turn co
 
 // channelLoop builds the per-turn channel loop (ModeDefault ALWAYS — F2).
 func (d *Daemon) channelLoop(identity string) (*loop.Loop, error) {
-	pep, err := effectpath.NewPEP(d.deps.Rules, effectpath.NewApprovals(nil, 5*time.Minute), d.deps.Audit, effectpath.ModeDefault)
+	pep, err := effectpath.NewPEP(d.deps.Rules, d.deps.ArgGates, effectpath.NewApprovals(nil, 5*time.Minute), d.deps.Audit, effectpath.ModeDefault)
 	if err != nil {
 		return nil, err
 	}

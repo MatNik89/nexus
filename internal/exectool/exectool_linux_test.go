@@ -95,7 +95,7 @@ func path(t *testing.T, a *Adapter, mode effectpath.PolicyMode, approvals *effec
 	if approvals == nil {
 		approvals = effectpath.NewApprovals(nil, 5*time.Minute)
 	}
-	pep, err := effectpath.NewPEP(Rules(), approvals, nopAudit{}, mode)
+	pep, err := effectpath.NewPEP(Rules(), nil, approvals, nopAudit{}, mode)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +128,7 @@ func TestExecRunsSandboxedE2EWithAsk(t *testing.T) {
 	a := adapter(t)
 	approvals := effectpath.NewApprovals(nil, 5*time.Minute)
 	auth := s7.NewAuthority(nil, time.Minute)
-	pep, err := effectpath.NewPEP(Rules(), approvals, nopAudit{}, effectpath.ModeDefault)
+	pep, err := effectpath.NewPEP(Rules(), nil, approvals, nopAudit{}, effectpath.ModeDefault)
 	if err != nil {
 		t.Fatal(err)
 	}

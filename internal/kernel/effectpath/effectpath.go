@@ -205,8 +205,20 @@ type DurableApprovals interface {
 
 // PEP is the S6.0 policy enforcement point: a closed per-tool rule table,
 // default-DENY for everything it does not know.
+// ArgGate additionally restricts a tool whose risk depends on its
+// arguments, not just its ToolID (S6.1 — SECTION-MAP "permission gating
+// ask/allow/deny po alatu i argumentu"). It can only ADD a denial on top
+// of the static per-tool rule, NEVER upgrade one: a nil error falls
+// through to the existing static Allow/Ask/Deny; a non-nil error is an
+// unconditional DENY, full stop. A static DENY or an unknown tool (no
+// static rule at all) is TERMINAL and never reaches an ArgGate — this is
+// a restriction mechanism, not a second grant mechanism, so it cannot be
+// used to escalate a tool PEP's static table has already refused.
+type ArgGate func(json.RawMessage) error
+
 type PEP struct {
 	rules     map[contracts.ToolID]Decision
+	argGates  map[contracts.ToolID]ArgGate
 	approvals *Approvals
 	durable   DurableApprovals
 	audit     AuditSink
@@ -217,7 +229,16 @@ type PEP struct {
 // AFTER the in-memory exact-intent store (both are single-use).
 func (p *PEP) SetDurableApprovals(d DurableApprovals) { p.durable = d }
 
-func NewPEP(rules map[contracts.ToolID]Decision, approvals *Approvals, audit AuditSink, mode PolicyMode) (*PEP, error) {
+// NewPEP takes argGates as a constructor parameter, never a post-
+// construction setter (sealed-startup discipline, HARDQ B9): a mutable
+// setter reachable after Serve starts would race with concurrent Decide
+// calls, since rules/argGates are otherwise treated as immutable after
+// construction. A nil entry in argGates is REFUSED during the copy
+// (round-1 code-review: silently dropping it fails open, leaving the
+// static Allow/Ask unrestricted with no signal anything was
+// misconfigured) — optionality means the key is absent, never present
+// with a nil value.
+func NewPEP(rules map[contracts.ToolID]Decision, argGates map[contracts.ToolID]ArgGate, approvals *Approvals, audit AuditSink, mode PolicyMode) (*PEP, error) {
 	if approvals == nil || audit == nil {
 		return nil, fmt.Errorf("effectpath: approvals and audit sink are required (fail closed)")
 	}
@@ -228,20 +249,42 @@ func NewPEP(rules map[contracts.ToolID]Decision, approvals *Approvals, audit Aud
 	for k, v := range rules {
 		cp[k] = v
 	}
-	return &PEP{rules: cp, approvals: approvals, audit: audit, mode: mode}, nil
+	gcp := make(map[contracts.ToolID]ArgGate, len(argGates))
+	for k, v := range argGates {
+		if v == nil {
+			// Optionality means the KEY is absent — an explicitly
+			// present nil entry is a caller defect (e.g. a map built
+			// from an expression that unexpectedly evaluated to nil),
+			// not a legitimate "no restriction" request. Silently
+			// dropping it would fail OPEN (round-1 code-review:
+			// leaves the static Allow/Ask completely unrestricted with
+			// no signal anything was misconfigured) — refusing
+			// construction outright surfaces the defect immediately
+			// instead of masking it as an inert no-op.
+			return nil, fmt.Errorf("effectpath: argGates entry for %q is nil — omit the key entirely for no restriction (fail closed)", k)
+		}
+		gcp[k] = v
+	}
+	return &PEP{rules: cp, argGates: gcp, approvals: approvals, audit: audit, mode: mode}, nil
 }
 
 // Approvals exposes the approval store (the HITL owner feeds it in T16).
 func (p *PEP) Approvals() *Approvals { return p.approvals }
 
 // Decide is the total policy switch: unknown tool or an invalid stored
-// rule → DENY (S6.0 default-deny; N4-C01).
+// rule → DENY (S6.0 default-deny; N4-C01), terminal — never consults an
+// ArgGate. Only a static Allow/Ask can be additionally narrowed to Deny
+// by a registered ArgGate; nothing can widen a static decision.
 func (p *PEP) Decide(c contracts.ToolCall) Decision {
 	switch p.rules[c.ToolID] {
-	case DecisionAllow:
-		return DecisionAllow
-	case DecisionAsk:
-		return DecisionAsk
+	case DecisionAllow, DecisionAsk:
+		static := p.rules[c.ToolID]
+		if gate, ok := p.argGates[c.ToolID]; ok {
+			if err := gate(c.Arguments); err != nil {
+				return DecisionDeny
+			}
+		}
+		return static
 	case DecisionDeny:
 		return DecisionDeny
 	default:

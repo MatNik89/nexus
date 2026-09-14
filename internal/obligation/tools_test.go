@@ -20,7 +20,7 @@ func TestReminderSetExactIntentApproval(t *testing.T) {
 	h := build(t)
 	auth := s7.NewAuthority(nil, time.Minute)
 	approvals := effectpath.NewApprovals(nil, time.Minute)
-	pep, err := effectpath.NewPEP(Rules(), approvals, nopAudit{}, effectpath.ModeDefault)
+	pep, err := effectpath.NewPEP(Rules(), nil, approvals, nopAudit{}, effectpath.ModeDefault)
 	if err != nil {
 		t.Fatal(err)
 	}

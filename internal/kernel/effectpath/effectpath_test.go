@@ -98,7 +98,7 @@ func build(t *testing.T, mode PolicyMode, rules map[contracts.ToolID]Decision) *
 	t.Helper()
 	audit := &fakeAudit{}
 	approvals := NewApprovals(func() time.Time { return time.Unix(1000, 0) }, time.Minute)
-	pep, err := NewPEP(rules, approvals, audit, mode)
+	pep, err := NewPEP(rules, nil, approvals, audit, mode)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -354,7 +354,7 @@ func TestYoloCannotBeSetByChannelInput(t *testing.T) {
 		}
 	}
 	// An invalid mode at construction is refused (fail closed).
-	if _, err := NewPEP(nil, NewApprovals(nil, time.Minute), &fakeAudit{}, PolicyMode(0)); err == nil {
+	if _, err := NewPEP(nil, nil, NewApprovals(nil, time.Minute), &fakeAudit{}, PolicyMode(0)); err == nil {
 		t.Fatal("zero PolicyMode accepted")
 	}
 }
@@ -425,7 +425,7 @@ func (m *nilSwallowMW) OnError(ctx context.Context, e error) error {
 func TestOnErrorCannotEraseRefusal(t *testing.T) {
 	audit := &fakeAudit{}
 	approvals := NewApprovals(func() time.Time { return time.Unix(1000, 0) }, time.Minute)
-	pep, err := NewPEP(map[contracts.ToolID]Decision{"boom": DecisionAllow}, approvals, audit, ModeDefault)
+	pep, err := NewPEP(map[contracts.ToolID]Decision{"boom": DecisionAllow}, nil, approvals, audit, ModeDefault)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -468,7 +468,7 @@ func TestYoloRefusedWhenAuditNotDurable(t *testing.T) {
 func TestResultValidationAndEffectfulReceiptRule(t *testing.T) {
 	mk := func(fn InProcFunc) (*EffectPath, *s7.Authority) {
 		audit := &fakeAudit{}
-		pep, _ := NewPEP(map[contracts.ToolID]Decision{"w": DecisionAllow},
+		pep, _ := NewPEP(map[contracts.ToolID]Decision{"w": DecisionAllow}, nil,
 			NewApprovals(func() time.Time { return time.Unix(1000, 0) }, time.Minute), audit, ModeDefault)
 		grants := s7.NewAuthority(nil, time.Minute)
 		path, _ := NewEffectPath(pep, &recordingMW{}, NewInProcessExecutor(map[contracts.ToolID]InProcFunc{"w": fn}),
@@ -564,7 +564,7 @@ func TestModifiedCallCannotRideOldGrant(t *testing.T) {
 // CANCELLED (nothing durable can exist).
 func TestCallDeadlinePropagatedIntoExecution(t *testing.T) {
 	audit := &fakeAudit{}
-	pep, _ := NewPEP(map[contracts.ToolID]Decision{"slow": DecisionAllow},
+	pep, _ := NewPEP(map[contracts.ToolID]Decision{"slow": DecisionAllow}, nil,
 		NewApprovals(func() time.Time { return time.Unix(1000, 0) }, time.Minute), audit, ModeDefault)
 	grants := s7.NewAuthority(nil, time.Minute)
 	var sawDeadline time.Time

@@ -20,9 +20,11 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
 )
@@ -420,8 +422,22 @@ func ValidateBounds(c Config) error {
 		}
 	}
 	for _, p := range c.ExecAllow {
-		if strings.Contains(p, "*") || !strings.HasPrefix(p, "/") {
+		if strings.ContainsRune(p, utf8.RuneError) {
+			// A raw invalid UTF-8 byte and an unpaired surrogate escape
+			// both decode to the SAME U+FFFD replacement character —
+			// two distinct configured entries could alias to one stored
+			// string (S6.1 code-review, live-reproduced; see
+			// exectool.New's matching check).
+			errs = append(errs, fmt.Errorf("exec_allow: %q contains an invalid-UTF-8 replacement character (rejected)", p))
+		} else if strings.Contains(p, "*") || !strings.HasPrefix(p, "/") {
 			errs = append(errs, fmt.Errorf("exec_allow: %q must be an absolute path without wildcards (rejected)", p))
+		} else if p != filepath.Clean(p) {
+			// A non-lexically-clean entry (e.g. a symlink component
+			// followed by "..") would silently store under a DIFFERENT
+			// key than configured if exectool cleaned it — S6.1
+			// round-4 code-review, live-reproduced (see exectool.New's
+			// matching check for the full explanation).
+			errs = append(errs, fmt.Errorf("exec_allow: %q is not a lexically clean path (rejected)", p))
 		}
 	}
 	if c.SandboxDisabled {

@@ -730,7 +730,7 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 		}
 	}
 	allTools := mergedTools(memStore, redactor, oblManager, symeditTools)
-	sysPep, err := effectpath.NewPEP(mergedRules(), effectpath.NewApprovals(nil, 5*time.Minute),
+	sysPep, err := effectpath.NewPEP(mergedRules(), mergedArgGates(execAdapter), effectpath.NewApprovals(nil, 5*time.Minute),
 		&journalAudit{j: j, profile: profile}, effectpath.ModeDefault)
 	if err != nil {
 		if sealed != nil {
@@ -787,6 +787,7 @@ func buildDaemon(layout pathx.Layout, resolved config.Resolved) (*daemonBundle, 
 		},
 		Authority: authority, Profile: profile,
 		Rules:            mergedRules(),
+		ArgGates:         mergedArgGates(execAdapter),
 		Tools:            allTools,
 		Audit:            &journalAudit{j: j, profile: profile},
 		Redactor:         redactor,
@@ -825,6 +826,23 @@ func (systemMW) AfterTool(context.Context, contracts.ToolCall, contracts.ToolRes
 	return nil
 }
 func (systemMW) OnError(ctx context.Context, e error) error { return e }
+
+// mergedArgGates combines every tool family's per-argument PEP restriction
+// (S6.1). exec's gate is ALWAYS present — a real one when the sandbox
+// probe bound an adapter, a deny-all one otherwise — never omitted:
+// exec's static rule is always Ask (mergedRules, above) regardless of
+// sandbox availability, so a missing gate here would let a durably-
+// approved call (replayed at startup recovery) consume its approval
+// before an unavailable sandbox ever gets a chance to refuse.
+func mergedArgGates(execAdapter *exectool.Adapter) map[contracts.ToolID]effectpath.ArgGate {
+	gate := func(json.RawMessage) error {
+		return fmt.Errorf("exectool: sandbox unavailable — process execution refused (fail closed)")
+	}
+	if execAdapter != nil {
+		gate = execAdapter.ArgGate
+	}
+	return map[contracts.ToolID]effectpath.ArgGate{exectool.ToolID: gate}
+}
 
 // mergedRules combines every tool family's PEP decisions.
 func mergedRules() map[contracts.ToolID]effectpath.Decision {

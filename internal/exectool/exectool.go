@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/MatNik89/nexus/internal/kernel/contracts"
 	"github.com/MatNik89/nexus/internal/kernel/effectpath"
@@ -58,10 +59,32 @@ func New(b sandbox.Backend, report sandbox.ProbeReport, r redact.Redactor, execA
 	}
 	allow := map[string]bool{}
 	for _, p := range execAllow {
+		if strings.ContainsRune(p, utf8.RuneError) {
+			// Same corruption class as parseArgs' matching check: a
+			// raw invalid byte and an unpaired surrogate escape both
+			// decode to U+FFFD, letting two distinct configured
+			// spellings alias to one stored string.
+			return nil, fmt.Errorf("exectool: exec_allow entry %q contains an invalid-UTF-8 replacement character (fail closed)", p)
+		}
 		if !filepath.IsAbs(p) {
 			return nil, fmt.Errorf("exectool: exec_allow entry %q is not absolute (fail closed)", p)
 		}
-		allow[filepath.Clean(p)] = true
+		if p != filepath.Clean(p) {
+			// Symmetric to parseArgs' request-side check (round-4 code-
+			// review): silently cleaning a non-lexically-clean config
+			// entry would store it under a DIFFERENT key than what the
+			// owner configured — "/safe/link/../git" (a real symlink
+			// traversal) would be stored as "/safe/git", so a model
+			// requesting the perfectly clean "/safe/git" would match an
+			// entry the owner never actually listed. Rejecting outright,
+			// independently of config.ValidateBounds's own check
+			// (defense-in-depth — never rely solely on the config layer
+			// having validated correctly), and storing verbatim below
+			// closes this by construction, the same way as the request
+			// side.
+			return nil, fmt.Errorf("exectool: exec_allow entry %q is not a lexically clean path (fail closed)", p)
+		}
+		allow[p] = true
 	}
 	return &Adapter{backend: b, report: report, redactor: r, allow: allow}, nil
 }
@@ -82,6 +105,96 @@ func Spec() map[contracts.ToolID]effectpath.ToolSpec {
 	}
 }
 
+// parseArgs is the ONE decode+validate path for exec's arguments — shared
+// by Launch and ArgGate (S6.1) so the DECISION and the EXECUTION always
+// parse identically. A divergence between two independent parses could
+// decide on one command and run another (round-2 code-review discipline,
+// same principle as Audn's canonical-intent re-marshal).
+func parseArgs(raw json.RawMessage) (execArgs, error) {
+	if effectpath.HasDuplicateJSONKeys(raw) {
+		// Last-wins duplicate keys let the approver-visible summary and
+		// the executed value diverge (Phase-6 kilo #1) — refused.
+		return execArgs{}, fmt.Errorf("exectool: duplicate argument keys (fail closed)")
+	}
+	// Decode Args as []*string, not []string: a JSON `null` array
+	// element silently becomes the zero value "" under []string (round-2
+	// code-review, live-reproduced: {"args":[null]} decoded to
+	// Args==[]string{""}, so the approved/requested representation
+	// diverged from what actually ran) — a nil pointer element makes the
+	// substitution visible so it can be refused instead of silently
+	// executed.
+	var wire struct {
+		Command string    `json:"command"`
+		Args    []*string `json:"args,omitempty"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&wire); err != nil {
+		return execArgs{}, fmt.Errorf("exectool: malformed args (closed schema): %w", err)
+	}
+	args := execArgs{Command: wire.Command, Args: make([]string, len(wire.Args))}
+	for i, a := range wire.Args {
+		if a == nil {
+			return execArgs{}, fmt.Errorf("exectool: args[%d] is null, not a string (closed schema, fail closed)", i)
+		}
+		args.Args[i] = *a
+	}
+	// A raw invalid UTF-8 byte and an unpaired surrogate escape
+	// (\ud800-\udfff with no partner) BOTH decode to the SAME literal
+	// U+FFFD replacement character — two distinct byte sequences alias
+	// to one visible string (round-1 code-review, live-reproduced:
+	// "/tmp/tool-\ud800" and a raw 0xFF byte both produced
+	// "/tmp/tool-�"). This is the identical corruption class
+	// internal/memory/store.go's validUTF8 closes: reject the LITERAL
+	// replacement character post-decode, uniformly, rather than
+	// enumerate JSON escape forms — closes it here for the same reason.
+	if strings.ContainsRune(args.Command, utf8.RuneError) {
+		return execArgs{}, fmt.Errorf("exectool: command contains an invalid-UTF-8 replacement character (fail closed)")
+	}
+	for _, a := range args.Args {
+		if strings.ContainsRune(a, utf8.RuneError) {
+			return execArgs{}, fmt.Errorf("exectool: an argument contains an invalid-UTF-8 replacement character (fail closed)")
+		}
+	}
+	if !filepath.IsAbs(args.Command) {
+		return execArgs{}, fmt.Errorf("exectool: command must be an absolute path (no shell strings, fail closed)")
+	}
+	if args.Command != filepath.Clean(args.Command) {
+		// A symlink component followed by ".." resolves differently in
+		// the kernel than in filepath.Clean's purely lexical rewrite
+		// (round-3 code-review, live-reproduced: "/safe/link/../git"
+		// cleans to "/safe/git" — an allowlisted spelling — while the
+		// kernel actually opens "/evil/git"). Refusing any non-lexically-
+		// clean spelling outright closes this BY CONSTRUCTION: no
+		// resolution is attempted, so there is no TOCTOU window either.
+		// This is "lexically clean," never "canonical" — filepath.Clean
+		// is a string operation with no knowledge of the filesystem, so
+		// it cannot detect a symlink AT an already-clean path (a
+		// separate, pre-existing exec_allow configuration-trust
+		// question this check does not attempt to close).
+		return execArgs{}, fmt.Errorf("exectool: command must already be a lexically clean path, no traversal or non-canonical segments (fail closed)")
+	}
+	return args, nil
+}
+
+// ArgGate is the S6.1 per-argument PEP restriction (effectpath.ArgGate):
+// it can only narrow exec's static Ask down to Deny, never grant
+// anything — an allowlisted, lexically clean command still falls through
+// to the static Ask (approval is still required for every exec call);
+// only a non-allowlisted or malformed one is denied before any approval
+// ceremony is wasted (closing the round-1 finding: approving a call that
+// Launch was always going to refuse anyway accomplished nothing).
+func (a *Adapter) ArgGate(raw json.RawMessage) error {
+	args, err := parseArgs(raw)
+	if err != nil {
+		return err
+	}
+	if !a.allow[args.Command] {
+		return fmt.Errorf("exectool: %q is not in the exec_allow promoted-target list (deny-default, fail closed)", args.Command)
+	}
+	return nil
+}
+
 // Launch implements effectpath.SandboxBackend: the ONLY door process
 // execution can come through. Unknown tool ids and non-ExecProcess kinds
 // are rejected, never run in-process (CLAUDE.md hard rule).
@@ -92,25 +205,18 @@ func (a *Adapter) Launch(ctx context.Context, call contracts.ToolCall) (contract
 	if call.ExecutionKind != contracts.ExecProcess {
 		return contracts.ToolResult{}, fmt.Errorf("exectool: execution kind %d is not ExecProcess (fail closed)", call.ExecutionKind)
 	}
-	if effectpath.HasDuplicateJSONKeys(call.Arguments) {
-		// Last-wins duplicate keys let the approver-visible summary and
-		// the executed value diverge (Phase-6 kilo #1) — refused.
-		return contracts.ToolResult{}, fmt.Errorf("exectool: duplicate argument keys (fail closed)")
-	}
-	dec := json.NewDecoder(bytes.NewReader(call.Arguments))
-	dec.DisallowUnknownFields()
-	var args execArgs
-	if err := dec.Decode(&args); err != nil {
-		return contracts.ToolResult{}, fmt.Errorf("exectool: malformed args (closed schema): %w", err)
-	}
-	if !filepath.IsAbs(args.Command) {
-		return contracts.ToolResult{}, fmt.Errorf("exectool: command must be an absolute path (no shell strings, fail closed)")
+	args, err := parseArgs(call.Arguments)
+	if err != nil {
+		return contracts.ToolResult{}, err
 	}
 	// PROMOTED-TARGET allowlist, DENY-DEFAULT (Phase-6 codex #5): only
 	// programs the owner listed in exec_allow may run — an absolute ELF
 	// interpreter (/bin/sh -c …) is not a loophole unless explicitly
-	// promoted by the owner.
-	if !a.allow[filepath.Clean(args.Command)] {
+	// promoted by the owner. Kept here as defense-in-depth even though
+	// ArgGate (above) already checks this before Launch is ever reached
+	// through the normal effect-path — never remove a redundant check
+	// just because a decision moved earlier.
+	if !a.allow[args.Command] {
 		return contracts.ToolResult{}, fmt.Errorf("exectool: %q is not in the exec_allow promoted-target list (deny-default, fail closed)", args.Command)
 	}
 	// Disposable RW workdir per call, under a guarded root; removed after.

@@ -362,6 +362,29 @@ func TestCodingWorkspaceRootResolvesPerProfile(t *testing.T) {
 // Detector: malformed entries, wildcards, relative paths, invalid profile
 // ids, and duplicate profile entries are all rejected (fail closed, same
 // rigor as exec_allow).
+// A non-lexically-clean exec_allow entry (a symlink-traversal spelling
+// like "/safe/link/../git") must be rejected at config validation, not
+// silently normalized — exectool.New would otherwise store it under a
+// DIFFERENT key than what the owner configured (S6.1 round-4 code
+// review, live-reproduced against exectool's own matching test).
+func TestExecAllowRejectsNonCanonicalEntry(t *testing.T) {
+	dir := t.TempDir()
+	g := write(t, dir, "exec.json", `{"exec_allow":["/safe/link/../git"]}`)
+	_, err := Resolve(g, filepath.Join(dir, "missing.json"), noEnv, nil)
+	if err == nil || !strings.Contains(err.Error(), "lexically clean") {
+		t.Fatalf("want error containing \"lexically clean\", got %v", err)
+	}
+}
+
+// A clean entry keeps working unchanged.
+func TestExecAllowAcceptsCleanEntry(t *testing.T) {
+	dir := t.TempDir()
+	g := write(t, dir, "exec.json", `{"exec_allow":["/usr/bin/git"]}`)
+	if _, err := Resolve(g, filepath.Join(dir, "missing.json"), noEnv, nil); err != nil {
+		t.Fatalf("clean exec_allow entry refused: %v", err)
+	}
+}
+
 func TestCodingWorkspaceRootsBoundsRejected(t *testing.T) {
 	dir := t.TempDir()
 	cases := []struct {

@@ -85,7 +85,7 @@ func build(t *testing.T) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pep, err := effectpath.NewPEP(Rules(), effectpath.NewApprovals(nil, time.Minute), nopAudit{}, effectpath.ModeYolo)
+	pep, err := effectpath.NewPEP(Rules(), nil, effectpath.NewApprovals(nil, time.Minute), nopAudit{}, effectpath.ModeYolo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -550,7 +550,7 @@ func buildWithKind(t *testing.T, dir, kindName string, k Kind) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pep, err := effectpath.NewPEP(Rules(), effectpath.NewApprovals(nil, time.Minute), nopAudit{}, effectpath.ModeYolo)
+	pep, err := effectpath.NewPEP(Rules(), nil, effectpath.NewApprovals(nil, time.Minute), nopAudit{}, effectpath.ModeYolo)
 	if err != nil {
 		t.Fatal(err)
 	}
